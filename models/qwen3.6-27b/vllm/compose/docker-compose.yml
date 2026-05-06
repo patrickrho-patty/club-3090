@@ -138,6 +138,12 @@ services:
       # turboquant_attn.py:_decode_attention. Surfaced 2026-05-06 in #82.
       # See docs/CLIFFS.md row "PN34" for full context.
       - GENESIS_ENABLE_PN34_WORKSPACE_LOCK_RELAX=1
+      # P98: forward-compat for when Sander ships the marker fix
+      # (auto-skips on v0.20 today via UNIFORM_SINGLE_TOKEN_DECODE drift-marker
+      # false-positive — tracked at docs/UPSTREAM.md). PN34 above is what's
+      # actually firing today; P98 will engage once the marker fix lands.
+      # Belt+suspenders pattern matches long-text.yml + long-text-no-mtp.yml.
+      - GENESIS_ENABLE_P98=1
       # P68/P69 deliberately DISABLED (2026-04-29) — same reasoning as
       # tools-text.yml: 8000-char threshold breaks IDE-agent flows with
       # silent finish_reason=stop. Bisected on club-3090 issue #2.
