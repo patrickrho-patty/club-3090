@@ -8,39 +8,47 @@ Sweep methodology: time-bounded streaming bench (10s/direction at each cap).
 Total wall: 8m12s for 21 caps from 190-390W in 10W increments. The time-bounded
 approach (vs token-bounded) makes per-cap wall constant ~23s regardless of cap,
 so total runtime scales linearly with cap count, not throttle severity.
+
+Sampling fields: SM clock, memory clock, power-throttle %, P-state per cap
+(median of in-load samples where util>50%). The boost-clock plateau visible at
+caps 340-370W is now directly evidenced by SM clock locked at 1560 MHz across
+all four caps, with identical 334W actual draw and 34.66 TPS — power is binding
+at every cap (throttle=100%) but firmware refuses to push above 1560 MHz until
+the cap reaches 380W.
 """
 import matplotlib.pyplot as plt
 
-# (cap_W, narr_TPS, code_TPS, actual_W, eff_TPS_per_W) — full 21-cap clean sweep
+# (cap_W, narr_TPS, code_TPS, actual_W, sm_clk_MHz, eff_TPS_per_W) — 21-cap clean sweep
 data = [
-    (190, 13.88, 13.69, 189.73, 0.073),
-    (200, 15.58, 15.68, 199.71, 0.078),
-    (210, 17.68, 17.48, 209.77, 0.084),
-    (220, 19.38, 19.28, 219.73, 0.088),
-    (230, 21.27, 21.07, 229.71, 0.093),
-    (240, 23.17, 22.97, 239.84, 0.097),
-    (250, 24.97, 24.77, 249.80, 0.100),
-    (260, 26.77, 26.57, 259.86, 0.103),
-    (270, 28.57, 28.47, 269.56, 0.106),
-    (280, 30.36, 30.77, 279.75, 0.109),
-    (290, 32.16, 32.06, 289.37, 0.111),  # ⭐ sweet spot
-    (300, 32.76, 32.76, 299.30, 0.109),
-    (310, 33.36, 33.26, 309.59, 0.108),
-    (320, 33.86, 33.76, 319.47, 0.106),
-    (330, 34.37, 34.26, 329.47, 0.104),
-    (340, 34.46, 34.25, 333.70, 0.103),  # boost-state plateau begins
-    (350, 34.46, 34.36, 334.00, 0.103),
-    (360, 34.36, 34.37, 333.97, 0.103),
-    (370, 34.36, 34.26, 334.02, 0.103),  # stock TDP, plateau holds
-    (380, 35.36, 35.26, 361.30, 0.098),  # plateau ends, draw jumps to 361
-    (390, 36.06, 35.96, 388.72, 0.093),  # max — 388W draw at 390W cap
+    (190, 14.19, 13.78, 189.71, 540, 0.075),
+    (200, 15.68, 15.58, 199.72, 585, 0.079),
+    (210, 17.48, 17.38, 209.69, 660, 0.083),
+    (220, 19.28, 19.48, 219.71, 750, 0.088),
+    (230, 21.58, 21.37, 229.73, 825, 0.094),
+    (240, 23.38, 23.17, 239.74, 915, 0.098),
+    (250, 25.17, 25.07, 249.80, 975, 0.101),
+    (260, 27.07, 26.97, 259.87, 1080, 0.104),
+    (270, 28.97, 28.87, 269.86, 1185, 0.107),
+    (280, 30.77, 30.67, 279.76, 1260, 0.110),
+    (290, 32.26, 32.17, 289.55, 1380, 0.111),  # ⭐ sweet spot
+    (300, 32.96, 32.87, 299.22, 1425, 0.110),
+    (310, 33.57, 33.47, 309.57, 1470, 0.108),
+    (320, 34.06, 33.96, 319.41, 1515, 0.107),
+    (330, 34.57, 34.37, 329.42, 1545, 0.105),
+    (340, 34.66, 34.66, 334.08, 1560, 0.104),  # ←┐
+    (350, 34.67, 34.67, 334.09, 1560, 0.104),  #   │ boost-clock plateau
+    (360, 34.66, 34.67, 333.93, 1560, 0.104),  #   │ SM clk locks at 1560 MHz
+    (370, 34.66, 34.67, 334.00, 1560, 0.104),  # ←┘ stock TDP
+    (380, 35.56, 35.46, 361.67, 1635, 0.098),  # plateau ends, SM jumps to 1635
+    (390, 36.26, 36.06, 388.53, 1680, 0.093),  # max — SM 1680 MHz at 388W draw
 ]
 
 caps = [d[0] for d in data]
 narr = [d[1] for d in data]
 code = [d[2] for d in data]
 draw = [d[3] for d in data]
-eff = [d[4] for d in data]
+sm_clk = [d[4] for d in data]
+eff = [d[5] for d in data]
 
 plt.rcParams.update({
     "font.family": "sans-serif",
@@ -80,9 +88,9 @@ ax2.set_ylim(0.07, 0.118)
 # Sweet spot annotation: 290W
 ax1.axvline(290, color="goldenrod", linestyle=":", alpha=0.5, linewidth=1.5)
 ax1.annotate(
-    "★ 290W cap\n0.111 TPS/W (best efficiency)\n32.2 narr / 32.1 code\n78% of stock TDP",
-    xy=(290, 32.16),
-    xytext=(220, 27),
+    "★ 290W cap\n0.111 TPS/W (best efficiency)\n32.3 narr / 32.2 code\nSM 1380 MHz, 78% of stock TDP",
+    xy=(290, 32.26),
+    xytext=(217, 27),
     fontsize=10.5,
     fontweight="bold",
     bbox=dict(boxstyle="round,pad=0.4", facecolor="#fff3cd", edgecolor="goldenrod", linewidth=1.2),
@@ -90,9 +98,9 @@ ax1.annotate(
     zorder=4,
 )
 
-# Boost-state plateau region (340-370W → all 334W draw)
+# Boost-clock plateau region (340-370W → all SM 1560 MHz, 334W draw, 34.66 TPS)
 ax1.axvspan(335, 375, alpha=0.10, color="orange", zorder=0)
-ax1.text(355, 12.5, "boost-state plateau\n(caps 340-370W → ~334W draw)",
+ax1.text(355, 12.7, "boost-clock plateau\n(caps 340-370W → SM locked\nat 1560 MHz, 334W draw, 34.66 TPS)",
          fontsize=9.5, ha="center", color="#aa5500", fontstyle="italic")
 
 # Stock TDP marker at 370W
@@ -105,6 +113,18 @@ ax1.annotate(
     ha="left",
     color="#555",
     fontstyle="italic",
+)
+
+# Plateau-escape annotation at 380W
+ax1.annotate(
+    "plateau escape:\nSM jumps 1560→1635 MHz",
+    xy=(380, 35.56),
+    xytext=(345, 38),
+    fontsize=9,
+    color="#aa5500",
+    fontstyle="italic",
+    arrowprops=dict(arrowstyle="->", color="#aa5500", lw=0.9, alpha=0.7),
+    zorder=4,
 )
 
 # Title
