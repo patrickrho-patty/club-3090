@@ -122,6 +122,7 @@ services:
       - ../cache/torch_compile:/root/.cache/vllm/torch_compile_cache
       - ../cache/triton:/root/.triton/cache
       - ../patches/genesis/vllm/_genesis:/usr/local/lib/python3.12/dist-packages/vllm/_genesis:ro
+      - ../patches/local/qwen3coder_tool_parser_deferred_commit.py:/patches/qwen3coder_tool_parser_deferred_commit.py:ro
       # workspace_lock_disable DROPPED on v7.69 — Genesis PN34 covers the
       # boot-time AND runtime _decode_attention paths. Opt-in via
       # GENESIS_ENABLE_PN34_WORKSPACE_LOCK_RELAX=1 in environment block.
@@ -290,6 +291,9 @@ services:
           exit 1
         fi
         python3 -m vllm._genesis.patches.apply_all
+        # Tool-parser deferred-commit fix for qwen3coder SSE-silence bug (issue #72).
+        # Drops out when vllm-project/vllm lands the upstream fix.
+        python3 /patches/qwen3coder_tool_parser_deferred_commit.py
         # patch_tolist_cudagraph.py — still needed pending upstream
         # vllm#40807 .tolist() capture-stream guard fix.
         # patch_inputs_embeds_optional.py — backport of vllm#35975

@@ -131,6 +131,7 @@ services:
       - ../cache/torch_compile:/root/.cache/vllm/torch_compile_cache
       - ../cache/triton:/root/.triton/cache
       - ../patches/genesis/vllm/_genesis:/usr/local/lib/python3.12/dist-packages/vllm/_genesis:ro
+      - ../patches/local/qwen3coder_tool_parser_deferred_commit.py:/patches/qwen3coder_tool_parser_deferred_commit.py:ro
       # workspace_lock_disable — relaxes vllm#39226 strict assertion until
       # Sandermage's P98 marker fix lands. v0.20-only requirement.
     environment:
@@ -248,6 +249,9 @@ services:
           exit 1
         fi
         python3 -m vllm._genesis.patches.apply_all
+        # Tool-parser deferred-commit fix for qwen3coder SSE-silence bug (issue #72).
+        # Drops out when vllm-project/vllm lands the upstream fix.
+        python3 /patches/qwen3coder_tool_parser_deferred_commit.py
         exec vllm serve "$@"
       - --
     command:
