@@ -481,6 +481,73 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Recent failed boot attempts
+# ---------------------------------------------------------------------------
+# Capture exited vLLM/llama.cpp containers from the last 24h. Most valuable
+# diagnostic data for boot-failure scenarios — without this, contributors hit
+# "no container running" and have to manually paste docker logs ad-hoc.
+# Engine-agnostic: matches both vllm-* and llama-cpp-* container patterns.
+
+section "Recent failed boot attempts"
+if ! have docker; then
+  echo "_docker not available — skipping._"
+elif ! docker info >/dev/null 2>&1; then
+  echo "_docker daemon unreachable — skipping._"
+else
+  # Get exited containers matching club-3090 engine patterns. `docker ps -a`
+  # without a time filter; we'll filter to last 24h via the FinishedAt field.
+  exited_lines=$(docker ps -a \
+    --format '{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.ID}}' \
+    --filter 'status=exited' 2>/dev/null \
+    | grep -E '^(vllm-|llama-cpp-)' || true)
+
+  if [[ -z "$exited_lines" ]]; then
+    echo "_No recently-exited vLLM or llama.cpp containers found._"
+  else
+    found_recent=0
+    while IFS=$'\t' read -r ex_name ex_image ex_status ex_id; do
+      [[ -z "$ex_name" ]] && continue
+      # Cutoff: last 24h. docker inspect gives ISO-8601 FinishedAt.
+      finished_at=$(docker inspect "$ex_id" --format '{{.State.FinishedAt}}' 2>/dev/null || echo "")
+      exit_code=$(docker inspect "$ex_id" --format '{{.State.ExitCode}}' 2>/dev/null || echo "?")
+      [[ -z "$finished_at" ]] && continue
+
+      # Skip containers that exited >24h ago (epoch comparison)
+      finished_epoch=$(date -d "$finished_at" +%s 2>/dev/null || echo 0)
+      cutoff_epoch=$(date -d '24 hours ago' +%s 2>/dev/null || echo 0)
+      [[ "$finished_epoch" -lt "$cutoff_epoch" ]] && continue
+
+      found_recent=1
+      relative_when=$(date -d "$finished_at" '+%Y-%m-%dT%H:%M:%SZ (%s seconds ago)' 2>/dev/null || echo "$finished_at")
+      # Format relative_when nicely: how many minutes ago?
+      mins_ago=$(( ($(date +%s) - finished_epoch) / 60 ))
+      if [[ $mins_ago -lt 60 ]]; then
+        relative_label="${mins_ago} min ago"
+      else
+        hrs_ago=$(( mins_ago / 60 ))
+        rem_mins=$(( mins_ago % 60 ))
+        relative_label="${hrs_ago}h ${rem_mins}min ago"
+      fi
+
+      subsection "\`$ex_name\` — exited $relative_label (code $exit_code)"
+      {
+        echo "- **Name:** \`$ex_name\`"
+        echo "- **Image:** \`$ex_image\`"
+        echo "- **Status:** $ex_status"
+        echo "- **Exit code:** $exit_code"
+        echo "- **Finished at:** $finished_at"
+      } | redact
+
+      docker logs --tail 80 "$ex_id" 2>&1 | redact | details "Last 80 log lines from \`$ex_name\`"
+    done <<< "$exited_lines"
+
+    if [[ "$found_recent" == "0" ]]; then
+      echo "_Exited vLLM/llama.cpp containers exist but all >24h old — likely not relevant to current investigation._"
+    fi
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 # Optional: verify-full
 # ---------------------------------------------------------------------------
 
