@@ -928,6 +928,25 @@ if [ "$LOAD_MODE" = "prefill-heavy" ]; then
     PREFILL_FILLER_REPEATS="$BENCH_PREFILL_FILLER_REPEATS"
     CALIBRATION_NOTE="prefill filler_repeats=${PREFILL_FILLER_REPEATS} from BENCH_PREFILL_FILLER_REPEATS override"
   else
+    # Detect model's max context window for prompt-size clamping. If the
+    # calibrated target prompt exceeds the context, llama.cpp truncates
+    # silently → wall time becomes meaningless → bogus TPS readings.
+    # Prefer llama.cpp's /props endpoint (exposes n_ctx); fall back to
+    # vLLM's /v1/models (exposes max_model_len). 0 = unable to detect,
+    # skip the clamp (preserve existing behavior).
+    MODEL_MAX_CTX=$(
+      curl -sf --max-time 5 "${URL}/props" 2>/dev/null \
+        | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('default_generation_settings',{}).get('n_ctx',0))" 2>/dev/null \
+        || curl -sf --max-time 5 "${URL}/v1/models" 2>/dev/null \
+        | python3 -c "import json,sys; d=json.load(sys.stdin); m=d.get('data',[{}])[0]; print(m.get('max_model_len', m.get('context_length',0)))" 2>/dev/null \
+        || echo 0
+    )
+    MODEL_MAX_CTX="${MODEL_MAX_CTX:-0}"
+    if [ "$MODEL_MAX_CTX" -gt 0 ]; then
+      echo "[calibrate] detected model context: ${MODEL_MAX_CTX} tokens (will clamp prompt to 90%)"
+    else
+      echo "[calibrate] could not detect model context — proceeding without clamp (set MODEL_MAX_CTX env if needed)"
+    fi
     echo "[calibrate] prefill-heavy: sizing prompt at ${HIGHEST_CAP}W cap for ~${TARGET_PREFILL_SECONDS}s at the fastest cap"
     nvidia-smi -pl "$HIGHEST_CAP" -i "$GPU_INDEX" >/dev/null
     sleep 2
@@ -940,7 +959,7 @@ if [ "$LOAD_MODE" = "prefill-heavy" ]; then
       echo "[error] prefill calibration failed; see $CAL_LOG" >&2
       exit 1
     fi
-    read -r PREFILL_FILLER_REPEATS PREFILL_PROMPT_TOKENS < <(python3 - "$PROBE_TPS" "$PROBE_TOKENS" "$TARGET_PREFILL_SECONDS" "$PREFILL_CALIBRATION_REPEATS" <<'PY'
+    read -r PREFILL_FILLER_REPEATS PREFILL_PROMPT_TOKENS PREFILL_CLAMPED < <(python3 - "$PROBE_TPS" "$PROBE_TOKENS" "$TARGET_PREFILL_SECONDS" "$PREFILL_CALIBRATION_REPEATS" "$MODEL_MAX_CTX" <<'PY'
 import math
 import sys
 
@@ -948,13 +967,29 @@ tps = float(sys.argv[1])
 probe_tokens = int(sys.argv[2])
 target_seconds = int(sys.argv[3])
 tokens_per_repeat = max(probe_tokens / float(sys.argv[4]), 1.0)
+max_ctx = int(sys.argv[5])
 target_tokens = max(1000, int(round(tps * target_seconds)))
-repeats = max(1, int(math.ceil(target_tokens / tokens_per_repeat)))
-print(repeats, int(round(repeats * tokens_per_repeat)))
+clamped = 0
+if max_ctx > 0:
+    safe_max = int(max_ctx * 0.9)
+    # Subtract some headroom for the chat template + max_tokens overhead
+    safe_max = max(1000, safe_max - 256)
+    if target_tokens > safe_max:
+        target_tokens = safe_max
+        clamped = 1
+repeats = max(1, int(math.floor(target_tokens / tokens_per_repeat)))
+print(repeats, int(round(repeats * tokens_per_repeat)), clamped)
 PY
 )
-    CALIBRATION_NOTE="prefill probe at ${HIGHEST_CAP}W: ${PROBE_TOKENS} tok in ${PROBE_WALL}s = ${PROBE_TPS} TPS; target=${TARGET_PREFILL_SECONDS}s -> filler_repeats=${PREFILL_FILLER_REPEATS} (~${PREFILL_PROMPT_TOKENS} prompt tok)"
-    echo "[calibrate] ${CALIBRATION_NOTE}"
+    if [ "${PREFILL_CLAMPED:-0}" = "1" ]; then
+      EFFECTIVE_SECONDS=$(awk "BEGIN{printf \"%.1f\", ${PREFILL_PROMPT_TOKENS} / ${PROBE_TPS}}")
+      CALIBRATION_NOTE="prefill probe at ${HIGHEST_CAP}W: ${PROBE_TOKENS} tok in ${PROBE_WALL}s = ${PROBE_TPS} TPS; target=${TARGET_PREFILL_SECONDS}s would have needed >${MODEL_MAX_CTX}-token prompt, clamped to 90% of model ctx → filler_repeats=${PREFILL_FILLER_REPEATS} (~${PREFILL_PROMPT_TOKENS} prompt tok, ~${EFFECTIVE_SECONDS}s effective at high cap)"
+      echo "[calibrate] ⚠️  clamped: ${CALIBRATION_NOTE}"
+      echo "[calibrate] note: per-cap walls at the high end will be < ${TARGET_PREFILL_SECONDS}s. For longer wall, restart engine with bigger context (e.g. -c $((MODEL_MAX_CTX * 2))) or lower --target-prefill-seconds."
+    else
+      CALIBRATION_NOTE="prefill probe at ${HIGHEST_CAP}W: ${PROBE_TOKENS} tok in ${PROBE_WALL}s = ${PROBE_TPS} TPS; target=${TARGET_PREFILL_SECONDS}s -> filler_repeats=${PREFILL_FILLER_REPEATS} (~${PREFILL_PROMPT_TOKENS} prompt tok)"
+      echo "[calibrate] ${CALIBRATION_NOTE}"
+    fi
     echo
   fi
 fi
