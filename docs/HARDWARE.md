@@ -273,6 +273,29 @@ sudo nvidia-smi -rgc -i 0   # release graphics-clock lock
 - This is an **air-cooled 5090 finding** — water-cooled rigs may have different optimal clock pairs (lower thermals → higher sustained boost-clock-vs-power tradeoff)
 - The freq-cap methodology hasn't been wrapped into `power-cap-sweep.sh` yet — apnar's data is hand-rolled. If you want to run a similar sweep on your 5090, copy his approach until we ship a `freq-cap-sweep.sh` companion
 
+### Laptop GPUs — EC-managed power (no software power-cap)
+
+On laptop-class Ampere/Ada/Blackwell GPUs (RTX 30/40/50-series Laptop variants), `nvidia-smi -pl <W>` returns `[N/A]` and software power-cap tools cannot enforce a limit. The power envelope is owned by the **embedded controller (EC)** via the platform firmware (a vendor-specific implementation of NVIDIA's Dynamic Boost / OEM platform-power policy), not exposed to the OS:
+
+```text
+Power: limit=[N/A] (default=95W, max=175W) | current_draw=94W @ load
+```
+
+The card reports a max TDP in PCI config but the EC enforces the actual operating point based on platform thermals, AC-vs-battery, cooling fans, and OEM-specific tuning. `nvidia-smi` cannot override the EC.
+
+**Confirmed on**: RTX 5090 Laptop (driver 596.36, EC profile 95W) — [@easel #102 follow-up 2026-05-09](https://github.com/noonghunna/club-3090/issues/102#issuecomment-4412264989).
+
+**Implications**:
+- `scripts/power-cap-sweep.sh` detects the limitation and exits gracefully — it cannot characterize laptop GPUs
+- The matrix entry for laptop rigs in HARDWARE.md should read: *software power-cap: N/A (EC-managed)*
+- The clock-lock approach (`-lgc` / `-lmc` from the Blackwell desktop section above) is the **only available characterization path** on laptop GPUs — clock-locking does not have the same EC-dependency as the power-cap actuator
+
+**Practical guidance for laptop owners**:
+- Don't try to run our power-cap sweep tools — they'll fail to actuate
+- Tune via clock-locking instead, but expect the EC to potentially override your clock locks under thermal pressure
+- For sustained throughput, focus on cooling (laptop cooling pad, undervolt via vendor tools, AC power) rather than software caps
+- The pre-set EC profiles (Performance / Quiet / Eco modes in vendor tools like NVIDIA App, Lenovo Vantage, ASUS Armoury Crate) are the user-accessible knobs
+
 ### Interpreting "draw plateaued below cap" sweeps
 
 If your sweep ends with the high-cap rows showing **actual draw < cap by 5-15%** (e.g. 547W actual at 600W cap on a 5090 with `decode-concurrent N=4`), it usually means one of:

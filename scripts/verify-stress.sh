@@ -49,6 +49,13 @@
 #   PREFILL_TARGET_CHARS   Tool-response prefill payload size in chars
 #                          (default: 100000 ≈ 25K tokens; set higher to
 #                          push closer to the cliff under investigation).
+#   STRESS_LONGCTX_TIMEOUT_S       Curl timeout for long-context needle checks
+#                          (default: 300, auto-bumped to 600 if container has
+#                          VLLM_ENFORCE_EAGER=1 — eager prefill at 60K+ can
+#                          take 200-290s, see easel #102 follow-up).
+#   STRESS_TOOL_PREFILL_TIMEOUT_S  Curl timeout for tool-prefill OOM check
+#                          (default: 240, auto-bumped to 480 if container has
+#                          VLLM_ENFORCE_EAGER=1).
 
 set -euo pipefail
 
@@ -63,6 +70,26 @@ fi
 URL="${URL:-http://localhost:8020}"
 MODEL="${MODEL:-qwen3.6-27b-autoround}"
 CONTAINER="${CONTAINER:-vllm-qwen36-27b}"
+
+# Detect VLLM_ENFORCE_EAGER=1 in the running container's env. Eager-mode
+# prefill at 60K-140K can take 200-290s (vs <60s with CUDA graphs); the
+# default curl timeouts below would false-positive as HTTP 000 on rigs that
+# need eager mode to fit (typical for WSL2 / laptop GPUs at long ctx, see
+# easel #102). When detected, scale the long-ctx + tool-prefill timeouts up.
+EAGER_MODE_DETECTED=0
+if command -v docker >/dev/null 2>&1; then
+  if docker inspect "${CONTAINER}" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
+       | grep -qE '^VLLM_ENFORCE_EAGER=1$'; then
+    EAGER_MODE_DETECTED=1
+  fi
+fi
+if [[ "${EAGER_MODE_DETECTED}" == "1" ]]; then
+  STRESS_LONGCTX_TIMEOUT_S="${STRESS_LONGCTX_TIMEOUT_S:-600}"
+  STRESS_TOOL_PREFILL_TIMEOUT_S="${STRESS_TOOL_PREFILL_TIMEOUT_S:-480}"
+else
+  STRESS_LONGCTX_TIMEOUT_S="${STRESS_LONGCTX_TIMEOUT_S:-300}"
+  STRESS_TOOL_PREFILL_TIMEOUT_S="${STRESS_TOOL_PREFILL_TIMEOUT_S:-240}"
+fi
 
 pass() { printf "  \033[32m✓\033[0m %s\n" "$1"; }
 fail() { printf "  \033[31m✗\033[0m %s\n" "$1"; printf "    \033[33m→\033[0m %s\n" "$2"; return 1; }
@@ -201,7 +228,7 @@ EOF
     secret="$(cat "$secret_file")"
     local resp content_raw prompt_tok http_code resp_file
     resp_file="$(mktemp --suffix=.json)"
-    http_code="$(curl -s -m 300 -o "${resp_file}" -w '%{http_code}' \
+    http_code="$(curl -s -m "${STRESS_LONGCTX_TIMEOUT_S}" -o "${resp_file}" -w '%{http_code}' \
       "${URL}/v1/chat/completions" \
       -H "Content-Type: application/json" \
       --data-binary "@${req_file}")" || http_code="000"
@@ -327,7 +354,7 @@ with open(os.environ['REQ_FILE'], 'w') as f:
 EOF
 
   local http_code
-  http_code="$(curl -s -m 240 -o "${resp_file}" -w '%{http_code}' \
+  http_code="$(curl -s -m "${STRESS_TOOL_PREFILL_TIMEOUT_S}" -o "${resp_file}" -w '%{http_code}' \
     "${URL}/v1/chat/completions" \
     -H "Content-Type: application/json" \
     --data-binary "@${req_file}")" || http_code="000"

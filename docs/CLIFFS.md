@@ -417,6 +417,21 @@ On 24 GB / 3090 the per-card budget absorbs TQ3's activation peak and the smalle
 
 The general principle: **the variant matrix is per-card-budget × KV-format-tradeoff aware**. Compose defaults are tuned for 24 GB / 3090; users on different VRAM classes may need to override `--kv-cache-dtype` to relocate the activation/pool balance for their hardware.
 
+#### The naming trap — fp8 is *larger* than TQ3 per token
+
+The KV-format names are misleading. **fp8_e5m2 stores 8 bits per cached element; turboquant_3bit_nc packs 3 bits.** At long single-prompt contexts on memory-tight rigs, this flips the conventional intuition:
+
+| KV format | Bytes / cached token | Verdict at 180K on 24 GB single-card |
+|---|---:|---|
+| `turboquant_3bit_nc` (TQ3) | 0.375 | ✅ fits at 180K with mem-util 0.93 |
+| `fp8_e5m2` | 1.0 | ❌ OOMs — needs 6.64 GiB KV pool, only 4.36 GiB available |
+
+**Validated by [@easel #102](https://github.com/noonghunna/club-3090/issues/102#issuecomment-4412264989) on RTX 5090 Laptop**: switching from TQ3 → fp8_e5m2 at 180K context produced `ValueError: 6.64 GiB KV cache is needed, larger than available (4.36 GiB)`. Reverted to TQ3 and the boot succeeded.
+
+**Pin**: on 24 GB single-card, **TQ3 is the long-context KV; fp8 is for short-context throughput**. The TQ3 activation-peak trade discussed above is real but ~1 GB; the fp8 KV-pool inflation at long-ctx is several GB. At 180K the activation-peak trade is dominated by the pool-size trade.
+
+**On dual-card rigs** the analysis is the same per-card; TQ3 is still the long-context-on-tight-budget choice. fp8 starts to make sense again when (a) context is short enough that pool size doesn't dominate, or (b) you have generous per-card headroom (32 GB+ cards, or shorter max_model_len giving you VRAM to spare).
+
 ### Why llama.cpp doesn't have Cliff 2
 
 llama.cpp's Qwen3-Next implementation processes DeltaNet/GDN layers with **online state updates** (incremental) rather than materializing the full intermediate. State is updated per-token or per-tile, never as a single multi-GB tensor. Different algorithm, different memory profile.
