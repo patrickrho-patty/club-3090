@@ -191,6 +191,16 @@ This separation keeps the stack maintainable as it grows. We don't want a model-
 
 ---
 
+## Community projects
+
+Projects in the club-3090 ecosystem maintained outside this repo:
+
+- **[VykosX/club-3090-server](https://github.com/VykosX/club-3090-server)** — single-file installer adding a server-management layer on top of club-3090: browser admin panel on `:8008/admin`, OpenAI-compatible reverse proxy on `:8009` with multi-backend routing, GPU-aware multi-instance orchestration, fan/power controls, audit logs, and per-user API auth/quota. Headless Arch + Debian/Ubuntu friendly. Started 2026-05-05, AGPL-3.0; see [discussion #108](https://github.com/noonghunna/club-3090/discussions/108) for the announcement and current WIP status. **Not yet officially adopted** — listed here as a community pointer until it converges on a stable surface area.
+
+If you've built something that integrates with club-3090 and you'd like a pointer added here, open a discussion.
+
+---
+
 ## Migration history
 
 - **2026-04-28** — Repo created. Consolidates and supersedes:
