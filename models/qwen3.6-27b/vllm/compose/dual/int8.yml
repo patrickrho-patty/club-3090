@@ -1,0 +1,115 @@
+# ===========================================================================
+# Profile (at-a-glance):
+#   Model:     Qwen3.6-27B (Lorbus AutoRound INT4 + BF16 mtp.fc preserved)
+#   Topology:  Dual 3090 PCIe (TP=2, no NVLink)
+#   Drafter:   MTP n=3 (built-in, architectural max for Qwen3-Next)
+#   KV:        int8_per_token_head (PTH, via vllm#40391) — 1 byte/token like fp8
+#              but uses PR #40391 quantized-pool path that lets Gemma run at
+#              the same KV class. Created for **matched-config head-to-head
+#              against gemma-int8.yml** — same vLLM pin, same KV class, same
+#              262K ctx.
+#   Vision:    yes
+#   Max ctx:   262144 (262K — same as fp8 dual.yml)
+#   Genesis:   none (matches dual.yml — intentionally Genesis-free)
+#   Status:    🧪 Experimental — INT8 PTH KV compatibility on Qwen3-Next DeltaNet
+#              hybrid not previously validated on this stack. Boot test + verify-
+#              full + bench before treating as a shipping path.
+#   Best for:  Apples-to-apples comparison with Gemma 4 31B int8.yml on the
+#              same vLLM nightly + KV class.
+# ---------------------------------------------------------------------------
+# Run:
+#   docker compose -f dual/int8.yml up -d
+# ===========================================================================
+services:
+  vllm-qwen36-27b-dual-int8:
+    # Same vLLM nightly as gemma-4-31b/vllm/compose/dual/int8.yml — 2026-05-08
+    # cut, post Gemma 4 MTP merge + INT8 PTH KV path (vllm#40391). Pin matches
+    # so head-to-head TPS deltas reflect model intrinsics, not vLLM-version
+    # drift between Qwen and Gemma legs.
+    image: vllm/vllm-openai:nightly-1acd67a795ebccdf9b9db7697ae9082058301657
+    container_name: vllm-qwen36-27b-dual-int8
+    restart: "no"
+    ports:
+      - "${BIND_HOST:-0.0.0.0}:${PORT:-8011}:8000"
+    volumes:
+      - ${MODEL_DIR:-../../../../../models-cache}:/root/.cache/huggingface
+      # Reuse the same torch.compile + Triton kernel caches as dual.yml so
+      # second-boot warm time stays short. The kernel cache is keyed by
+      # (model, kv-dtype, vllm-version) so we share with dual.yml only when
+      # all three match — for int8 vs fp8 the cache won't collide.
+      - ../../cache/torch_compile:/root/.cache/vllm/torch_compile_cache
+      - ../../cache/triton:/root/.triton/cache
+      # Marlin pad-sub-tile-n patch (vLLM PR #40361) — still required for
+      # TP=2 on AutoRound W4A16 (drops out when upstream merges).
+      - ../../patches/vllm-marlin-pad/marlin.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/kernels/linear/mixed_precision/marlin.py:ro
+      - ../../patches/vllm-marlin-pad/MPLinearKernel.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/kernels/linear/mixed_precision/MPLinearKernel.py:ro
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+      - VLLM_WORKER_MULTIPROC_METHOD=spawn
+      - NCCL_CUMEM_ENABLE=0
+      - NCCL_P2P_DISABLE=1
+      - VLLM_NO_USAGE_STATS=1
+      - VLLM_USE_FLASHINFER_SAMPLER=1
+      - OMP_NUM_THREADS=1
+      - PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True,max_split_size_mb:512}
+    shm_size: "16gb"
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    entrypoint:
+      - bash
+      - -c
+      - |
+        exec vllm serve ${VLLM_ENFORCE_EAGER:+--enforce-eager} "$@"
+      - --
+    command:
+      - --model
+      - /root/.cache/huggingface/qwen3.6-27b-autoround-int4
+      - --served-model-name
+      - qwen3.6-27b-autoround
+      - --quantization
+      - auto_round
+      - --dtype
+      - float16
+      - --tensor-parallel-size
+      - "2"
+      - --disable-custom-all-reduce
+      - --max-model-len
+      - "${MAX_MODEL_LEN:-262144}"
+      - --gpu-memory-utilization
+      - "${GPU_MEMORY_UTILIZATION:-0.92}"
+      - --max-num-seqs
+      - "${MAX_NUM_SEQS:-2}"
+      - --max-num-batched-tokens
+      - "8192"
+      # INT8 per-token-head KV via vllm#40391 (same as gemma-int8.yml).
+      # If this errors at boot on Qwen3-Next DeltaNet hybrid attention,
+      # the model may not yet be compatible — fall back to fp8_e5m2 dual.yml.
+      - --kv-cache-dtype
+      - "${KV_DTYPE:-int8_per_token_head}"
+      - --trust-remote-code
+      - --reasoning-parser
+      - qwen3
+      - --default-chat-template-kwargs
+      - '{"enable_thinking": false}'
+      - --enable-auto-tool-choice
+      - --tool-call-parser
+      - qwen3_coder
+      - --enable-prefix-caching
+      - --enable-chunked-prefill
+      # MTP n — architectural target for Qwen3-Next built-in heads is the
+      # number of physical MTP layers in the model (3 for Qwen3.6 AutoRound
+      # at time of writing). Higher n re-uses the same MTP layer for the
+      # extra draft steps and emits a vLLM warning about reduced acceptance
+      # rate. Use SPEC_N_MAX=4 to A/B against Gemma's n=4.
+      - --speculative-config
+      - '{"method":"mtp","num_speculative_tokens":${SPEC_N_MAX:-3}}'
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"

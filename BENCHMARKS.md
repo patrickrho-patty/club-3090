@@ -330,7 +330,44 @@ Cross-reference [Quality benches — Aider Polyglot 30](#quality-benches--aider-
 | Rust | 3/5 (60%) | 3/5 (60%) | tied |
 | **Total** | **20/30 (66.7%)** | 17/30 (56.7%) | **−10 pp** |
 
-### Headline takeaways
+### Matched-config rebench (later same day) — most of the "Gemma +60% TPS" gap was config drift
+
+After the first run, the two legs differed on (a) vLLM nightly, (b) KV dtype, (c) max context, (d) MTP n. Re-ran both with everything matched (vLLM `1acd67a7` · `int8_per_token_head` KV · 262K ctx · MTP n=4 · TP=2 · mem-util 0.92 · max-num-seqs=2 · AutoRound INT4 W4A16 group_size 128). Compose files added: `models/qwen3.6-27b/vllm/compose/dual/int8.yml` (new, this work) + `models/gemma-4-31b/vllm/compose/dual/int8.yml` (existing, `SPEC_N_MAX` parameterized).
+
+**Notable side-finding:** Qwen3-Next + INT8 PTH KV (vllm#40391) **works end-to-end on our stack** — first validation. Real chat completions, MTP acceptance ~75%, **+27%/+33% TPS** vs Qwen's prior fp8 KV row above (most of which is the newer vLLM nightly + INT8 PTH KV combo, not architectural). Qwen `int8.yml` is now a candidate shipping path.
+
+#### Matched-config performance (2026-05-10 PM)
+
+| Metric | Qwen 3.6 27B int8.yml | Gemma 4 31B int8.yml | Gemma vs Qwen |
+|---|---:|---:|---:|
+| Narrative decode TPS | 88.05 | **98.12** | **+11%** |
+| Code decode TPS | 120.17 | **129.34** | **+8%** |
+| TTFT narrative | 152 ms | **79 ms** | **−48%** |
+| TTFT code | 137 ms | **79 ms** | **−42%** |
+| CV narrative / code | 1.6% / 5.3% | 2.1% / 0.6% | both clean |
+| MTP avg accept (warm) | 75.3% | 70.6% | Qwen +5 pp |
+| MTP per-pos rates (n=4) | 0.94 / 0.83 / 0.69 / 0.55 | 0.89 / 0.75 / 0.65 / 0.55 | Qwen earlier-pos better |
+
+#### Concurrency + VRAM (matched config)
+
+| Metric | Qwen | Gemma | Δ |
+|---|---:|---:|---:|
+| VRAM used / card | 21.4 GiB | 22.5 GiB | +1.0 GiB Gemma |
+| Available KV cache / card | 11.10 GiB | 10.82 GiB | -0.28 GiB Gemma |
+| **GPU KV cache size (tokens)** | **605,495** | 466,892 | **+30% Qwen** |
+| max_num_seqs (configured) | 2 | 2 | tied |
+| **Max concurrency @ 262K/req** | **2.31×** | 1.78× | +30% Qwen |
+| Practical concurrency @ 100K/req | ~6.0× | ~4.7× | +28% Qwen |
+| Practical concurrency @ 32K/req | ~18.9× | ~14.6× | +30% Qwen |
+
+#### Matched-config headline
+
+- **Per-stream speed:** Gemma wins **~10% decode TPS + ~45% TTFT** — that's the model-architecture-attributable gap. Dense attention prefills faster than DeltaNet hybrid.
+- **Throughput at scale:** Qwen wins **~30% more KV pool** — supports more concurrent streams at the same per-stream context budget. Lighter weights + smaller per-token KV from the hybrid attention.
+- **Workload pick:** Single-agent / chat → Gemma. Multi-tenant fleet → Qwen.
+- **Original mismatched table below preserved** for the "shipping defaults" comparison. The +60% gap from this morning was nearly all vLLM-nightly + KV-class drift, not model intrinsics.
+
+### Headline takeaways (original mismatched-config bench, kept for reference)
 
 - **TPS:** Gemma 4 31B is **~60% faster** across both narrative and code, plus ~2× faster TTFT and 0.8 GiB less VRAM per card. For throughput-bound workloads at ≤32K ctx, Gemma 4 wins decisively at this config. For long-context (>32K), Qwen 3.6 27B's 262K ceiling + fp8 KV is the only option in this matchup (use `gemma-int8` for Gemma at 262K — separate compose, not benched here).
 - **Quality aggregate:** Effectively tied — **180-scenario combined total: Qwen 120/180 (66.7%), Gemma 119/180 (66.1%)**. Within noise. Neither model is generically "better"; the choice is workload-shaped.

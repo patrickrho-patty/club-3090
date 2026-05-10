@@ -188,5 +188,9 @@ services:
       - gemma4
       - --chat-template
       - /vllm-workspace/examples/tool_chat_template_gemma4.jinja
+      # SPEC_N_MAX overridable for matched-config head-to-head against
+      # qwen3.6-27b/vllm/compose/dual/int8.yml (Qwen's built-in MTP caps at
+      # n=3 architecturally, so the canonical apples-to-apples bench uses
+      # SPEC_N_MAX=3 here).
       - --speculative-config
-      - '{"model":"/root/.cache/huggingface/gemma-4-31b-it-assistant","num_speculative_tokens":4}'
+      - '{"model":"/root/.cache/huggingface/gemma-4-31b-it-assistant","num_speculative_tokens":${SPEC_N_MAX:-4}}'
