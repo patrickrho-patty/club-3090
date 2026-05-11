@@ -63,7 +63,7 @@ services:
     # TurboQuant), so it doesn't accumulate the same anchor-drift exposure
     # the single-card project does. Pin if you hit a regression; otherwise
     # ride the wave.
-    image: vllm/vllm-openai:nightly-01d4d1ad375dc5854779c593eee093bcebb0cada
+    image: vllm/vllm-openai:nightly-1acd67a795ebccdf9b9db7697ae9082058301657
     container_name: vllm-qwen36-27b-dual-nvlink
     restart: "no"
     ports:

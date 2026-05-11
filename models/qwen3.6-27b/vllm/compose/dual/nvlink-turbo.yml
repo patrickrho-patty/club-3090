@@ -63,7 +63,7 @@
 # ===========================================================================
 services:
   vllm-qwen36-27b-dual-nvlink-turbo:
-    image: vllm/vllm-openai:nightly-01d4d1ad375dc5854779c593eee093bcebb0cada
+    image: vllm/vllm-openai:nightly-1acd67a795ebccdf9b9db7697ae9082058301657
     container_name: vllm-qwen36-27b-dual-nvlink-turbo
     restart: "no"
     ports:
@@ -217,7 +217,6 @@ services:
         # Tool-parser deferred-commit fix for qwen3coder SSE-silence bug (issue #72).
         # Drops out when vllm-project/vllm lands the upstream fix.
         python3 /patches/qwen3coder_tool_parser_deferred_commit.py
-        # NOTE: patch_workspace_lock_disable.py + patch_tolist_cudagraph.py
         # were previously invoked here; superseded by Genesis natives in
         # v7.72.2 (P78 + PN34). Mounts and invocations dropped 2026-05-05.
         # VLLM_ENFORCE_EAGER=1 in compose/.env disables CUDA graphs — use on

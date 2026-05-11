@@ -131,7 +131,7 @@
 # ===========================================================================
 services:
   vllm-qwen36-27b-bounded-thinking:
-    image: vllm/vllm-openai:nightly-01d4d1ad375dc5854779c593eee093bcebb0cada
+    image: vllm/vllm-openai:nightly-1acd67a795ebccdf9b9db7697ae9082058301657
     container_name: vllm-qwen36-27b-bounded-thinking
     restart: "no"
     ports:
