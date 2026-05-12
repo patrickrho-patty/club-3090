@@ -16,6 +16,44 @@ history; SemVer takes over from `v0.3.0` onward.
 
 ---
 
+## v0.5.0 — 2026-05-12
+
+
+### ✨ Features
+
+- feat(qwen): ship froggeric chat-template fixes as default-on ([84498d4](https://github.com/noonghunna/club-3090/commit/84498d47aaf7a2fdb7c0203d53bb64414a64b6c1))
+- feat(vllm): add PR #35936 required-tool fallback overlay ([28b16b5](https://github.com/noonghunna/club-3090/commit/28b16b5dc9d602a8e1c4b8d5496aa82cbca7f95d))
+- feat(qwen-tq3): add CLUB3090_TQ_K1_SKIP_MTP layer-filter for PR #40914 K+1 dispatch ([6b2a7d5](https://github.com/noonghunna/club-3090/commit/6b2a7d553b6164bb4854e80fc0acdf8dcec18a87))
+
+
+### 🎯 New models + serving paths
+
+- compose(tq3-mtp-genesis): pin to Genesis v7.72.2 known-good vLLM nightly ([570fa71](https://github.com/noonghunna/club-3090/commit/570fa71240a12ab642693c0570851611e933f8c4))
+
+
+### 📊 Benchmarks + cross-rig data
+
+- bench(matrix): @ygafarov first heterogeneous Ampere + Blackwell eGPU dual ([1770931](https://github.com/noonghunna/club-3090/commit/1770931729a354bad319c8b58bdee143fe6ebce2))
+
+
+### 📝 Documentation
+
+- docs(dtype-matrix): more polish — RDNA naming, FP8 maturity caveats, AMD detection ([62b3b45](https://github.com/noonghunna/club-3090/commit/62b3b455a9ea5146cbf5576febd0c8b25a8c0fa1))
+- docs(dtype-matrix): polish nuances + add Intel and AMD vendor sections ([3d4548c](https://github.com/noonghunna/club-3090/commit/3d4548c50422da07c16fcba2a59d6f42f268355b))
+- docs(dtype-matrix): per-arch hardware accelerator matrix for compose optimization ([9c6d3cf](https://github.com/noonghunna/club-3090/commit/9c6d3cfba1de9d9079d6eafc9ff68c352cac7197))
+- docs(faq): add 'INT8 PTH doesn't scale at concurrency — is that a bug?' ([df53287](https://github.com/noonghunna/club-3090/commit/df53287b1c26ec83be8a30eec24baf2bddc993eb))
+- docs(tq3-mtp): writeup + charts for the Genesis-backed TQ3+MTP path ([c2b1c93](https://github.com/noonghunna/club-3090/commit/c2b1c93872f84fa9afa3bbe41360dc42be28c066))
+- docs(qwen-tq3): close round-4 — #40914 not shippable, route to nomtp + Genesis ([9fba037](https://github.com/noonghunna/club-3090/commit/9fba03788e30151f9bf8c85f279260696954d094))
+- docs(qwen-tq3): re-tombstone tq3-mtp.yml after round-3 MTP-skip validation ([063d3e9](https://github.com/noonghunna/club-3090/commit/063d3e943ce8da9cc69bd30c68b87426aca6202e))
+
+
+### 🧹 Maintenance
+
+- refactor(qwen): rename int8-tq3 → tq3-* family + add no-MTP + Genesis variants ([6182922](https://github.com/noonghunna/club-3090/commit/6182922225dfeee1c28084d1ff917bfd25539520))
+
+
+
+[Pin: `git checkout v0.5.0`] · [Full diff](https://github.com/noonghunna/club-3090/compare/v0.4.0...v0.5.0)
 ## v0.4.0 — 2026-05-11
 
 
