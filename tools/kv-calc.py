@@ -44,69 +44,62 @@ Usage:
 
 import argparse
 import json
+import logging
+import os
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from scripts.lib.profiles.compat import load_profiles
+from scripts.lib.profiles.compose_registry import COMPOSE_REGISTRY
 
 
 # =============================================================================
 # Model specs
 # =============================================================================
 
-# ---- Qwen3.6-27B AutoRound INT4 — from config.json text_config ----
-QWEN36_27B = {
-    "model_id": "qwen3.6-27b",
-    "model_family": "qwen3-next-hybrid",
-    "hidden_size": 5120,
-    "num_hidden_layers": 64,
-    "num_gdn_layers": 48,        # linear_attention layers (Gated DeltaNet)
-    "num_attn_layers": 16,       # full_attention layers
-    "num_attn_heads": 24,
-    "num_kv_heads": 4,           # GQA
-    "valid_tp": [1, 2, 4],
-    "head_dim_attn": 256,        # attention head dim
-    "linear_num_v_heads": 48,    # GDN value heads
-    "linear_num_k_heads": 16,    # GDN key heads (GQA-style at the GDN level too)
-    "linear_v_head_dim": 128,    # GDN value head dim
-    "linear_k_head_dim": 128,    # GDN key head dim
-    "linear_conv_kernel_dim": 4,
-    "weights_total_gb": 17.5,    # AutoRound INT4 storage on disk
-    "mamba_state_bytes": 4,      # mamba_ssm_dtype=float32
-    "chunk_size": 256,           # fla.ops.chunk default
-    "max_ctx_supported": 262144,
-    "attention_k_eq_v": False,   # Qwen stores K and V independently
-}
+def _load_profiles_silent():
+    logger = logging.getLogger("compat")
+    old_disabled, old_env = logger.disabled, os.environ.get("CLUB3090_LOG_LEVEL")
+    logger.disabled = True
+    os.environ["CLUB3090_LOG_LEVEL"] = "CRITICAL"
+    try:
+        return load_profiles()
+    finally:
+        logger.disabled = old_disabled
+        if old_env is None:
+            os.environ.pop("CLUB3090_LOG_LEVEL", None)
+        else:
+            os.environ["CLUB3090_LOG_LEVEL"] = old_env
 
-# ---- Gemma 4 31B — from config.json text_config ----
-# Layer pattern: [sliding_attention × 5, full_attention × 1] × 10
-#                = 50 sliding-attention + 10 full-attention.
-GEMMA4_31B = {
-    "model_id": "gemma-4-31b",
-    "model_family": "gemma4-swa-dense",
-    "hidden_size": 5376,
-    "intermediate_size": 21504,
-    "num_hidden_layers": 60,
-    "num_full_attn_layers": 10,         # full_attention (growing KV, head_dim=512)
-    "num_sliding_attn_layers": 50,      # sliding_attention (fixed window, head_dim=256)
-    "num_attn_heads": 32,
-    "num_kv_heads": 16,                 # GQA 2:1
-    "valid_tp": [1, 2, 4, 8, 16],
-    "head_dim_sliding": 256,            # sliding_attention head dim
-    "global_head_dim": 512,             # full_attention head dim (asymmetric)
-    "sliding_window": 1024,
-    "weights_int4_gb": 18.0,            # AutoRound INT4 on disk
-    "weights_awq_gb": 17.0,             # cyankiwi AWQ-4bit (lower on-card due to AWQ packing)
-    "weights_bf16_gb": 58.0,            # unquantized — does not fit on 24 GB
-    "max_ctx_supported": 262144,
-    "drafter_mtp_gb": 0.97,             # google/gemma-4-31b-it-assistant (FP16)
-    "drafter_dflash_gb": 2.9,           # z-lab/gemma-4-31b-it-dflash
-    "attention_k_eq_v": True,           # vLLM allocator exploits K==V tying (per_token uses ×1 not ×2)
-}
 
-MODEL_SPECS = {
-    "qwen3.6-27b": QWEN36_27B,
-    "gemma-4-31b": GEMMA4_31B,
-}
+PROFILES = _load_profiles_silent()
+
+
+def _weight_size(model, variant):
+    value = model.weights[variant]["size_gb"]
+    if not isinstance(value, (int, float)):
+        raise ValueError(f"weight size for {model.id}/{variant} is not numeric: {value}")
+    return float(value)
+
+
+def _load_model_specs_from_yaml(profiles):
+    qwen, gemma = profiles.models["qwen3.6-27b"], profiles.models["gemma-4-31b"]
+    q_fields = ("hidden_size", "num_hidden_layers", "num_gdn_layers", "num_attn_layers", "num_attn_heads", "num_kv_heads", "head_dim_attn", "linear_num_v_heads", "linear_num_k_heads", "linear_v_head_dim", "linear_k_head_dim", "linear_conv_kernel_dim", "max_ctx_supported", "attention_k_eq_v")
+    g_fields = ("hidden_size", "intermediate_size", "num_hidden_layers", "num_full_attn_layers", "num_sliding_attn_layers", "num_attn_heads", "num_kv_heads", "head_dim_sliding", "global_head_dim", "sliding_window", "max_ctx_supported", "attention_k_eq_v")
+    qspec = {"model_id": qwen.id, "model_family": qwen.family, **{k: getattr(qwen, k) for k in q_fields}, "valid_tp": list(qwen.valid_tp), "weights_total_gb": _weight_size(qwen, qwen.default_weight_variant), "mamba_state_bytes": 4, "chunk_size": 256}
+    gspec = {"model_id": gemma.id, "model_family": gemma.family, **{k: getattr(gemma, k) for k in g_fields}, "valid_tp": list(gemma.valid_tp), "weights_int4_gb": _weight_size(gemma, "autoround_int4"), "weights_awq_gb": _weight_size(gemma, "awq"), "weights_bf16_gb": _weight_size(gemma, "bf16"), "drafter_mtp_gb": float(profiles.drafters["gemma-it-assistant"].vram_footprint_gb), "drafter_dflash_gb": float(profiles.drafters["gemma-dflash"].vram_footprint_gb)}
+    return {"qwen3.6-27b": qspec, "gemma-4-31b": gspec}
+
+
+MODEL_SPECS = _load_model_specs_from_yaml(PROFILES)
+QWEN36_27B = MODEL_SPECS["qwen3.6-27b"]
+GEMMA4_31B = MODEL_SPECS["gemma-4-31b"]
 
 
 # =============================================================================
@@ -160,44 +153,46 @@ GEMMA_ACTIVATION_PER_TOKEN_BYTES = 8  # tiny ctx scaling term to keep solver wel
 # =============================================================================
 # Compose presets (per-model)
 # =============================================================================
-# Pulled from each compose's CLI args. Update if a compose changes.
-# Compose IDs are namespaced: Qwen uses bare names (back-compat); Gemma uses gemma-* prefix.
+COMPOSE_ALIAS_TEXT = {
+    "qwen3.6-27b": "minimal=vllm/minimal long-text=vllm/long-text long-text-no-mtp=vllm/long-text-no-mtp long-vision=vllm/long-vision bounded-thinking=vllm/bounded-thinking tools-text=vllm/tools-text dual=vllm/dual dual-turbo=vllm/dual-turbo dual-dflash=vllm/dual-dflash dual-dflash-noviz=vllm/dual-dflash-noviz dual4=vllm/dual4 dual4-dflash=vllm/dual4-dflash",
+    "gemma-4-31b": "gemma-dual=vllm/gemma-mtp gemma-dual-int8=vllm/gemma-int8 gemma-dual-int8-262k=vllm/gemma-int8-262k gemma-dual-bf16=vllm/gemma-bf16 gemma-dual-int8-tq3=vllm/gemma-int8-tq3 gemma-dual-dflash=vllm/gemma-dflash gemma-dual-dflash-int8=vllm/gemma-dflash-int8 gemma-dual-awq=vllm/gemma-awq gemma-single=vllm/gemma-mtp-tp1",
+}
+COMPOSE_ALIASES = {model: tuple(part.split("=", 1) for part in text.split()) for model, text in COMPOSE_ALIAS_TEXT.items()}
+
+REGISTRY_TO_LEGACY_COMPOSE = {
+    registry: legacy
+    for aliases in COMPOSE_ALIASES.values()
+    for legacy, registry in aliases
+}
+
+COMPOSE_COMPAT_OVERRIDES = {
+    ("qwen3.6-27b", "minimal"): {"max_num_seqs": 4, "mem_util": 0.90},
+    ("qwen3.6-27b", "dual"): {"mem_util": 0.95},
+    ("qwen3.6-27b", "dual-turbo"): {"mem_util": 0.95},
+    ("qwen3.6-27b", "dual-dflash-noviz"): {"max_num_seqs": 2},
+    ("qwen3.6-27b", "dual4"): {"mem_util": 0.95},
+    ("gemma-4-31b", "gemma-single"): {"kv_format": "fp8_e5m2"},
+}
+
+
+def _compose_cfg_from_registry(profiles, model_id, legacy_name, registry_name):
+    entry = COMPOSE_REGISTRY[registry_name]
+    drafter = profiles.drafters[entry["drafter"]] if entry.get("drafter") else None
+    cfg = {k: entry[k] for k in ("max_ctx", "max_num_seqs", "tp", "kv_format", "mem_util")}
+    cfg["mtp"] = drafter is not None and drafter.spec_method in ("mtp", "mtp_assistant")
+    if drafter is not None and drafter.spec_method == "dflash":
+        cfg.update({"mtp": False, "dflash_draft_gb": float(drafter.vram_footprint_gb)})
+    if model_id == "gemma-4-31b" and drafter is not None:
+        cfg["drafter_gb"] = float(drafter.vram_footprint_gb)
+    if model_id == "gemma-4-31b":
+        cfg["weights_variant"] = {"awq": "awq", "bf16": "bf16"}.get(entry["weights_variant"], "int4")
+    cfg.update(COMPOSE_COMPAT_OVERRIDES.get((model_id, legacy_name), {}))
+    return cfg
+
 
 COMPOSES = {
-    "qwen3.6-27b": {
-        "minimal":          {"max_ctx": 32768,  "max_num_seqs": 4, "tp": 1, "kv_format": "fp8_e5m2",            "mem_util": 0.90, "mtp": False},
-        "long-text":        {"max_ctx": 180000, "max_num_seqs": 1, "tp": 1, "kv_format": "turboquant_3bit_nc",  "mem_util": 0.93, "mtp": True},
-        "long-text-no-mtp": {"max_ctx": 200000, "max_num_seqs": 1, "tp": 1, "kv_format": "turboquant_3bit_nc",  "mem_util": 0.95, "mtp": False},
-        "long-vision":      {"max_ctx": 145000, "max_num_seqs": 1, "tp": 1, "kv_format": "turboquant_3bit_nc",  "mem_util": 0.95, "mtp": True},
-        "bounded-thinking": {"max_ctx": 180000, "max_num_seqs": 1, "tp": 1, "kv_format": "turboquant_3bit_nc",  "mem_util": 0.95, "mtp": True},
-        "tools-text":       {"max_ctx": 75000,  "max_num_seqs": 1, "tp": 1, "kv_format": "fp8_e5m2",            "mem_util": 0.97, "mtp": True},
-        "dual":             {"max_ctx": 262144, "max_num_seqs": 2, "tp": 2, "kv_format": "fp8_e5m2",            "mem_util": 0.95, "mtp": True},
-        "dual-turbo":       {"max_ctx": 262144, "max_num_seqs": 4, "tp": 2, "kv_format": "turboquant_3bit_nc",  "mem_util": 0.95, "mtp": True},
-        "dual-dflash":      {"max_ctx": 185000, "max_num_seqs": 1, "tp": 2, "kv_format": "fp16",                "mem_util": 0.95, "mtp": False, "dflash_draft_gb": 1.75},
-        "dual-dflash-noviz":{"max_ctx": 200000, "max_num_seqs": 2, "tp": 2, "kv_format": "fp16",                "mem_util": 0.95, "mtp": False, "dflash_draft_gb": 1.75},
-        "dual4":            {"max_ctx": 262144, "max_num_seqs": 4, "tp": 4, "kv_format": "fp8_e5m2",            "mem_util": 0.95, "mtp": True},
-        "dual4-dflash":     {"max_ctx": 262144, "max_num_seqs": 2, "tp": 4, "kv_format": "fp16",                "mem_util": 0.95, "mtp": False, "dflash_draft_gb": 1.75},
-    },
-    "gemma-4-31b": {
-        # dual/docker-compose.yml — default MTP, 32K BF16 KV, max-num-seqs=4
-        "gemma-dual":        {"max_ctx": 32768,  "max_num_seqs": 4, "tp": 2, "kv_format": "bf16",                "mem_util": 0.92, "weights_variant": "int4", "drafter_gb": 0.97, "mtp": True},
-        # dual/int8.yml default — 98K + INT8 PTH KV + 4 seqs
-        "gemma-dual-int8":   {"max_ctx": 98304,  "max_num_seqs": 4, "tp": 2, "kv_format": "int8_per_token_head", "mem_util": 0.95, "weights_variant": "int4", "drafter_gb": 0.97, "mtp": True},
-        # dual/int8.yml long — 262K + INT8 PTH KV + seqs=1 (model native max)
-        "gemma-dual-int8-262k": {"max_ctx": 262144, "max_num_seqs": 1, "tp": 2, "kv_format": "int8_per_token_head", "mem_util": 0.95, "weights_variant": "int4", "drafter_gb": 0.97, "mtp": True},
-        # dual/bf16.yml — long-ctx BF16 weights + BF16 KV (auto)
-        "gemma-dual-bf16":   {"max_ctx": 200000, "max_num_seqs": 1, "tp": 2, "kv_format": "bf16",                "mem_util": 0.95, "weights_variant": "int4", "drafter_gb": 0.97, "mtp": True},
-        # dual/int8-tq3.yml — TQ3 KV alt
-        "gemma-dual-int8-tq3": {"max_ctx": 98304, "max_num_seqs": 4, "tp": 2, "kv_format": "turboquant_3bit_nc",  "mem_util": 0.95, "weights_variant": "int4", "drafter_gb": 0.97, "mtp": True},
-        # dual/dflash.yml — DFlash drafter + 32K BF16
-        "gemma-dual-dflash": {"max_ctx": 32768,  "max_num_seqs": 4, "tp": 2, "kv_format": "bf16",                "mem_util": 0.92, "weights_variant": "int4", "drafter_gb": 2.9,  "mtp": False, "dflash_draft_gb": 2.9},
-        # dual/dflash-int8.yml — DFlash + INT8 PTH KV (PR #42102 unblock)
-        "gemma-dual-dflash-int8": {"max_ctx": 65536, "max_num_seqs": 2, "tp": 2, "kv_format": "int8_per_token_head", "mem_util": 0.95, "weights_variant": "int4", "drafter_gb": 2.9, "mtp": False, "dflash_draft_gb": 2.9},
-        # dual/awq.yml — cyankiwi AWQ weights
-        "gemma-dual-awq":    {"max_ctx": 65536,  "max_num_seqs": 4, "tp": 2, "kv_format": "bf16",                "mem_util": 0.85, "weights_variant": "awq",  "drafter_gb": 0.97, "mtp": True},
-        # single/docker-compose.yml — 32 GB+ required; Ampere consumer OOMs at boot
-        "gemma-single":      {"max_ctx": 8192,   "max_num_seqs": 256, "tp": 1, "kv_format": "fp8_e5m2",          "mem_util": 0.95, "weights_variant": "int4", "drafter_gb": 0.97, "mtp": True},
-    },
+    model_id: {legacy: _compose_cfg_from_registry(PROFILES, model_id, legacy, registry) for legacy, registry in aliases}
+    for model_id, aliases in COMPOSE_ALIASES.items()
 }
 
 
@@ -206,30 +201,11 @@ COMPOSES = {
 # =============================================================================
 
 CALIBRATION = {
-    "qwen3.6-27b": [
-        # (compose, vram_gb, measured_peak_gb, ctx_override_or_none, source_url)
-        ("dual",              24, 23.6, None,   "BENCHMARKS.md#qwen36-27b dual.yml @noonghunna 2026-04-29"),
-        ("dual-turbo",        24, 19.8, None,   "BENCHMARKS.md#qwen36-27b dual-turbo.yml @noonghunna 2026-04-29"),
-        ("dual-dflash",       24, 23.6, None,   "BENCHMARKS.md#qwen36-27b dual-dflash.yml @noonghunna 2026-04-29"),
-        ("dual-dflash-noviz", 24, 23.8, None,   "BENCHMARKS.md#qwen36-27b dual-dflash-noviz.yml @noonghunna 2026-04-29"),
-        ("dual4",             24, 23.5, None,   "BENCHMARKS.md#qwen36-27b dual4.yml @whamp 2026-05-03"),
-        ("dual4-dflash",      24, 22.0, None,   "BENCHMARKS.md#qwen36-27b dual4-dflash.yml @whamp 2026-05-03"),
-        ("dual-dflash-noviz", 24, 21.8, 180000, "BENCHMARKS.md#qwen36-27b dual-dflash-noviz.yml @snoby 2026-05-04 (2× 4090, ctx=180K)"),
-        ("long-text",         24, 22.3, None,   "BENCHMARKS.md#qwen36-27b long-text.yml @noonghunna 2026-04-30"),
-        ("long-vision",       24, 23.0, None,   "BENCHMARKS.md#qwen36-27b long-vision.yml @noonghunna 2026-04-30"),
-        ("bounded-thinking",  24, 21.7, None,   "BENCHMARKS.md#qwen36-27b bounded-thinking.yml @noonghunna 2026-05-04"),
-        ("minimal",           24, 22.4, 65536,  "BENCHMARKS.md#qwen36-27b minimal.yml @noonghunna 2026-05-03 (mem-util 0.95, max-ctx 65536)"),
-    ],
-    "gemma-4-31b": [
-        # All TP=2 dual configs on 2× 3090 24 GB.
-        ("gemma-dual-int8",      24, 22.2, None,   "BENCHMARKS.md#gemma-4-31b dual/int8.yml @noonghunna 2026-05-08 (98K + max-num-seqs=4)"),
-        ("gemma-dual-int8-262k", 24, 22.1, None,   "BENCHMARKS.md#gemma-4-31b dual/int8.yml @noonghunna 2026-05-08 (262K + max-num-seqs=1)"),
-        ("gemma-dual-dflash",    24, 22.7, None,   "BENCHMARKS.md#gemma-4-31b dual/dflash.yml @noonghunna 2026-05-06 (n=7)"),
-        ("gemma-dual-dflash",    24, 22.3, None,   "BENCHMARKS.md#gemma-4-31b dual/dflash.yml @noonghunna 2026-05-08 (rebench)"),
-        ("gemma-dual-awq",       24, 19.8, None,   "BENCHMARKS.md#gemma-4-31b dual/awq.yml @noonghunna 2026-05-08 (AWQ-4bit, mem-util 0.85)"),
-        ("gemma-dual",           24, 22.5, None,   "BENCHMARKS.md#gemma-4-31b dual/docker-compose.yml @noonghunna matched-config rebench 2026-05-09"),
-        ("gemma-dual-int8",      24, 22.5, 262144, "BENCHMARKS.md#gemma-4-31b dual/int8.yml matched-config rebench 2026-05-09 (262K seqs=2)"),
-    ],
+    model_id: [
+        (REGISTRY_TO_LEGACY_COMPOSE[row["compose"]], row["vram_gb"], row["measured_peak_gb"], row.get("ctx_override"), row.get("source", ""))
+        for row in cal.rows
+    ]
+    for model_id, cal in PROFILES.calibration.items()
 }
 
 
