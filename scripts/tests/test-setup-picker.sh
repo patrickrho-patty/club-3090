@@ -131,6 +131,7 @@ assert_contains "$out" "[model]   SKIP_MODEL=1"
 # skip prompts, select the expected variant, and export GPU / TP / PP envs.
 mkdir -p "${TMP_DIR}/models/qwen3.6-27b-autoround-int4" \
          "${TMP_DIR}/models/gemma-4-31b-autoround-int4"
+FAKE_8X3090='0:RTX_3090:24576:8.6,1:RTX_3090:24576:8.6,2:RTX_3090:24576:8.6,3:RTX_3090:24576:8.6,4:RTX_3090:24576:8.6,5:RTX_3090:24576:8.6,6:RTX_3090:24576:8.6,7:RTX_3090:24576:8.6'
 
 out="$(MODEL_DIR="${TMP_DIR}/models" CLUB3090_FAKE_GPUS='0:RTX_3090:24576:8.6' \
   SWITCH="${TMP_DIR}/switch-mock" bash "${ROOT_DIR}/scripts/launch.sh" \
@@ -143,6 +144,12 @@ out="$(MODEL_DIR="${TMP_DIR}/models" CLUB3090_FAKE_GPUS='0:RTX_3090:24576:8.6,1:
   --no-preflight --no-verify --model qwen3.6-27b --gpus 0,1 --no-projection 2>&1)"
 assert_contains "$out" "[launch] Tensor parallel TP=2"
 assert_contains "$out" "SWITCHED vllm/dual CUDA=0,1 NVD=0,1 TP=2 PP=1"
+selected_count="$(grep -c "\[launch\] selected variant:" <<< "$out" || true)"
+if [[ "$selected_count" != "1" ]]; then
+  echo "ASSERTION FAILED: expected one selected-variant line, got ${selected_count}" >&2
+  echo "$out" >&2
+  exit 1
+fi
 
 if out="$(MODEL_DIR="${TMP_DIR}/models" CLUB3090_FAKE_GPUS='0:RTX_3090:24576:8.6' \
   SWITCH="${TMP_DIR}/switch-mock" bash "${ROOT_DIR}/scripts/launch.sh" \
@@ -160,6 +167,26 @@ if out="$(MODEL_DIR="${TMP_DIR}/models" CLUB3090_FAKE_GPUS='0:RTX_3090:24576:8.6
   echo "$out" >&2
   exit 1
 fi
+assert_contains "$out" "Valid TP values: 1 2 4"
+
+out="$(MODEL_DIR="${TMP_DIR}/models" CLUB3090_FAKE_GPUS="${FAKE_8X3090}" \
+  SWITCH="${TMP_DIR}/switch-mock" bash "${ROOT_DIR}/scripts/launch.sh" \
+  --no-preflight --no-verify --model gemma-4-31b --gpus 0,1,2,3,4,5,6,7 --tp 8 2>&1)"
+assert_contains "$out" "[launch] Tensor parallel TP=8"
+assert_contains "$out" "[launch] Suggested: vllm/gemma-mtp"
+assert_contains "$out" "VRAM budget — per card"
+assert_contains "$out" "Note: TP > 4 predictions are extrapolated"
+assert_not_contains "$out" "KV projection skipped"
+assert_contains "$out" "SWITCHED vllm/gemma-mtp CUDA=0,1,2,3,4,5,6,7 NVD=0,1,2,3,4,5,6,7 TP=8 PP=1"
+
+if out="$(MODEL_DIR="${TMP_DIR}/models" CLUB3090_FAKE_GPUS="${FAKE_8X3090}" \
+  SWITCH="${TMP_DIR}/switch-mock" bash "${ROOT_DIR}/scripts/launch.sh" \
+  --no-preflight --no-verify --model qwen3.6-27b --gpus 0,1,2,3,4,5,6,7 --tp 8 --no-projection 2>&1)"; then
+  echo "ASSERTION FAILED: invalid Qwen TP=8 unexpectedly succeeded" >&2
+  echo "$out" >&2
+  exit 1
+fi
+assert_contains "$out" "num_kv_heads does not divide TP=8"
 assert_contains "$out" "Valid TP values: 1 2 4"
 
 # TTY-backed no-arg setup supports the cosmetic but real "Both" choice by

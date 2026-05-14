@@ -706,12 +706,6 @@ kv_projection() {
     echo "[launch] KV projection only available for vLLM variants today." >&2
     return 0
   fi
-  if (( TP_VALUE > 4 )); then
-    echo "[launch] KV projection skipped: tools/kv-calc.py currently models TP up to 4." >&2
-    echo "[launch] Proceeding with launch-side head-divisibility validation only." >&2
-    return 0
-  fi
-
   local kv_model="${mapping%%:*}" kv_compose="${mapping#*:}" kv_json status
   if kv_json="$("${ROOT_DIR}/tools/kv-calc.py" --model "$kv_model" --compose "$kv_compose" --vram "$MIN_VRAM_GB" --tp "$TP_VALUE" --json 2>&1)"; then
     status=0
@@ -783,7 +777,6 @@ if [[ -z "$VARIANT" ]]; then
     VARIANT="${CANDIDATE_VARIANTS[0]}"
   fi
   echo "[launch] model: $(model_label "$MODEL_NAME")" >&2
-  echo "[launch] selected variant: ${VARIANT}" >&2
   if (( HET_VRAM_MIXED == 1 && TP_VALUE > 1 )); then
     echo "[launch] Note: heterogeneous TP is bottlenecked by the smallest selected card (${MIN_VRAM_GB} GB)." >&2
   fi

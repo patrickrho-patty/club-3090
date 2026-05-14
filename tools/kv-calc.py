@@ -1,5 +1,10 @@
-#!/usr/bin/env python3
-"""kv-calc.py — predict per-card VRAM budget for vLLM composes.
+#!/bin/sh
+''':'
+exec python3 "$0" "$@"
+':'''
+from __future__ import annotations
+
+__doc__ = """kv-calc.py — predict per-card VRAM budget for vLLM composes.
 
 Predicts (per card, after TP split):
   - Model weights
@@ -37,8 +42,6 @@ Usage:
   bash tools/kv-calc.py --calibration  # both models, grouped per-model
 """
 
-from __future__ import annotations
-
 import argparse
 import json
 import sys
@@ -60,6 +63,7 @@ QWEN36_27B = {
     "num_attn_layers": 16,       # full_attention layers
     "num_attn_heads": 24,
     "num_kv_heads": 4,           # GQA
+    "valid_tp": [1, 2, 4],
     "head_dim_attn": 256,        # attention head dim
     "linear_num_v_heads": 48,    # GDN value heads
     "linear_num_k_heads": 16,    # GDN key heads (GQA-style at the GDN level too)
@@ -86,6 +90,7 @@ GEMMA4_31B = {
     "num_sliding_attn_layers": 50,      # sliding_attention (fixed window, head_dim=256)
     "num_attn_heads": 32,
     "num_kv_heads": 16,                 # GQA 2:1
+    "valid_tp": [1, 2, 4, 8, 16],
     "head_dim_sliding": 256,            # sliding_attention head dim
     "global_head_dim": 512,             # full_attention head dim (asymmetric)
     "sliding_window": 1024,
@@ -357,6 +362,16 @@ def cudagraph_overhead_gb(mem_util, tp):
     return base + tp_bump
 
 
+def _validate_tp_for_spec(spec, tp):
+    valid_tp = spec.get("valid_tp")
+    if valid_tp and tp not in valid_tp:
+        raise ValueError(
+            f"TP={tp} invalid for {spec['model_id']} "
+            f"(num_kv_heads={spec['num_kv_heads']} cannot be divided across TP cleanly). "
+            f"Valid TP values: {valid_tp}"
+        )
+
+
 def predict(
     spec=QWEN36_27B,
     kv_format="fp8_e5m2",
@@ -380,6 +395,8 @@ def predict(
       drafter_gb: total drafter weight (MTP / DFlash) — split by TP.
       dflash_draft_gb: legacy alias — folded into drafter_gb if set.
     """
+    _validate_tp_for_spec(spec, tp)
+
     weights_gb = _weights_per_card_gb(spec, tp, weights_variant)
 
     growing_b, sliding_b = kv_pool_per_card_bytes(
@@ -441,6 +458,8 @@ def predict(
         notes.append("⚠ fp8_e4m3 on Ampere (sm_86): Triton `fp8e4nv` kernel unsupported; use int8_per_token_head instead (PR #40391 via #42102)")
     if spec["model_family"] == "gemma4-swa-dense" and tp == 1 and vram_gb < 32:
         notes.append("⚠ Gemma 4 31B TP=1 needs ≥32 GB VRAM; 24 GB Ampere boot-OOMs (model weights + drafter + min KV)")
+    if tp > 4:
+        notes.append("TP > 4 predictions are extrapolated; report deltas via scripts/report.sh --bench")
 
     return Prediction(
         model=spec["model_id"],
@@ -636,7 +655,7 @@ def main():
                    help="KV cache format. Default: from --compose, or fp8_e5m2.")
     p.add_argument("--max-ctx", type=int, help="max_model_len. Default: from --compose, or 180000.")
     p.add_argument("--max-num-seqs", type=int, help="max_num_seqs. Default: from --compose, or 1.")
-    p.add_argument("--tp", type=int, choices=[1, 2, 4], help="tensor_parallel_size. Default: from --compose, or 1.")
+    p.add_argument("--tp", type=int, choices=[1, 2, 4, 8, 16], help="tensor_parallel_size. Default: from --compose, or 1.")
     p.add_argument("--mem-util", type=float, help="gpu_memory_utilization. Default: from --compose, or 0.95.")
     p.add_argument("--vram", type=float, default=24, help="VRAM per card in GB. Default 24.")
     p.add_argument("--mtp", action="store_true", default=None, help="MTP enabled (Qwen: n=3 built-in; Gemma: external drafter).")
@@ -689,6 +708,12 @@ def main():
         dflash_gb = args.dflash_draft_gb or 0.0
         weights_variant = args.weights_variant or "default"
         header = f"Predicted budget — {model_key} custom config on {args.vram} GB VRAM (kv={kv_format}, ctx={max_ctx:,}, seqs={max_num_seqs}, TP={tp}, mem={mem_util})"
+
+    try:
+        _validate_tp_for_spec(spec, tp)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
 
     if args.solve_max_ctx:
         best = solve_max_ctx(
