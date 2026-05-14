@@ -74,7 +74,7 @@ services:
     container_name: vllm-qwen36-27b-dual-int8-tq3
     restart: "no"
     ports:
-      - "${BIND_HOST:-0.0.0.0}:${PORT:-8013}:8000"
+      - "${BIND_HOST:-0.0.0.0}:${ESTATE_PORT:-${PORT:-8013}}:8000"
     volumes:
       - ${MODEL_DIR:-../../../../../models-cache}:/root/.cache/huggingface
       # Reuse the same torch.compile + Triton kernel caches as dual.yml so
@@ -111,7 +111,7 @@ services:
       # https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates
       - ../../patches/froggeric-chat-template/chat_template.jinja:/etc/qwen-froggeric-chat-template.jinja:ro
     environment:
-      - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all}
+      - NVIDIA_VISIBLE_DEVICES=${ESTATE_GPUS:-${NVIDIA_VISIBLE_DEVICES:-all}}
       - VLLM_ENFORCE_EAGER=1
       - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
       - VLLM_WORKER_MULTIPROC_METHOD=spawn

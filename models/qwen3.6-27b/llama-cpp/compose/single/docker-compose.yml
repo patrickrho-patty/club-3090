@@ -85,7 +85,7 @@ services:
     container_name: llama-cpp-qwen36-27b
     restart: unless-stopped
     ports:
-      - "${PORT:-8020}:8080"
+      - "${ESTATE_PORT:-${PORT:-8020}}:8080"
     volumes:
       - "${MODEL_DIR:-../../../../../models-cache}:/models:ro"
     entrypoint:
@@ -136,5 +136,5 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              device_ids: ["${CUDA_VISIBLE_DEVICES:-0}"]
+              device_ids: ["${ESTATE_GPUS:-${CUDA_VISIBLE_DEVICES:-0}}"]
               capabilities: [compute, utility]
