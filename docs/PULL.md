@@ -118,8 +118,10 @@ scripts/pull.sh some-org/Some-Llama-7B --profile-like vllm/minimal --dry-run
 |---|---|
 | `0` | Download-eligible / clean verdict. |
 | `3` | Needs a flag — a `confirm→proceed` or advisory terminal that is not yet satisfied (re-run with the named flag). |
-| `2` | Honest hard-stop (a gate aborted, or `hard-block`) — **and** argument/usage errors (missing/unknown flag): the CLI argument parser exits `2`. So a typo and an honest gate-block currently share `2`; check the printed message to tell them apart. |
-| `64` | Reserved for post-parse usage errors. (Note: argument-parser errors currently exit `2`, not `64` — distinguishing them is a tracked follow-up.) |
+| `2` | Honest hard-stop — a gate aborted, or a `hard-block` terminal. |
+| `64` | Usage error — missing/unknown argument (distinct from `2`, so a typo is distinguishable from an honest gate-block). |
+
+> *Note: the `64` usage-vs-`2` hard-stop split is a post-`v0.8.0` fix — present on `master`/the next release; the `v0.8.0` release tag still exits `2` for argument errors.*
 
 ---
 

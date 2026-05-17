@@ -1316,7 +1316,19 @@ _EXIT_USAGE = 64
 def main(argv: list[str]) -> int:
     import argparse
 
-    ap = argparse.ArgumentParser(
+    class _UsageExit64Parser(argparse.ArgumentParser):
+        """argparse's default `error()` hard-exits 2 — which collides with
+        `_EXIT_ABORT` (honest gate hard-stop), so a typo and a legitimate
+        block are indistinguishable to callers/automation. Override to exit
+        `_EXIT_USAGE` (64) on argument/usage errors, restoring the
+        documented contract. `--help` is unaffected (it goes through
+        `exit()`, not `error()`, and still returns 0)."""
+
+        def error(self, message):
+            self.print_usage(sys.stderr)
+            self.exit(_EXIT_USAGE, f"{self.prog}: error: {message}\n")
+
+    ap = _UsageExit64Parser(
         prog="pull.sh",
         description="v0.8.0 Pull-Gate — derive an HF repo, gate it through "
         "the locked 6-stratum taxonomy, and (Path A, curated+emittable) "

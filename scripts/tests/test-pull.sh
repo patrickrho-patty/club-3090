@@ -1335,4 +1335,18 @@ print("\nSUMMARY: all Pull-Gate P4 truth-table assertions passed "
       "CONTRACT-5 reject).")
 PY
 
+# ---------------------------------------------------------------------------
+# CLI-contract: exit-code boundary (the pure truth-table above can't cover
+# argv parsing / process exit). #370 regression lock: argparse usage errors
+# MUST exit 64 (not 2 — argparse default), so a typo is distinguishable
+# from an honest gate hard-stop (2); --help stays 0; hard-stop stays 2.
+_clifail=0
+_ec(){ bash scripts/pull.sh "$@" >/dev/null 2>&1; echo $?; }
+[ "$(_ec)" = 64 ]                                              || { echo "FAIL: no-args -> 64 (#370)" >&2; _clifail=1; }
+[ "$(_ec Qwen/Qwen2.5-0.5B-Instruct)" = 64 ]                   || { echo "FAIL: missing required --profile-like -> 64 (#370)" >&2; _clifail=1; }
+[ "$(_ec --nope x)" = 64 ]                                     || { echo "FAIL: unknown flag -> 64 (#370)" >&2; _clifail=1; }
+[ "$(_ec --help)" = 0 ]                                        || { echo "FAIL: --help -> 0 (#370 must not regress help)" >&2; _clifail=1; }
+[ "$(_ec definitely/nonexistent-xyz123 --profile-like vllm/minimal --dry-run)" = 2 ] || { echo "FAIL: honest hard-stop -> 2 (must stay 2, not 64) (#370)" >&2; _clifail=1; }
+[ "$_clifail" = 0 ] && echo "PASS: CLI exit-code contract (#370): usage=64, --help=0, hard-stop=2" || { echo "1+ CLI-contract assertion(s) failed." >&2; exit 1; }
+
 echo "test-pull.sh OK"
