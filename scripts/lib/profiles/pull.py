@@ -63,6 +63,7 @@ import sys
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable, Optional
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -159,6 +160,15 @@ class PullResult:
     compose_text: Optional[str] = None          # Path A only, on emit
     notices: list[str] = field(default_factory=list)
     diagnostics: dict[str, Any] = field(default_factory=dict)
+    # ----- v0.8.0 [E] E4 additive outcome fields (CONTRACT-1) -------------
+    # None == the [E] stage did NOT run (curated Path-A, --dry-run Path-B,
+    # not-download-eligible, or CONTRACT-5 reject). Existing PullResult
+    # fields/semantics are UNCHANGED — these are purely additive so every
+    # pre-E4 test-pull.sh assertion is byte-unaffected.
+    download_ok: Optional[bool] = None          # E2 download stage outcome
+    boot_ok: Optional[bool] = None              # E3 derived boot outcome
+    smoke: Optional[dict[str, Any]] = None      # E3 derived smoke result
+    capture_paths: list[str] = field(default_factory=list)  # §6 artifacts
 
 
 # ===========================================================================
@@ -355,6 +365,65 @@ def detect_hardware_sm() -> Optional[float]:
 
 
 # ===========================================================================
+# GPU / topology detection (v0.8.0 [E] E4 — additive; reuses the SAME
+# nvidia-smi detection discipline as detect_hardware_sm(); INJECTABLE so
+# tests are hermetic — NO real GPU in CI). gates.py has no GPU-count/VRAM
+# helper (only the compute_cap SM path), so the additive-behaviour-preserving
+# option per the brief is a new pull.py helper here (frozen modules
+# untouched; curated Path-A unaffected — this is only consulted on the
+# post-[C1] derived [E] path).
+#
+# Returns (visible_gpu_count, per_gpu_vram_mib, gpu_names) over ALL visible
+# GPUs; None when nvidia-smi is unavailable AND no override was given (the
+# derived [E] path then refuses honestly — never fabricates a topology).
+# ===========================================================================
+def detect_gpu_topology() -> Optional[tuple[int, list[int], list[str]]]:
+    """Real detection via `nvidia-smi --query-gpu=memory.total,name`.
+    Returns (count, per_gpu_vram_mib, gpu_names) for ALL visible GPUs, or
+    None when nvidia-smi is absent. NEVER called in tests (they inject)."""
+    import shutil
+    import subprocess
+
+    if not shutil.which("nvidia-smi"):  # pragma: no cover - env dependent
+        return None
+    try:  # pragma: no cover - exercised on-rig (E5), injected in CI
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total,name",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):  # pragma: no cover
+        return None
+    if out.returncode != 0:  # pragma: no cover
+        return None
+    vram: list[int] = []
+    names: list[str] = []
+    for line in out.stdout.splitlines():  # pragma: no cover - on-rig
+        line = line.strip()
+        if not line:
+            continue
+        parts = [p.strip() for p in line.split(",", 1)]
+        try:
+            vram.append(int(float(parts[0])))
+        except (ValueError, IndexError):
+            continue
+        names.append(parts[1] if len(parts) > 1 else "GPU")
+    if not vram:  # pragma: no cover
+        return None
+    return len(vram), vram, names  # pragma: no cover
+
+
+def _topology_summary_canonical(names: list[str], vram_mib: list[int]) -> str:
+    """§6.2 verbatim — deterministic serialization of SORTED
+    (gpu_name, vram_mib) tuples. Stable across runs/rigs for the
+    capture consensus key."""
+    tuples = sorted(
+        (str(n), int(v)) for n, v in zip(names, vram_mib)
+    )
+    return "[" + ", ".join(f"({n}, {v})" for n, v in tuples) + "]"
+
+
+# ===========================================================================
 # The orchestrator — chains the frozen slices in the LOCKED stratum order.
 # ===========================================================================
 def run_pull(
@@ -375,6 +444,20 @@ def run_pull(
     d_runner: Optional[Callable[[Path, str, bool], tuple]] = None,
     profiles=None,
     root: Optional[Path] = None,
+    # ----- v0.8.0 [E] E4 — INJECTABLE GPU/topology + [E]-stage hooks ------
+    # gpu_topology: (count, per_gpu_vram_mib, gpu_names) — None -> real
+    # detect_gpu_topology(); tests inject. Mirrors hardware_sm's
+    # inject-or-detect pattern (the brief's --hardware-gpus-style override).
+    gpu_topology: Optional[tuple[int, list[int], list[str]]] = None,
+    # The 5 [E]-stage funcs are injectable so test-pull.sh stays mock-only
+    # (NO real Docker / GPU / network — real on-rig is E5). None -> the real
+    # shipped E1/E2/E3 functions.
+    emit_fn: Optional[Callable] = None,         # E1 generate_from_profile
+    download_fn: Optional[Callable] = None,     # E2 download_model
+    boot_fn: Optional[Callable] = None,         # E3 boot_derived
+    smoke_fn: Optional[Callable] = None,        # E3 smoke_derived
+    capture_fn: Optional[Callable] = None,      # E3 emit_capture
+    override_capture_fn: Optional[Callable] = None,  # E4 emit_override_capture
 ) -> PullResult:
     """Execute the 6-stratum Pull-Gate state machine.
 
@@ -577,21 +660,44 @@ def run_pull(
         return res
 
     if c1.terminal is Terminal.OVERRIDE_ACCEPTED:
-        # NOT a gate-pass (design line 106): record the state + a telemetry
-        # notice; do NOT download / emit this phase.
+        # NOT a fit (design line 106). v0.8.0 [E] E4 trigger semantics:
+        # --force-download (which is what SATISFIED this terminal) now
+        # ACTIVATES the derived [E] stage for a non-curated model that is
+        # NOT --dry-run (was a no-op pre-[E]). The §5.3 override-accepted
+        # force-capture (pt5) is emitted on this path. Curated / --dry-run
+        # stay verdict-only (unchanged).
         res.ok = True
         res.stratum = Stratum.DECIDED
         res.abort_reason = None
         res.detail = (
             f"[C1] {conf}×{raw} → override-accepted ({c1.note}); "
-            f"override-accepted is NOT a fit — telemetry capture + "
-            f"download deferred to the Loop phase (no download this phase)"
+            f"override-accepted is NOT a fit (calibration signal, never "
+            f"recorded as fit-validated — §5.3)"
         )
         res.notices.append(
-            "override-accepted: telemetry capture deferred to Loop phase; "
-            "no weights downloaded this phase"
+            "override-accepted: forced low-confidence download is a "
+            "calibration signal, NOT a validated fit (§5.3)"
         )
         res.notices.append(CAVEAT_S7)
+        if not is_curated and not dry_run:
+            # Trigger C: --force-download activates [E] ONLY for the
+            # override-accepted terminal. The §5.3 pt5 force-capture is
+            # emitted (is_override_accepted=True).
+            _run_derived_e_stage(
+                res, slug=slug, profile_like=profile_like,
+                der=der, s2=s2, c2a=c2a, conf=conf, raw=raw,
+                terminal=c1.terminal.value, is_override_accepted=True,
+                hf_home=hf_home, hardware_sm=float(hardware_sm),
+                gpu_topology=gpu_topology, root=root, fetcher=fetcher,
+                emit_fn=emit_fn, download_fn=download_fn, boot_fn=boot_fn,
+                smoke_fn=smoke_fn, capture_fn=capture_fn,
+                override_capture_fn=override_capture_fn,
+            )
+        else:
+            res.notices.append(
+                "override-accepted: download/telemetry capture deferred "
+                "(curated or --dry-run — verdict-only this run)"
+            )
         return res
 
     # ----- terminal is proceed / confirm→proceed (satisfied) --------------
@@ -602,7 +708,7 @@ def run_pull(
             "UNCHANGED (no compose config rewritten)"
         )
 
-    # ----- Path B: print the §7-caveated verdict, NEVER touch [D] ---------
+    # ----- Path B: print the §7-caveated verdict ---------------------------
     if eff_path == "B":
         res.ok = True
         res.stratum = Stratum.DECIDED
@@ -610,12 +716,34 @@ def run_pull(
             f"Path B verdict: [C1] {conf}×{raw} → {c1.terminal.value} "
             f"({c1.note})"
         )
-        if force_download:
-            res.notices.append(
-                "--force-download is a no-op this phase (Path B never "
-                "downloads / emits; deferred to a later phase)"
-            )
         res.notices.append(CAVEAT_S7)
+        # v0.8.0 [E] E4 trigger semantics (the new user-facing contract,
+        # ADDITIVE — supersedes "Path B never emits/downloads" ONLY for the
+        # non-curated derived download-eligible no-dry-run case):
+        #   * non-curated + download-eligible [C1] terminal + NO --dry-run
+        #     -> continue into the derived [E] stage;
+        #   * --dry-run stays verdict-only (NEVER enters [E]);
+        #   * curated forced-B (e.g. --dry-run on a curated slug) is
+        #     verdict-only — curated weights are local, no download stage.
+        # is_curated is True for a Tier-1 curated hit; a curated slug only
+        # reaches Path B here via --dry-run, which the guard below excludes.
+        if not is_curated and not dry_run:
+            _run_derived_e_stage(
+                res, slug=slug, profile_like=profile_like,
+                der=der, s2=s2, c2a=c2a, conf=conf, raw=raw,
+                terminal=c1.terminal.value, is_override_accepted=False,
+                hf_home=hf_home, hardware_sm=float(hardware_sm),
+                gpu_topology=gpu_topology, root=root, fetcher=fetcher,
+                emit_fn=emit_fn, download_fn=download_fn, boot_fn=boot_fn,
+                smoke_fn=smoke_fn, capture_fn=capture_fn,
+                override_capture_fn=override_capture_fn,
+            )
+        else:
+            if force_download:
+                res.notices.append(
+                    "--force-download is a no-op here (curated / --dry-run "
+                    "verdict-only; download deferred)"
+                )
         return res
 
     # ----- Path A: stratum-6 [D] dry-run, then real emit ------------------
@@ -666,6 +794,301 @@ def run_pull(
     )
     res.notices.append(CAVEAT_S7)
     return res
+
+
+# ===========================================================================
+# v0.8.0 [E] E4 — the post-`[C1]` derived `[E]` stage.
+#
+# ADDITIVE: wired ONLY from the two post-`[C1]` non-curated download-eligible
+# return points (override-accepted-with-force-download, and the satisfied
+# proceed/confirm→proceed Path-B verdict), and ONLY when `not is_curated and
+# not dry_run`. It NEVER touches the `[C1]` table, the 6-stratum logic, or
+# curated Path-A — those are CONSUMED, not modified. It mutates ONLY the
+# additive `PullResult` fields (download_ok / boot_ok / smoke /
+# capture_paths) + notices/diagnostics; ok/terminal/raw_verdict/emitted/
+# stratum/abort_reason are left exactly as the [C1] decision set them.
+#
+# Sequence (CONTRACT-1..5):
+#   1. populate EInput from in-scope run_pull state (CONTRACT-1)
+#   2. derived_emittable(einput)  — CONTRACT-5 pre-[E] precondition; on
+#      refuse -> structured `derived-runtime-unsupported:<reason>` notice +
+#      diagnostics, NO download / NO boot.
+#   3. generate_from_profile -> download_model -> boot_derived ->
+#      smoke_derived -> emit_capture (pt1-4 + manifest)
+#   4. if is_override_accepted: emit_override_capture (§5.3 pt5)
+#
+# Every stage func is INJECTABLE (test-pull.sh mocks them; real on-rig is
+# E5). All stage exceptions are caught + recorded structurally — the [E]
+# stage NEVER raises out of run_pull and NEVER mutates the [C1]-owned
+# fields, so every pre-existing test-pull.sh assertion is byte-unaffected.
+# ===========================================================================
+def _build_einput(
+    *, slug, der, s2, c2a, terminal, is_override_accepted,
+    hf_home, hardware_sm, gpu_topology, root, fetcher,
+):
+    """CONTRACT-1 — construct the EInput from the in-scope run_pull state.
+    GPU/topology via the injectable detect_gpu_topology() (None when no
+    nvidia-smi and no override -> the caller refuses honestly)."""
+    from scripts.lib.profiles.einput import EInput
+
+    runtime = dict(s2.registry_entry or {})
+    der_prof = getattr(der, "profile", None) or {}
+    selected = list(
+        der_prof.get("download_set")
+        or der_prof.get("selected_weight_files")
+        or []
+    )
+    resolved_hf_home = D.resolve_hf_home(hf_home)
+
+    topo = gpu_topology
+    if topo is None:
+        topo = detect_gpu_topology()
+    if topo is None:
+        return None, "gpu-topology-undetermined"
+    vis_count, per_gpu_vram_mib, gpu_names = topo
+
+    tp = int(runtime.get("tp") or 1)
+    # The EXACT tp GPUs the derived compose binds — the contiguous first-tp
+    # (the curated `gpu_assignment_mode: contiguous` convention; CONTRACT-5
+    # also asserts len(selected_gpu_indices) == tp).
+    selected_gpu_indices = list(range(min(tp, vis_count)))
+    selected_gpu_vram_mib = [
+        per_gpu_vram_mib[i] for i in selected_gpu_indices
+        if i < len(per_gpu_vram_mib)
+    ]
+    sel_names = [
+        gpu_names[i] for i in selected_gpu_indices if i < len(gpu_names)
+    ]
+    topology_summary = _topology_summary_canonical(
+        sel_names, selected_gpu_vram_mib
+    )
+
+    # club3090 commit captured on the HOST (NEVER git-in-container).
+    commit = "unknown"
+    try:
+        import subprocess
+
+        cp = subprocess.run(
+            ["git", "-C", str(root or REPO_ROOT), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        if cp.returncode == 0 and cp.stdout.strip():
+            commit = cp.stdout.strip()
+    except (OSError, Exception):  # pragma: no cover - git always present
+        commit = "unknown"
+
+    ei = EInput(
+        slug=slug,
+        terminal=terminal,
+        is_override_accepted=is_override_accepted,
+        der=der,
+        runtime=runtime,
+        selected_files=selected,
+        hf_home=resolved_hf_home,
+        c2a=c2a,
+        hardware_sm=float(hardware_sm),
+        visible_gpu_count=int(vis_count),
+        per_gpu_vram_mib=list(per_gpu_vram_mib),
+        selected_gpu_indices=selected_gpu_indices,
+        selected_gpu_vram_mib=selected_gpu_vram_mib,
+        topology_summary=topology_summary,
+        club3090_commit=commit,
+        diagnostics={"_root": str(root or REPO_ROOT)},
+    )
+    return ei, None
+
+
+def _run_derived_e_stage(
+    res, *, slug, profile_like, der, s2, c2a, conf, raw, terminal,
+    is_override_accepted, hf_home, hardware_sm, gpu_topology, root, fetcher,
+    emit_fn, download_fn, boot_fn, smoke_fn, capture_fn,
+    override_capture_fn,
+):
+    """Run the post-`[C1]` derived `[E]` stage. Mutates ONLY the additive
+    `res` fields + notices/diagnostics — NEVER ok/terminal/raw_verdict/
+    emitted/stratum/abort_reason (those are the [C1] decision, CONSUMED).
+    Every stage func is injectable; all exceptions are recorded
+    structurally so this never raises out of run_pull (pre-existing
+    test-pull.sh assertions byte-unaffected)."""
+    from datetime import datetime, timezone
+
+    # Lazy imports — the real E1/E2/E3 funcs (only when not injected). This
+    # keeps the import surface of pull.py unchanged for callers that never
+    # reach [E] (curated Path-A / --dry-run).
+    from scripts.lib import generate_compose as gc
+    from scripts.lib.profiles import booter as _B
+    from scripts.lib.profiles import capture as _CAP
+    from scripts.lib.profiles import downloader as _DL
+
+    emit_fn = emit_fn or gc.generate_from_profile
+    download_fn = download_fn or _DL.download_model
+    boot_fn = boot_fn or _B.boot_derived
+    smoke_fn = smoke_fn or _CAP.smoke_derived
+    capture_fn = capture_fn or _CAP.emit_capture
+    override_capture_fn = override_capture_fn or _CAP.emit_override_capture
+    root = root or REPO_ROOT
+
+    # ----- CONTRACT-1: populate EInput from in-scope state ----------------
+    ei, topo_err = _build_einput(
+        slug=slug, der=der, s2=s2, c2a=c2a, terminal=terminal,
+        is_override_accepted=is_override_accepted, hf_home=hf_home,
+        hardware_sm=hardware_sm, gpu_topology=gpu_topology, root=root,
+        fetcher=fetcher,
+    )
+    if ei is None:
+        res.notices.append(
+            f"[E] not run: {topo_err} (no nvidia-smi and no GPU-topology "
+            f"override; refusing to fabricate a topology — verdict stands)"
+        )
+        res.diagnostics["e_stage"] = {"ran": False, "reason": topo_err}
+        return
+
+    # ----- CONTRACT-5: derived-emittable pre-[E] precondition -------------
+    try:
+        ok, reason = gc.derived_emittable(ei)
+    except Exception as exc:  # pragma: no cover - gate is pure
+        ok, reason = False, f"derived-runtime-unsupported:gate-error:{exc!r}"
+    if not ok:
+        res.notices.append(
+            f"[E] CONTRACT-5 refuse: {reason} — NO download / NO boot"
+        )
+        res.diagnostics["e_stage"] = {
+            "ran": False, "contract5_refuse": reason,
+        }
+        return
+
+    # E2's standardized header-probe fetcher wiring (no-op on the dtype
+    # resolution ORDER; just supplies the object E1 looks for).
+    try:
+        _DL.set_probe_fetcher(ei, fetcher)
+    except Exception:  # pragma: no cover - defensive
+        pass
+
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    stage = {"ran": True, "contract5_refuse": None}
+
+    # ----- E1: generate_from_profile --------------------------------------
+    try:
+        compose_text, compose_meta = emit_fn(root, ei)
+    except gc.Refuse as r:
+        res.notices.append(f"[E] generate refuse: {r}")
+        stage["emit_ok"] = False
+        res.diagnostics["e_stage"] = stage
+        return
+    except Exception as exc:
+        res.notices.append(f"[E] generate failed: {exc!r}")
+        stage["emit_ok"] = False
+        res.diagnostics["e_stage"] = stage
+        return
+    stage["emit_ok"] = True
+
+    # ----- E2: download_model ---------------------------------------------
+    try:
+        dl = download_fn(ei, fetcher=fetcher)
+    except TypeError:
+        # an injected mock may not accept the fetcher kwarg.
+        dl = download_fn(ei)
+    except Exception as exc:
+        res.notices.append(f"[E] download failed: {exc!r}")
+        res.download_ok = False
+        stage["download_failure"] = repr(exc)
+        res.diagnostics["e_stage"] = stage
+        return
+    res.download_ok = bool(getattr(dl, "ok", False))
+    if not res.download_ok:
+        res.notices.append(
+            f"[E] download not ok: failure="
+            f"{getattr(dl, 'failure', None)!r}"
+        )
+
+    # ----- E3: boot_derived -----------------------------------------------
+    try:
+        bt = boot_fn(ei, compose_text)
+    except Exception as exc:
+        res.notices.append(f"[E] boot failed: {exc!r}")
+        res.boot_ok = False
+        bt = _B.BootResult(ok=False, failure=f"boot raised: {exc!r}")
+    else:
+        res.boot_ok = bool(getattr(bt, "ok", False))
+
+    # ----- E3: smoke_derived (only when the boot produced an endpoint) ----
+    sm = _CAP.SmokeResult()
+    endpoint = getattr(bt, "endpoint", None)
+    if res.boot_ok and endpoint:
+        try:
+            sm = smoke_fn(ei, endpoint)
+        except Exception as exc:  # pragma: no cover - smoke defensive
+            res.notices.append(f"[E] smoke failed: {exc!r}")
+    res.smoke = {
+        "smoke_capability_set": list(
+            getattr(sm, "smoke_capability_set", []) or []
+        ),
+        "results": dict(getattr(sm, "results", {}) or {}),
+        "partial": bool(getattr(sm, "partial", False)),
+    }
+
+    # ----- E3: emit_capture (pt1-4 + manifest) ----------------------------
+    try:
+        cap = capture_fn(
+            ei,
+            confidence=SimpleNamespace(name=str(conf)),
+            raw_verdict=raw,
+            profile_like=profile_like,
+            download_result=dl,
+            boot_result=bt,
+            smoke_result=sm,
+            compose_meta=compose_meta,
+            kv_calc_version=_KV_CALC_VERSION,
+            repo_root=root,
+            ts=ts,
+        )
+        res.capture_paths = list((cap.get("paths") or {}).values())
+        res.diagnostics["capture_dir"] = cap.get("dir")
+    except Exception as exc:
+        res.notices.append(f"[E] capture emit failed: {exc!r}")
+        stage["capture_ok"] = False
+        res.diagnostics["e_stage"] = stage
+        return
+    stage["capture_ok"] = True
+
+    # ----- CONTRACT-4 pt5: override-accepted force-capture (§5.3) ----------
+    # Emitted ONLY when is_override_accepted (the §5.3 trigger). The literal
+    # calibration_signal_not_validated:true is enforced inside the emitter.
+    if is_override_accepted:
+        boot_peak = None
+        gpu_worker = None
+        exit_summary = None
+        if not res.boot_ok:
+            # boot never reached allocation -> actual null; the WHY is the
+            # boot failure reason (CONTRACT-4 pt5).
+            exit_summary = getattr(bt, "failure", None) or (
+                "boot did not reach allocation"
+            )
+        try:
+            p5 = override_capture_fn(
+                ei,
+                predicted_b_breakdown=res.diagnostics.get("b_breakdown"),
+                boot_peak_mib=boot_peak,
+                gpu_worker_reported_mib=gpu_worker,
+                exit_error_summary=exit_summary,
+                repo_root=root,
+                ts=ts,
+            )
+            res.capture_paths.append(p5)
+            res.notices.append(
+                "[E] §5.3 override-accepted force-capture (pt5) emitted "
+                "(calibration signal, NOT fit-validated)"
+            )
+        except Exception as exc:  # pragma: no cover - emitter defensive
+            res.notices.append(f"[E] pt5 override-capture failed: {exc!r}")
+
+    res.diagnostics["e_stage"] = stage
+
+
+# kv-calc has no version constant; this is the stable label E4 stamps into
+# the §6.2 capture manifest's `kv_calc_version` (a [F] consensus-key input).
+# Kept here (pull.py, the orchestrator) — NOT a frozen-module edit.
+_KV_CALC_VERSION = "kvcalc-v0.8.0"
 
 
 def _short_refuse(msg: str) -> str:
@@ -808,7 +1231,30 @@ def main(argv: list[str]) -> int:
         help="override detected GPU compute capability (e.g. 8.6 for "
         "RTX 3090); default = nvidia-smi detection",
     )
+    ap.add_argument(
+        "--hardware-gpus", default=None,
+        help="v0.8.0 [E]: override detected GPU topology for the derived "
+        "[E] stage as 'VRAM_MIB:NAME,VRAM_MIB:NAME' (e.g. "
+        "'24576:RTX 3090,24576:RTX 3090'); default = nvidia-smi detection",
+    )
     args = ap.parse_args(argv)
+
+    gpu_topology = None
+    if args.hardware_gpus:
+        vram: list[int] = []
+        names: list[str] = []
+        for tok in args.hardware_gpus.split(","):
+            tok = tok.strip()
+            if not tok:
+                continue
+            if ":" in tok:
+                v, n = tok.split(":", 1)
+            else:
+                v, n = tok, "GPU"
+            vram.append(int(float(v)))
+            names.append(n.strip() or "GPU")
+        if vram:
+            gpu_topology = (len(vram), vram, names)
 
     res = run_pull(
         args.slug, args.profile_like,
@@ -818,6 +1264,7 @@ def main(argv: list[str]) -> int:
         trust_remote_code=args.trust_remote_code,
         hf_home=args.hf_home, out=args.out,
         hardware_sm=args.hardware,
+        gpu_topology=gpu_topology,
     )
 
     tag = "OK" if res.ok else "ABORT"

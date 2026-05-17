@@ -959,6 +959,269 @@ check(
 )
 
 # ===========================================================================
+# SECTION 9 — v0.8.0 [E] E4: post-[C1] derived-[E] orchestration + trigger
+#   semantics + override force-capture (pt5). All [E]-stage funcs MOCKED
+#   (NO real Docker / GPU / network — real on-rig is E5). These are ADDED
+#   cases (g16..g22); every assertion above (§4.1 9-cell, 6-stratum, g0..g15,
+#   trc-leak, Path-B isolation) is unchanged and stays green.
+# ===========================================================================
+print("\n--- [E] E4: post-[C1] derived orchestration + triggers "
+      "(g16..g22, mocked) ---")
+
+import shutil as _sh  # noqa: E402
+
+from scripts.lib.profiles import capture as _CAP  # noqa: E402
+
+# E4 [E]-stage capture artifacts land under <root>/.pull-captures (the
+# real runtime dir); these are mocked-run artifacts — purge the whole tree
+# at the end so the test leaves NO repo residue (and it is .gitignore'd).
+_CAP_ROOT = root / ".pull-captures"
+
+
+def _purge_captures():
+    _sh.rmtree(_CAP_ROOT, ignore_errors=True)
+
+
+# Injected GPU topology (no real nvidia-smi dependence): 2× 24 GiB.
+TOPO_2 = (2, [24576, 24576], ["NVIDIA GeForce RTX 3090",
+                              "NVIDIA GeForce RTX 3090"])
+TOPO_1 = (1, [24576], ["NVIDIA GeForce RTX 3090"])
+
+
+class _Calls:
+    def __init__(self):
+        self.emit = self.dl = self.boot = self.smoke = 0
+        self.cap = self.p5 = 0
+
+
+def mk_emocks(calls, *, emittable=True, boot_ok=True):
+    """Mocked E1/E2/E3 + E4-pt5 funcs. NO Docker/GPU/network."""
+    from scripts.lib.profiles.downloader import DownloadResult
+    from scripts.lib.profiles.booter import BootResult
+
+    def emit_fn(root, ei):
+        calls.emit += 1
+        if not emittable:
+            raise GC.Refuse("derived-runtime-unsupported:kv")
+        return ("services:\n  vllm-derived-x:\n    image: img:pin\n",
+                {"resolved_image": "img:pin", "max_model_len": 32768,
+                 "kv_format": ei.runtime.get("kv_format"),
+                 "engine": ei.runtime.get("engine")})
+
+    def download_fn(ei, fetcher=None):
+        calls.dl += 1
+        return DownloadResult(ok=True, files=["model.safetensors"],
+                              bytes=8_000_000_000, sha_verified=True,
+                              failure=None,
+                              local_dir=str(ei.hf_home))
+
+    def boot_fn(ei, compose_text):
+        calls.boot += 1
+        if boot_ok:
+            return BootResult(ok=True, seconds=1.0, failure=None,
+                              endpoint="http://127.0.0.1:8020/v1")
+        return BootResult(ok=False, seconds=0.5,
+                          failure="CUDA OOM; worker exited", endpoint=None)
+
+    def smoke_fn(ei, endpoint):
+        calls.smoke += 1
+        return _CAP.SmokeResult(
+            smoke_capability_set=["plain-chat", "streaming"],
+            results={"plain-chat": "green", "streaming": "green",
+                     "tool-call": "unsmoked", "reasoning-streaming":
+                     "unsmoked", "structured-output": "unsmoked",
+                     "vision": "unsmoked", "long-context": "unsmoked"},
+            partial=True)
+
+    def capture_fn(ei, **kw):
+        calls.cap += 1
+        return _CAP.emit_capture(ei, **kw)
+
+    def override_capture_fn(ei, **kw):
+        calls.p5 += 1
+        return _CAP.emit_override_capture(ei, **kw)
+
+    return dict(emit_fn=emit_fn, download_fn=download_fn, boot_fn=boot_fn,
+                smoke_fn=smoke_fn, capture_fn=capture_fn,
+                override_capture_fn=override_capture_fn)
+
+
+import tempfile as _tf  # noqa: E402
+
+# A non-curated generic-dense Llama (Qwen2 arch -> known arch row, no trc).
+# torch_dtype bfloat16 -> weight_format bfloat16 (pure-dtype CONTRACT-2 row;
+# CONTRACT-5 dispatch passes). vllm/minimal: clean engine, fp8_e5m2 KV,
+# drafter None, no required features, tp=1 -> derived-emittable.
+DSLUG = "fixtures/e4-dense"
+
+
+def derived_run(profile_like, *, calls, emittable=True, boot_ok=True,
+                topo=TOPO_2, **kw):
+    with _tf.TemporaryDirectory() as _td:
+        # repo_root for capture goes to a tmp dir via root override is not
+        # possible (root selects the registry); capture writes under
+        # <root>/.pull-captures — use the real root but a unique slug+ts so
+        # artifacts are isolated. We assert on res.capture_paths.
+        return P.run_pull(
+            DSLUG, profile_like, path="B", hardware_sm=SM_86,
+            fetcher=ff_derived(DSLUG, dense_cfg("Qwen2ForCausalLM"),
+                               weight_gb=4.0),
+            profiles=profiles, statvfs=BIG_DISK, trust_remote_code=True,
+            gpu_topology=topo, **mk_emocks(calls, emittable=emittable,
+                                           boot_ok=boot_ok), **kw)
+
+
+# --- g16: non-curated proceed (download-eligible), NO --dry-run -> [E] ----
+c = _Calls()
+r = derived_run("vllm/minimal", calls=c, yes=True)
+check(r.ok and not r.emitted and r.confidence == "estimated-lower-bound",
+      f"g16: non-curated download-eligible verdict stands "
+      f"(ok={r.ok}, emitted={r.emitted}, conf={r.confidence})")
+check(c.emit == 1 and c.dl == 1 and c.boot == 1 and c.cap == 1,
+      f"g16: [E] ran emit+download+boot+capture "
+      f"(emit={c.emit} dl={c.dl} boot={c.boot} cap={c.cap})")
+check(r.download_ok is True and r.boot_ok is True
+      and isinstance(r.smoke, dict)
+      and r.smoke["smoke_capability_set"] == ["plain-chat", "streaming"],
+      f"g16: PullResult [E] additive fields populated "
+      f"(dl_ok={r.download_ok} boot_ok={r.boot_ok} smoke={r.smoke})")
+_g16caps = [x for x in r.capture_paths if x.endswith(".json")]
+check(any("pt1-gate" in x for x in _g16caps)
+      and any("pt2-download" in x for x in _g16caps)
+      and any("pt3-boot" in x for x in _g16caps)
+      and any("pt4-smoke" in x for x in _g16caps)
+      and any("manifest" in x for x in _g16caps)
+      and not any("pt5" in x or "override" in x for x in _g16caps),
+      f"g16: pt1-4 + manifest emitted, NO pt5 (non-override) "
+      f"(paths={[os.path.basename(x) for x in _g16caps]})")
+check(c.p5 == 0, "g16: override-capture (pt5) NOT invoked (not override)")
+for _x in r.capture_paths:
+    try:
+        os.unlink(_x)
+    except OSError:
+        pass
+
+# --- g17: non-curated + --dry-run -> verdict-only, NO [E] ----------------
+c = _Calls()
+r = P.run_pull(DSLUG, "vllm/minimal", dry_run=True, hardware_sm=SM_86,
+                fetcher=ff_derived(DSLUG, dense_cfg("Qwen2ForCausalLM"),
+                                   weight_gb=4.0),
+                profiles=profiles, statvfs=BIG_DISK, trust_remote_code=True,
+                yes=True, gpu_topology=TOPO_2, **mk_emocks(c))
+check(r.path == "B" and (c.emit + c.dl + c.boot + c.cap + c.p5) == 0,
+      f"g17: --dry-run stays verdict-only — NO [E] stage at all "
+      f"(emit={c.emit} dl={c.dl} boot={c.boot} cap={c.cap} p5={c.p5})")
+check(r.download_ok is None and r.boot_ok is None and r.smoke is None
+      and r.capture_paths == [],
+      f"g17: --dry-run leaves all [E] additive fields None/empty "
+      f"(dl_ok={r.download_ok} boot_ok={r.boot_ok})")
+check(any("soak-continuous" in n for n in r.notices),
+      "g17: --dry-run verdict still carries the §7 caveat (unchanged)")
+
+# --- g18: override-accepted + --force-download -> [E] + pt5 emitted ------
+# estimated-lower-bound × wont-fit + --force-download -> override-accepted.
+# A huge-weight derived model forces wont-fit on this hardware.
+c = _Calls()
+r = P.run_pull(DSLUG, "vllm/minimal", path="B", hardware_sm=SM_86,
+                fetcher=ff_derived(DSLUG, dense_cfg("Qwen2ForCausalLM"),
+                                   weight_gb=400.0),
+                profiles=profiles, statvfs=BIG_DISK, trust_remote_code=True,
+                force_download=True, gpu_topology=TOPO_2,
+                **mk_emocks(c, boot_ok=False))
+check(r.ok and r.terminal == "override-accepted",
+      f"g18: derived wont-fit + --force-download -> override-accepted "
+      f"(ok={r.ok}, terminal={r.terminal})")
+check(c.emit == 1 and c.dl == 1 and c.boot == 1 and c.cap == 1
+      and c.p5 == 1,
+      f"g18: --force-download ACTIVATES [E] for override-accepted incl "
+      f"pt5 (emit={c.emit} dl={c.dl} boot={c.boot} cap={c.cap} p5={c.p5})")
+_p5 = [x for x in r.capture_paths if "pt5" in x or "override" in x]
+check(len(_p5) == 1, f"g18: exactly one pt5 artifact (got {_p5})")
+_p5doc = json.loads(Path(_p5[0]).read_text())
+check(_p5doc["point"] == "override_capture"
+      and _p5doc["calibration_signal_not_validated"] is True,
+      f"g18: pt5 carries point=override_capture + literal "
+      f"calibration_signal_not_validated:true (got "
+      f"{_p5doc.get('calibration_signal_not_validated')!r})")
+check(_p5doc["actual"] is None and _p5doc["exit_error_summary"]
+      and _p5doc["predicted_vs_actual_delta_mib"] is None,
+      f"g18: boot never reached allocation -> actual null, "
+      f"exit_error_summary set, delta null (got actual="
+      f"{_p5doc['actual']!r}, exit={_p5doc['exit_error_summary']!r})")
+check("predicted_b_breakdown" in _p5doc,
+      "g18: pt5 carries the full [B] kv-calc predicted breakdown")
+for _x in r.capture_paths:
+    try:
+        os.unlink(_x)
+    except OSError:
+        pass
+
+# --- g19: override-accepted WITHOUT --force-download -> NO [E] -----------
+# Without --force-download the wont-fit advisory is NOT satisfied (the [C1]
+# row needs --force-download); honest non-pass, no [E].
+c = _Calls()
+r = P.run_pull(DSLUG, "vllm/minimal", path="B", hardware_sm=SM_86,
+                fetcher=ff_derived(DSLUG, dense_cfg("Qwen2ForCausalLM"),
+                                   weight_gb=400.0),
+                profiles=profiles, statvfs=BIG_DISK, trust_remote_code=True,
+                gpu_topology=TOPO_2, **mk_emocks(c))
+check(not r.ok and r.abort_reason.startswith("override-accepted")
+      and (c.emit + c.dl + c.boot + c.cap + c.p5) == 0,
+      f"g19: override-accepted WITHOUT --force-download -> NOT satisfied, "
+      f"NO [E] (ok={r.ok}, reason={r.abort_reason}, emit={c.emit})")
+
+# --- g20: confirm→proceed WITHOUT --yes -> NOT eligible, NO [E] ----------
+c = _Calls()
+r = P.run_pull(DSLUG, "vllm/minimal", path="B", hardware_sm=SM_86,
+                fetcher=ff_derived(DSLUG, dense_cfg("Qwen2ForCausalLM"),
+                                   weight_gb=4.0),
+                profiles=profiles, statvfs=BIG_DISK, trust_remote_code=True,
+                gpu_topology=TOPO_2, **mk_emocks(c))
+check(not r.ok and r.abort_reason.startswith("confirm→proceed")
+      and (c.emit + c.dl + c.boot + c.cap + c.p5) == 0,
+      f"g20: confirm→proceed WITHOUT --yes -> NOT download-eligible, "
+      f"NO [E] (ok={r.ok}, reason={r.abort_reason}, emit={c.emit})")
+
+# --- g21: curated Path-A -> NO download stage (unchanged) ----------------
+c = _Calls()
+_o21 = "/tmp/_pull_g21.yml"
+if os.path.exists(_o21):
+    os.unlink(_o21)
+r = P.run_pull(CURATED_SLUG, "vllm/dual", path="A", out=_o21,
+                hardware_sm=SM_86, fetcher=NoNet(), profiles=profiles,
+                statvfs=BIG_DISK, yes=True, gpu_topology=TOPO_2,
+                **mk_emocks(c))
+check(r.ok and r.emitted and r.path == "A"
+      and (c.emit + c.dl + c.boot + c.cap + c.p5) == 0,
+      f"g21: curated Path-A emits via [D], NO derived [E] download stage "
+      f"(emitted={r.emitted}, emit={c.emit} dl={c.dl})")
+check(r.download_ok is None and r.boot_ok is None,
+      "g21: curated Path-A leaves [E] additive fields untouched (unchanged)")
+if os.path.exists(_o21):
+    os.unlink(_o21)
+
+# --- g22: derived but CONTRACT-5 reject -> structured refuse, NO dl/boot -
+# Point --profile-like at an overlay/TQ3 shape so derived_emittable refuses
+# BEFORE any download/boot. vllm/gemma-int8-tq3 = TQ3 KV + required feats.
+c = _Calls()
+r = P.run_pull(DSLUG, "vllm/gemma-int8-tq3", path="B", hardware_sm=SM_90,
+                fetcher=ff_derived(DSLUG, dense_cfg("Qwen2ForCausalLM"),
+                                   weight_gb=4.0),
+                profiles=profiles, statvfs=BIG_DISK, trust_remote_code=True,
+                yes=True, gpu_topology=TOPO_2, **mk_emocks(c))
+_n22 = " ".join(r.notices)
+check("derived-runtime-unsupported:" in _n22
+      and (c.emit + c.dl + c.boot + c.cap + c.p5) == 0,
+      f"g22: CONTRACT-5 reject -> structured derived-runtime-unsupported "
+      f"refuse, NO emit/download/boot (notices={_n22!r}, emit={c.emit} "
+      f"dl={c.dl})")
+check(r.download_ok is None and r.boot_ok is None,
+      "g22: CONTRACT-5 reject leaves [E] additive fields None (no stage ran)")
+
+# Purge ALL mocked-[E] capture residue (leave NO repo artifact).
+_purge_captures()
+
+# ===========================================================================
 # Done.
 # ===========================================================================
 if failures:
@@ -970,7 +1233,10 @@ if failures:
 
 print("\nSUMMARY: all Pull-Gate P4 truth-table assertions passed "
       "(§4.1 9 cells + 6 strata + ordering + g0..g15 + trc-leak + "
-      "Path-B isolation).")
+      "Path-B isolation) + v0.8.0 [E] E4 orchestration (g16..g22: "
+      "derived-[E] continuation, --dry-run verdict-only, --force-download "
+      "override + pt5 force-capture, confirm-without-yes/override-without-"
+      "force gating, curated-Path-A unchanged, CONTRACT-5 reject).")
 PY
 
 echo "test-pull.sh OK"

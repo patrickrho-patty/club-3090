@@ -14,11 +14,15 @@ This module owns ONLY:
                          `manifest.json`, schema **v1**, redacted via the
                          `report.sh --redact` convention.
 
-OUT of E3 (do NOT add here): CAPTURE-POINT 5 (override-accepted
-force-capture) — it needs `einput.is_override_accepted` + the post-`[C1]`
-override path E4 wires; `[E]` builds pt1-4 + manifest only. NO `run_pull()`
-wiring. NO §6.1 failure classification (`failure_class` is left null — that
-is `[F]`'s job). NO docs (E5). NO real on-rig boot (E5).
+CAPTURE-POINT 5 (override-accepted force-capture) is the ONE additive E4
+extension to this module (`emit_override_capture()` — §5.3 / CONTRACT-4
+pt5). It is emitted ONLY on the post-`[C1]` override-accepted path E4
+wires; the E3 pt1-4 + manifest emitters below are byte-behaviour-preserving
+(`test-pullemit-capture.sh` stays green — it asserts pt5 is NOT written by
+`emit_capture()`; pt5 is a SEPARATE function E4 invokes only when
+`einput.is_override_accepted`). NO `run_pull()` wiring here (that is E4).
+NO §6.1 failure classification (`failure_class` is left null — that is
+`[F]`'s job). NO docs (E5). NO real on-rig boot (E5).
 """
 
 from __future__ import annotations
@@ -450,3 +454,114 @@ def emit_capture(
     _write_redacted_json(Path(paths["manifest"]), manifest)
 
     return {"paths": paths, "dir": str(out_dir), "manifest": manifest}
+
+
+# ---------------------------------------------------------------------------
+# CAPTURE-POINT 5 — override-accepted force-capture (CONTRACT-4 pt5 / §5.3).
+#
+# ADDITIVE E4 extension (NOT invoked by emit_capture(); a SEPARATE function
+# E4 calls ONLY on the post-`[C1]` override-accepted path, i.e. when
+# `einput.is_override_accepted` is True). E3's pt1-4 + manifest emitters
+# above are byte-behaviour-preserving — `test-pullemit-capture.sh` continues
+# to assert `emit_capture()` writes ONLY pt1-4 + manifest and NO override
+# artifact. pt5 is written into the SAME `<repo>/.pull-captures/<slug>/<ts>/`
+# directory, redacted via the SAME convention, schema-less per CONTRACT-4
+# pt5's literal field list.
+#
+# CONTRACT-4 pt5 / §5.3 — emit EXACTLY:
+#   { point:"override_capture",
+#     predicted_b_breakdown:{ the full [B] kv-calc GB breakdown that
+#                             produced the verdict },
+#     actual:{ boot_peak_mib:int|null, gpu_worker_reported_mib:int|null },
+#     predicted_vs_actual_delta_mib:int|null,
+#     exit_error_summary:str|null,
+#     calibration_signal_not_validated:true }
+# The `true` flag is MANDATORY + LITERAL — §5.3: a forced low-confidence
+# download is a calibration SIGNAL, never recorded as fit-validated. `actual`
+# may be null (boot never reached allocation) — then `exit_error_summary`
+# carries why; the artifact is STILL emitted regardless.
+# ---------------------------------------------------------------------------
+def emit_override_capture(
+    einput,
+    *,
+    predicted_b_breakdown,
+    boot_peak_mib: Optional[int] = None,
+    gpu_worker_reported_mib: Optional[int] = None,
+    exit_error_summary: Optional[str] = None,
+    repo_root: Path,
+    ts: str,
+) -> str:
+    """Write the §5.3 / CONTRACT-4 pt5 override-accepted force-capture
+    artifact into the SAME capture directory `emit_capture()` used (keyed by
+    the SAME sanitized-slug + `ts`). Returns the written path.
+
+    `predicted_b_breakdown` is the full `[B]` kv-calc GB breakdown that
+    produced the verdict (E4 passes `res.diagnostics['b_breakdown']`).
+    `actual` is `null` iff BOTH `boot_peak_mib` and
+    `gpu_worker_reported_mib` are None (boot never reached allocation) — in
+    that case `predicted_vs_actual_delta_mib` is also `null` and
+    `exit_error_summary` carries why. `calibration_signal_not_validated` is
+    ALWAYS the literal `True` (mandatory; §5.3).
+    """
+    san = sanitize_slug(einput.slug)
+    out_dir = Path(repo_root) / ".pull-captures" / san / ts
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    have_actual = (
+        boot_peak_mib is not None or gpu_worker_reported_mib is not None
+    )
+    if have_actual:
+        actual: Optional[dict] = {
+            "boot_peak_mib": (
+                int(boot_peak_mib) if boot_peak_mib is not None else None
+            ),
+            "gpu_worker_reported_mib": (
+                int(gpu_worker_reported_mib)
+                if gpu_worker_reported_mib is not None
+                else None
+            ),
+        }
+    else:
+        # boot never reached allocation -> actual is null; the WHY lives in
+        # exit_error_summary (CONTRACT-4 pt5).
+        actual = None
+
+    # predicted_vs_actual_delta_mib: only computable when we have a measured
+    # peak AND the prediction carries a comparable MiB figure; else null.
+    delta: Optional[int] = None
+    if actual is not None and boot_peak_mib is not None:
+        pred_mib = _predicted_total_mib(predicted_b_breakdown)
+        if pred_mib is not None:
+            delta = int(boot_peak_mib) - int(pred_mib)
+
+    pt5 = {
+        "point": "override_capture",
+        "predicted_b_breakdown": predicted_b_breakdown,
+        "actual": actual,
+        "predicted_vs_actual_delta_mib": delta,
+        "exit_error_summary": exit_error_summary,
+        # MANDATORY + LITERAL — never "fit validated" (§5.3).
+        "calibration_signal_not_validated": True,
+    }
+    path = out_dir / "pt5-override-capture.json"
+    _write_redacted_json(path, pt5)
+    return str(path)
+
+
+def _predicted_total_mib(breakdown) -> Optional[int]:
+    """Best-effort MiB total of the `[B]` GB breakdown (for the
+    predicted-vs-actual delta). The `[B]` breakdown is a `{component: GB}`
+    dict (`kv.raw_verdict()['breakdown_gb']`); sum numeric components and
+    convert GB -> MiB. Returns None if it is not a usable numeric mapping
+    (delta stays null — never fabricate a number)."""
+    if not isinstance(breakdown, dict) or not breakdown:
+        return None
+    total_gb = 0.0
+    saw = False
+    for v in breakdown.values():
+        if isinstance(v, (int, float)):
+            total_gb += float(v)
+            saw = True
+    if not saw:
+        return None
+    return int(round(total_gb * 1024.0))
