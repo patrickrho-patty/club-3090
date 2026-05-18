@@ -40,6 +40,14 @@
 
 set -euo pipefail
 
+# The VRAM-budget block formats dot-decimal numbers emitted by kv-calc.py JSON
+# (e.g. "9.0") with `printf "%.2f"`. Under a comma-decimal LC_NUMERIC locale
+# (de_DE, fr_FR, …) bash printf rejects the dot — `printf: 9.0: invalid number`
+# / `Ungültige Zahl` — and the launcher aborts at the budget print (#159).
+# Force C numeric parsing for the whole script; LC_CTYPE/encoding is left
+# untouched so UTF-8 UI glyphs (—, ×, ⚠) still render.
+export LC_NUMERIC=C
+
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 SWITCH="${SWITCH:-${ROOT_DIR}/scripts/switch.sh}"
 VERIFY="${VERIFY:-${ROOT_DIR}/scripts/verify-full.sh}"
