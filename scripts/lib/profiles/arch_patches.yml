@@ -257,27 +257,46 @@ arches:
   # longer fires). They are ADDITIVE DATA ONLY — no [C0] decision-logic
   # change.
   #
-  # ZERO FALSE-PASS by construction: every row below follows the SAME
-  # honest precedent as the dense lower-bound rows above —
-  # `requires_trust_remote_code: unverified` + evidence `none`, so [C0]
-  # still resolves `needs-trust-remote-code-ack` (fail-closed; bypassable
-  # ONLY by an explicit `--trust-remote-code`, NEVER auto-passed). The
-  # expansion removes ONLY the `--experimental-arch` requirement — it never
-  # claims a verified boot. `confidence: estimated-lower-bound` /
-  # `status: unverified` make the non-anchored nature explicit; a real
-  # on-rig boot would later promote a specific row to `verified`/`exact`
-  # (data-only). The shipped test invariants prove the no-false-pass:
-  # negative-TP -> engine-support-unknown, unverified-trc ->
-  # needs-trust-remote-code-ack.
+  # TWO-CLASS, ZERO-FALSE-PASS by construction. The expansion removes the
+  # `--experimental-arch` requirement (a row now exists). Each row then
+  # takes ONE of two honest TRC postures:
   #
-  # Anchor for each row: it is a long-standing BUILT-IN vLLM model class
-  # (documented in vLLM's supported-models registry — a real upstream
-  # constraint, not an optimistic guess), so `no-arch-row` was an
-  # over-refusal; quant/dtype/kernel specifics remain deferred to the
-  # later deriver gates exactly as the existing lower-bound rows state.
-  # `PhiForCausalLM` additionally has a concrete on-rig anchor: it is the
+  #   (1) requires_trust_remote_code: "false" + a documented-constraint
+  #       evidence string — for long-standing native vLLM BUILT-IN model
+  #       classes (vLLM supported-models registry) that execute NO remote
+  #       code. A repo declaring such an arch with NO auto_map passes [C0]
+  #       engine-supported CLEANLY (CONTRACT-2's actual goal — the
+  #       over-refusal is REMOVED, not relabelled). This is NOT a
+  #       false-pass: gates.py's `has_auto_map` is an INDEPENDENT OR-term,
+  #       so a repo that ships auto_map / custom modeling code STILL
+  #       hard-blocks `needs-trust-remote-code-ack` regardless of this
+  #       flag — the per-repo trust boundary is untouched; this flag only
+  #       removes the arch-ROW-level blanket over-refusal. Evidence is the
+  #       documented upstream "built-in class" constraint (NOT a claim that
+  #       we inspected specific third-party weights).
+  #
+  #   (2) requires_trust_remote_code: unverified + evidence `none` — for
+  #       arch families with genuine remote-code lineage (their canonical
+  #       models historically ship custom modeling): `Phi3SmallForCausalLM`
+  #       (blocksparse custom attention), `InternLM2ForCausalLM` (commonly
+  #       auto_map/TRC). These stay fail-closed at `needs-trc-ack`
+  #       (bypassable ONLY by explicit `--trust-remote-code`) — the honest
+  #       label where "no remote code" is NOT a defensible documented
+  #       constraint.
+  #
+  # Neither class claims a verified boot: `confidence: estimated-lower-bound`
+  # / `status: unverified` stay on every expansion row (TRC posture is
+  # orthogonal to boot-verification — cf. the shipped Gemma4ForCausalLM
+  # row); a real on-rig boot later promotes confidence/status data-only.
+  # Test invariants prove no-false-pass: negative-TP ->
+  # engine-support-unknown; class-(2)/auto_map -> needs-trc-ack;
+  # still-absent arch -> no-arch-row; class-(1)+no-auto_map ->
+  # engine-supported.
+  #
+  # `PhiForCausalLM` (class 1) has a concrete on-rig anchor: it is the
   # `microsoft/phi-2` C0 case that hard-blocked on `no-arch-row` during
-  # v0.8.2 STEP V1 on-rig validation (2026-05-18).
+  # v0.8.2 STEP V1 on-rig validation (2026-05-18), and now passes
+  # engine-supported on-rig (2026-05-18, post-correction).
   # ---------------------------------------------------------------------
 
   - arch: PhiForCausalLM
@@ -293,8 +312,8 @@ arches:
       marlin_alignment_required: false
       moe_layout: dense
       evidence: "vLLM built-in PhiForCausalLM model class (supported-models registry); on-rig anchor: microsoft/phi-2 C0 no-arch-row hard-block observed v0.8.2 STEP V1 (2026-05-18) — registry gap, not an engine limitation"
-    requires_trust_remote_code: unverified
-    requires_trust_remote_code_evidence: none
+    requires_trust_remote_code: "false"
+    requires_trust_remote_code_evidence: "long-standing native vLLM built-in model class (vLLM supported-models registry — a documented upstream constraint); a repo declaring this arch with no auto_map is served by vLLM's built-in implementation, no remote code. Per-repo remote-code stays independently fail-closed at [C0] branch-1 via the has_auto_map OR-term in scripts/lib/profiles/gates.py — this flag removes ONLY the arch-row-level over-refusal, NOT the per-repo trust boundary. Not anchored to a verified on-rig boot (status stays unverified); a real boot promotes confidence/status data-only. Concrete on-rig anchor: microsoft/phi-2 hard-blocked at [C0] no-arch-row during v0.8.2 STEP V1 on-rig validation (2026-05-18) — a registry gap, not an engine limitation."
     kernel_constraints:
       - "Quant/dtype compatibility must be resolved by later deriver gates."
     confidence: estimated-lower-bound
@@ -333,8 +352,8 @@ arches:
       marlin_alignment_required: false
       moe_layout: dense
       evidence: "vLLM built-in GemmaForCausalLM (Gemma 1) model class (supported-models registry); registry gap not an engine limitation"
-    requires_trust_remote_code: unverified
-    requires_trust_remote_code_evidence: none
+    requires_trust_remote_code: "false"
+    requires_trust_remote_code_evidence: "long-standing native vLLM built-in model class (vLLM supported-models registry — a documented upstream constraint); a repo declaring this arch with no auto_map is served by vLLM's built-in implementation, no remote code. Per-repo remote-code stays independently fail-closed at [C0] branch-1 via the has_auto_map OR-term in scripts/lib/profiles/gates.py — this flag removes ONLY the arch-row-level over-refusal, NOT the per-repo trust boundary. Not anchored to a verified on-rig boot (status stays unverified); a real boot promotes confidence/status data-only."
     kernel_constraints:
       - "Quant/dtype compatibility must be resolved by later deriver gates."
     confidence: estimated-lower-bound
@@ -353,8 +372,8 @@ arches:
       marlin_alignment_required: false
       moe_layout: dense
       evidence: "vLLM built-in Gemma3ForCausalLM model class (supported-models registry); registry gap not an engine limitation"
-    requires_trust_remote_code: unverified
-    requires_trust_remote_code_evidence: none
+    requires_trust_remote_code: "false"
+    requires_trust_remote_code_evidence: "long-standing native vLLM built-in model class (vLLM supported-models registry — a documented upstream constraint); a repo declaring this arch with no auto_map is served by vLLM's built-in implementation, no remote code. Per-repo remote-code stays independently fail-closed at [C0] branch-1 via the has_auto_map OR-term in scripts/lib/profiles/gates.py — this flag removes ONLY the arch-row-level over-refusal, NOT the per-repo trust boundary. Not anchored to a verified on-rig boot (status stays unverified); a real boot promotes confidence/status data-only."
     kernel_constraints:
       - "Quant/dtype compatibility must be resolved by later deriver gates."
       - "Gemma 3 hybrid-SWA KV specifics are resolved by later deriver/[C0] runtime gates, not asserted here."
@@ -374,8 +393,8 @@ arches:
       marlin_alignment_required: false
       moe_layout: dense
       evidence: "vLLM built-in Gemma3ForConditionalGeneration (Gemma 3 multimodal wrapper) model class (supported-models registry); registry gap not an engine limitation"
-    requires_trust_remote_code: unverified
-    requires_trust_remote_code_evidence: none
+    requires_trust_remote_code: "false"
+    requires_trust_remote_code_evidence: "long-standing native vLLM built-in model class (vLLM supported-models registry — a documented upstream constraint); a repo declaring this arch with no auto_map is served by vLLM's built-in implementation, no remote code. Per-repo remote-code stays independently fail-closed at [C0] branch-1 via the has_auto_map OR-term in scripts/lib/profiles/gates.py — this flag removes ONLY the arch-row-level over-refusal, NOT the per-repo trust boundary. Not anchored to a verified on-rig boot (status stays unverified); a real boot promotes confidence/status data-only."
     kernel_constraints:
       - "Quant/dtype compatibility must be resolved by later deriver gates."
       - "Vision wrapper shares the Gemma 3 hybrid-SWA KV constraints; resolved by later runtime gates."
@@ -395,8 +414,8 @@ arches:
       marlin_alignment_required: false
       moe_layout: dense
       evidence: "vLLM built-in Starcoder2ForCausalLM model class (supported-models registry); registry gap not an engine limitation"
-    requires_trust_remote_code: unverified
-    requires_trust_remote_code_evidence: none
+    requires_trust_remote_code: "false"
+    requires_trust_remote_code_evidence: "long-standing native vLLM built-in model class (vLLM supported-models registry — a documented upstream constraint); a repo declaring this arch with no auto_map is served by vLLM's built-in implementation, no remote code. Per-repo remote-code stays independently fail-closed at [C0] branch-1 via the has_auto_map OR-term in scripts/lib/profiles/gates.py — this flag removes ONLY the arch-row-level over-refusal, NOT the per-repo trust boundary. Not anchored to a verified on-rig boot (status stays unverified); a real boot promotes confidence/status data-only."
     kernel_constraints:
       - "Quant/dtype compatibility must be resolved by later deriver gates."
     confidence: estimated-lower-bound
@@ -415,8 +434,8 @@ arches:
       marlin_alignment_required: false
       moe_layout: dense
       evidence: "vLLM built-in CohereForCausalLM (Command-R family) model class (supported-models registry); registry gap not an engine limitation"
-    requires_trust_remote_code: unverified
-    requires_trust_remote_code_evidence: none
+    requires_trust_remote_code: "false"
+    requires_trust_remote_code_evidence: "long-standing native vLLM built-in model class (vLLM supported-models registry — a documented upstream constraint); a repo declaring this arch with no auto_map is served by vLLM's built-in implementation, no remote code. Per-repo remote-code stays independently fail-closed at [C0] branch-1 via the has_auto_map OR-term in scripts/lib/profiles/gates.py — this flag removes ONLY the arch-row-level over-refusal, NOT the per-repo trust boundary. Not anchored to a verified on-rig boot (status stays unverified); a real boot promotes confidence/status data-only."
     kernel_constraints:
       - "Quant/dtype compatibility must be resolved by later deriver gates."
     confidence: estimated-lower-bound
@@ -455,8 +474,8 @@ arches:
       marlin_alignment_required: false
       moe_layout: moe
       evidence: "vLLM built-in MixtralForCausalLM (sparse-MoE) model class (supported-models registry); registry gap not an engine limitation"
-    requires_trust_remote_code: unverified
-    requires_trust_remote_code_evidence: none
+    requires_trust_remote_code: "false"
+    requires_trust_remote_code_evidence: "long-standing native vLLM built-in model class (vLLM supported-models registry — a documented upstream constraint); a repo declaring this arch with no auto_map is served by vLLM's built-in implementation, no remote code. Per-repo remote-code stays independently fail-closed at [C0] branch-1 via the has_auto_map OR-term in scripts/lib/profiles/gates.py — this flag removes ONLY the arch-row-level over-refusal, NOT the per-repo trust boundary. Not anchored to a verified on-rig boot (status stays unverified); a real boot promotes confidence/status data-only."
     kernel_constraints:
       - "MoE expert-tile / quant-kernel (incl. Marlin K-dim) alignment is resolved by later deriver/[C0] runtime gates, not asserted here."
     confidence: estimated-lower-bound
@@ -475,8 +494,8 @@ arches:
       marlin_alignment_required: false
       moe_layout: moe
       evidence: "vLLM built-in Qwen2MoeForCausalLM (sparse-MoE) model class (supported-models registry); registry gap not an engine limitation"
-    requires_trust_remote_code: unverified
-    requires_trust_remote_code_evidence: none
+    requires_trust_remote_code: "false"
+    requires_trust_remote_code_evidence: "long-standing native vLLM built-in model class (vLLM supported-models registry — a documented upstream constraint); a repo declaring this arch with no auto_map is served by vLLM's built-in implementation, no remote code. Per-repo remote-code stays independently fail-closed at [C0] branch-1 via the has_auto_map OR-term in scripts/lib/profiles/gates.py — this flag removes ONLY the arch-row-level over-refusal, NOT the per-repo trust boundary. Not anchored to a verified on-rig boot (status stays unverified); a real boot promotes confidence/status data-only."
     kernel_constraints:
       - "MoE expert-tile / quant-kernel (incl. Marlin K-dim) alignment is resolved by later deriver/[C0] runtime gates, not asserted here."
     confidence: estimated-lower-bound
@@ -495,8 +514,8 @@ arches:
       marlin_alignment_required: false
       moe_layout: moe
       evidence: "vLLM built-in Qwen3MoeForCausalLM (sparse-MoE) model class (supported-models registry); registry gap not an engine limitation. NOTE: distinct from the Qwen3-Next hybrid Qwen3_5MoeForConditionalGeneration row above (DeltaNet) — this is the standard Qwen3 MoE class."
-    requires_trust_remote_code: unverified
-    requires_trust_remote_code_evidence: none
+    requires_trust_remote_code: "false"
+    requires_trust_remote_code_evidence: "long-standing native vLLM built-in model class (vLLM supported-models registry — a documented upstream constraint); a repo declaring this arch with no auto_map is served by vLLM's built-in implementation, no remote code. Per-repo remote-code stays independently fail-closed at [C0] branch-1 via the has_auto_map OR-term in scripts/lib/profiles/gates.py — this flag removes ONLY the arch-row-level over-refusal, NOT the per-repo trust boundary. Not anchored to a verified on-rig boot (status stays unverified); a real boot promotes confidence/status data-only."
     kernel_constraints:
       - "MoE expert-tile / quant-kernel (incl. Marlin K-dim) alignment is resolved by later deriver/[C0] runtime gates, not asserted here."
     confidence: estimated-lower-bound
@@ -515,8 +534,8 @@ arches:
       marlin_alignment_required: false
       moe_layout: dense
       evidence: "vLLM built-in Qwen2VLForConditionalGeneration (Qwen2-VL multimodal) model class (supported-models registry); registry gap not an engine limitation"
-    requires_trust_remote_code: unverified
-    requires_trust_remote_code_evidence: none
+    requires_trust_remote_code: "false"
+    requires_trust_remote_code_evidence: "long-standing native vLLM built-in model class (vLLM supported-models registry — a documented upstream constraint); a repo declaring this arch with no auto_map is served by vLLM's built-in implementation, no remote code. Per-repo remote-code stays independently fail-closed at [C0] branch-1 via the has_auto_map OR-term in scripts/lib/profiles/gates.py — this flag removes ONLY the arch-row-level over-refusal, NOT the per-repo trust boundary. Not anchored to a verified on-rig boot (status stays unverified); a real boot promotes confidence/status data-only."
     kernel_constraints:
       - "Quant/dtype + vision-tower compatibility must be resolved by later deriver gates."
     confidence: estimated-lower-bound

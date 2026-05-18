@@ -435,28 +435,44 @@ def _mk_cfg(slug, arch):
 
 
 # (a) PhiForCausalLM = the real microsoft/phi-2 C0 case that hard-blocked on
-#     `no-arch-row` during v0.8.2 STEP V1 on-rig validation. With the
-#     expansion it NO LONGER requires `--experimental-arch` ...
+#     `no-arch-row` during v0.8.2 STEP V1 on-rig validation. It is a
+#     long-standing native vLLM built-in class with no remote code, so the
+#     arch row carries requires_trust_remote_code:"false" (documented
+#     upstream constraint). A repo declaring it with NO auto_map now passes
+#     [C0] engine-supported CLEANLY (CONTRACT-2 delivered — the over-refusal
+#     is removed, not merely relabelled).
 phi = G.c0_engine_support(
     "vllm/minimal", _mk_cfg("microsoft/phi-2", "PhiForCausalLM"),
     path="B", hardware_sm=SM_86,
 )
 check(
-    phi.sub_reason != G.C0SubReason.NO_ARCH_ROW
-    and G.BYPASS_EXPERIMENTAL_ARCH not in phi.bypassable_by,
-    f"CONTRACT-2: PhiForCausalLM (microsoft/phi-2 on-rig anchor) no longer "
-    f"requires --experimental-arch (got {phi.state.value}/"
-    f"{phi.sub_reason}/{phi.bypassable_by})",
+    phi.state == G.C0State.ENGINE_SUPPORTED
+    and phi.sub_reason is None
+    and phi.bypassable_by == (),
+    f"CONTRACT-2 DELIVERED: PhiForCausalLM (microsoft/phi-2 on-rig anchor, "
+    f"no auto_map) passes [C0] engine-supported with NO bypass flag "
+    f"(got {phi.state.value}/{phi.sub_reason}/{phi.bypassable_by})",
 )
-# ... yet stays TRC-fail-closed — ZERO FALSE-PASS (never auto-passed; the
-#     unverified-TRC row resolves needs-trc-ack, bypassable ONLY by an
-#     explicit --trust-remote-code).
+# ZERO FALSE-PASS is preserved PER-REPO: the SAME native arch from a repo
+# that ships auto_map (custom/remote modeling code) STILL hard-blocks
+# needs-trc-ack — the row's "false" only removes the arch-row-level
+# over-refusal; gates.py's independent `has_auto_map` OR-term keeps the
+# per-repo trust boundary fail-closed.
+_phi_am = D.DeriveResult(slug="evil/phi")
+_phi_am.tier1 = None
+_phi_am.profile = {
+    "arch": "PhiForCausalLM", "auto_map": True,
+    "weight_format": "safetensors",
+}
+phi_am = G.c0_engine_support(
+    "vllm/minimal", _phi_am, path="B", hardware_sm=SM_86,
+)
 check(
-    phi.state == G.C0State.NEEDS_TRC_ACK
-    and phi.bypassable_by == (G.BYPASS_TRUST_REMOTE_CODE,),
-    f"CONTRACT-2 zero-false-pass: PhiForCausalLM stays TRC-fail-closed "
-    f"(needs-trc-ack, --trust-remote-code only; got {phi.state.value}/"
-    f"{phi.bypassable_by})",
+    phi_am.state == G.C0State.NEEDS_TRC_ACK
+    and phi_am.bypassable_by == (G.BYPASS_TRUST_REMOTE_CODE,),
+    f"CONTRACT-2 zero-false-pass: a PhiForCausalLM repo WITH auto_map STILL "
+    f"hard-blocks needs-trc-ack (per-repo safety intact despite row "
+    f"TRC=false; got {phi_am.state.value}/{phi_am.bypassable_by})",
 )
 
 # (b) An arch STILL absent from the registry must STILL hard-block
@@ -475,19 +491,35 @@ check(
     f"{absent.bypassable_by})",
 )
 
-# (c) Every expansion row's declarative flags are defensible by schema (the
-#     test-patch-attribution arch-schema gate already enforces structure;
-#     here assert the no-false-pass-bearing fields specifically): each
-#     carries unverified TRC + evidence none (so it CANNOT silently pass),
-#     a non-empty integer tp_divisors, and a moe_layout.
+# (c) Every expansion row's declarative flags are defensible — and the
+#     no-false-pass invariant is now a TWO-CLASS rule (post the V3 on-rig
+#     CONTRACT-2-delivery correction):
+#       * requires_trust_remote_code:"false"  -> a deliberately-blessed
+#         long-standing native vLLM built-in class; MUST carry a non-empty,
+#         non-"none" documented-constraint evidence string (never blank).
+#         Per-repo remote-code is still independently gated by gates.py's
+#         has_auto_map OR-term, so this is NOT a false-pass.
+#       * requires_trust_remote_code:"unverified" -> conservative
+#         fail-closed; MUST carry evidence "none".
+#     Anything else (true / missing) is a hard fail. Plus a non-empty
+#     integer tp_divisors and a moe_layout.
 for r in expansion_arches:
     a = r.get("arch", "<?>")
-    check(
-        r.get("requires_trust_remote_code") == "unverified"
-        and r.get("requires_trust_remote_code_evidence") == "none",
-        f"CONTRACT-2 zero-false-pass: expansion arch {a} is TRC-fail-closed "
-        f"(unverified + evidence none)",
-    )
+    _trc = r.get("requires_trust_remote_code")
+    _ev = r.get("requires_trust_remote_code_evidence")
+    if _trc == "false":
+        check(
+            isinstance(_ev, str) and _ev not in ("", "none") and len(_ev) > 40,
+            f"CONTRACT-2: blessed-native arch {a} (TRC=false) carries a "
+            f"non-empty documented-constraint evidence anchor (got {_ev!r:.60})",
+        )
+    else:
+        check(
+            _trc == "unverified" and _ev == "none",
+            f"CONTRACT-2 zero-false-pass: non-blessed expansion arch {a} is "
+            f"TRC-fail-closed (unverified + evidence none; got "
+            f"{_trc!r}/{_ev!r:.40})",
+        )
     vt = r.get("valid_tp") or {}
     check(
         isinstance(vt.get("tp_divisors"), list)
