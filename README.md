@@ -68,6 +68,7 @@ bash scripts/update.sh
 - **Model-agnostic**: today ships curated configs for Qwen3.6-27B and friends; structure scales as we add models
 - **Universal `pull`** (v0.8.0; extended in v0.8.2) — evaluate any safetensors HF repo, get an honest one-line fit verdict (`--recommend`), and when a pull hard-blocks, send the redacted diagnostic back in one consented step (`--submit-last`). Broader arch coverage each release. See [`docs/PULL.md`](docs/PULL.md)
 
+**New to local AI itself?** → [`docs/LOCAL_AI_PRIMER.md`](docs/LOCAL_AI_PRIMER.md) — plain-English: how hardware / engines / model sizes / quants fit together.
 **New here?** → [`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md) — 5-minute clone-to-curl path.
 **Already running, want to compare engines?** → [docs/engines/](docs/engines/)
 **Picking an engine** (vLLM / llama.cpp / SGLang)? → [docs/INFERENCE_ENGINES.md](docs/INFERENCE_ENGINES.md)
@@ -121,6 +122,7 @@ club-3090/
 ├── CHANGELOG.md                           cross-cutting changes (engine pin bumps, script updates)
 ├── LICENSE                                Apache-2.0
 ├── docs/
+│   ├── LOCAL_AI_PRIMER.md                 plain-English on-ramp: hardware / engines / sizes / quants
 │   ├── ARCHITECTURE.md                    how this stack thinks about LLM serving on 24 GB
 │   ├── HARDWARE.md                        Ampere SM 8.6+, NVLink note, 24 GB ceilings
 │   ├── GLOSSARY.md                        plain-language definitions (TPS / KV / MTP / TP / etc.)
