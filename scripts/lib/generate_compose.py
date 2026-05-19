@@ -363,6 +363,18 @@ def _patch_wiring_markers(patch: dict) -> list[str]:
     if spec.get("script"):
         markers.append(_dir_token(spec["script"]))
         markers.append(Path(spec["script"]).name)
+    # chat_template: the vendored `.jinja` is mounted via the
+    # compose-relative `patches/<name>/...jinja` path; `mounted_at` (added
+    # above) is the container side. For the explicit `--chat-template`
+    # wiring style add both serving tokens so a strip of an omitted/
+    # undelivered chat_template patch removes the --chat-template arg too
+    # (emit stays in lock-step with reaches()).
+    if patch.get("delivery_mechanism") == "chat_template":
+        if spec.get("jinja"):
+            markers.append(_dir_token(spec["jinja"]))
+            markers.append(Path(spec["jinja"]).name)
+        if "--chat-template" in (spec.get("invoke") or "") and spec.get("mounted_at"):
+            markers.append("--chat-template")
     inv = spec.get("invoke")
     if inv and "/" in inv and not inv.endswith((".", "serving", "import")):
         markers.append(inv)

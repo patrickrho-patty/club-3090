@@ -424,6 +424,75 @@ def _topology_summary_canonical(names: list[str], vram_mib: list[int]) -> str:
 
 
 # ===========================================================================
+# v0.8.2 CONTRACT-1.1 — capture-on-hard-block PASS-THROUGH.
+#
+# Emits a pt1-gate-only redacted bundle on a terminal hard-block, BEFORE the
+# existing `return res`. This is a PURE PASS-THROUGH: it changes NONE of the
+# `[C1]`/6-stratum decision logic — every `return res` decision (ok / stratum
+# / abort_reason / detail) is exactly what it was; we only emit a bundle (a
+# local file op, no network) and record the bundle dir on `res`. ANY emit
+# failure is swallowed structurally — a capture problem must NEVER change a
+# gate decision or raise out of `run_pull` (the locked `[F]`-offline / I/O-
+# free-gate boundary; pre-existing test-pull.sh assertions byte-unaffected).
+#
+# `res.capture_paths` (an existing additive PullResult field) is appended so
+# the surface step (V2) + tests can find the bundle; nothing else on `res`
+# is touched.
+# ===========================================================================
+def _gate_capture_passthrough(
+    res, *, slug, profile_like, der, hardware_sm, gpu_topology, root,
+    gate_capture_fn,
+):
+    """Emit the pt1-gate-only bundle for a terminal hard-block, then return
+    `res` UNCHANGED (pass-through). Swallows every exception — a capture
+    failure never alters a gate decision."""
+    try:
+        from scripts.lib.profiles import capture as _CAP
+
+        fn = gate_capture_fn or _CAP.emit_gate_capture
+
+        # club3090 commit captured on the HOST (mirrors _build_einput; never
+        # git-in-container) — best-effort, "unknown" on any failure.
+        commit = "unknown"
+        try:
+            import subprocess
+
+            cp = subprocess.run(
+                ["git", "-C", str(root or REPO_ROOT), "rev-parse", "HEAD"],
+                capture_output=True, text=True, timeout=10, check=False,
+            )
+            if cp.returncode == 0 and cp.stdout.strip():
+                commit = cp.stdout.strip()
+        except Exception:  # pragma: no cover - git always present on rig
+            commit = "unknown"
+
+        out = fn(
+            slug=slug,
+            profile_like=profile_like,
+            abort_reason=res.abort_reason or "",
+            confidence=(
+                SimpleNamespace(name=res.confidence)
+                if res.confidence else None
+            ),
+            raw_verdict=res.raw_verdict,
+            detail=res.detail,
+            der=der,
+            hardware_sm=hardware_sm,
+            gpu_topology=gpu_topology,
+            club3090_commit=commit,
+            predicted_b_breakdown=res.diagnostics.get("b_breakdown"),
+            repo_root=root or REPO_ROOT,
+        )
+        d = out.get("dir") if isinstance(out, dict) else None
+        if d:
+            res.capture_paths.append(str(d))
+            res.diagnostics["gate_capture"] = {"dir": str(d)}
+    except Exception as exc:  # pragma: no cover - capture is best-effort
+        res.diagnostics["gate_capture"] = {"error": repr(exc)}
+    return res
+
+
+# ===========================================================================
 # The orchestrator — chains the frozen slices in the LOCKED stratum order.
 # ===========================================================================
 def run_pull(
@@ -462,6 +531,23 @@ def run_pull(
     smoke_fn: Optional[Callable] = None,        # E3 smoke_derived
     capture_fn: Optional[Callable] = None,      # E3 emit_capture
     override_capture_fn: Optional[Callable] = None,  # E4 emit_override_capture
+    # v0.8.2 CONTRACT-1.1 — the pt1-gate-only emitter, wired as a pure
+    # PASS-THROUGH on the terminal hard-block return paths (it emits a
+    # bundle BEFORE the existing `return res`; the decision is UNCHANGED).
+    # Injectable so test-pull.sh stays mock-only; None -> the real shipped
+    # capture.emit_gate_capture.
+    gate_capture_fn: Optional[Callable] = None,
+    # v0.8.2 CONTRACT-3 — OPTIONAL non-NVIDIA hardware-enumeration augment.
+    # Consulted ONLY when `nvidia-smi` already returned nothing (so the
+    # NVIDIA majority NEVER enters this seam — that path is byte-identical
+    # with this absent OR present-but-degrading). hw-detect-ONLY: it yields
+    # an SM-equivalent for the [C0] SM gate; it NEVER feeds kv-calc. None
+    # -> the real shipped hwdetect.detect_non_nvidia_sm (optional bounded
+    # `whichllm` subprocess; absent/failed -> graceful degrade to today's
+    # exact `hardware-sm-undetermined` behaviour). Injectable so
+    # test-pull.sh / test-hwdetect.sh stay hermetic (no `whichllm`, no
+    # non-NVIDIA GPU in CI).
+    hwdetect_fn: Optional[Callable] = None,
 ) -> PullResult:
     """Execute the 6-stratum Pull-Gate state machine.
 
@@ -499,10 +585,17 @@ def run_pull(
         slug, hf_home=hf_home, fetcher=fetcher, profiles=profiles
     )
     if der.error is not None:
-        return PullResult(
+        _der_res = PullResult(
             slug=slug, profile_like=profile_like, path="?",
             ok=False, stratum=Stratum.DERIVER,
             abort_reason=der.error.kind.value, detail=str(der.error),
+        )
+        # v0.8.2 CONTRACT-1.1 pass-through (pre-deriver: no der.profile ->
+        # model/arch/quant null). Decision UNCHANGED.
+        return _gate_capture_passthrough(
+            _der_res, slug=slug, profile_like=profile_like, der=None,
+            hardware_sm=hardware_sm, gpu_topology=gpu_topology, root=root,
+            gate_capture_fn=gate_capture_fn,
         )
 
     is_curated = der.tier1 is not None
@@ -530,11 +623,50 @@ def run_pull(
         res.stratum = Stratum.PROFILE_LIKE
         res.abort_reason = s2.refusal.reason
         res.detail = s2.refusal.detail
-        return res
+        return _gate_capture_passthrough(
+            res, slug=slug, profile_like=profile_like, der=der,
+            hardware_sm=hardware_sm, gpu_topology=gpu_topology, root=root,
+            gate_capture_fn=gate_capture_fn,
+        )
 
     # ----- stratum-3: [C0] engine-support / runtime / SM (P3, frozen) -----
     if hardware_sm is None:
         hardware_sm = detect_hardware_sm()
+    if hardware_sm is None:
+        # v0.8.2 CONTRACT-3 (hw-detect-ONLY) — OPTIONAL non-NVIDIA augment.
+        # Reached ONLY when `nvidia-smi` gave nothing, so the NVIDIA
+        # majority never executes this and that path is byte-identical
+        # whether this augment is absent or present-but-degrading. An
+        # absent/failed/non-applicable `whichllm` returns None and we fall
+        # straight through to the unchanged `hardware-sm-undetermined`
+        # terminal below (safety half). A recognised non-NVIDIA device
+        # (AMD ROCm / Apple) yields an SM-equivalent so the eval path can
+        # run the [C0] SM gate instead of refusing blind (delivery half).
+        # This SM-equivalent feeds ONLY the [C0] gate — NEVER kv-calc
+        # (kv-calc stays the sole fit authority; CONTRACT-3 is
+        # enumeration-only). Any exception is swallowed by hwdetect itself
+        # (leaf module never raises out).
+        if hwdetect_fn is None:
+            from scripts.lib.profiles.hwdetect import detect_non_nvidia_sm
+
+            hwdetect_fn = detect_non_nvidia_sm
+        _aug_sm = hwdetect_fn()
+        if _aug_sm is not None:
+            # Additive-only: mutate the existing `res` (created above;
+            # stratum-2 already passed). NO decision field is touched —
+            # only `hardware_sm` (so the EXISTING [C0] gate now runs
+            # instead of the unchanged blind-refuse terminal) + an
+            # additive notice/diagnostic. kv-calc is NOT consulted.
+            hardware_sm = float(_aug_sm)
+            res.notices.append(
+                "[hw] nvidia-smi absent; non-NVIDIA accelerator "
+                "enumerated via the optional hardware-detect subprocess "
+                "(enumeration only — kv-calc remains the sole fit "
+                "authority; validate with soak-continuous)"
+            )
+            res.diagnostics["hwdetect"] = {
+                "augmented": True, "sm_equiv": float(_aug_sm),
+            }
     if hardware_sm is None:
         # No GPU detected and none injected: cannot honestly run the SM
         # gate. Fail closed (never fabricate a fit per §1).
@@ -546,7 +678,14 @@ def run_pull(
             "and no --hardware override given; refusing to run the SM gate "
             "blind"
         )
-        return res
+        # topology GUARANTEED null here (nvidia-smi absent — CONTRACT-1.1):
+        # pass gpu_topology=None so the bundle's topology is null even if
+        # an unrelated override was supplied.
+        return _gate_capture_passthrough(
+            res, slug=slug, profile_like=profile_like, der=der,
+            hardware_sm=None, gpu_topology=None, root=root,
+            gate_capture_fn=gate_capture_fn,
+        )
 
     c0 = G.c0_engine_support(
         profile_like, der, path=eff_path, hardware_sm=float(hardware_sm),
@@ -577,7 +716,11 @@ def run_pull(
             )
             res.detail = c0.detail
             res.diagnostics["c0_bypassable_by"] = list(c0.bypassable_by)
-            return res
+            return _gate_capture_passthrough(
+                res, slug=slug, profile_like=profile_like, der=der,
+                hardware_sm=hardware_sm, gpu_topology=gpu_topology,
+                root=root, gate_capture_fn=gate_capture_fn,
+            )
         res.notices.append(
             f"[C0] {c0.state.value}"
             + (f"/{c0.sub_reason.value}" if c0.sub_reason else "")
@@ -592,7 +735,11 @@ def run_pull(
         res.stratum = Stratum.C2A_DISK
         res.abort_reason = c2a.state.value          # "disk-short"
         res.detail = c2a.detail
-        return res
+        return _gate_capture_passthrough(
+            res, slug=slug, profile_like=profile_like, der=der,
+            hardware_sm=hardware_sm, gpu_topology=gpu_topology, root=root,
+            gate_capture_fn=gate_capture_fn,
+        )
 
     # ----- stratum-5: pre-[B] generic-dense eligibility (P4) --------------
     # Separate pre-[B] abort — NOT a [C0] rewrite ([C0] already emitted
@@ -614,7 +761,11 @@ def run_pull(
                 f"to price — pre-[B] hard-stop (non-bypassable; "
                 f"--experimental-arch does NOT apply — there is no model)"
             )
-            return res
+            return _gate_capture_passthrough(
+                res, slug=slug, profile_like=profile_like, der=der,
+                hardware_sm=hardware_sm, gpu_topology=gpu_topology,
+                root=root, gate_capture_fn=gate_capture_fn,
+            )
 
     # ----- [B]: raw fit verdict (P1 kv.raw_verdict) -----------------------
     entry = s2.registry_entry or {}
@@ -648,7 +799,15 @@ def run_pull(
         res.stratum = Stratum.DECIDED
         res.abort_reason = "hard-block"
         res.detail = f"[C1] {conf}×{raw} → hard-block ({c1.note})"
-        return res
+        # v0.8.2 CONTRACT-1.1 — the C1 exact×wont-fit terminal (the genuine
+        # kv-calc VRAM refusal). predicted_b_breakdown is in scope
+        # (res.diagnostics["b_breakdown"] set above) — the pass-through
+        # carries it. Decision UNCHANGED.
+        return _gate_capture_passthrough(
+            res, slug=slug, profile_like=profile_like, der=der,
+            hardware_sm=hardware_sm, gpu_topology=gpu_topology, root=root,
+            gate_capture_fn=gate_capture_fn,
+        )
 
     if not c1.satisfied:
         # confirm→proceed without --yes, or low-conf wont-fit advisory
@@ -1305,6 +1464,140 @@ def _curated_spec(profiles, der) -> dict:
 
 
 # ===========================================================================
+# v0.8.2 CONTRACT-4 — the `recommend` UX (success-path counterpart to the
+# CONTRACT-1 failure on-ramp).
+#
+# This is PURE PRESENTATION / AGGREGATION over the SHIPPED `run_pull`
+# verdict. It introduces NO decision logic: every field it renders is read
+# straight off the real `PullResult` (`ok` / `confidence` / `raw_verdict` /
+# `terminal` / `stratum` / `abort_reason` / `notices` / `emitted`) that the
+# locked 6-stratum + §4.1 machinery produced for THIS run. The recommendation
+# therefore tracks the real verdict by construction — a model that fits, one
+# that hard-blocks, and one that is `confirm→proceed` each yield a different
+# block because each carries a different real `res`. It is NOT a static or
+# templated summary: remove the gate and the recommendation changes with it.
+#
+# Honesty invariants (CONTRACT-4):
+#   * vLLM-only by construction (the shipped gate is vLLM-only; we add
+#     nothing — we only echo what the gate decided).
+#   * Carries the §7 boot-fit≠runtime caveat verbatim (CAVEAT_S7) + the
+#     soak-continuous pointer, on any verdict the gate itself marked
+#     boot-fit-satisfied (detected via CAVEAT_S7 ∈ res.notices — the SAME
+#     signal the gate already emits; we do not re-derive it).
+#   * States WHICH gate decided (`res.stratum`) — never silently summarised.
+#   * Honest about the confidence tier (echoes res.confidence; an
+#     estimated-lower-bound floor is stated, never hidden).
+#   * NEVER implies a non-emitted artifact: a compose line is printed ONLY
+#     when `res.emitted` is true (Path A actually emitted one).
+# ===========================================================================
+def _render_recommendation(res: "PullResult") -> list[str]:
+    """Aggregate the SHIPPED `run_pull` verdict into an honest, human
+    recommendation. Pure presentation: derives every line from `res`;
+    introduces no decision logic. Returns the lines to print (so the
+    test can assert the recommendation tracks a *real* differing verdict
+    without driving a tty)."""
+    out: list[str] = ["[recommend] ----- recommendation -----"]
+    out.append(
+        f"[recommend] model={res.slug} profile-like={res.profile_like} "
+        f"engine=vLLM (the pull gate is vLLM-only by construction)"
+    )
+
+    if res.ok:
+        # The gate said download-eligible / clean. Echo the real terminal +
+        # confidence; never upgrade the gate's honesty.
+        verdict = res.terminal or "proceed"
+        out.append(
+            f"[recommend] verdict: FITS → {verdict} "
+            f"(confidence={res.confidence or 'n/a'}, "
+            f"raw_verdict={res.raw_verdict or 'n/a'})"
+        )
+        if res.confidence == "estimated-lower-bound":
+            out.append(
+                "[recommend] note: this is an ESTIMATED LOWER BOUND — the "
+                "modelled VRAM is a floor and is likely under-modelled; "
+                "treat the fit as the optimistic edge, not a guarantee."
+            )
+        if res.emitted:
+            out.append(
+                "[recommend] a ready compose was emitted for this config "
+                "(see the --out path / stdout above)."
+            )
+        else:
+            # Honesty: do NOT imply a compose that was not produced.
+            out.append(
+                "[recommend] no compose was emitted this run (Path B "
+                "evaluate / --dry-run / not download-eligible) — this is a "
+                "verdict only, not a launchable artifact."
+            )
+    else:
+        # `res.ok` is False, but that means "the run did not produce a
+        # launchable artifact" — NOT necessarily "does not fit". Distinguish
+        # the gate's *acceptance* terminals (it fits the modelled budget; the
+        # run merely needs an explicit flag) from a genuine hard-block.
+        # Honesty (CONTRACT-4): never label a fits-clean model "DOES NOT FIT".
+        # Pure presentation: still derives only from `res`, no decision logic.
+        reason = res.abort_reason or "see the gate output above"
+        _rv = res.raw_verdict or ""
+        _ar = res.abort_reason or ""
+        _needs_accept = _rv == "fits-clean" and (
+            _ar.startswith("confirm→proceed")
+            or _ar.startswith("override-accepted")
+            or "needs --yes" in _ar
+            or "needs --force-download" in _ar
+        )
+        if _needs_accept:
+            out.append(
+                f"[recommend] verdict: FITS (estimated) — NOT YET ACCEPTED: "
+                f"{reason} (confidence={res.confidence or 'n/a'}, "
+                f"raw_verdict={res.raw_verdict or 'n/a'})"
+            )
+            out.append(
+                "[recommend] the model fits the gate's modelled budget — this "
+                "is an ACCEPTANCE gate, not a fit failure. Re-run with the "
+                "flag named in the reason above to proceed."
+            )
+            if res.confidence == "estimated-lower-bound":
+                out.append(
+                    "[recommend] note: this is an ESTIMATED LOWER BOUND — the "
+                    "modelled VRAM is a floor and is likely under-modelled; "
+                    "treat the fit as the optimistic edge, not a guarantee."
+                )
+        else:
+            # Genuine hard-block / needs-a-flag. Carry the precise reason and
+            # WHICH gate decided; point at the failure on-ramp (CONTRACT-1).
+            out.append(
+                f"[recommend] verdict: DOES NOT FIT / BLOCKED — {reason}"
+            )
+            out.append(
+                "[recommend] this is an honest stop, not a stack failure. The "
+                "diagnostics (if a redacted bundle was captured) can be sent "
+                "back with `scripts/pull.sh --submit-last` — see the failure "
+                "on-ramp section of docs/PULL.md."
+            )
+
+    # WHICH gate decided — always stated (CONTRACT-4: never silently
+    # summarised). Read straight off the real result.
+    out.append(
+        f"[recommend] decided at: stratum={res.stratum.name}"
+    )
+
+    # §7 boot-fit ≠ runtime caveat + soak-continuous pointer — carried
+    # verbatim ONLY when the gate itself marked this run boot-fit-satisfied
+    # (CAVEAT_S7 ∈ res.notices is the gate's own signal; we echo, not
+    # re-derive). A blocked verdict that never reached [B] has no such
+    # notice and (correctly) gets no false soak pointer.
+    if CAVEAT_S7 in res.notices:
+        out.append(f"[recommend] §7 caveat: {CAVEAT_S7}")
+        out.append(
+            "[recommend] before relying on this in production run: "
+            "scripts/soak.sh SOAK_MODE=continuous (the only test that "
+            "catches Cliff 2b)."
+        )
+    out.append("[recommend] -------------------------------")
+    return out
+
+
+# ===========================================================================
 # CLI (thin; pull.sh execs this). Renders PullResult to stdout + exit code.
 # ===========================================================================
 _EXIT_OK = 0
@@ -1313,8 +1606,46 @@ _EXIT_NEEDS_FLAG = 3     # confirm→proceed / advisory not yet satisfied
 _EXIT_USAGE = 64
 
 
+def _maybe_submit_verb(argv: list[str]) -> Optional[int]:
+    """v0.8.2 CONTRACT-1.3 — the `--submit-last` / `--submit <dir>` verb is
+    a DISTINCT top-level verb, parsed BEFORE the positional-slug /
+    `--profile-like` requirement (so `--submit*` needs NEITHER a slug NOR
+    `--profile-like`). Returns an exit code when the submit verb was
+    invoked, else `None` (fall through to the normal gate CLI).
+
+    This is intentionally a pre-argparse intercept: the shipped gate parser
+    hard-requires `slug` + `--profile-like`, and the submit verb is a
+    different invocation grammar entirely (the on-ramp, not a gate run).
+    The submit path is the ONLY place network ever happens, and only after
+    an explicit `y` (the locked `[F]`-offline boundary — `run_pull` itself
+    stays I/O-free).
+    """
+    if "--submit-last" not in argv and "--submit" not in argv:
+        return None
+
+    from scripts.lib.profiles.submit_pull import submit_pull
+
+    submit_last = "--submit-last" in argv
+    capture_dir: Optional[str] = None
+    if "--submit" in argv:
+        i = argv.index("--submit")
+        if i + 1 < len(argv):
+            capture_dir = argv[i + 1]
+    return submit_pull(
+        capture_dir=capture_dir,
+        submit_last=submit_last,
+        repo_root=REPO_ROOT,
+    )
+
+
 def main(argv: list[str]) -> int:
     import argparse
+
+    # v0.8.2 CONTRACT-1.3 — the submit verb is parsed BEFORE the gate
+    # parser's slug/--profile-like requirement (a distinct top-level verb).
+    _sub_rc = _maybe_submit_verb(argv)
+    if _sub_rc is not None:
+        return _sub_rc
 
     class _UsageExit64Parser(argparse.ArgumentParser):
         """argparse's default `error()` hard-exits 2 — which collides with
@@ -1371,6 +1702,14 @@ def main(argv: list[str]) -> int:
         "[E] stage as 'VRAM_MIB:NAME,VRAM_MIB:NAME' (e.g. "
         "'24576:RTX 3090,24576:RTX 3090'); default = nvidia-smi detection",
     )
+    ap.add_argument(
+        "--recommend", action="store_true",
+        help="v0.8.2 CONTRACT-4: after the gate runs, print an honest "
+        "aggregated recommendation (fits? which quant/variant; the §7 "
+        "boot-fit≠runtime caveat; which gate decided). Presentation only "
+        "— derives entirely from the real gate verdict, changes no "
+        "decision; vLLM-only by construction",
+    )
     args = ap.parse_args(argv)
 
     gpu_topology = None
@@ -1415,6 +1754,41 @@ def main(argv: list[str]) -> int:
         print(f"[pull] note: {n}")
     if res.emitted and not args.out:
         sys.stdout.write(res.compose_text or "")
+
+    # v0.8.2 CONTRACT-1.2 — surface the failure on-ramp pointer (gate path,
+    # I/O-FREE: a single print; NO network, NO blocking prompt, NO auto-send
+    # — submission is the separate, explicit, consented `--submit-last`
+    # step). The TRIGGER is "a gate bundle was emitted for this run", keyed
+    # on the capture dir the V1 pass-through recorded on `res.diagnostics`
+    # — EXPLICITLY NOT gated on the exit code. The single most important
+    # §10-R9 lever (`engine-support-unknown/no-arch-row`) is the
+    # `--experimental-arch`-bypassable advisory path that exits 0 yet emits
+    # a bundle; gating this pointer on `exit==2` would silently suppress the
+    # submit prompt for exactly that class. It does NOT classify (that is
+    # loop-side at submit) — it prints unconditionally on any emitted gate
+    # bundle; suppression (no public issue) is enforced loop-side. The
+    # surfaced message points ONLY at the redacted `.pull-captures/`
+    # artifact + the exact one-command — never "paste your terminal output"
+    # (console is not a safe submission source).
+    _gc = res.diagnostics.get("gate_capture") if res.diagnostics else None
+    _gc_dir = _gc.get("dir") if isinstance(_gc, dict) else None
+    if _gc_dir:
+        print(
+            f"[pull] Diagnostics captured (redacted, no paths/tokens): "
+            f"{_gc_dir}"
+        )
+        print(
+            "[pull] Help improve the fit math — submit with: "
+            "scripts/pull.sh --submit-last"
+        )
+
+    # v0.8.2 CONTRACT-4 — the `recommend` UX. Pure presentation/aggregation
+    # over the SHIPPED verdict (`res`); changes NO decision and NOT the exit
+    # code (the recommendation only RENDERS what the gate already decided).
+    # Emitted last so it summarises the full verdict the user just saw.
+    if args.recommend:
+        for ln in _render_recommendation(res):
+            print(ln)
 
     if res.ok:
         return _EXIT_OK

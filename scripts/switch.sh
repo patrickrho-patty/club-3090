@@ -13,7 +13,9 @@
 #   bash scripts/switch.sh --list              # show all variants
 #   bash scripts/switch.sh --down              # just bring down whatever's up
 #
-# Variant names (engine/file, file is the docker-compose.<file>.yml stem):
+# Variant names are derived from the compose registry (the single source of
+# truth); `bash scripts/switch.sh --list` is authoritative. A representative
+# subset (engine/file, file is the docker-compose.<file>.yml stem):
 #
 #   Single-card vLLM:
 #     vllm/default            48K + TQ3 + MTP + vision + tools (recommended)
@@ -64,58 +66,71 @@ if [[ -f "${ROOT_DIR}/.env" ]]; then
   set +a
 fi
 
-# Per-variant default port (matches each compose's "${PORT:-XXXX}:8000"
-# fallback). Used when neither $PORT nor $READY_URL is set explicitly.
-declare -A VARIANT_DEFAULT_PORT=(
-  [vllm/default]=8020
-  [vllm/long-vision]=8020
-  [vllm/long-text]=8020
-  [vllm/long-text-no-mtp]=8021
-  [vllm/bounded-thinking]=8020
-  [vllm/tools-text]=8020
-  [vllm/minimal]=8020
-  [vllm/dual]=8010
-  [vllm/dual4]=8015
-  [vllm/dual4-dflash]=8016
-  [vllm/dual-turbo]=8011
-  [vllm/dual-dflash]=8012
-  [vllm/dual-dflash-noviz]=8013
-  [vllm/dual-nvlink]=8014
-  [vllm/dual-nvlink-turbo]=8017
-  [vllm/dual-nvlink-dflash]=8018
-  [vllm/dual-nvlink-dflash-noviz]=8019
-  [vllm/gemma-mtp]=8030
-  [vllm/gemma-mtp-tp1]=8031
-  [vllm/gemma-dflash]=8032
-  [llamacpp/default]=8020
-  [llamacpp/concurrent]=8020
-)
+# Variant tables are DERIVED from the single source of truth
+# (scripts/lib/profiles/compose_registry.py COMPOSE_REGISTRY) so that every
+# registered compose is launchable and there are no launcher-only ghosts
+# (CONTRACT-2b-ii / registry↔launcher parity). The previous hardcoded
+# `declare -A` maps drifted out of the registry (e.g. vllm/dual-int8 shipped
+# in the registry + as dual/int8.yml but was unlaunchable here); deriving
+# eliminates that drift class structurally. `scripts/tests/test-switch-registry-parity.sh`
+# fails CI on ANY mismatch in either direction.
+#
+#   VARIANT_DEFAULT_PORT[<key>]  = registry default_port (matches each
+#                                  compose's "${PORT:-XXXX}:8000" fallback).
+#   VARIANTS[<key>]              = "engine|compose_dir|file" derived from the
+#                                  registry compose_path
+#                                  (<dir>/compose/<file>) + the key's engine
+#                                  prefix (vllm|llamacpp).
+declare -A VARIANT_DEFAULT_PORT=()
+declare -A VARIANTS=()
 
-# variant -> "engine|compose_dir|file"  (file relative to compose_dir)
-declare -A VARIANTS=(
-  [vllm/default]="vllm|models/qwen3.6-27b/vllm/compose|single/docker-compose.yml"
-  [vllm/long-vision]="vllm|models/qwen3.6-27b/vllm/compose|single/long-vision.yml"
-  [vllm/long-text]="vllm|models/qwen3.6-27b/vllm/compose|single/long-text.yml"
-  [vllm/long-text-no-mtp]="vllm|models/qwen3.6-27b/vllm/compose|single/long-text-no-mtp.yml"
-  [vllm/bounded-thinking]="vllm|models/qwen3.6-27b/vllm/compose|single/bounded-thinking.yml"
-  [vllm/tools-text]="vllm|models/qwen3.6-27b/vllm/compose|single/tools-text.yml"
-  [vllm/minimal]="vllm|models/qwen3.6-27b/vllm/compose|single/minimal.yml"
-  [vllm/dual]="vllm|models/qwen3.6-27b/vllm/compose|dual/docker-compose.yml"
-  [vllm/dual4]="vllm|models/qwen3.6-27b/vllm/compose|multi4/docker-compose.yml"
-  [vllm/dual4-dflash]="vllm|models/qwen3.6-27b/vllm/compose|multi4/dflash.yml"
-  [vllm/dual-turbo]="vllm|models/qwen3.6-27b/vllm/compose|dual/turbo.yml"
-  [vllm/dual-dflash]="vllm|models/qwen3.6-27b/vllm/compose|dual/dflash.yml"
-  [vllm/dual-dflash-noviz]="vllm|models/qwen3.6-27b/vllm/compose|dual/dflash-noviz.yml"
-  [vllm/dual-nvlink]="vllm|models/qwen3.6-27b/vllm/compose|dual/nvlink.yml"
-  [vllm/dual-nvlink-turbo]="vllm|models/qwen3.6-27b/vllm/compose|dual/nvlink-turbo.yml"
-  [vllm/dual-nvlink-dflash]="vllm|models/qwen3.6-27b/vllm/compose|dual/nvlink-dflash.yml"
-  [vllm/dual-nvlink-dflash-noviz]="vllm|models/qwen3.6-27b/vllm/compose|dual/nvlink-dflash-noviz.yml"
-  [vllm/gemma-mtp]="vllm|models/gemma-4-31b/vllm/compose|dual/docker-compose.yml"
-  [vllm/gemma-mtp-tp1]="vllm|models/gemma-4-31b/vllm/compose|single/docker-compose.yml"
-  [vllm/gemma-dflash]="vllm|models/gemma-4-31b/vllm/compose|dual/dflash.yml"
-  [llamacpp/default]="llamacpp|models/qwen3.6-27b/llama-cpp/compose|single/docker-compose.yml"
-  [llamacpp/concurrent]="llamacpp|models/qwen3.6-27b/llama-cpp/compose|single/concurrent.yml"
-)
+_derive_variant_tables() {
+  local emit
+  if ! emit="$(python3 - "$ROOT_DIR" <<'PY' 2>/dev/null
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+sys.path.insert(0, str(root))
+from scripts.lib.profiles.compose_registry import COMPOSE_REGISTRY
+
+for key, entry in COMPOSE_REGISTRY.items():
+    engine_prefix = key.split("/", 1)[0]
+    # switch.sh engine token: vllm | llamacpp (matches the on-disk tree).
+    engine = "llamacpp" if engine_prefix == "llamacpp" else engine_prefix
+    cp = entry["compose_path"]
+    if "/compose/" not in cp:
+        # A registry entry whose compose_path can't be split is a registry
+        # bug; surface it loudly rather than silently dropping the variant.
+        print(f"__ERR__\t{key}\tcompose_path lacks /compose/: {cp}")
+        continue
+    dirpart, filepart = cp.split("/compose/", 1)
+    compose_dir = f"{dirpart}/compose"
+    port = entry["default_port"]
+    print(f"{key}\t{engine}\t{compose_dir}\t{filepart}\t{port}")
+PY
+  )"; then
+    echo "[switch] ERROR: could not derive variant tables from compose_registry.py" >&2
+    echo "[switch]        (python3 + scripts/lib/profiles/compose_registry.py must be importable)" >&2
+    exit 2
+  fi
+  local key engine cdir cfile port
+  while IFS=$'\t' read -r key engine cdir cfile port; do
+    [[ -n "$key" ]] || continue
+    if [[ "$key" == "__ERR__" ]]; then
+      echo "[switch] ERROR: registry entry not launchable: ${engine} (${cdir})" >&2
+      exit 2
+    fi
+    VARIANTS["$key"]="${engine}|${cdir}|${cfile}"
+    VARIANT_DEFAULT_PORT["$key"]="$port"
+  done <<< "$emit"
+  if [[ ${#VARIANTS[@]} -eq 0 ]]; then
+    echo "[switch] ERROR: derived an empty variant table from compose_registry.py" >&2
+    exit 2
+  fi
+}
+
+_derive_variant_tables
 
 # Container name patterns we'll bring down — covers all current composes
 # AND any vllm/llama-cpp container we don't formally know about (catches

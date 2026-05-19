@@ -48,7 +48,7 @@ A load-bearing patch entry in `patches.yml` MUST carry all of:
 | `model` | list of model slugs the patch applies to |
 | `files` | repo-relative path(s) to the patch artifact |
 | `load_bearing_when[].composes` | the **exact** list of profile keys this patch is load-bearing for. This is the *only* thing the generator keys patch selection off (`X ∈ P.load_bearing_when[].composes`). Each entry also carries `reason` + `evidence`. |
-| `delivery_mechanism` | one of `python_sidecar`, `site_package_overlay`, `install_script`, or `none` (diagnostics / negative-result / Genesis-env patches) |
+| `delivery_mechanism` | one of `python_sidecar`, `site_package_overlay`, `install_script`, `chat_template` (vendored `.jinja` override — see §3.1), or `none` (diagnostics / negative-result / Genesis-env patches) |
 | `delivery_spec` | the concrete wiring: mount target(s) (`overlay_files[].dest`, `overlay_dir`+`dest_root`, `mounted_at`), sidecar/script path, `invoke` command, and `wired_at` (`volumes`, `entrypoint`, or both). This is the **single source** both the generator's emit and `reaches()`'s reachability validation read — they must agree by construction. |
 | `drift_guard` | **mandatory** for any load-bearing patch (`kind`, `check`, `on_fail`). See §4. |
 | `capability` | the capability the patch delivers (e.g. `tp-weight-load`, `tool-choice-required`, `tool-call-stream`, `dflash-spec-decode`) |
@@ -90,6 +90,56 @@ Choose the delivery mechanism in this order of preference:
 
 If you reach for `site_package_overlay`, justify it in the PR and file the
 re-home follow-up.
+
+### 3.1 The `chat_template` delivery class
+
+A **model chat-template override** (a vendored `.jinja` mounted into the
+container) is its own delivery class — `delivery_mechanism: chat_template`.
+A bad/regressed/re-vendored template is exactly the **#145 silent-break
+class** (tool-call XML / reasoning delimiters / streaming), so it MUST be
+attributed and drift-guarded like any other load-bearing patch, not left
+invisible to the generator and `test-patch-attribution`.
+
+`delivery_spec` for a `chat_template` patch carries:
+
+- `jinja` — repo-relative path to the vendored `.jinja` (it is also the
+  patch's `files[]` entry; an orphan `.jinja` under a model `patches/`
+  tree with no `chat_template` patch is a hard test failure);
+- `mounted_at` — the container path the `.jinja` is bind-mounted to;
+- `mount_mode` — typically `ro`;
+- `invoke` — the serving wiring. Two in-tree styles:
+  - **explicit** `--chat-template <mounted_at>` (e.g. froggeric):
+    `wired_at: [volumes, entrypoint]`;
+  - **mount-only** (e.g. carnice mounts over the model dir's
+    `chat_template.jinja` and vLLM auto-loads it): `wired_at: [volumes]`,
+    no `--chat-template` arg;
+- `wired_at` — as above.
+
+**Effective coverage is computed from the REAL merged compose graph.**
+A `chat_template` patch's reachability is resolved with **Docker Compose
+`extends:` merge semantics** (`docker compose -f <child> config`, or a
+deterministic offline merge that applies the same rules), **never a raw
+single-base text concat**. This is mandatory because a child compose can
+`!reset` the base's mount/command or simply stop extending a
+template-bearing base — a text concat would still "see" the base's mount
+line and report coverage that no longer exists (a **false negative** —
+the dangerous direction; the #377 silent-drift mode). Note Compose merges
+`extends:` *sequences* additively: a plain re-declared `volumes: []` does
+**not** drop a base mount; only the `!reset` tag (or not extending the
+base at all) removes it. `test-patch-attribution.sh` carries a fixture
+asserting a `!reset` child and a stopped-extending child both lose
+coverage.
+
+The `drift_guard` for a `chat_template` patch is `kind: behavioral` and
+its `check` MUST encode the **self-contained symmetric restart+settle
+protocol**: identical `docker restart <container>` on BOTH arms → wait
+for `/v1/models` healthy → fixed 60 s settle → ≥3 `bench.sh` runs/arm →
+compare the **grand mean** of the SAME canonical bench segment (NARRATIVE
+800-word essay + CODE; never mix segments, never a single run); flag
+ONLY a deterministic regression reproduced across all 3 runs. A
+non-symmetric guard fabricates phantom regressions (the asymmetric-restart
+"−7%" artifact) and gets ignored. The same guard must clear the *next*
+template re-vendor.
 
 ---
 

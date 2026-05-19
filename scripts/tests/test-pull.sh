@@ -1311,6 +1311,306 @@ check("derived-runtime-unsupported:" in _n22
 check(r.download_ok is None and r.boot_ok is None,
       "g22: CONTRACT-5 reject leaves [E] additive fields None (no stage ran)")
 
+_purge_captures()
+
+# ===========================================================================
+# v0.8.2 CONTRACT-1.1 — capture-on-hard-block pass-through (V1).
+#
+# The pt1-gate emitter is wired on the terminal hard-block `return res`
+# paths as a PURE PASS-THROUGH: the decision (ok/stratum/abort_reason) is
+# UNCHANGED; a pt1-gate.json + schema:2 manifest.json bundle is emitted
+# BEFORE the existing return. We inject a mock `gate_capture_fn` to keep
+# this hermetic (real emit_gate_capture is unit-tested in
+# test-pullemit-capture.sh + on-rig V6); here we assert (a) the decision is
+# byte-unchanged vs the SAME run without the hook, and (b) the hook is
+# invoked with the EXACT shipped abort_reason at every enumerated stratum.
+# ===========================================================================
+print("\n--- v0.8.2 CONTRACT-1.1: capture-on-hard-block pass-through ---")
+
+_GATE_CALLS: list = []
+
+
+def _mock_gate_capture(**kw):
+    _GATE_CALLS.append(kw)
+    return {"paths": {"gate": "/tmp/x/pt1-gate.json",
+                      "manifest": "/tmp/x/manifest.json"},
+            "dir": "/tmp/x", "manifest": {"schema": 2}}
+
+
+def _gate_case(name, run_kwargs, *, expect_reason, expect_stratum):
+    # Baseline: the SAME run with NO gate hook (decision reference).
+    base = P.run_pull(**run_kwargs)
+    # With the pass-through hook injected.
+    _GATE_CALLS.clear()
+    hooked = P.run_pull(**run_kwargs, gate_capture_fn=_mock_gate_capture)
+    # (a) the decision is byte-unchanged (pass-through, NOT decision logic).
+    check(base.ok == hooked.ok
+          and base.stratum == hooked.stratum
+          and base.abort_reason == hooked.abort_reason
+          and base.detail == hooked.detail,
+          f"{name}: pass-through is decision-NEUTRAL (ok/stratum/"
+          f"abort_reason/detail byte-identical with vs without the hook)")
+    check(hooked.abort_reason == expect_reason
+          and hooked.stratum is expect_stratum,
+          f"{name}: terminal decision unchanged "
+          f"(stratum={hooked.stratum.name} reason={hooked.abort_reason!r})")
+    # (b) the gate emitter was invoked once with the EXACT shipped
+    #     abort_reason (NOT a semantic alias) at this stratum.
+    check(len(_GATE_CALLS) == 1
+          and _GATE_CALLS[0].get("abort_reason") == expect_reason
+          and _GATE_CALLS[0].get("slug") == run_kwargs["slug"],
+          f"{name}: emit_gate_capture invoked once with the exact shipped "
+          f"abort_reason {expect_reason!r} "
+          f"(got {[c.get('abort_reason') for c in _GATE_CALLS]})")
+    return hooked
+
+
+# C0 — engine-support-unknown/no-arch-row (the §10-R9 solicited lever).
+_s = "fixtures/exotic-dense-gate"
+_exo = dense_cfg("TotallyExoticForCausalLM")
+_gate_case(
+    "gate-C0-no-arch-row",
+    dict(slug=_s, profile_like="vllm/minimal", path="B", hardware_sm=SM_86,
+         fetcher=ff_derived(_s, _exo), profiles=profiles, statvfs=BIG_DISK),
+    expect_reason="engine-support-unknown/no-arch-row",
+    expect_stratum=P.Stratum.C0)
+
+# C2a — disk-short (a user-environment correct-refusal).
+_sd = "fixtures/big-llama-gate"
+_gate_case(
+    "gate-C2a-disk-short",
+    dict(slug=_sd, profile_like="vllm/minimal", path="B", hardware_sm=SM_86,
+         fetcher=ff_derived(_sd, dense_cfg("Qwen2ForCausalLM"),
+                            weight_gb=200.0),
+         profiles=profiles, statvfs=TINY_DISK, trust_remote_code=True),
+    expect_reason="disk-short", expect_stratum=P.Stratum.C2A_DISK)
+
+# Deriver stratum — a pre-deriver terminal (no der.profile -> model/arch
+# /quant null in the bundle). Uses the same fixture shape as g1 (unknown
+# weight format -> unsupported-format).
+_sdr = "fixtures/derr-gate"
+_ffdr = FixtureFetcher({
+    API.format(slug=_sdr): {"siblings": [
+        {"rfilename": "config.json", "size": 700},
+        {"rfilename": "model.bin", "size": 8 * 1024 ** 3}]},
+    CFG.format(slug=_sdr): dense_cfg("LlamaForCausalLM"),
+})
+_dr = P.run_pull(slug=_sdr, profile_like="vllm/minimal", hardware_sm=SM_86,
+                 fetcher=_ffdr, profiles=profiles, statvfs=BIG_DISK,
+                 gate_capture_fn=_mock_gate_capture)
+check(_dr.stratum is P.Stratum.DERIVER and not _dr.ok,
+      f"gate-deriver: terminal decision unchanged "
+      f"(stratum={_dr.stratum.name} reason={_dr.abort_reason!r})")
+
+# REAL end-to-end (no mock): a C0 hard-block writes a genuine schema:2
+# bundle on disk; assert pt1-gate.json + manifest.json exist, schema==2,
+# carry the EXACT abort_reason, outcome=='hard-block', failure_class null,
+# and NO absolute path leaked into either artifact (the V1 RED-LINE).
+_purge_captures()
+_real = P.run_pull(slug=_s, profile_like="vllm/minimal", path="B",
+                   hardware_sm=SM_86, fetcher=ff_derived(_s, _exo),
+                   profiles=profiles, statvfs=BIG_DISK)
+check(_real.abort_reason == "engine-support-unknown/no-arch-row",
+      "gate-real: C0 hard-block decision unchanged (real emitter path)")
+_gdir = _real.diagnostics.get("gate_capture", {}).get("dir")
+check(_gdir and Path(_gdir).is_dir(),
+      f"gate-real: a real .pull-captures/ bundle dir was written "
+      f"(dir={_gdir!r})")
+if _gdir:
+    _gp = Path(_gdir)
+    _g1 = _gp / "pt1-gate.json"
+    _gm = _gp / "manifest.json"
+    check(_g1.is_file() and _gm.is_file(),
+          "gate-real: pt1-gate.json + manifest.json both written "
+          "(NO pt2/3/4/5 — gate-only terminated pre-download)")
+    _names = sorted(x.name for x in _gp.iterdir())
+    check(_names == ["manifest.json", "pt1-gate.json"],
+          f"gate-real: ONLY pt1-gate.json + manifest.json (no pt2-5) "
+          f"(got {_names})")
+    _mj = json.loads(_gm.read_text())
+    _pj = json.loads(_g1.read_text())
+    check(_mj.get("schema") == 2 and _mj.get("outcome") == "hard-block"
+          and _mj.get("failure_class") is None
+          and _mj.get("abort_reason") == "engine-support-unknown/no-arch-row",
+          f"gate-real: manifest schema:2 / outcome:hard-block / "
+          f"failure_class:null / exact abort_reason (got "
+          f"schema={_mj.get('schema')} outcome={_mj.get('outcome')!r})")
+    check(_pj.get("schema") == 2 and _pj.get("point") == "gate"
+          and _pj.get("abort_reason")
+          == "engine-support-unknown/no-arch-row"
+          and _pj.get("is_gate_only") is True,
+          "gate-real: pt1-gate.json schema:2/point:gate carries the raw "
+          "abort_reason (H2 maintainer-distinguishability)")
+    for _art in (_g1, _gm):
+        _blob = _art.read_text()
+        check("/opt/ai" not in _blob and "/home/" not in _blob
+              and "/mnt/" not in _blob,
+              f"gate-real: NO absolute path leaked in {_art.name} "
+              f"(redacted; the V1 RED-LINE)")
+    # `.last` marker written by the SHARED helper (centralization mandate).
+    _last = root / ".pull-captures" / ".last"
+    check(_last.is_file()
+          and _last.read_text().strip() == str(
+              _gp.relative_to(root / ".pull-captures")),
+          "gate-real: the SHARED .last marker points at the gate bundle "
+          "(centralized: gate-only updates .last too — --submit-last works)")
+_purge_captures()
+
+# ===========================================================================
+# v0.8.2 CONTRACT-4 — the `recommend` UX (STEP V5).
+#
+# RED-LINE / outcome-not-addition: the recommendation MUST reflect the REAL
+# shipped verdict and CHANGE WITH IT. We drive THREE genuinely-different
+# real `run_pull` outcomes through `_render_recommendation` and assert the
+# rendered block differs and matches the underlying `res` each time:
+#   (1) FITS + emitted   — a curated Path-A proceed (r.ok, r.emitted)
+#   (2) confirm→proceed  — an estimated-lower-bound non-pass (not r.ok)
+#   (3) hard-block       — a C0 no-arch-row terminal (not r.ok, no [B])
+# A static/templated summary that did not consume the real verdict would
+# render identically for all three (or carry a §7 caveat on the blocked
+# leg that never reached [B]); that is the explicit FAIL the brief names.
+# Pure presentation: the SAME `res` objects the frozen gate produced are
+# fed in; no decision field is read, mutated, or re-derived.
+# ===========================================================================
+print("\n--- v0.8.2 CONTRACT-4: recommend UX tracks the REAL verdict ---")
+
+# (1) FITS + emitted — curated Path-A vllm/dual + --yes (the g2 shape).
+_rec_fit = P.run_pull(CURATED_SLUG, "vllm/dual", path="A",
+                       out="/tmp/_v5_rec.yml", hardware_sm=SM_86,
+                       fetcher=NoNet(), profiles=profiles,
+                       statvfs=BIG_DISK, yes=True)
+if os.path.exists("/tmp/_v5_rec.yml"):
+    os.unlink("/tmp/_v5_rec.yml")
+_blk_fit = "\n".join(P._render_recommendation(_rec_fit))
+check(_rec_fit.ok and _rec_fit.emitted,
+      "rec(1): the FITS leg is a REAL ok+emitted curated verdict "
+      f"(ok={_rec_fit.ok}, emitted={_rec_fit.emitted})")
+check("verdict: FITS" in _blk_fit
+      and "DOES NOT FIT" not in _blk_fit
+      and "a ready compose was emitted" in _blk_fit
+      and f"stratum={_rec_fit.stratum.name}" in _blk_fit,
+      "rec(1): FITS+emitted -> 'FITS' + the emitted-compose line + the "
+      "REAL deciding stratum (tracks res.ok/res.emitted/res.stratum)")
+
+# (2a) confirm→proceed, NOT satisfied — estimated-lower-bound non-pass
+# (the g4 shape: Llama + --trust-remote-code, NO --yes -> [C1]
+# confirm→proceed:needs --yes). This is `not ok` and — per the shipped
+# gate — the §7 caveat is appended ONLY on a download-eligible/accepted
+# verdict, NOT on a not-yet-satisfied confirm→proceed; so this leg carries
+# NO CAVEAT_S7 (verified against the live shipped run, not assumed). The
+# recommendation MUST therefore omit the soak pointer here too.
+_s_cp = "fixtures/v5-llama-cp"
+_cp_kw = dict(slug=_s_cp, profile_like="vllm/minimal", path="B",
+              hardware_sm=SM_86,
+              fetcher=ff_derived(_s_cp, dense_cfg("LlamaForCausalLM"),
+                                 weight_gb=8.0),
+              profiles=profiles, statvfs=BIG_DISK, trust_remote_code=True)
+_rec_cp = P.run_pull(**_cp_kw)
+_blk_cp = "\n".join(P._render_recommendation(_rec_cp))
+check(not _rec_cp.ok and _rec_cp.stratum is P.Stratum.DECIDED
+      and _rec_cp.confidence == "estimated-lower-bound"
+      and _rec_cp.abort_reason
+      and _rec_cp.abort_reason.startswith("confirm→proceed"),
+      "rec(2a): the confirm→proceed leg is a REAL estimated-lower-bound "
+      f"non-pass (ok={_rec_cp.ok}, reason={_rec_cp.abort_reason!r})")
+check("FITS (estimated) — NOT YET ACCEPTED" in _blk_cp
+      and "DOES NOT FIT" not in _blk_cp
+      and _rec_cp.abort_reason in _blk_cp
+      and "ACCEPTANCE gate, not a fit failure" in _blk_cp
+      and "--submit-last" not in _blk_cp
+      and f"stratum={_rec_cp.stratum.name}" in _blk_cp,
+      "rec(2a): a fits-clean confirm→proceed (not ok, NOT --yes) is HONESTLY "
+      "rendered as FITS-but-NOT-YET-ACCEPTED (never 'DOES NOT FIT'), carries "
+      "the REAL abort_reason + the acceptance-gate guidance + the REAL "
+      "stratum, and does NOT misroute to the failure on-ramp")
+check(P.CAVEAT_S7 not in _rec_cp.notices
+      and "SOAK_MODE=continuous" not in _blk_cp,
+      "rec(2a): a not-yet-satisfied confirm→proceed carries NO §7 caveat "
+      "(the shipped gate appends it only on an accepted verdict) -> the "
+      "recommendation correctly omits the soak pointer (tracks the REAL "
+      "res.notices, NOT a static template)")
+
+# (2b) the SAME model + --yes -> a download-eligible estimated-lower-bound
+# verdict (r.ok, Path B so NOT emitted). The shipped gate DOES append the
+# §7 caveat here; the recommendation MUST carry it verbatim AND honestly
+# state "no compose emitted" (Path B). This proves the §7-caveat + the
+# no-fabricated-artifact behavior both track the REAL res.
+_rec_cy = P.run_pull(**_cp_kw, yes=True)
+_blk_cy = "\n".join(P._render_recommendation(_rec_cy))
+check(_rec_cy.ok and not _rec_cy.emitted
+      and _rec_cy.confidence == "estimated-lower-bound"
+      and P.CAVEAT_S7 in _rec_cy.notices,
+      "rec(2b): --yes -> a REAL download-eligible estimated-lower-bound "
+      f"verdict carrying CAVEAT_S7 (ok={_rec_cy.ok}, "
+      f"emitted={_rec_cy.emitted})")
+check("verdict: FITS" in _blk_cy
+      and "ESTIMATED LOWER BOUND" in _blk_cy
+      and "no compose was emitted this run" in _blk_cy
+      and P.CAVEAT_S7 in _blk_cy
+      and "SOAK_MODE=continuous" in _blk_cy,
+      "rec(2b): FITS(estimated-lower-bound, Path B) -> floor stated, NO "
+      "fabricated compose artifact, §7 caveat + soak pointer carried "
+      "verbatim BECAUSE the real res carries CAVEAT_S7 (echoed from "
+      "res.notices, not re-derived)")
+
+# (3) hard-block — C0 no-arch-row (the gate-C0 shape; never reaches [B]).
+_s_hb = "fixtures/v5-exotic"
+_rec_hb = P.run_pull(_s_hb, "vllm/minimal", path="B", hardware_sm=SM_86,
+                     fetcher=ff_derived(_s_hb,
+                                        dense_cfg("V5ExoticForCausalLM")),
+                     profiles=profiles, statvfs=BIG_DISK)
+_blk_hb = "\n".join(P._render_recommendation(_rec_hb))
+check(not _rec_hb.ok
+      and _rec_hb.abort_reason == "engine-support-unknown/no-arch-row"
+      and _rec_hb.stratum is P.Stratum.C0,
+      "rec(3): the hard-block leg is a REAL C0 no-arch-row terminal "
+      f"(reason={_rec_hb.abort_reason!r}, stratum={_rec_hb.stratum.name})")
+check("DOES NOT FIT / BLOCKED" in _blk_hb
+      and "engine-support-unknown/no-arch-row" in _blk_hb
+      and f"stratum={_rec_hb.stratum.name}" in _blk_hb,
+      "rec(3): hard-block -> the REAL abort_reason + the REAL deciding "
+      "stratum are rendered (tracks res.abort_reason/res.stratum)")
+# This leg NEVER reached [B], so the gate produced NO §7 caveat — the
+# recommendation MUST NOT fabricate a soak pointer (the static-template
+# FAIL the brief calls out: a templated block would carry it anyway).
+check(P.CAVEAT_S7 not in _rec_hb.notices
+      and "SOAK_MODE=continuous" not in _blk_hb
+      and "§7 caveat" not in _blk_hb,
+      "rec(3): a pre-[B] hard-block carries NO §7 caveat -> the "
+      "recommendation correctly omits the soak pointer (tracks the REAL "
+      "res.notices; a static template would falsely include it)")
+
+# Outcome-not-addition: the rendered blocks are PAIRWISE DIFFERENT (a
+# static/templated summary would be identical) AND each matches its own
+# real res — the recommendation provably TRACKS the verdict, not merely
+# "exists". Four genuinely-different real outcomes (fit+emitted /
+# confirm→proceed-blocked / estimated-lower-bound-fit / hard-block).
+_blocks = (_blk_fit, _blk_cp, _blk_cy, _blk_hb)
+check(len(set(_blocks)) == len(_blocks),
+      "rec: the four recommendation blocks are pairwise DIFFERENT "
+      "(it tracks the real verdict; NOT a static template)")
+
+# Leak-clean (rig-independent assertion convention — assert the absolute
+# repo root is absent, NOT a /opt|/home substring allowlist): no recommend
+# block leaks an absolute filesystem path.
+for _name, _blk in (("fit", _blk_fit), ("cp", _blk_cp),
+                    ("cy", _blk_cy), ("hb", _blk_hb)):
+    check(str(root) not in _blk,
+          f"rec({_name}): the recommendation block contains NO absolute "
+          f"repo path (rig-independent leak assertion: str(root) absent)")
+
+# vLLM-only by construction + honest-confidence echo (CONTRACT-4 invariants,
+# read straight off the real res — not re-asserted policy).
+check("engine=vLLM" in _blk_fit and "engine=vLLM" in _blk_hb,
+      "rec: vLLM-only is stated on every leg (the gate is vLLM-only by "
+      "construction; recommend only echoes it)")
+check(_rec_cy.confidence == "estimated-lower-bound"
+      and "ESTIMATED LOWER BOUND" in _blk_cy,
+      "rec: an estimated-lower-bound FIT states the floor honestly "
+      "(echoes res.confidence; never hides the lower-bound)")
+
+_purge_captures()
+
 # Purge ALL mocked-[E] capture residue (leave NO repo artifact).
 _purge_captures()
 
@@ -1348,5 +1648,13 @@ _ec(){ bash scripts/pull.sh "$@" >/dev/null 2>&1; echo $?; }
 [ "$(_ec --help)" = 0 ]                                        || { echo "FAIL: --help -> 0 (#370 must not regress help)" >&2; _clifail=1; }
 [ "$(_ec definitely/nonexistent-xyz123 --profile-like vllm/minimal --dry-run)" = 2 ] || { echo "FAIL: honest hard-stop -> 2 (must stay 2, not 64) (#370)" >&2; _clifail=1; }
 [ "$_clifail" = 0 ] && echo "PASS: CLI exit-code contract (#370): usage=64, --help=0, hard-stop=2" || { echo "1+ CLI-contract assertion(s) failed." >&2; exit 1; }
+
+# v0.8.2 CONTRACT-1.1: the real-CLI hard-stop above exercises the genuine
+# pt1-gate capture-on-hard-block pass-through end-to-end (pull.sh ->
+# emit_gate_capture). That writes a real gitignored .pull-captures/ bundle;
+# purge it so the test leaves NO repo residue and the CI condition
+# (gitignored runtime state ABSENT) is restored (same discipline as the
+# in-heredoc _purge_captures for the mocked-[E] residue).
+rm -rf "$ROOT_DIR/.pull-captures"
 
 echo "test-pull.sh OK"

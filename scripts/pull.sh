@@ -24,6 +24,12 @@
 #   # Path B — universal evaluate (never emits/downloads):
 #   scripts/pull.sh some-org/Some-Llama-7B --profile-like vllm/minimal --dry-run
 #
+#   # Failure on-ramp — submit a captured failed pull (a SEPARATE, consented
+#   # verb: the ONLY step that touches the network, and only after an
+#   # explicit y; reuses the shipped dedup; needs no slug/--profile-like):
+#   scripts/pull.sh --submit-last            # the most-recent capture
+#   scripts/pull.sh --submit <capture-dir>   # an explicit bundle dir
+#
 # Opts: --yes  --force-download  --experimental-arch  --trust-remote-code
 #       --hf-home DIR  --out FILE (Path A)  --hardware SM (override nvidia-smi)
 #
