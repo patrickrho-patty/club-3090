@@ -11,18 +11,21 @@
 #   Template:  native (GGUF-embedded) — A/B'd froggeric v19 here, native won
 #              the 8-pack 103 vs 99 (toolcall TIED 9/9); see header note below
 #   Vision:    NO (text-only this profile; mmproj is a separate axis → -vision.yml)
-#   Default ctx: 200000 — cross-engine-aligned with llama-cpp mtp.yml's measured
-#              max-safe fill (2026-05-23), q4_0 KV, -ub 1024. Was 262144 (full
-#              n_ctx_train) but that is a *boot* ceiling, not a verified *fill*
-#              ceiling on ik — see the "boots ≠ fills" note below. For lower VRAM /
+#   Default ctx: 200000 — ik's MEASURED max-safe fill (ceiling-laddered on-rig
+#              2026-05-23), q4_0 KV. Was 262144 (full n_ctx_train) but that is a
+#              *boot* ceiling, not a *fill* ceiling — see the "boots ≠ fills" note
+#              below. The ~0.5 GB weight lean does NOT buy more ctx than mainline:
+#              ik forces n_ubatch=n_batch (=4096) so its larger graph buffer eats
+#              the lean → ~same free VRAM as mainline at equal ctx. For lower VRAM /
 #              cross-rig-safe boot, set CTX_SIZE=131072.
 #   MAX ctx:   262144 (model native ceiling; n_ctx_train = n_ctx_orig_yarn = 262144).
 #              ⚠ "boots ≠ fills": -ub 1024 @ 262144 boots at 22.5 GB / 24 with the KV
 #              pool pre-reserved (verified 2026-05-21) — but that is a boot number, it
 #              does NOT mean a prompt fills to 262K. The mainline llama-cpp twin walls
 #              at ~125K (FA transient scratch at high fill — docs/CLIFFS.md 2026-05-23);
-#              ik's fillable ceiling is not yet laddered (ik is ~0.5 GB leaner, so ≥ that
-#              is expected). Default lowered to 200000 for fill-safety. -ub 512 @ 262144
+#              ik laddered on-rig 2026-05-23: 224K fills 205K but leaves only 477 MB at
+#              the ceiling; 210K fills 193K leaving 863 MB — both under the 1024 MB
+#              agent-safety margin. 200000 (≈1131 MB at ceiling) is the safe default. -ub 512 @ 262144
 #              → 21.5 GB if you need the extra ~1 GB back.
 #   Status:    ✅ Shipped (advanced-quant track, #180). In the wizard +
 #              `bash scripts/switch.sh ik-llama/iq4ks-mtp`.
