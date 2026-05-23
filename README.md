@@ -32,6 +32,7 @@ bash scripts/launch.sh
 #      bash scripts/launch.sh --variant llamacpp/default     # single-card MTP, fast + cliff-immune (alias of llamacpp/mtp; 200K @ -ub 512)
 #      bash scripts/launch.sh --variant llamacpp/mtp         # single-card 200K + MTP (fast, ~60 code TPS; 131K @ -ub 1024 for faster prefill)
 #      bash scripts/launch.sh --variant llamacpp/mtp-vision  # single-card 49K + MTP + vision
+#      bash scripts/launch.sh --variant ik-llama/iq4ks-mtp   # single-card FASTEST — ~60/69 TPS, leanest VRAM (ik_llama IQK quant)
 #    Or partial flags (wizard fills the rest):
 #      bash scripts/launch.sh --model qwen3.6-27b --gpus 0,1
 #      bash scripts/launch.sh --tp 2 --pp 1               # override vLLM parallelism
