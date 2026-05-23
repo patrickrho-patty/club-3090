@@ -33,6 +33,8 @@ For workloads that **don't** accumulate context across turns (single-shot RAG, s
 
 > ⛔ **The four vLLM rows below are struck through — they're pinned to a purged vLLM nightly ([#167](https://github.com/noonghunna/club-3090/issues/167)) and won't boot until the next Genesis-compatible pin lands.** Until then, use the **llama.cpp / ik_llama** rows — they work today and are cliff-immune. (`minimal.yml` is Genesis-free and *can* still run on a current image via `VLLM_IMAGE=vllm/vllm-openai:latest`.)
 
+> 💡 **Simplest vs fastest (single-card):** `llamacpp/default` (mainline Q4_K_M, clean upstream image) is the no-friction pick; **`ik-llama/iq4ks-mtp` is ~18–20% faster + leanest VRAM** (separate fork + IQK quant) for max single-card speed. Both are cliff-immune — see [#184](https://github.com/noonghunna/club-3090/discussions/184).
+
 | What you're doing | Compose | Max ctx | Narr / Code TPS | VRAM (24 GB / card) |
 |---|---|---|---|---|
 | ⛔ ~~**Long ctx + vision** (chat, agents, image input)~~ _(vLLM — blocked #167)_ | ~~[`long-vision.yml`](../models/qwen3.6-27b/vllm/compose/single/long-vision.yml)~~ | ~~145K~~ | ~~50 / 66~~ | ~~23.0 GB~~ |
