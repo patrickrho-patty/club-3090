@@ -244,6 +244,18 @@ GPU_MEMORY_UTILIZATION=0.80 \
 
 Generally prefer **dropping `MAX_MODEL_LEN` first** (clean KV budget reduction, predictable behavior) over `GPU_MEMORY_UTILIZATION` (interacts with profiling overhead in non-obvious ways). Drop both if your envelope is really tight.
 
+### Running two llama.cpp / ik variants at once
+
+Each variant ships a **distinct default `container_name`** (`llamacpp/mtp` → `llama-cpp-qwen36-27b`, `llamacpp/mtp-vision` → `llama-cpp-qwen36-27b-vision`; ik's `iq4ks-mtp` / `-vision` / `-two-stage` likewise), so they no longer collide on the docker name. They **do** still share the default host port `8020`, so give the second one a port with `ESTATE_PORT` (and, if you want a custom name, `ESTATE_CONTAINER`):
+
+```bash
+# text workhorse on :8020 + vision variant on :8030, side by side
+bash scripts/switch.sh llamacpp/mtp
+ESTATE_PORT=8030 bash scripts/switch.sh llamacpp/mtp-vision
+```
+
+(Whether both fit depends on your VRAM envelope — two full-context single-card servers won't co-reside on one 24 GB card; drop `CTX_SIZE` on one, or use this across two cards.)
+
 ---
 
 ## Quick start

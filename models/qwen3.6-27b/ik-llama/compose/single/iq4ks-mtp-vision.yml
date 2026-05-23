@@ -94,7 +94,7 @@
 services:
   ik-llama-qwen36-27b-iq4ks-mtp-vision:
     image: ${IK_LLAMA_IMAGE:-ghcr.io/ikawrakow/ik-llama-cpp:cu13-server}
-    container_name: "${ESTATE_CONTAINER:-ik-llama-qwen36-27b}"
+    container_name: "${ESTATE_CONTAINER:-ik-llama-qwen36-27b-vision}"
     restart: unless-stopped
     ports:
       - "${ESTATE_PORT:-${PORT:-8020}}:8080"

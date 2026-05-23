@@ -1169,9 +1169,10 @@ declare -A LAUNCH_DEFAULT_CONTAINER=(
   [vllm/gemma-dflash]=vllm-gemma-4-31b-dflash
   [llamacpp/default]=llama-cpp-qwen36-27b
   [llamacpp/mtp]=llama-cpp-qwen36-27b
-  [llamacpp/mtp-vision]=llama-cpp-qwen36-27b
+  [llamacpp/mtp-vision]=llama-cpp-qwen36-27b-vision
   [ik-llama/iq4ks-mtp]=ik-llama-qwen36-27b
-  [ik-llama/iq4ks-mtp-vision]=ik-llama-qwen36-27b
+  [ik-llama/iq4ks-mtp-vision]=ik-llama-qwen36-27b-vision
+  [ik-llama/iq4ks-two-stage]=ik-llama-qwen36-27b-two-stage
 )
 ENDPOINT_PORT="${PORT:-${LAUNCH_DEFAULT_PORT[$VARIANT]:-8020}}"
 ENDPOINT_URL="http://localhost:${ENDPOINT_PORT}"

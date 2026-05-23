@@ -206,9 +206,10 @@ show_status() {
         m=$(curl -sf -m 2 http://localhost:8011/v1/models | python3 -c "import sys,json;d=json.load(sys.stdin);print(', '.join(x['id'] for x in d.get('data',[])))" 2>/dev/null)
         echo -e "  ${GREEN}▶${NC} 27b-turbo @ :8011       → ${m:-unknown} (TurboQuant_3bit_nc + MTP n=3 + v7.14, 4-stream concurrency)"
     fi
-    # :8020 = llama.cpp single-card (any of llamacpp/default, llamacpp/mtp,
-    # llamacpp/mtp-vision — they all default to container llama-cpp-qwen36-27b
-    # so active compose variant can't be inferred from container name alone).
+    # :8020 = llama.cpp single-card. llamacpp/default + llamacpp/mtp share the
+    # base container llama-cpp-qwen36-27b (same compose, collapsed 2026-05-22);
+    # llamacpp/mtp-vision now defaults to llama-cpp-qwen36-27b-vision (#169).
+    # All still match the llama-cpp-* prefix used for detection below.
     if curl -sf -m 2 http://localhost:8020/v1/models >/dev/null 2>&1; then
         local m
         m=$(curl -sf -m 2 http://localhost:8020/v1/models | python3 -c "import sys,json;d=json.load(sys.stdin);print(', '.join(x['id'] for x in d.get('data',[])))" 2>/dev/null)
