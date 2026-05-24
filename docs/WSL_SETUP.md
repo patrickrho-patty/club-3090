@@ -7,7 +7,9 @@ A start-to-finish path for getting club-3090 running on a Windows machine via **
 | Engine | Native Windows | WSL2 |
 |---|---|---|
 | vLLM | ❌ (Linux + CUDA only) | ✅ |
-| llama.cpp / ik_llama | ✅ (native build, no Docker) | ✅ (Docker, matches the recipes) |
+| llama.cpp / ik_llama | ⚠️ *engine* only — no club-3090 tooling | ✅ (Docker, matches the recipes) |
+
+> ⚠️ **club-3090 itself requires WSL2 (or native Linux).** Its scripts, composes, and `setup.sh` / `launch.sh` / `switch.sh` are bash + Docker + Linux-path based — **none of them run on *native* Windows.** There, you can drive the *upstream* llama.cpp binary by hand against the GGUF weights, but with none of this repo's helpers (no picker, no SHA-verify, no VRAM-budget composes, no bench/verify scripts). For the full stack, use WSL2 (this guide) or native Linux.
 
 This guide uses **WSL2 + Docker** so the commands match the rest of the repo. The bulk of the work is one-time host setup (steps 1–6); after that it's the normal [Quick start](../README.md#quick-start).
 
