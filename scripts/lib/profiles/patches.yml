@@ -368,6 +368,42 @@ patches:
       drop_when: "the Carnice weights ship a corrected default chat template, OR the override is re-vendored (the same drift_guard must clear the next re-vendor)"
     status: verified
 
+  - id: apex-qwen-chat-template
+    model: [qwen3.6-35b-a3b]
+    files:
+      - models/qwen3.6-35b-a3b/ik-llama/patches/apex-qwen-chat-template.jinja
+    load_bearing_when:
+      - composes:
+          - ik-llama/apex-mtp-compact
+          - ik-llama/apex-mtp-compact-long
+          - ik-llama/apex-mtp-quality-dual
+        reason: "mudler's APEX-MTP GGUF ships a chat template that emits empty <think></think> stubs on reasoning-disabled launches; the vendored APEX override makes thinking-off launches clean for the ik-llama APEX preset family. Wired via llama.cpp's --chat-template-file in the compose command + a read-only bind mount (vs froggeric's vLLM --chat-template). community-experimental: weights-gated, not yet live-validated on our rig."
+        evidence: "models/qwen3.6-35b-a3b/ik-llama/compose/single/mudler-apex-compact/mtp.yml command (--chat-template-file) + volumes block; PR #235 (conform of VykosX #223)"
+    delivery:               # DEPRECATED/READ-ONLY (test-only) — see header
+      dockerfile_bake: false
+      entrypoint_invoke: false
+      genesis: false
+    delivery_gaps: []
+    delivery_mechanism: chat_template
+    delivery_spec:
+      jinja: models/qwen3.6-35b-a3b/ik-llama/patches/apex-qwen-chat-template.jinja
+      mounted_at: /etc/apex-qwen-chat-template.jinja
+      mount_mode: ro
+      invoke: "--chat-template-file /etc/apex-qwen-chat-template.jinja"
+      wired_at: [volumes, command]
+      note: "vendored chat-template override for the mudler APEX-MTP GGUF on ik-llama; effective coverage is computed from the REAL merged compose graph so a child that removes the mount/arg is caught as a coverage loss."
+    drift_guard:
+      kind: behavioral
+      check: "A reasoning-disabled APEX launch produces no empty <think></think> stubs and tool/chat output stays coherent on the pinned ik-llama image with the APEX template mounted. Any behavioral/TPS comparison the guard performs MUST use the self-contained symmetric restart+settle protocol: identical `docker restart <container>` on BOTH arms -> wait for /health healthy -> fixed 60s settle -> >=3 bench.sh runs/arm -> compare the GRAND MEAN of the SAME canonical bench segment (NARRATIVE 800-word essay + CODE; never mix segments, never a single run). NOT yet live-validated (weights-gated); the first live APEX boot must clear this before status moves to verified."
+      on_fail: capability-degraded   # serves with the GGUF's default template, may re-emit empty <think></think> stubs
+    capability: chat-template-override
+    foundational: false
+    upstream:
+      ref: club-3090#235 (conform of VykosX #223); vendored for mudler/Qwen3.6-35B-A3B-APEX-MTP-GGUF
+      status: local-vendored
+      drop_when: "the APEX GGUF ships a corrected default chat template, OR the override is re-vendored (the same drift_guard must clear the next re-vendor)"
+    status: unverified
+
   - id: gemma-vllm-pr41800-truncate-prompt-tokens
     model: [gemma-4-31b]
     files:
