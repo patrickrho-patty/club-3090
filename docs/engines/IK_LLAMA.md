@@ -20,7 +20,7 @@ For *what the quants actually are* and how IQK compares to k-quants / i-quants /
 
 ```bash
 MODEL_DIR=/your/models docker compose \
-  -f models/qwen3.6-27b/ik-llama/compose/single/iq4ks-mtp.yml up -d
+  -f models/qwen3.6-27b/ik-llama/compose/single/ubergarm-iq4ks/mtp.yml up -d
 curl http://localhost:8020/v1/models
 ```
 
@@ -86,11 +86,11 @@ Or directly via compose:
 ```bash
 # MTP-only (default):
 MODEL_DIR=$MODEL_DIR docker compose \
-  -f models/qwen3.6-27b/ik-llama/compose/single/iq4ks-mtp.yml up -d
+  -f models/qwen3.6-27b/ik-llama/compose/single/ubergarm-iq4ks/mtp.yml up -d
 
 # Two-stage ngram+MTP (code-optimized, experimental):
 MODEL_DIR=$MODEL_DIR docker compose \
-  -f models/qwen3.6-27b/ik-llama/compose/single/iq4ks-two-stage.yml up -d
+  -f models/qwen3.6-27b/ik-llama/compose/single/ubergarm-iq4ks/two-stage.yml up -d
 ```
 Defaults: q4_0 KV, 200K ctx (MTP) / 131K ctx (two-stage), MTP n=2, native template, thinking-off. Overrides:
 - **Max context:** **200K** is the max-safe default (fills cleanly with ~1.1 GB margin). 262144 is the model's native max but *boots ≠ fills* — `UBATCH_SIZE=512 CTX_SIZE=262144` boots but crosses the agent-safety margin at high fill, so 200K is the recommended ceiling (see [`docs/CLIFFS.md`](../CLIFFS.md)).

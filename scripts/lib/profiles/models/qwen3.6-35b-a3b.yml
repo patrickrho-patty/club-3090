@@ -29,7 +29,7 @@ mtp_num_hidden_layers: 1
 attn_output_gate: true
 vision_capable: true
 weights:
-  autoround_int4:
+  autoround-int4:
     path: qwen3.6-35b-a3b-autoround-int4
     local_subdir: qwen3.6-35b-a3b-autoround-int4
     size_gb: 20.0
@@ -77,7 +77,7 @@ weights:
     engine: llama-cpp
     kind: gguf
     verify_glob: "*.gguf"
-default_weight_variant: autoround_int4
+default_weight_variant: autoround-int4
 compatible_drafters:
   - qwen-mtp-builtin
 # num_kv_heads=2 caps TP at 2 (each rank needs at least 1 KV head)

@@ -184,7 +184,7 @@ You still do steps **1–3** (WSL + driver/passthrough + `.wslconfig` RAM) and *
    ```
    …or grab a prebuilt CUDA binary. To match the MTP / spec-decode support the Docker image ships, track a recent build — the composes pin `ghcr.io/ggml-org/llama.cpp:server-cuda-b9246` (or newer).
 
-2. **Run `llama-server` with the flags the compose uses.** The compose is the source of truth — lift them from [`models/qwen3.6-27b/llama-cpp/compose/single/mtp.yml`](../models/qwen3.6-27b/llama-cpp/compose/single/mtp.yml). The equivalent native invocation:
+2. **Run `llama-server` with the flags the compose uses.** The compose is the source of truth — lift them from [`models/qwen3.6-27b/llama-cpp/compose/single/unsloth-q4km/mtp.yml`](../models/qwen3.6-27b/llama-cpp/compose/single/unsloth-q4km/mtp.yml). The equivalent native invocation:
    ```bash
    ./build/bin/llama-server --host 0.0.0.0 --port 8020 \
      -m "$MODEL_DIR/qwen3.6-27b-gguf/unsloth-mtp-q4km/Qwen3.6-27B-Q4_K_M.gguf" \

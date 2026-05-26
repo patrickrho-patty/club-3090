@@ -17,7 +17,7 @@ linear_conv_kernel_dim: 4
 max_ctx_supported: 262144
 attention_k_eq_v: false
 weights:
-  autoround_int4:
+  autoround-int4:
     path: qwen3.6-27b-autoround-int4
     local_subdir: qwen3.6-27b-autoround-int4
     size_gb: 17.5
@@ -80,7 +80,7 @@ weights:
     engine: llama-cpp
     kind: gguf
     verify_glob: "*.gguf"
-  gguf_q4km:
+  unsloth-q4km:
     path: qwen3.6-27b-gguf/unsloth-mtp-q4km
     local_subdir: qwen3.6-27b-gguf/unsloth-mtp-q4km
     size_gb: variable
@@ -106,7 +106,7 @@ weights:
     kind: mmproj
     verify_glob: "*.gguf"
     setup_weights_key: gguf
-  gguf_iq4ks:
+  ubergarm-iq4ks:
     path: qwen3.6-27b-gguf/ubergarm-mtp-iq4ks
     local_subdir: qwen3.6-27b-gguf/ubergarm-mtp-iq4ks
     size_gb: variable
@@ -119,7 +119,7 @@ weights:
     kind: gguf
     verify_glob: "*.gguf"
     setup_weights_key: iq4ks
-  carnice_bf16mtp:
+  carnice-bf16mtp:
     path: carnice-v2-27b-int4-recipe-d-bf16mtp
     local_subdir: carnice-v2-27b-int4-recipe-d-bf16mtp
     size_gb: 17.5
@@ -131,7 +131,7 @@ weights:
     engine: vllm
     kind: main
     verify_glob: "*.safetensors"
-  qwopus_bf16mtp:
+  qwopus-bf16mtp:
     path: qwopus3.6-27b-int4-recipe-d-bf16mtp
     local_subdir: qwopus3.6-27b-int4-recipe-d-bf16mtp
     size_gb: 17.5
@@ -143,7 +143,7 @@ weights:
     kind: main
     verify_glob: "*.safetensors"
     manual_note: "This compose expects a local Recipe-D INT4+BF16MTP artifact. The repo only documents the BF16 source Jackrong/Qwopus3.6-27B-v1-preview, not a directly downloadable packed artifact."
-default_weight_variant: autoround_int4
+default_weight_variant: autoround-int4
 compatible_drafters:
   - qwen-mtp-builtin
   - zlab-qwen-dflash

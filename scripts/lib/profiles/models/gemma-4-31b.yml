@@ -15,7 +15,7 @@ sliding_window: 1024
 max_ctx_supported: 262144
 attention_k_eq_v: true
 weights:
-  autoround_int4:
+  autoround-int4:
     path: gemma-4-31b-autoround-int4
     local_subdir: gemma-4-31b-autoround-int4
     size_gb: 18.0
@@ -70,7 +70,7 @@ weights:
     engine: vllm
     kind: main
     verify_glob: "*.safetensors"
-default_weight_variant: autoround_int4
+default_weight_variant: autoround-int4
 compatible_drafters:
   - gemma-it-assistant
   - gemma-dflash

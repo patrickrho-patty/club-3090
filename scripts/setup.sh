@@ -172,20 +172,20 @@ NEEDS_GENESIS=0
 
 case "${MODEL_NAME}" in
   qwen3.6-27b)
-    PRIMARY_WEIGHT_KEY="qwen3.6-27b:autoround_int4"
+    PRIMARY_WEIGHT_KEY="qwen3.6-27b:autoround-int4"
     DFLASH_KEY="qwen3.6-27b:dflash"
     NEEDS_GENESIS=1
     ;;
   qwen3.6-35b-a3b)
-    PRIMARY_WEIGHT_KEY="qwen3.6-35b-a3b:autoround_int4"
+    PRIMARY_WEIGHT_KEY="qwen3.6-35b-a3b:autoround-int4"
     ;;
   gemma-4-31b)
-    PRIMARY_WEIGHT_KEY="gemma-4-31b:autoround_int4"
+    PRIMARY_WEIGHT_KEY="gemma-4-31b:autoround-int4"
     ALWAYS_DRAFT_KEY="gemma-4-31b:assistant"
     DFLASH_KEY="gemma-4-31b:dflash"
     ;;
   gemma-4-26b-a4b)
-    PRIMARY_WEIGHT_KEY="gemma-4-26b-a4b:autoround_int4_mixed"
+    PRIMARY_WEIGHT_KEY="gemma-4-26b-a4b:autoround-int4-mixed"
     ;;
   *)
     echo "ERROR: unsupported model '${MODEL_NAME}'."
@@ -207,7 +207,7 @@ if [[ -n "${WEIGHT_KEY:-}" ]]; then
 elif [[ "${WEIGHTS}" == "gguf" ]]; then
   case "${MODEL_NAME}" in
     qwen3.6-27b)
-      PRIMARY_WEIGHT_KEY="qwen3.6-27b:gguf_q4km"
+      PRIMARY_WEIGHT_KEY="qwen3.6-27b:unsloth-q4km"
       EXTRA_WEIGHT_KEYS+=("qwen3.6-27b:gguf_mmproj_f16")
       NEEDS_GENESIS=0
       ;;
@@ -219,7 +219,7 @@ elif [[ "${WEIGHTS}" == "gguf" ]]; then
 elif [[ "${WEIGHTS}" == "iq4ks" ]]; then
   case "${MODEL_NAME}" in
     qwen3.6-27b)
-      PRIMARY_WEIGHT_KEY="qwen3.6-27b:gguf_iq4ks"
+      PRIMARY_WEIGHT_KEY="qwen3.6-27b:ubergarm-iq4ks"
       NEEDS_GENESIS=0
       ;;
     *)
@@ -229,7 +229,7 @@ elif [[ "${WEIGHTS}" == "iq4ks" ]]; then
 elif [[ "${WEIGHTS}" == "awq" ]]; then
   case "${MODEL_NAME}" in
     gemma-4-31b) PRIMARY_WEIGHT_KEY="gemma-4-31b:awq" ;;
-    gemma-4-26b-a4b) PRIMARY_WEIGHT_KEY="gemma-4-26b-a4b:awq_compressed_tensors" ;;
+    gemma-4-26b-a4b) PRIMARY_WEIGHT_KEY="gemma-4-26b-a4b:awq" ;;
     *)
       echo "ERROR: WEIGHTS=awq is only wired for gemma-4-31b and gemma-4-26b-a4b." >&2
       exit 1 ;;
@@ -610,11 +610,11 @@ SETUP_MODEL_DISPLAY="$(model_label "${MODEL_NAME}")"
 case "${MODEL_NAME}" in
   qwen3.6-27b)
     SAMPLE_CONTAINER="vllm-qwen36-27b"
-    SAMPLE_COMPOSE_FLAGS_DUAL=" -f dual/docker-compose.yml"
+    SAMPLE_COMPOSE_FLAGS_DUAL=" -f dual/autoround-int4/fp8-mtp.yml"
     SAMPLE_PORT="8020"
     SAMPLE_MODEL_NAME="qwen3.6-27b-autoround"
     NEXT_STEPS_NOTE="Or dual-card vLLM (Marlin patched files already vendored in-repo):
-  cd models/${MODEL_NAME}/vllm/compose && docker compose -f dual/docker-compose.yml up -d"
+  cd models/${MODEL_NAME}/vllm/compose && docker compose -f dual/autoround-int4/fp8-mtp.yml up -d"
     ;;
   gemma-4-31b)
     SAMPLE_CONTAINER="vllm-gemma-4-31b-mtp"

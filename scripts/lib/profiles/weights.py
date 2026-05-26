@@ -26,23 +26,32 @@ PROFILE_ROOT = Path(__file__).resolve().parent
 
 
 ALIASES = {
-    "qwen3.6-27b-autoround-int4": ("qwen3.6-27b", "autoround_int4"),
+    "qwen3.6-27b:autoround_int4": ("qwen3.6-27b", "autoround-int4"),
+    "qwen3.6-27b:gguf_q4km": ("qwen3.6-27b", "unsloth-q4km"),
+    "qwen3.6-27b:gguf_iq4ks": ("qwen3.6-27b", "ubergarm-iq4ks"),
+    "qwen3.6-27b:carnice_bf16mtp": ("qwen3.6-27b", "carnice-bf16mtp"),
+    "qwen3.6-27b:qwopus_bf16mtp": ("qwen3.6-27b", "qwopus-bf16mtp"),
+    "qwen3.6-35b-a3b:autoround_int4": ("qwen3.6-35b-a3b", "autoround-int4"),
+    "gemma-4-31b:autoround_int4": ("gemma-4-31b", "autoround-int4"),
+    "gemma-4-26b-a4b:autoround_int4_mixed": ("gemma-4-26b-a4b", "autoround-int4-mixed"),
+    "gemma-4-26b-a4b:awq_compressed_tensors": ("gemma-4-26b-a4b", "awq"),
+    "qwen3.6-27b-autoround-int4": ("qwen3.6-27b", "autoround-int4"),
     "qwen3.6-27b-dflash": ("qwen3.6-27b", "dflash"),
     "qwen3.6-27b-prism-eagle3": ("qwen3.6-27b", "prism_eagle3"),
     "qwen3.6-27b-mtp-head": ("qwen3.6-27b", "mtp_head"),
-    "qwen3.6-27b-gguf-q4km": ("qwen3.6-27b", "gguf_q4km"),
+    "qwen3.6-27b-gguf-q4km": ("qwen3.6-27b", "unsloth-q4km"),
     "qwen3.6-27b-mmproj-f16": ("qwen3.6-27b", "gguf_mmproj_f16"),
-    "qwen3.6-27b-gguf-iq4ks": ("qwen3.6-27b", "gguf_iq4ks"),
-    "qwen3.6-35b-a3b-autoround-int4": ("qwen3.6-35b-a3b", "autoround_int4"),
-    "gemma-4-31b-autoround-int4": ("gemma-4-31b", "autoround_int4"),
+    "qwen3.6-27b-gguf-iq4ks": ("qwen3.6-27b", "ubergarm-iq4ks"),
+    "qwen3.6-35b-a3b-autoround-int4": ("qwen3.6-35b-a3b", "autoround-int4"),
+    "gemma-4-31b-autoround-int4": ("gemma-4-31b", "autoround-int4"),
     "gemma-4-31b-it-AWQ-4bit": ("gemma-4-31b", "awq"),
     "gemma-4-31b-it-assistant": ("gemma-4-31b", "assistant"),
     "gemma-4-31b-it-dflash": ("gemma-4-31b", "dflash"),
-    "gemma-4-26b-a4b-autoround-int4-mixed": ("gemma-4-26b-a4b", "autoround_int4_mixed"),
-    "gemma-4-26b-a4b-awq-4bit": ("gemma-4-26b-a4b", "awq_compressed_tensors"),
+    "gemma-4-26b-a4b-autoround-int4-mixed": ("gemma-4-26b-a4b", "autoround-int4-mixed"),
+    "gemma-4-26b-a4b-awq-4bit": ("gemma-4-26b-a4b", "awq"),
     "gemma-4-26b-a4b-it-assistant": ("gemma-4-26b-a4b", "assistant"),
-    "carnice-v2-27b-int4-recipe-d-bf16mtp": ("qwen3.6-27b", "carnice_bf16mtp"),
-    "qwopus3.6-27b-int4-recipe-d-bf16mtp": ("qwen3.6-27b", "qwopus_bf16mtp"),
+    "carnice-v2-27b-int4-recipe-d-bf16mtp": ("qwen3.6-27b", "carnice-bf16mtp"),
+    "qwopus3.6-27b-int4-recipe-d-bf16mtp": ("qwen3.6-27b", "qwopus-bf16mtp"),
 }
 
 
@@ -82,6 +91,11 @@ def _recipe(model_id: str, variant: str) -> dict[str, str]:
         _die(f"unknown model: {model_id}")
     weights = model.get("weights") or {}
     meta = weights.get(variant)
+    if not isinstance(meta, dict):
+        alias = ALIASES.get(f"{model_id}:{variant}") or ALIASES.get(variant)
+        if alias and alias[0] == model_id:
+            variant = alias[1]
+            meta = weights.get(variant)
     if not isinstance(meta, dict):
         _die(f"unknown weight variant: {model_id}:{variant}")
 
