@@ -2,7 +2,25 @@
 
 End-to-end workflow for onboarding a new model into the **curated profile catalog** + serving infrastructure. Pairs with [KV_MATH.md](KV_MATH.md) (math reference) and [ARCHITECTURE.md](ARCHITECTURE.md) (current stack state).
 
-> **Just want to run a model, not add it to the catalog?** As of v0.8.0 you don't need this workflow — `scripts/pull.sh <org/Model> --profile-like vllm/minimal` evaluates *any* safetensors HF repo against the KV math and boots it if it passes (see [docs/PULL.md](PULL.md)). This page is for the heavier task of promoting a model into the **measured/calibration catalog** (real benchmarks, validated composes, calibration anchors, per-model gotchas) — the high-confidence backbone, not a prerequisite for serving.
+> **Adding a model? Three paths — pick the lightest that fits:**
+>
+> 1. **Serve any safetensors repo locally (no catalog).** `scripts/pull.sh <org/Model> --profile-like vllm/minimal --dry-run` evaluates *any* safetensors HF repo against this stack's KV math (no download) and tells you whether it fits + at what confidence; drop `--dry-run` and add `--yes` to download + generate a minimal compose + boot. vLLM / safetensors only. See [PULL.md](PULL.md).
+> 2. **Run your own GGUF locally (no catalog).** `pull.sh` doesn't take GGUF — use the [local-GGUF recipe](#run-a-local-gguf-without-the-catalog) below (copy an existing compose, 3 steps, llama.cpp / ik-llama).
+> 3. **Promote a model into the curated catalog** — *this page*. The heavier task: validated composes, profile-compat coverage, calibration anchors, real benchmarks, per-model gotchas. The high-confidence backbone — **not** a prerequisite for serving.
+
+## Run a local GGUF without the catalog
+
+Want to serve a GGUF you grabbed yourself (a community quant, your own conversion) on llama.cpp or ik-llama, *without* the full catalog workflow? Three steps:
+
+1. **Drop the GGUF** at `/mnt/models/huggingface/<your-name>-gguf/<file>.gguf` (weights live on `/mnt/models` — disk-hygiene rule).
+2. **Copy an existing compose** for the engine as a starting point, e.g.:
+   - llama.cpp: `models/qwen3.6-27b/llama-cpp/compose/single/unsloth-q4km/mtp.yml`
+   - ik-llama:  `models/qwen3.6-27b/ik-llama/compose/single/ubergarm-iq4ks/mtp.yml`
+
+   Copy it **outside the repo tree** (e.g. `/tmp/my-model.yml`) so you don't have to re-figure the `../` mount depth, point its `--model` / `GGUF_FILE` default at your `.gguf`, and tune `CTX_SIZE`, `KV_TYPE` (`q4_0` = max ctx · `q8_0` = higher fidelity, ~half the ctx), container name + port.
+3. **Boot it directly:** `MODEL_DIR=/mnt/models/huggingface docker compose -f /tmp/my-model.yml up`.
+
+No `compose_registry.py` entry, no profile YAML, no calibration. You give up `launch.sh`/`switch.sh` discovery, the VRAM projection, and the guard tests — but you get a one-off local serve in minutes. When you want it discoverable + measured, do the full workflow below.
 
 ## When to add a new model vs a new quant of an existing one
 
@@ -21,11 +39,12 @@ This doc covers the **new base model** case. The others are addressed in the v0.
 ┌─────────────────────────────────────────────────────────────────────┐
 │  1. Source the architecture facts (config.json + README + code)     │
 │  2. Author ModelProfile YAML  (scripts/lib/profiles/models/<id>.yml) │
-│  3. Build the first compose  (models/<id>/<engine>/compose/...)     │
+│  3. Build the first compose  (.../compose/<topology>/<quant>/*.yml) │
 │  4. Add COMPOSE_REGISTRY entries  (scripts/lib/profiles/...)        │
+│ 4b. Profile-catalog compatibility (engine/hardware/patches.yml)     │
 │  5. Boot + verify-full + capture the boot log                       │
 │  6. Author CalibrationData YAML  (scripts/lib/profiles/calibration/) │
-│  7. Validate via fits() + diagnose-profile.sh                       │
+│  7. Validate: diagnose-profile + the FULL guard suite               │
 │  8. Run rebench-full to populate BENCHMARKS.md                      │
 │  9. Update CLAUDE.md, ARCHITECTURE.md, learnings/<model>.md         │
 └─────────────────────────────────────────────────────────────────────┘
@@ -116,19 +135,33 @@ num_experts: <int>
 num_experts_per_tok: <int>
 active_params_b: <float>                # for documentation; not in fits()
 
-# Weight variants (drives fits() C14)
+# Weight variants (drives fits() C14) — a MAP keyed by quant-slug, NOT a list.
+# The slug is the SAME string in three places: this key == the compose
+# `<quant>/` dir == compose_registry `weights_variant`. A provider repo with
+# N quant files → N sibling slugs sharing one `hf_repo`, differing by `files:`.
 weights:
-  - id: autoround-int4
-    format: hf_safetensors
-    path: /mnt/models/huggingface/<id>-autoround-int4
+  autoround-int4:                          # ← quant-slug = the map key
+    path: <id>-autoround-int4              # relative to /mnt/models/huggingface
+    local_subdir: <id>-autoround-int4
     size_gb: <float>
-    status: production
-  - id: gguf
+    format: autoround                      # autoround | awq | gguf | …
+    status: production                     # production | experimental | community-experimental
+    hf_repo: <Org/Repo>
+    files: ["*.safetensors"]               # or explicit GGUF filenames
+    engine: vllm                           # vllm | ik-llama | llama-cpp
+    kind: main                             # main | draft | mmproj | gguf
+    verify_glob: "*.safetensors"           # or "*.gguf"
+  ubergarm-iq4ks:                          # second quant of the same model (own slug dir)
+    path: <id>-gguf/ubergarm-mtp-iq4ks
+    local_subdir: <id>-gguf/ubergarm-mtp-iq4ks
+    size_gb: <float>
     format: gguf
-    path: /mnt/models/huggingface/<id>-gguf
-    files: ["..."]
-    size_gb: <float>
     status: production
+    hf_repo: <Org/GGUF-Repo>
+    files: ["<File>.gguf"]
+    engine: ik-llama
+    kind: gguf
+    verify_glob: "*.gguf"
 default_weight_variant: autoround-int4
 
 # Drafter compatibility (drives fits() C7-C9)
@@ -196,17 +229,18 @@ COMPOSE_REGISTRY = {
     # ... existing entries ...
     "vllm/<model-slug>": _entry(
         model="<model-id>",                          # matches models/<id>.yml
-        weights_variant="autoround-int4",            # matches the weights[].id
+        weights_variant="autoround-int4",            # the quant-slug (weights map key == compose <quant>/ dir)
         workload="long-ctx-single",                  # one of the 5 workload IDs
-        engine="vllm-nightly-mtp",                   # matches engines/<id>.yml
+        engine="vllm-nightly-mtp",                   # matches engines/<id>.yml (and its supported_model_families!)
         drafter="qwen-mtp-builtin",                  # or None
-        kv_format="turboquant_3bit_nc",
+        kv_format="turboquant_3bit_nc",              # must be in the hardware profile's supported_kv_formats
         tp=2,
         max_ctx=180000,
         max_num_seqs=1,
         mem_util=0.92,
         compose_path="models/<model-id>/vllm/compose/dual/autoround-int4/<serving>.yml",
-        default_port=8040,                           # next-free 20-slot block
+        default_port=8040,                           # MUST equal the compose's ${PORT:-NNNN} fallback (parity test)
+        kvcalc_key="<model-id>:dual",                # vLLM: "<model>:<kvcalc-profile>"; llama.cpp/ik: "SKIP"
         required_engine_features=["turboquant_3bit_nc"],
     ),
 }
@@ -233,6 +267,24 @@ New models pick the next free 20-slot block (8050, 8070, ...). Wizard uses this 
 | `fast-chat` | max_num_seqs ≥ 4, max_ctx ≤ 32K, decode-throughput-priority |
 
 If unsure, run `fits()` against the proposed combination first — `compat.fits()` will tell you which workloads validate.
+
+## Step 4b — Profile-catalog compatibility (do NOT skip — the easy-to-miss class)
+
+A registry entry isn't enough: every entry must **validate against the profile catalog**, or `test-profiles-compat` / `diagnose-profile` go red. New `(model, engine, KV-format)` combos commonly trip one of these — each is a one-line data fix *once you know it exists* (this whole section is the lesson of hotfix #236):
+
+| Symptom (constraint) | Fix |
+|---|---|
+| `C10: engine <e> supported_model_families=[…] excludes <family>` | Add the model's `family` to `scripts/lib/profiles/engines/<engine>.yml` → `supported_model_families` (only if the engine genuinely serves it — e.g. llama.cpp does serve `qwen3-next-moe`). |
+| `C5: kv_format=<fmt> not supported by hardware: <card>` | Add `<fmt>` to `supported_kv_formats` in the relevant `scripts/lib/profiles/hardware/*.yml`. KV quants like `q5_0`/`q8_0` are *software* (valid on any CUDA card) — add them to **all** hardware profiles, not just yours. |
+| `composes with no fitting canonical scenario: [...]` | Usually a *downstream* symptom of the two above — fix the engine/hardware constraint and the entry validates on an existing scenario in `scripts/lib/profiles/canonical_scenarios.py` (the 9 are hardware topologies; you rarely add new ones). |
+
+**If the model ships a vendored chat-template** (a `.jinja` mounted into the container), register it in `scripts/lib/profiles/patches.yml` with `delivery_mechanism: chat_template`, the `load_bearing_when` composes, and a `drift_guard.check` that **encodes the symmetric restart+settle protocol** (the check string must contain `symmetric`, `docker restart`, `settle`, `>=3`, `grand mean` — copy the `qwen-froggeric-chat-template` entry as the template). Otherwise `test-patch-attribution` flags it as an orphan. `status` must be one of `verified | unverified | suspect` (use `unverified` until live-validated).
+
+**Two more easy-to-forget mechanics:**
+- **Catalog-size guard** — `scripts/tests/test-compose-registry-disk.sh` asserts a hardcoded compose/registry count; bump it by the number of composes you added (`47 → 55`-style).
+- **`+1 ../` mount depth** — composes live at `<topology>/<quant>/<serving>.yml`, one level deeper than the old flat layout, so relative mounts need an extra `../` (e.g. `${MODEL_DIR:-../../../../../../models-cache}`, 6× for `single/<quant>/`). `test-compose-mounts-resolve` catches a wrong depth.
+
+**Launchers are registry-derived (since v0.8.x) — do NOT edit `launch.sh`/`switch.sh`.** Adding the registry entry makes the variant launchable automatically; `<engine>/default` and `<engine>/<topology>/default` resolve via the registry's `DEFAULTS` map (topology-autodetect). Promoting a new default = one line in `DEFAULTS`, never a `default.yml` file.
 
 ## Step 5 — Boot + verify-full + capture the boot log
 
@@ -309,20 +361,31 @@ Look at the verdict accuracy per model. Target: **≥80% within ±1.5 GB**.
 
 If accuracy is poor, the activation coefficient in `tools/kv-calc.py` needs tuning for this model. The coefficient lives in `MODEL_SPECS` or activation coefficient dicts (see Phase 3 refactor for the current home).
 
-## Step 7 — Validate via fits() + diagnose-profile.sh
+## Step 7 — Validate: per-compose triage + the FULL guard suite
 
 ```bash
-# Sanity check: does the wizard discover the new compose?
-bash scripts/launch.sh --variant <model-slug> --no-verify
+# Per-compose triage: registry → cross-ref → fits() vs canonical scenarios →
+# kv-calc projection → calibration freshness → vendored-overlay matching.
+bash scripts/diagnose-profile.sh <engine>/<your-variant>
 
-# Per-compose triage
-bash scripts/diagnose-profile.sh vllm/<your-variant>
-
-# Run the profile compat test suite
-bash scripts/tests/test-profiles-compat.sh
+# Run the WHOLE suite — not just the one test you think is relevant.
+for t in scripts/tests/*.sh; do echo "== $t =="; bash "$t" >/tmp/$(basename "$t").log 2>&1 && echo "  PASS" || echo "  FAIL — see /tmp/$(basename "$t").log"; done
 ```
 
-`diagnose-profile.sh` runs the full triage chain: registry lookup → cross-ref → fits() against canonical scenarios → kv-calc projection → calibration freshness → vendored overlay matching. Green here means the new compose is well-integrated.
+The catalog-relevant gates and what each guards:
+
+| Test | Guards |
+|---|---|
+| `test-compose-registry-disk` | every `compose_path` exists · descriptive filename (no `docker-compose.yml`/`default.yml`) · quant-slug ↔ `weights_variant` · the **catalog-size count** |
+| `test-compose-mounts-resolve` | every relative mount resolves (the **`../` depth**) |
+| `test-model-weights-registry` | every `weights_variant` has a weights entry in `models/<id>.yml` |
+| `test-switch-registry-parity` + `test-launch-registry-parity` | the variant is launchable from both launchers · `default_port` matches the compose's `PORT` fallback |
+| `test-default-resolver` | `<engine>/default` topology-autodetect resolves |
+| `test-profiles-compat` | every entry fits a canonical scenario (Step 4b) |
+| `test-patch-attribution` | any vendored chat-template is registered (Step 4b) |
+| `tools/kv-calc.py --calibration` | VRAM projection accuracy ≥80% |
+
+> **Run the full suite, not the single test you assume is relevant.** A narrow gate-subset shipped a model with two real catalog gaps that only `test-profiles-compat` + `test-patch-attribution` caught (#236). Conversely, some failures are **pre-existing or environmental** (fixture-absent tests, or `.pull-captures` cross-contamination between tests) — **baseline against the last release tag** (`git worktree add /tmp/base vX.Y.Z && run there`) to separate a real regression from pre-existing noise before you treat it as a blocker.
 
 ## Step 8 — Run rebench-full + update BENCHMARKS.md
 
@@ -463,8 +526,9 @@ When the new model is ready for review:
 
 - [ ] `scripts/lib/profiles/models/<id>.yml` lands with all required fields + `schema_version: 1`
 - [ ] At least one compose at `models/<id>/<engine>/compose/...` with `ESTATE_GPUS` + `ESTATE_PORT` + `ESTATE_CONTAINER` env hooks + sensible fallback defaults
-- [ ] COMPOSE_REGISTRY entries added with `default_port` + `gpu_assignment_mode`
-- [ ] `scripts/tests/test-profiles-compat.sh` passes (catches schema + cross-ref issues)
+- [ ] COMPOSE_REGISTRY entries added with `default_port` (== compose `PORT` fallback) + `kvcalc_key`
+- [ ] **Profile-catalog compat (Step 4b):** engine `supported_model_families` covers the family · hardware `supported_kv_formats` covers the KV format · any vendored chat-template registered in `patches.yml` · `test-compose-registry-disk` size-count bumped · `../` mount depth correct
+- [ ] The **full** `scripts/tests/*.sh` suite is green (or only pre-existing/env fails, baselined vs the last release tag)
 - [ ] `bash scripts/launch.sh --variant <slug>` boots cleanly + `verify-full.sh` 8/8 PASS
 - [ ] Boot log captured + reviewed against KV_MATH projections (per_token_bytes within 10% of formula)
 - [ ] `scripts/lib/profiles/calibration/<id>.yml` populated with ≥4 measured rows
@@ -477,7 +541,7 @@ When the new model is ready for review:
 ## See also
 
 - [KV_MATH.md](KV_MATH.md) — KV cache math reference (formulas, per-model derivations, error bands)
-- [CLAUDE.md](../CLAUDE.md#when-the-user-adds-a-new-model) — stack-level "When the user adds a new model" checklist (canonical at `/opt/ai/CLAUDE.md` outside the repo)
+- [AGENTS.md](../AGENTS.md) — the in-repo agent guide; its "Adding a model / quant" section is the entry point an AI agent working in a clone should read first, and links back here for the full workflow
 - [ARCHITECTURE.md](ARCHITECTURE.md) — current stack state to update
 - [BENCHMARKS.md](../BENCHMARKS.md) — the measured-data home for new calibration rows
 - `scripts/lib/profiles/compat.py` — live ModelProfile schema definition

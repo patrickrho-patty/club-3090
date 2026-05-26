@@ -157,6 +157,15 @@ This rule applies to **shipped composes AND local-only test composes** — apply
 
 When testing a new model, create the directory hierarchy from the start: `models/<new-model>/<engine>/compose/<topology>/<quant-slug>/<serving>.yml`. The quant slug must match the `weights_variant` key in `scripts/lib/profiles/models/<model>.yml` and `scripts/lib/profiles/weights.py`. When the model isn't Qwen3-Next, write `Genesis: N/A — Genesis is Qwen3-Next-specific` in the profile schema so readers don't expect Genesis-style perf folds where they don't apply.
 
+#### Adding a model — full workflow → [`docs/ADDING_MODELS.md`](docs/ADDING_MODELS.md)
+
+Read that doc before catalog work; the at-a-glance for agents:
+
+- **Just serving, not cataloging?** Safetensors → `scripts/pull.sh <org/Model> --profile-like vllm/minimal`; a self-grabbed **GGUF** → copy an ik/llama compose and point `--model` at it (no registry/profile needed — see ADDING_MODELS "Run a local GGUF without the catalog"). The steps below are only for promoting a model into the **curated catalog**.
+- **Catalog steps the compose alone doesn't cover:** (1) `scripts/lib/profiles/models/<id>.yml` — `weights:` is a **map keyed by quant-slug**, not a list; (2) a `compose_registry.py` entry (`weights_variant`=slug · `kvcalc_key` — vLLM `"<model>:<profile>"`, ik/llama `"SKIP"` · `default_port` == the compose's `${PORT:-NNNN}`); (3) launchers **auto-derive** from the registry — never edit `launch.sh`/`switch.sh`; promote a default via the `DEFAULTS` map.
+- **Profile-catalog compatibility (easy to miss — hotfix #236):** the new `(model, engine, KV-format)` combo must validate or `test-profiles-compat` / `diagnose-profile` go red. Add the model's `family` to the engine's `supported_model_families` (`scripts/lib/profiles/engines/*.yml`), the KV format to the hardware profiles' `supported_kv_formats` (`scripts/lib/profiles/hardware/*.yml`); register any vendored chat-template in `scripts/lib/profiles/patches.yml` (with the symmetric-protocol `drift_guard`); bump the `test-compose-registry-disk` size-count.
+- **Run the FULL catalog test suite**, not just the serving tests in [Tests](#tests): `for t in scripts/tests/*.sh; do bash "$t"; done`. Key gates: `test-compose-registry-disk`, `test-compose-mounts-resolve` (the `../` depth), `test-model-weights-registry`, `test-switch-registry-parity` + `test-launch-registry-parity`, `test-profiles-compat`, `test-patch-attribution`, plus `tools/kv-calc.py --calibration`. A narrow subset shipped a model with two real catalog gaps (#236) — and some failures are pre-existing/env, so **baseline against the last release tag** before treating one as a blocker.
+
 #### Where do experimental / unvalidated composes live?
 
 **Same directory as shipped composes, but kept untracked until validation passes.** Don't create a separate `experimental/` subdirectory — the relative paths to `../patches/...` and `../cache/...` are calibrated to the compose dir, and promoting an experiment from a sub-folder would require re-pathing every mount.
