@@ -158,8 +158,14 @@ bash scripts/quality-test.sh --full
 bash scripts/quality-test.sh --full --sampling-from-server
 SAMPLING_FROM_SERVER=1 bash scripts/rebench-full.sh
 
-# or an explicit temperature, via benchlocal-cli directly
-benchlocal-cli run --full --endpoint http://localhost:8020 --model <name> --temperature 0.8
+# or an explicit temperature, via benchlocal-cli directly.
+# NB: invoking benchlocal-cli directly BYPASSES the wrapper's localhost guard. With a
+# localhost endpoint + a sandboxed *agentic* pack (HermesAgent-20 runs the agent INSIDE
+# the sandbox), you must set BENCHLOCAL_HERMES_RESOLVE_LOCALHOST=1 yourself — otherwise the
+# in-sandbox agent can't reach the host model and hermes silently scores ~0/20.
+# quality-test.sh sets this automatically for localhost URLs (see Limitations).
+BENCHLOCAL_HERMES_RESOLVE_LOCALHOST=1 \
+  benchlocal-cli run --full --endpoint http://localhost:8020 --model <name> --temperature 0.8
 ```
 
 ### Reasoning-on evals
@@ -227,8 +233,9 @@ For comparing a new pin / quant / config A/B against the previous version: a >10
 ## Limitations
 
 1. **Sandboxed packs need Docker** — BugFind / HermesAgent / CLI-40 run in Docker-hosted verifier sandboxes. On a host without Docker, run `--medium` (or `--full --no-sandboxed`) for the 5 deterministic packs.
-2. **Verifier translation is lossy in places** — the upstream BenchLocal evaluators have partial-credit branches we collapsed to pass/fail. See benchlocal-cli's [`docs/EXTRACTOR_NOTES.md`](https://github.com/noonghunna/benchlocal-cli/blob/master/docs/EXTRACTOR_NOTES.md) for the specific surfaces.
-3. **Single-run sampling at temperature 0** — each scenario runs once, greedy, by default (see [Sampling & temperature](#sampling--temperature) for the non-canonical override modes). For non-determinism debugging, use `benchlocal-cli run --pack <id> --repeat N`.
+2. **Sandboxed *agentic* packs need a container-reachable model URL** — HermesAgent-20 runs the agent *inside* the sandbox, so it calls the model over the network. A `localhost` / `127.x` / `[::1]` endpoint is the *container's* own loopback, not the host. `quality-test.sh` auto-detects this and exports `BENCHLOCAL_HERMES_RESOLVE_LOCALHOST=1` (rewrites the URL → `host.docker.internal` + adds `--add-host`). **If you bypass the wrapper and run `benchlocal-cli` directly against a localhost endpoint, set that env var yourself** — otherwise the in-sandbox agent never reaches the model and hermes silently scores ~0/20. Failure signature: uniform ~timeout-length per-scenario latencies + flat GPU (*not* `turn_count`, which is `0` for hermes regardless of engagement).
+3. **Verifier translation is lossy in places** — the upstream BenchLocal evaluators have partial-credit branches we collapsed to pass/fail. See benchlocal-cli's [`docs/EXTRACTOR_NOTES.md`](https://github.com/noonghunna/benchlocal-cli/blob/master/docs/EXTRACTOR_NOTES.md) for the specific surfaces.
+4. **Single-run sampling at temperature 0** — each scenario runs once, greedy, by default (see [Sampling & temperature](#sampling--temperature) for the non-canonical override modes). For non-determinism debugging, use `benchlocal-cli run --pack <id> --repeat N`.
 
 For the full pipeline architecture + JSONL pack format, read [benchlocal-cli's docs](https://github.com/noonghunna/benchlocal-cli/tree/master/docs).
 
