@@ -22,9 +22,10 @@
 #                   ggml_aborts (Anbeeld's "explicit draft device" fix).
 #                ✅ CODE DFlash: up to ~157 TPS dual (≈4.2× the ~37 no-spec baseline), accept 0.33–0.64.
 #                ⚠️ PROSE acceptance REGRESSED to ~0.07 → ~35 TPS (net-negative vs no-spec).
-#                   IDENTICAL single + dual → NOT multi-GPU; a v0.3.0-wide draft regression
-#                   (old b9459 build was ~0.20 prose, net-positive). SWA mismatch (n_swa 1024 vs
-#                   2048) is the suspect — the DFlash-IQ4_XS draft may need regenerating.
+#                   IDENTICAL single + dual → NOT multi-GPU; a v0.3.0-wide DFlash-on-prose
+#                   regression (old b9459 was ~0.20 prose, net-positive). Qwen3.6-27B (DeltaNet,
+#                   NOT SWA-windowed) shows the identical collapse → NOT the SWA mismatch; a
+#                   cross-model v0.3.0 DFlash regression. Code unaffected.
 #                ❌ MTP (--spec-type mtp + radamanthys-assistant Q8_0): "unknown model
 #                   architecture: gemma4_mtp" — unsupported on this build (distinct from the
 #                   CLOSED Anbeeld #36, which was garbage MTP *output* on Qwen, not arch-load).
