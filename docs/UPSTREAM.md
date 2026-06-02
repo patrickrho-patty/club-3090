@@ -181,7 +181,7 @@ purged (e.g. `VLLM_IMAGE=vllm/vllm-openai:latest`).
 
 **Heads-up — naming clarification:**
 - This section tracks **`Luce-Org/lucebox-hub`** (a llama.cpp fork from Luce). **As of 2026-05-04 this is no longer single-card-only** — see "Dual-GPU split landed" below.
-- Our **`dual/autoround-int4/dflash.yml` / `dual-dflash-noviz.yml`** (vLLM TP=2 dual-card) IS shipping and is the recommended DFlash path on this stack today. Both consume the **same draft model** (`z-lab/Qwen3.6-27B-DFlash`), but the engine + topology differ. Don't confuse the two.
+- Our **`dual/autoround-int4/dflash.yml` / `dual-dflash-noviz.yml`** (vLLM TP=2 dual-card) were the vLLM DFlash path but were **deprecated 2026-05-31** — superseded by `dual.yml` (stock v0.22.0, 262K + vision + MTP + 2 streams) and stranded on a now-purged nightly ([#297](https://github.com/noonghunna/club-3090/discussions/297)). **DFlash on dual now ships on beellama** (`beellama/qwen-dflash-dual`, v0.3.0 🧪). They consumed the **same draft model** (`z-lab/Qwen3.6-27B-DFlash`), but the engine + topology differ from Luce's fork. Don't confuse the two.
 
 ### 🆕 Dual-GPU split landed (2026-05-02 + 2026-05-04)
 
