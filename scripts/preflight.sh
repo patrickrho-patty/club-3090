@@ -194,7 +194,7 @@ _preflight_hardware_suggestions() {
     echo "[preflight]   - Single 24 GB card, use:  bash scripts/switch.sh beellama/gemma-dflash" >&2
     echo "[preflight]   - On 2x 24 GB cards, use:  bash scripts/switch.sh vllm/gemma-bf16-mtp" >&2
   fi
-  echo "[preflight]   - On a single 24 GB card, start with:  bash scripts/switch.sh vllm/default" >&2
+  echo "[preflight]   - On a single 24 GB card, start with:  bash scripts/switch.sh beellama/dflash  (single-card default)" >&2
   echo "[preflight]   - For maximum compatibility, use:  bash scripts/switch.sh llamacpp/default" >&2
   echo "[preflight]   - Explicit bypass:  bash scripts/switch.sh --force ${variant:-<variant>}" >&2
 }
