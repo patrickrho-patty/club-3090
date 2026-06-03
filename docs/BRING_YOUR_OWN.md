@@ -198,6 +198,10 @@ Notes:
 - Contributing the compose upstream? **One model — or one feature/concern — per
   PR** (see [`CONTRIBUTING.md`](../CONTRIBUTING.md)). Reproduce-before-promote: we
   re-run community numbers on our own rig before promoting past `🧪`.
+- Your compose must carry the **Profile header** — the `# Profile (at-a-glance):`
+  block with a `Status:` field (and a `Caveats:` line if `⚠️`/`👁️`/`⏸️`/`🗑️`).
+  It's gate-tested (`test-compose-status-drift`); schema in
+  [`CLAUDE.md`](../CLAUDE.md) → "Profile schema header."
 
 ## See also
 

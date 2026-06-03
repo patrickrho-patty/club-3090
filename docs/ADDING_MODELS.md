@@ -7,6 +7,8 @@ End-to-end workflow for onboarding a new model into the **curated profile catalo
 > 1. **Serve any safetensors repo locally (no catalog).** `scripts/pull.sh <org/Model> --profile-like vllm/minimal --dry-run` evaluates *any* safetensors HF repo against this stack's KV math (no download) and tells you whether it fits + at what confidence; drop `--dry-run` and add `--yes` to download + generate a minimal compose + boot. vLLM / safetensors only. See [PULL.md](PULL.md).
 > 2. **Run your own GGUF locally (no catalog).** `pull.sh` doesn't take GGUF — use the [local-GGUF recipe](#run-a-local-gguf-without-the-catalog) below (copy an existing compose, 3 steps, llama.cpp / ik-llama).
 > 3. **Promote a model into the curated catalog** — *this page*. The heavier task: validated composes, profile-compat coverage, calibration anchors, real benchmarks, per-model gotchas. The high-confidence backbone — **not** a prerequisite for serving.
+>
+> Paths 1–2 (serve + **tune** + **validate** your own model without the catalog) are walked end-to-end in [BRING_YOUR_OWN.md](BRING_YOUR_OWN.md) — start there if you're not yet cataloging. This page is the promotion step *after* you've validated a config there.
 
 ## Run a local GGUF without the catalog
 
@@ -192,6 +194,10 @@ Place at `models/<model-id>/<engine>/compose/<topology>/<quant-slug>/<serving>.y
 - Topologies: `single`, `dual`, `multi4`
 - Quant slug: exactly matches the `weights_variant` key (`autoround-int4`, `awq`, `unsloth-q4km`, etc.)
 - Serving filename: the feature stack only (`fp8-mtp.yml`, `turbo.yml`, `dflash.yml`, etc.). Do not create `docker-compose.yml` or `default.yml`; defaults are registry pointers.
+
+### Profile header (mandatory)
+
+Every compose opens with the `# Profile (at-a-glance):` block — `Model` / `Topology` / `Drafter` / `KV` / `Vision` / `Max ctx` / `Genesis` / **`Status`** / `Best for` — plus a sibling-comparison table. **`Status:` is required**: exactly one of `✅ Production` · `⚠️ Production w/ caveats` · `🧪 Experimental` · `👁️ Preview` · `⏸️ Upstream-gated` · `🗑️ Deprecated`, with a `Caveats:` line whenever it's `⚠️`/`👁️`/`⏸️`/`🗑️`. `test-compose-status-drift` asserts the header status matches the registry entry, so a missing/mismatched `Status` **fails CI**. Full schema: [`CLAUDE.md`](../CLAUDE.md) → "Profile schema header." For a non-Qwen3-Next model write `Genesis: N/A — Genesis is Qwen3-Next-specific`.
 
 ### Required env-var hooks (post-v0.7.0)
 
