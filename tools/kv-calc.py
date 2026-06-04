@@ -93,6 +93,7 @@ def _weight_size(model, variant):
 def _load_model_specs_from_yaml(profiles):
     qwen, gemma = profiles.models["qwen3.6-27b"], profiles.models["gemma-4-31b"]
     qwen_moe, gemma_moe = profiles.models["qwen3.6-35b-a3b"], profiles.models["gemma-4-26b-a4b"]
+    gemma12 = profiles.models["gemma-4-12b"]
     q_fields = ("hidden_size", "num_hidden_layers", "num_gdn_layers", "num_attn_layers", "num_attn_heads", "num_kv_heads", "head_dim_attn", "linear_num_v_heads", "linear_num_k_heads", "linear_v_head_dim", "linear_k_head_dim", "linear_conv_kernel_dim", "max_ctx_supported", "attention_k_eq_v")
     g_fields = ("hidden_size", "intermediate_size", "num_hidden_layers", "num_full_attn_layers", "num_sliding_attn_layers", "num_attn_heads", "num_kv_heads", "head_dim_sliding", "global_head_dim", "sliding_window", "max_ctx_supported", "attention_k_eq_v")
     gm_fields = (*g_fields, "num_global_kv_heads", "num_experts", "num_experts_per_tok", "moe_intermediate_size", "active_params_b", "mtp_num_hidden_layers")
@@ -101,11 +102,24 @@ def _load_model_specs_from_yaml(profiles):
     qmspec = {"model_id": qwen_moe.id, "model_family": qwen_moe.family, **{k: getattr(qwen_moe, k) for k in qm_fields}, "valid_tp": list(qwen_moe.valid_tp), "weights_total_gb": _weight_size(qwen_moe, qwen_moe.default_weight_variant), "weights_gptq_gb": _weight_size(qwen_moe, "gptq_int4"), "mamba_state_bytes": 4, "chunk_size": 256, "mtp_n_default": profiles.drafters["qwen-mtp-builtin"].n_default}
     gspec = {"model_id": gemma.id, "model_family": gemma.family, **{k: getattr(gemma, k) for k in g_fields}, "valid_tp": list(gemma.valid_tp), "weights_int4_gb": _weight_size(gemma, "autoround-int4"), "weights_awq_gb": _weight_size(gemma, "awq"), "weights_bf16_gb": _weight_size(gemma, "bf16"), "drafter_mtp_gb": float(profiles.drafters["gemma-it-assistant"].vram_footprint_gb), "drafter_dflash_gb": float(profiles.drafters["gemma-dflash"].vram_footprint_gb), "mtp_n_default": profiles.drafters["gemma-it-assistant"].n_default}
     gmspec = {"model_id": gemma_moe.id, "model_family": gemma_moe.family, **{k: getattr(gemma_moe, k) for k in gm_fields}, "valid_tp": list(gemma_moe.valid_tp), "weights_int4_gb": _weight_size(gemma_moe, "autoround-int4-mixed"), "weights_awq_gb": _weight_size(gemma_moe, "awq"), "drafter_mtp_gb": float(profiles.drafters["gemma-26b-it-assistant"].vram_footprint_gb), "mtp_n_default": profiles.drafters["gemma-26b-it-assistant"].n_default}
+    # Gemma-4-12B (gemma4_unified arch). Its TEXT backbone is gemma4-swa-dense
+    # shaped (same SWA KV math family as gemma-4-31b), so it rides the SAME
+    # "gemma4-swa-dense" prediction path — we set model_family to that internal
+    # KV-family tag (NOT its ModelProfile family "gemma4-unified", which is the
+    # vLLM arch name). It ships only bf16 weights (+ a small assistant drafter):
+    # there is no int4/awq variant, so all three weight-size keys point at the
+    # one real bf16 blob (23.9 GB) — this keeps _weights_per_card_gb()'s
+    # int4/awq/bf16 branch from KeyError'ing regardless of which the resolver
+    # asks for. Activation/overhead constants are the SHARED Gemma dense
+    # constants — deliberately NOT re-tuned for this model.
+    g12_bf16 = _weight_size(gemma12, "bf16")
+    g12spec = {"model_id": gemma12.id, "model_family": "gemma4-swa-dense", **{k: getattr(gemma12, k) for k in g_fields}, "valid_tp": list(gemma12.valid_tp), "weights_int4_gb": g12_bf16, "weights_awq_gb": g12_bf16, "weights_bf16_gb": g12_bf16, "drafter_mtp_gb": float(profiles.drafters["gemma-12b-it-assistant"].vram_footprint_gb), "mtp_n_default": profiles.drafters["gemma-12b-it-assistant"].n_default}
     return {
         "qwen3.6-27b": qspec,
         "qwen3.6-35b-a3b": qmspec,
         "gemma-4-31b": gspec,
         "gemma-4-26b-a4b": gmspec,
+        "gemma-4-12b": g12spec,
     }
 
 
@@ -114,6 +128,7 @@ QWEN36_27B = MODEL_SPECS["qwen3.6-27b"]
 QWEN36_35B_A3B = MODEL_SPECS["qwen3.6-35b-a3b"]
 GEMMA4_31B = MODEL_SPECS["gemma-4-31b"]
 GEMMA4_26B_A4B = MODEL_SPECS["gemma-4-26b-a4b"]
+GEMMA4_12B = MODEL_SPECS["gemma-4-12b"]
 
 
 # =============================================================================
@@ -230,6 +245,11 @@ COMPOSE_ALIAS_TEXT = {
     "qwen3.6-27b": "minimal=vllm/minimal long-text=vllm/long-text long-text-no-mtp=vllm/long-text-no-mtp long-vision=vllm/long-vision bounded-thinking=vllm/bounded-thinking tools-text=vllm/tools-text dual=vllm/dual dual-turbo=vllm/dual-turbo dual-dflash=vllm/dual-dflash dual-dflash-noviz=vllm/dual-dflash-noviz dual-bf16=vllm/dual-bf16 dual-int8=vllm/dual-int8 dual-tq3-mtp=vllm/dual-tq3-mtp dual-tq3-mtp-genesis=vllm/dual-tq3-mtp-genesis dual-tq3-nomtp=vllm/dual-tq3-nomtp dual4=vllm/dual4 dual4-dflash=vllm/dual4-dflash",
     "qwen3.6-35b-a3b": "qwen-a3b-preview-single=vllm/qwen-a3b-preview-single qwen-35b-a3b-dual=vllm/qwen-35b-a3b-dual",
     "gemma-4-31b": "gemma-dual=vllm/gemma-bf16-mtp gemma-dual-int8=vllm/gemma-int8-mtp gemma-single=vllm/gemma-mtp-tp1",
+    # gemma-4-12b legacy alias namespace is keyed by model id, so reusing the
+    # bare `gemma-dual` string here is harmless — compat + the CLI always pass
+    # an explicit --model, and the reverse map is keyed by (unique) registry
+    # slug. `gemma-dual` → the MTP dual; `gemma-no-mtp` → the no-drafter dual.
+    "gemma-4-12b": "gemma-dual=vllm/gemma-12b-mtp gemma-no-mtp=vllm/gemma-12b",
     "gemma-4-26b-a4b": "gemma-a4b-single=vllm/gemma-a4b-single gemma-a4b=vllm/gemma-a4b gemma-a4b-awq=vllm/gemma-a4b-awq gemma-a4b-awq-mtp=vllm/gemma-a4b-awq-mtp",
 }
 COMPOSE_ALIASES = {model: tuple(part.split("=", 1) for part in text.split()) for model, text in COMPOSE_ALIAS_TEXT.items()}
@@ -259,9 +279,11 @@ def _compose_cfg_from_registry(profiles, model_id, legacy_name, registry_name):
         cfg.update({"mtp": False, "dflash_draft_gb": float(drafter.vram_footprint_gb)})
     if drafter is not None:
         cfg["mtp_n"] = int(drafter.n_default)
-    if model_id == "gemma-4-31b" and drafter is not None:
+    # gemma-4-12b rides the shared Gemma dense path (model_family
+    # gemma4-swa-dense in MODEL_SPECS); treat its drafter + weights the same way.
+    if model_id in ("gemma-4-31b", "gemma-4-12b") and drafter is not None:
         cfg["drafter_gb"] = float(drafter.vram_footprint_gb)
-    if model_id == "gemma-4-31b":
+    if model_id in ("gemma-4-31b", "gemma-4-12b"):
         cfg["weights_variant"] = {"awq": "awq", "bf16": "bf16"}.get(entry["weights_variant"], "int4")
     if model_id == "gemma-4-26b-a4b":
         cfg["weights_variant"] = "awq" if entry["weights_variant"] == "awq" else "int4"

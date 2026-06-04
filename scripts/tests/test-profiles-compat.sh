@@ -24,11 +24,11 @@ run_test "load_profiles parses all profile groups" <<'PY'
 from scripts.lib.profiles.compat import load_profiles
 p = load_profiles()
 assert len(p.hardware) == 9
-assert len(p.models) == 4
+assert len(p.models) == 5
 assert len(p.workloads) == 5
-assert len(p.engines) == 9
-assert len(p.drafters) == 8
-assert len(p.calibration) == 4
+assert len(p.engines) == 10
+assert len(p.drafters) == 9
+assert len(p.calibration) == 5
 PY
 
 run_test "fits() happy path: Qwen dual on 2x3090" <<'PY'

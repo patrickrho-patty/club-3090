@@ -1,0 +1,49 @@
+schema_version: 1
+id: gemma-4-12b
+display_name: Gemma 4 12B (unified)
+family: gemma4-unified
+hidden_size: 3840
+intermediate_size: 15360
+num_hidden_layers: 48
+num_full_attn_layers: 8
+num_sliding_attn_layers: 40
+num_attn_heads: 16
+num_kv_heads: 8
+head_dim_sliding: 256
+global_head_dim: 512
+sliding_window: 1024
+# Model card claims 256K, but vLLM's gemma4_unified OOB-crashes on prefill past
+# 131072 (p-RoPE large-prefill bug, vllm#39914) — 131072 is the hard validated
+# ceiling on this engine.
+max_ctx_supported: 131072
+attention_k_eq_v: true
+weights:
+  bf16:
+    path: gemma-4-12b-it
+    local_subdir: gemma-4-12b-it
+    size_gb: 23.9
+    format: bf16
+    status: experimental
+    hf_repo: unsloth/gemma-4-12b-it
+    engine: vllm
+    kind: main
+    verify_glob: "*.safetensors"
+  assistant:
+    path: gemma-4-12b-it-assistant
+    local_subdir: gemma-4-12b-it-assistant
+    size_gb: 0.85
+    format: bf16
+    status: experimental
+    hf_repo: google/gemma-4-12B-it-assistant
+    engine: vllm
+    kind: draft
+    verify_glob: "*.safetensors"
+default_weight_variant: bf16
+compatible_drafters:
+  - gemma-12b-it-assistant
+valid_tp:
+  - 1
+  - 2
+  - 4
+  - 8
+requires_genesis: false

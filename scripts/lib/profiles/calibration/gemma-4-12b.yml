@@ -1,0 +1,38 @@
+schema_version: 1
+model: gemma-4-12b
+# Seeded from the MEASURED gemma4-unified boot ground truth (dual RTX 3090
+# sm_86, TP=2, vLLM image vllm/vllm-openai:gemma4-unified, bf16 KV,
+# max_model_len 131072, gpu-memory-utilization 0.90, MTP assistant drafter
+# resident): boot log reported GPU KV cache size = 384,019 tokens, Available
+# KV cache memory = 8.16 GiB, Maximum concurrency = 2.93×. vLLM pre-reserves
+# the full KV pool, so measured per-card peak ≈ budget (0.90 × 24 = 21.6 GB);
+# implied non-KV resident = 21.6 − 8.76 (= 8.16 GiB) ≈ 12.84 GB/card.
+#
+# INTEGRITY NOTE: these rows are the measured ground truth, NOT back-fit to make
+# the predictor agree. The shared Gemma dense formula UNDER-predicts the live KV
+# pool: it prices the available-KV pool at ~6.69 GB (≈204K tokens) vs the
+# measured 8.16 GiB (≈384K tokens) — a ~−47% token-capacity gap, from (a) the
+# fixed-budget being over-priced by ~2 GB (cudagraph/activation conservatism) and
+# (b) the per-token growing bytes (8 global layers × 8 kv-heads × 512 × 2 / TP2 =
+# 32,768 B) being higher than the live pool's effective ~22,816 B/token. The
+# constants are intentionally left UNTUNED (shared with gemma-4-31b); the verdict
+# stays directionally correct (TIGHT, boots, peak < 24 GB). Re-tune the Gemma
+# dense activation/per-token terms only with ≥4 gemma-4-12b anchors across KV
+# format / ctx / TP — do NOT fit to this single boot.
+rows:
+  - compose: vllm/gemma-12b-mtp
+    vram_gb: 24
+    measured_peak_gb: 21.6
+    ctx_override: null
+    status: active
+    engine_pin: vllm-gemma4-unified
+    genesis_pin: null
+    source: "gemma4-unified boot log @2026-06-04 (KV 384,019 tok / 8.16 GiB avail / 2.93× conc, TP=2 bf16 131072 mem_util 0.90, MTP drafter resident)"
+  - compose: vllm/gemma-12b
+    vram_gb: 24
+    measured_peak_gb: 21.6
+    ctx_override: null
+    status: active
+    engine_pin: vllm-gemma4-unified
+    genesis_pin: null
+    source: "gemma4-unified boot log @2026-06-04 (no-drafter sibling of the MTP anchor; same budget-filling KV-pool reservation, peak ≈ budget)"

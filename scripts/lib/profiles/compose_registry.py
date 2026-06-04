@@ -546,6 +546,36 @@ COMPOSE_REGISTRY = {
         kvcalc_key="gemma-4-31b:gemma-dual-int8",
     ),
 
+    # Gemma-4-12B (gemma4_unified arch — vLLM PR #44429, merged 2026-06-03),
+    # dual-3090 bf16 on the ephemeral vllm/vllm-openai:gemma4-unified preview
+    # image (== today's vLLM main; Gemma-4 fixes baked in, nothing vendored).
+    # bf16 weights (~24 GB) don't fit one 24 GB card with KV → TP=2 mandatory.
+    # Both EXPERIMENTAL: arch-preview image, sm_86 gemma4_unified support
+    # unverified, ephemeral tag (pin a digest before promotion). Max ctx 131072
+    # is the HARD ceiling (card claims 256K but vLLM OOB-crashes past the
+    # trained max, vllm#39914). kvcalc routes through the shared Gemma dense
+    # path (gemma4_unified TEXT backbone == gemma4-swa-dense KV family).
+    "vllm/gemma-12b": _entry(
+        model="gemma-4-12b", weights_variant="bf16", workload="fast-chat",
+        engine="vllm-gemma4-unified", drafter=None, kv_format="bf16",
+        tp=2, max_ctx=131072, max_num_seqs=4, mem_util=0.90,
+        compose_path="models/gemma-4-12b/vllm/compose/dual/bf16/base.yml",
+        default_port=8035,
+        kvcalc_key="gemma-4-12b:gemma-dual",
+        status="experimental",
+        status_note="Gemma-4-12B (gemma4_unified, vLLM PR #44429) dual-3090 bf16, no drafter. Ephemeral gemma4-unified arch-preview image; sm_86 support UNVERIFIED. Max ctx 131072 = hard ceiling (256K card-claim OOB-crashes vLLM past the trained max, vllm#39914). Pin a digest before any Production promotion.",
+    ),
+    "vllm/gemma-12b-mtp": _entry(
+        model="gemma-4-12b", weights_variant="bf16", workload="fast-chat",
+        engine="vllm-gemma4-unified", drafter="gemma-12b-it-assistant", kv_format="bf16",
+        tp=2, max_ctx=131072, max_num_seqs=4, mem_util=0.90,
+        compose_path="models/gemma-4-12b/vllm/compose/dual/bf16/mtp.yml",
+        default_port=8036,
+        kvcalc_key="gemma-4-12b:gemma-dual",
+        status="experimental",
+        status_note="Gemma-4-12B (gemma4_unified, vLLM PR #44429) dual-3090 bf16 + assistant spec-dec (n=4). Ephemeral gemma4-unified arch-preview image; sm_86 support UNVERIFIED. Max ctx 131072 = hard ceiling (256K card-claim OOB-crashes vLLM past the trained max, vllm#39914). Pin a digest before any Production promotion.",
+    ),
+
     # Gemma-4-31B beellama.cpp DFlash — single-card DEFAULT (Q4_K_S target +
     # Anbeeld DFlash-IQ4_XS draft, q5_0(K)/q4_1(V) KV). The ONLY viable fast
     # single-card Gemma-4 path: does SWA windowed KV (big ctx) AND Gemma-4
