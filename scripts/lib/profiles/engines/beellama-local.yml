@@ -14,6 +14,7 @@ supported_model_families:
   - qwen3-next-hybrid
   - qwen3-next-moe
   - gemma4-swa-dense
+  - gemma4-unified
 features: {}
 supported_kv_formats:
   - q4_0

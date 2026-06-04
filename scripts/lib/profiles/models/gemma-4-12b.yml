@@ -39,6 +39,30 @@ weights:
     engine: vllm
     kind: draft
     verify_glob: "*.safetensors"
+  beellama-q8kxl:
+    path: gemma-4-12b-gguf/unsloth-ud-q8kxl
+    local_subdir: gemma-4-12b-gguf/unsloth-ud-q8kxl
+    size_gb: 13.6
+    format: gguf
+    status: experimental
+    hf_repo: unsloth/gemma-4-12b-it-GGUF
+    files:
+      - gemma-4-12b-it-UD-Q8_K_XL.gguf
+    engine: beellama
+    kind: gguf
+    verify_glob: "*.gguf"
+  unsloth-q8kxl:
+    path: gemma-4-12b-gguf/unsloth-ud-q8kxl
+    local_subdir: gemma-4-12b-gguf/unsloth-ud-q8kxl
+    size_gb: 13.6
+    format: gguf
+    status: experimental
+    hf_repo: unsloth/gemma-4-12b-it-GGUF
+    files:
+      - gemma-4-12b-it-UD-Q8_K_XL.gguf
+    engine: llama-cpp
+    kind: gguf
+    verify_glob: "*.gguf"
 default_weight_variant: bf16
 compatible_drafters:
   - gemma-12b-it-assistant

@@ -578,6 +578,32 @@ COMPOSE_REGISTRY = {
         status_note="Gemma-4-12B (gemma4_unified, vLLM PR #44429) dual-3090 bf16 + assistant spec-dec (n=4). Ephemeral gemma4-unified arch-preview image; sm_86 support UNVERIFIED. Max ctx 262144 via local vllm-gemma4-prope-longctx p-RoPE cache overlay (vllm#39914). Pin a digest before any Production promotion.",
     ),
 
+    # Gemma-4-12B single-card GGUF (Q8_K_XL) — the two engine-native single-3090
+    # paths that fit the bf16-too-big model in 24 GB. Both llama.cpp-family
+    # (kvcalc SKIP, no vLLM kv-calc); 256K via `--override-kv` p-RoPE; no
+    # spec-dec (gemma4 MTP draft arch unmerged, llama.cpp#23398). NIAH-clean to
+    # 246K on a single 3090.
+    "beellama/gemma-12b": _entry(
+        model="gemma-4-12b", weights_variant="beellama-q8kxl", workload="fast-chat",
+        engine="beellama-local", drafter=None, kv_format="q5_0",
+        tp=1, max_ctx=262144, max_num_seqs=1, mem_util=None,
+        compose_path="models/gemma-4-12b/beellama/compose/single/beellama-q8kxl/base.yml",
+        default_port=8067,
+        kvcalc_key="SKIP",
+        status="experimental",
+        status_note="Gemma-4-12B Q8_K_XL single-3090 on beellama.cpp (q5_0(K)/q4_1(V) KV, 256K via --override-kv, no spec-dec). NIAH-clean to 246K. Launchers inject Anbeeld's official server-cuda-v0.3.0 image (sm_86). v0.3.0 is a DEV branch → experimental; promote on a stable tag.",
+    ),
+    "llamacpp/gemma-12b": _entry(
+        model="gemma-4-12b", weights_variant="unsloth-q8kxl", workload="fast-chat",
+        engine="llama-cpp-local", drafter=None, kv_format="q8_0",
+        tp=1, max_ctx=262144, max_num_seqs=1, mem_util=None,
+        compose_path="models/gemma-4-12b/llama-cpp/compose/single/unsloth-q8kxl/base.yml",
+        default_port=8069,
+        kvcalc_key="SKIP",
+        status="experimental",
+        status_note="Gemma-4-12B Q8_K_XL single-3090 on mainline llama.cpp (q8_0 KV, 256K via --override-kv, no spec-dec). NIAH-clean to 246K. The no-fork mainline sibling of beellama/gemma-12b; no Gemma-4 spec-dec until llama.cpp#23398 merges.",
+    ),
+
     # Gemma-4-31B beellama.cpp DFlash — single-card DEFAULT (Q4_K_S target +
     # Anbeeld DFlash-IQ4_XS draft, q5_0(K)/q4_1(V) KV). The ONLY viable fast
     # single-card Gemma-4 path: does SWA windowed KV (big ctx) AND Gemma-4
