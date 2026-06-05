@@ -726,7 +726,7 @@ COMPOSE_REGISTRY = {
     "vllm/qwen-a3b-preview-single": _entry(
         model="qwen3.6-35b-a3b", weights_variant="autoround-int4", workload="fast-chat",
         engine="vllm-nightly-clean", drafter=None, kv_format="fp8_e5m2",
-        tp=1, max_ctx=8192, max_num_seqs=1, mem_util=0.92,
+        tp=1, max_ctx=8192, max_num_seqs=1, mem_util=0.95,
         compose_path="models/qwen3.6-35b-a3b/vllm/compose/single/autoround-int4/preview.yml",
         default_port=8050,
         kvcalc_key="qwen3.6-35b-a3b:qwen-a3b-preview-single",

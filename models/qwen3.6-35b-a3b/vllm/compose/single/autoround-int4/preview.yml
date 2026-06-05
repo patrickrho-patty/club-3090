@@ -100,8 +100,12 @@ services:
       - "${PP:-1}"
       - --max-model-len
       - "${MAX_MODEL_LEN:-8192}"
+      # 0.95 (was 0.92): v0.22.0 CUDA-graph memory profiling (default since
+      # v0.21.0) trims effective KV — at 0.92 the single-card KV check OOM'd on
+      # v0.22.0 (~20 GB weights leave too little KV on one 24 GB card). 0.95 is
+      # the documented headless-Linux single-card default; WSL2 → 0.94 via .env.
       - --gpu-memory-utilization
-      - "${GPU_MEMORY_UTILIZATION:-0.92}"
+      - "${GPU_MEMORY_UTILIZATION:-0.95}"
       - --max-num-seqs
       - "1"
       - --max-num-batched-tokens
