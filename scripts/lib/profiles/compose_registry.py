@@ -189,7 +189,7 @@ COMPOSE_REGISTRY = {
     ),
     "vllm/minimal": _entry(
         model="qwen3.6-27b", weights_variant="autoround-int4", workload="fast-chat",
-        engine="vllm-nightly-clean", drafter=None, kv_format="fp8_e5m2",
+        engine="vllm-stable", drafter=None, kv_format="fp8_e5m2",
         tp=1, max_ctx=32768, max_num_seqs=1, mem_util=0.92,
         compose_path="models/qwen3.6-27b/vllm/compose/single/autoround-int4/minimal.yml",
         default_port=8020,
@@ -199,10 +199,10 @@ COMPOSE_REGISTRY = {
     # Qwen 3.6 27B, vLLM dual/multi-card.
     "vllm/dual": _entry(
         model="qwen3.6-27b", weights_variant="autoround-int4", workload="long-ctx-single",
-        engine="vllm-nightly-clean", drafter="qwen-mtp-builtin", kv_format="fp8_e5m2",
+        engine="vllm-stable", drafter="qwen-mtp-builtin", kv_format="fp8_e5m2",
         tp=2, max_ctx=262144, max_num_seqs=2, mem_util=0.92,
         compose_path="models/qwen3.6-27b/vllm/compose/dual/autoround-int4/fp8-mtp.yml",
-        default_port=8010, recommended_engine_features=["marlin_pad_sub_tile_n"],
+        default_port=8010,
         kvcalc_key="qwen3.6-27b:dual",
     ),
     "vllm/dual-turbo": _entry(
@@ -735,7 +735,7 @@ COMPOSE_REGISTRY = {
     ),
     "vllm/qwen-35b-a3b-dual": _entry(
         model="qwen3.6-35b-a3b", weights_variant="autoround-int4", workload="fast-chat",
-        engine="vllm-nightly-clean", drafter=None, kv_format="fp8_e5m2",
+        engine="vllm-stable", drafter=None, kv_format="fp8_e5m2",
         tp=2, max_ctx=262144, max_num_seqs=1, mem_util=0.92,
         compose_path="models/qwen3.6-35b-a3b/vllm/compose/dual/autoround-int4/fp8.yml",
         default_port=8051,

@@ -78,15 +78,15 @@ assert_contains "$out" "Pass 2 fits()"
 out="$(python3 "$HELPER" resolve-engine-pin --engine-id vllm-nightly-mtp --format shell)"
 assert_contains "$out" "VLLM_NIGHTLY_SHA=${MTP_SHA}"
 
-if out="$(python3 "$HELPER" resolve-engine-pin --engine-id vllm-stable --format shell 2>&1)"; then
-  echo "ASSERTION FAILED: pip-only vllm-stable unexpectedly resolved as a docker nightly" >&2
+if out="$(python3 "$HELPER" resolve-engine-pin --engine-id vllm-pip-baseline --format shell 2>&1)"; then
+  echo "ASSERTION FAILED: pip-only vllm-pip-baseline unexpectedly resolved as a docker nightly" >&2
   echo "$out" >&2
   exit 1
 fi
 assert_contains "$out" "install.spec is not a docker image"
 
 out="$(python3 "$HELPER" resolve-variant-pin --variant vllm/dual --format shell)"
-assert_contains "$out" "VLLM_NIGHTLY_SHA=${CLEAN_SHA}"
+assert_contains "$out" "VLLM_IMAGE=vllm/vllm-openai:v0.22.0"
 
 out="$(python3 "$HELPER" resolve-variant-pin --variant vllm/dual-tq3-mtp --format shell)"
 assert_contains "$out" "VLLM_NIGHTLY_SHA=${MTP_SHA}"
@@ -109,13 +109,12 @@ from scripts.lib.profiles.estate_cli import compose_env
 clean = compose_env(InstanceSpec(name="qwen", compose_name="vllm/dual", gpu_indices=(0, 1), port=8010))
 tq3 = compose_env(InstanceSpec(name="qwen-tq3", compose_name="vllm/dual-tq3-mtp", gpu_indices=(0, 1), port=8010))
 gemma = compose_env(InstanceSpec(name="gemma", compose_name="vllm/gemma-int8-mtp", gpu_indices=(0, 1), port=8032))
-print(clean["VLLM_NIGHTLY_SHA"])
+print(clean["VLLM_IMAGE"])
 print(tq3["VLLM_NIGHTLY_SHA"])
 print(gemma["VLLM_IMAGE"])
 PY
 )"
-assert_contains "$out" "$CLEAN_SHA"
-assert_contains "$out" "$MTP_SHA"
 assert_contains "$out" "vllm/vllm-openai:v0.22.0"
+assert_contains "$out" "$MTP_SHA"
 
 echo "test-launch-compat: ok"

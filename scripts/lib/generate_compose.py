@@ -208,7 +208,7 @@ def validate_engine_pin(engine_id: str, engine: dict, arch_row: dict) -> str:
     ``image: ${VLLM_IMAGE:-...}`` expression untouched (correction #2).
     """
     spec = (engine.get("install") or {}).get("spec", "")
-    # spec looks like 'vllm/vllm-openai:nightly-<sha>' or 'vllm-stable@0.20.2'
+    # spec looks like 'vllm/vllm-openai:nightly-<sha>' or 'vllm-pip-baseline@0.20.2'
     sha = ""
     if ":" in spec and "nightly-" in spec:
         sha = spec.split("nightly-", 1)[1].strip()

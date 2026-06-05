@@ -153,7 +153,7 @@ check(
 # Path-B happy: a plain vLLM profile passes stratum-2 (shape-only).
 s2_ok = G.stratum2_profile_like("vllm/minimal", path="B")
 check(
-    s2_ok.ok and s2_ok.refusal is None and s2_ok.engine_id == "vllm-nightly-clean",
+    s2_ok.ok and s2_ok.refusal is None and s2_ok.engine_id == "vllm-stable",
     f"stratum-2: vllm/minimal (Path B) ok (got {s2_ok.refusal})",
 )
 # Path-A happy: curated model+variant match + emittable.

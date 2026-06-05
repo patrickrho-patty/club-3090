@@ -26,7 +26,7 @@ p = load_profiles()
 assert len(p.hardware) == 9
 assert len(p.models) == 5
 assert len(p.workloads) == 5
-assert len(p.engines) == 10
+assert len(p.engines) == 11
 assert len(p.drafters) == 9
 assert len(p.calibration) == 5
 PY
@@ -296,7 +296,7 @@ from scripts.lib.profiles.compat import load_profiles, to_compose_name
 p = load_profiles()
 name = to_compose_name(
     p.models["qwen3.6-27b"],
-    p.engines["vllm-nightly-clean"],
+    p.engines["vllm-stable"],
     p.drafters["qwen-mtp-builtin"],
     "fp8_e5m2",
     2,

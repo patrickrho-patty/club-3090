@@ -229,12 +229,12 @@ expect_refuse(
               gpu_count=1, sel_gpus=(0,)),
     "derived-runtime-unsupported:gpu-count", "e1-neg/gpu-count")
 
-# engine-install-method: a pip-install engine (vllm-stable, install.method
+# engine-install-method: a pip-install engine (vllm-pip-baseline, install.method
 # pip). No registry entry uses it; synthesize the runtime to point at it.
 ei_pip = mk_einput("vllm/gemma-a4b-single",
                    der=mk_der(weight_format="bfloat16", torch_dtype="bfloat16"),
                    gpu_count=1, sel_gpus=(0,))
-ei_pip.runtime["engine"] = "vllm-stable"
+ei_pip.runtime["engine"] = "vllm-pip-baseline"
 expect_refuse(ei_pip, "derived-runtime-unsupported:engine-install-method",
               "e1-neg/engine-install-method")
 

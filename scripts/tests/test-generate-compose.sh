@@ -10,8 +10,8 @@ set -euo pipefail
 #
 # 5 golden triples, all verified genesis_equipped:false in
 # profile_runtime.yml, spanning every in-scope engine class:
-#   vllm/minimal      vllm-nightly-clean, tp1, fp8,  drafter=None
-#   vllm/dual         vllm-nightly-clean, tp2, fp8,  mtp
+#   vllm/minimal      vllm-stable, tp1, fp8,  drafter=None
+#   vllm/dual         vllm-stable, tp2, fp8,  mtp
 #   vllm/gemma-bf16-mtp    vllm-gemma-stable, gemma, bf16
 #   vllm/gemma-int8-mtp   vllm-gemma-stable, int8-PTH, multi-file overlay
 #   vllm/gemma-mtp-tp1 vllm-gemma-stable, single-card fp8 risk path

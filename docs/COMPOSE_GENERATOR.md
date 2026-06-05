@@ -119,7 +119,7 @@ generates — it is a discovery aid so you can find the authoritative profile
 name:
 
 ```text
-$ scripts/generate-compose.sh --model gemma-4-31b --engine vllm-gemma-stable
+$ scripts/generate-compose.sh --model gemma-4-31b --engine vllm-stable
 convenience tuple matched these profiles (re-run with an authoritative --profile):
   --profile vllm/gemma-int8-mtp
   --profile vllm/gemma-bf16-mtp
@@ -358,9 +358,9 @@ in-scope engine class:
 |---|---|---|
 | `vllm/minimal` | `vllm-nightly-clean` | tp1, fp8, drafter=None; surfaces the qwen3coder delivery-gap as undelivered |
 | `vllm/dual` | `vllm-nightly-clean` | tp2, fp8, MTP drafter |
-| `vllm/gemma-bf16-mtp` | `vllm-gemma-stable` | gemma, bf16 |
-| `vllm/gemma-int8-mtp` | `vllm-gemma-stable` | int8-PTH, multi-file overlay |
-| `vllm/gemma-mtp-tp1` | `vllm-gemma-stable` | single-card fp8 risk path |
+| `vllm/gemma-bf16-mtp` | `vllm-stable` | gemma, bf16 |
+| `vllm/gemma-int8-mtp` | `vllm-stable` | int8-PTH, multi-file overlay |
+| `vllm/gemma-mtp-tp1` | `vllm-stable` | single-card fp8 risk path |
 
 Per triple the test asserts: the semantic diff vs the shipped compose is
 confined to the two patch insertion points (image expression + every constant

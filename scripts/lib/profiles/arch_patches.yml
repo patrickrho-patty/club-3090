@@ -3,6 +3,8 @@ arches:
   - arch: Qwen3NextForCausalLM
     family: qwen3-next-hybrid
     engine_pin:
+      - pin: vllm-stable@v0.22.0
+        loads: true
       - pin: vllm-nightly-clean@bf610c2f56764e1b30bc6065f4ceace3d6e59036
         loads: true
       - pin: vllm-nightly-mtp@01d4d1ad375dc5854779c593eee093bcebb0cada
@@ -36,6 +38,8 @@ arches:
   - arch: Qwen3_5MoeForConditionalGeneration
     family: qwen3-next-moe
     engine_pin:
+      - pin: vllm-stable@v0.22.0
+        loads: true
       - pin: vllm-nightly-clean@bf610c2f56764e1b30bc6065f4ceace3d6e59036
         loads: true
       - pin: vllm-nightly-mtp@01d4d1ad375dc5854779c593eee093bcebb0cada
@@ -130,7 +134,9 @@ arches:
   - arch: LlamaForCausalLM
     family: dense
     engine_pin:
-      - pin: vllm-stable@0.20.2
+      - pin: vllm-stable@v0.22.0
+        loads: true
+      - pin: vllm-pip-baseline@0.20.2
         loads: true
       - pin: vllm-nightly-clean@bf610c2f56764e1b30bc6065f4ceace3d6e59036
         loads: true
@@ -150,7 +156,9 @@ arches:
   - arch: MistralForCausalLM
     family: dense
     engine_pin:
-      - pin: vllm-stable@0.20.2
+      - pin: vllm-stable@v0.22.0
+        loads: true
+      - pin: vllm-pip-baseline@0.20.2
         loads: true
       - pin: vllm-nightly-clean@bf610c2f56764e1b30bc6065f4ceace3d6e59036
         loads: true
@@ -170,7 +178,9 @@ arches:
   - arch: Qwen2ForCausalLM
     family: dense
     engine_pin:
-      - pin: vllm-stable@0.20.2
+      - pin: vllm-stable@v0.22.0
+        loads: true
+      - pin: vllm-pip-baseline@0.20.2
         loads: true
       - pin: vllm-nightly-clean@bf610c2f56764e1b30bc6065f4ceace3d6e59036
         loads: true
@@ -190,6 +200,8 @@ arches:
   - arch: Qwen3ForCausalLM
     family: dense
     engine_pin:
+      - pin: vllm-stable@v0.22.0
+        loads: true
       - pin: vllm-stable-next@>=0.21.0rc0,<0.21.0
         loads: true
       - pin: vllm-nightly-clean@bf610c2f56764e1b30bc6065f4ceace3d6e59036
@@ -210,7 +222,9 @@ arches:
   - arch: Phi3ForCausalLM
     family: dense
     engine_pin:
-      - pin: vllm-stable@0.20.2
+      - pin: vllm-stable@v0.22.0
+        loads: true
+      - pin: vllm-pip-baseline@0.20.2
         loads: true
       - pin: vllm-nightly-clean@bf610c2f56764e1b30bc6065f4ceace3d6e59036
         loads: true
@@ -230,7 +244,9 @@ arches:
   - arch: Gemma2ForCausalLM
     family: dense
     engine_pin:
-      - pin: vllm-stable@0.20.2
+      - pin: vllm-stable@v0.22.0
+        loads: true
+      - pin: vllm-pip-baseline@0.20.2
         loads: true
       - pin: vllm-nightly-clean@bf610c2f56764e1b30bc6065f4ceace3d6e59036
         loads: true
@@ -301,7 +317,9 @@ arches:
   - arch: PhiForCausalLM
     family: dense
     engine_pin:
-      - pin: vllm-stable@0.20.2
+      - pin: vllm-stable@v0.22.0
+        loads: true
+      - pin: vllm-pip-baseline@0.20.2
         loads: true
       - pin: vllm-nightly-clean@bf610c2f56764e1b30bc6065f4ceace3d6e59036
         loads: true
@@ -321,7 +339,9 @@ arches:
   - arch: Phi3SmallForCausalLM
     family: dense
     engine_pin:
-      - pin: vllm-stable@0.20.2
+      - pin: vllm-stable@v0.22.0
+        loads: true
+      - pin: vllm-pip-baseline@0.20.2
         loads: true
       - pin: vllm-nightly-clean@bf610c2f56764e1b30bc6065f4ceace3d6e59036
         loads: true
@@ -341,7 +361,9 @@ arches:
   - arch: GemmaForCausalLM
     family: dense
     engine_pin:
-      - pin: vllm-stable@0.20.2
+      - pin: vllm-stable@v0.22.0
+        loads: true
+      - pin: vllm-pip-baseline@0.20.2
         loads: true
       - pin: vllm-nightly-clean@bf610c2f56764e1b30bc6065f4ceace3d6e59036
         loads: true
@@ -361,7 +383,9 @@ arches:
   - arch: Gemma3ForCausalLM
     family: dense
     engine_pin:
-      - pin: vllm-stable@0.20.2
+      - pin: vllm-stable@v0.22.0
+        loads: true
+      - pin: vllm-pip-baseline@0.20.2
         loads: true
       - pin: vllm-nightly-clean@bf610c2f56764e1b30bc6065f4ceace3d6e59036
         loads: true
@@ -382,7 +406,9 @@ arches:
   - arch: Gemma3ForConditionalGeneration
     family: dense
     engine_pin:
-      - pin: vllm-stable@0.20.2
+      - pin: vllm-stable@v0.22.0
+        loads: true
+      - pin: vllm-pip-baseline@0.20.2
         loads: true
       - pin: vllm-nightly-clean@bf610c2f56764e1b30bc6065f4ceace3d6e59036
         loads: true
@@ -403,7 +429,9 @@ arches:
   - arch: Starcoder2ForCausalLM
     family: dense
     engine_pin:
-      - pin: vllm-stable@0.20.2
+      - pin: vllm-stable@v0.22.0
+        loads: true
+      - pin: vllm-pip-baseline@0.20.2
         loads: true
       - pin: vllm-nightly-clean@bf610c2f56764e1b30bc6065f4ceace3d6e59036
         loads: true
@@ -423,7 +451,9 @@ arches:
   - arch: CohereForCausalLM
     family: dense
     engine_pin:
-      - pin: vllm-stable@0.20.2
+      - pin: vllm-stable@v0.22.0
+        loads: true
+      - pin: vllm-pip-baseline@0.20.2
         loads: true
       - pin: vllm-nightly-clean@bf610c2f56764e1b30bc6065f4ceace3d6e59036
         loads: true
@@ -443,7 +473,9 @@ arches:
   - arch: InternLM2ForCausalLM
     family: dense
     engine_pin:
-      - pin: vllm-stable@0.20.2
+      - pin: vllm-stable@v0.22.0
+        loads: true
+      - pin: vllm-pip-baseline@0.20.2
         loads: true
       - pin: vllm-nightly-clean@bf610c2f56764e1b30bc6065f4ceace3d6e59036
         loads: true
@@ -463,7 +495,7 @@ arches:
   - arch: MixtralForCausalLM
     family: moe
     engine_pin:
-      - pin: vllm-stable@0.20.2
+      - pin: vllm-pip-baseline@0.20.2
         loads: true
       - pin: vllm-nightly-clean@bf610c2f56764e1b30bc6065f4ceace3d6e59036
         loads: true
@@ -483,7 +515,7 @@ arches:
   - arch: Qwen2MoeForCausalLM
     family: moe
     engine_pin:
-      - pin: vllm-stable@0.20.2
+      - pin: vllm-pip-baseline@0.20.2
         loads: true
       - pin: vllm-nightly-clean@bf610c2f56764e1b30bc6065f4ceace3d6e59036
         loads: true
@@ -503,7 +535,7 @@ arches:
   - arch: Qwen3MoeForCausalLM
     family: moe
     engine_pin:
-      - pin: vllm-stable@0.20.2
+      - pin: vllm-pip-baseline@0.20.2
         loads: true
       - pin: vllm-nightly-clean@bf610c2f56764e1b30bc6065f4ceace3d6e59036
         loads: true
@@ -523,7 +555,9 @@ arches:
   - arch: Qwen2VLForConditionalGeneration
     family: dense
     engine_pin:
-      - pin: vllm-stable@0.20.2
+      - pin: vllm-stable@v0.22.0
+        loads: true
+      - pin: vllm-pip-baseline@0.20.2
         loads: true
       - pin: vllm-nightly-clean@bf610c2f56764e1b30bc6065f4ceace3d6e59036
         loads: true
