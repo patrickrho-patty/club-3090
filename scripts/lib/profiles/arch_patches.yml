@@ -8,8 +8,8 @@ arches:
       - pin: vllm-nightly-clean@bf610c2f56764e1b30bc6065f4ceace3d6e59036
         loads: true
       - pin: vllm-nightly-mtp@01d4d1ad375dc5854779c593eee093bcebb0cada
-        loads: true
-        enables: [tq3-kv, mtp, genesis]
+        loads: false
+        reason: "Engine DEPRECATED 2026-06-05 (#254): purged nightly + Genesis path on hold; zero registry users, not offered for derive."
       - pin: vllm-nightly-dflash@e47c98ef7a38792996e452ef53914e21e41928e9
         loads: true
         enables: [dflash]

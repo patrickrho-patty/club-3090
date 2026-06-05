@@ -12,6 +12,8 @@ schema_version: 1
 # not add new compose wiring decisions to the boolean block.
 patches:
   - id: qwen-sglang-autoround-fused-bf16
+    deprecated_on: "2026-06-05"
+    deprecation_reason: "SGLang path parked; no functional compose uses it (#254)."
     model: [qwen3.6-27b]
     files:
       - models/qwen3.6-27b/sglang/patches/patch_sglang_autoround_fused_bf16.py
@@ -33,6 +35,8 @@ patches:
     status: suspect
 
   - id: qwen-sglang-eagle3
+    deprecated_on: "2026-06-05"
+    deprecation_reason: "SGLang path parked; no functional compose uses it (#254)."
     model: [qwen3.6-27b]
     files:
       - models/qwen3.6-27b/sglang/patches/patch_sglang_eagle3.py
@@ -129,6 +133,8 @@ patches:
     status: verified
 
   - id: qwen-vllm-pr40798-rebased
+    deprecated_on: "2026-06-05"
+    deprecation_reason: "negative-local-result; abandoned, no functional compose uses it (#254)."
     model: [qwen3.6-27b]
     files:
       - models/qwen3.6-27b/vllm/patches/vllm-pr40798-rebased
@@ -150,6 +156,8 @@ patches:
     status: suspect
 
   - id: qwen-vllm-pr40914-k1-only
+    deprecated_on: "2026-06-05"
+    deprecation_reason: "negative-local-result; superseded, no functional compose uses it (#254)."
     model: [qwen3.6-27b]
     files:
       - models/qwen3.6-27b/vllm/patches/vllm-pr40914-k1-only
@@ -287,6 +295,8 @@ patches:
     status: verified
 
   - id: qwen-carnice-chat-template
+    deprecated_on: "2026-06-05"
+    deprecation_reason: "carnice fine-tune compose archived to _archive/; orphaned (#254)."
     model: [qwen3.6-27b]
     files:
       - models/qwen3.6-27b/vllm/patches/carnice-chat-template.jinja
@@ -356,6 +366,8 @@ patches:
     status: unverified
 
   - id: gemma-vllm-pr41800-truncate-prompt-tokens
+    deprecated_on: "2026-06-05"
+    deprecation_reason: "merged upstream + redundant on stock v0.22.0 (#254)."
     model: [gemma-4-31b]
     files:
       - models/gemma-4-31b/vllm/patches/vllm-pr41800-truncate-prompt-tokens
@@ -381,6 +393,8 @@ patches:
     status: verified
 
   - id: gemma-vllm-gemma4-fp8-ampere
+    deprecated_on: "2026-06-05"
+    deprecation_reason: "fp8 KV is hardware-dead on Ampere sm_86; never shippable here (#254)."
     model: [gemma-4-31b]
     files:
       - models/gemma-4-31b/vllm/patches/vllm-gemma4-fp8-ampere
@@ -439,6 +453,8 @@ patches:
 
 
   - id: gemma-vllm-perheadkv-hybridpage-fix
+    deprecated_on: "2026-06-05"
+    deprecation_reason: "superseded by gemma-vllm-pr40391-rebased (#254)."
     model: [gemma-4-31b]
     files:
       - models/gemma-4-31b/vllm/patches/vllm-perheadkv-hybridpage-fix
@@ -460,6 +476,8 @@ patches:
     status: suspect
 
   - id: gemma-vllm-pr40391-perheadkv
+    deprecated_on: "2026-06-05"
+    deprecation_reason: "superseded by gemma-vllm-pr40391-rebased (#254)."
     model: [gemma-4-31b]
     files:
       - models/gemma-4-31b/vllm/patches/vllm-pr40391-perheadkv
@@ -552,6 +570,8 @@ patches:
 
   - &genesis_env_patch
     id: genesis-p4
+    deprecated_on: "2026-06-05"
+    deprecation_reason: "Genesis env-gated patch; Genesis path retired/on-hold upstream, no live compose uses it (#254). Anchor-inherited by all genesis-p* entries."
     model: [qwen3.6-27b]
     files: []
     genesis_env: GENESIS_ENABLE_P4

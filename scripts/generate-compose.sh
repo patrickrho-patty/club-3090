@@ -11,7 +11,7 @@
 # Usage:
 #   scripts/generate-compose.sh --profile vllm/minimal [--out FILE]
 #   scripts/generate-compose.sh --profile vllm/gemma-int8-mtp --accept-degraded
-#   scripts/generate-compose.sh --model gemma-4-31b --engine vllm-nightly-full
+#   scripts/generate-compose.sh --model gemma-4-31b --engine vllm-gemma-stable
 #       # convenience tuple: prints candidate --profile values, exits non-zero
 #
 # All decision logic lives in scripts/lib/generate_compose.py (this is a
