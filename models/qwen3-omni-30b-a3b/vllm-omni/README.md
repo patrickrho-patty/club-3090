@@ -130,7 +130,48 @@ Tune per-stage VRAM/context in the mounted **`qwen3_omni_3090.yaml`** (thinker o
 
 ---
 
+## Using GPU1's spare VRAM for image / video generation (future — not done yet)
+
+We looked at co-locating an image-gen model on GPU1 alongside the audio stages and **shelved it.** The binding constraint: every quality image model bundles a **large text encoder** (~8 GB+) that blows the ~8–11 GB co-located budget — even though the *transformer* quantizes small:
+
+| Image model | text encoder | full-pipeline VRAM |
+|---|---|---|
+| FLUX.1-dev | T5-XXL ~5–8 GB | ~14 GB (Q8) |
+| FLUX.2-klein / Z-Image-Turbo | Qwen3-4B ~8 GB | ~10–15 GB |
+| FLUX.2-dev | **Mistral-3-24B** | huge — multi-GPU |
+| Ideogram-4 | Qwen3-VL-8B (+ dual transformer) | ~18–20 GB (NF4) |
+
+**So don't co-locate — time-share the card.** Since chat and image gen are rarely simultaneous: run omni for conversation, and when you want images either stop omni or run it **thinker-only** to free the full 24 GB of GPU1 for a dedicated image model.
+
+**Best open-weight image models for a freed 24 GB GPU1** (quality-ranked, all run in ComfyUI):
+
+| Model | ~VRAM (quant) | Why |
+|---|---|---|
+| **FLUX.1-dev** (Q8 GGUF) | ~14 GB | aesthetic/photoreal benchmark; most mature in ComfyUI |
+| **Qwen-Image** (Q4 GGUF) | ~14 GB | best **text-in-image** + prompt adherence |
+| **HiDream-I1** (Q5) | ~12 GB | top open quality (tight) |
+| **FLUX.2-klein-4B** (Q8) | ~8 GB | newer-gen, smaller/faster; lighter ceiling |
+| **Z-Image-Turbo** (Q6) | ~10 GB | 6B turbo (sub-second), photoreal; also vLLM-Omni-tested |
+| **Ideogram-4** (NF4) | ~18–20 GB | #1 open on DesignArena, but eats the whole card; diffusers/ComfyUI only |
+| SD-3.5-medium / Sana | ~5 GB | budget / fast |
+
+**Video** (VRAM-hungry — full card minimum): **Cosmos3-Nano**, **LTX-2 / 2.3** are the feasible-on-one-3090 options; **Wan2.2** (14B) and **HunyuanVideo-1.5** want quant + a full card and are tight.
+
+## UI recommendations
+
+- **Image / video generation → use [ComfyUI](https://github.com/comfyanonymous/ComfyUI), NOT this omni model.** Qwen3-Omni only generates text + speech; image/video are separate models, and ComfyUI is the mature runtime for them (GGUF/NF4/fp8 quants, LoRA, ControlNet, day-0 model support, node-graph workflows).
+- **Chat UI → [Open WebUI](https://github.com/open-webui/open-webui).** A clean OpenAI-compatible front-end — point it at this omni endpoint (and the rig's other LLMs) for conversation. It can *also* trigger image generation via a **ComfyUI backend**, so the tidy combined setup is: **Open WebUI as the front door (chat + image requests) → ComfyUI as the image/video engine.**
+
+## Lessons for 2× 3090 (from this deploy — worth knowing)
+
+- **The text encoder is the hidden VRAM cost.** A "4B"/"6B" image model often drags an 8–24 GB encoder. Always size the *full pipeline*, not the transformer.
+- **On PCIe-no-NVLink, reach full context with fp8/int8 KV on a single card before reaching for TP/PP.** fp8 KV got the omni thinker to its full 65 K on one card with zero cross-card all-reduce — strictly better than tensor/pipeline-parallel here.
+- **Pin pre-release engine images by exact tag + verify on boot.** `latest`/`rc` tags are frequently internally version-skewed (vLLM-Omni `latest` == `v0.21.0rc1` shipped a mismatched vLLM → ImportError). A `docker pull latest` is not reproducible.
+- **Request-level flags can swing perf 10×.** This model's text rate went **12 → 164 tok/s** just by adding `"modalities":["text"]`. Bench the path you'll actually use.
+- **Quantized diffusion: GGUF Q5/Q6 ≈ near-lossless** and FLUX-class tolerates Q4 well — but GGUF shrinks only the transformer; the encoder needs separate quant or CPU offload.
+
+For general 2× 3090 model guidance see the repo's `docs/DUAL_CARD.md` and `docs/FAQ.md`.
+
 ## Notes for maintainers
 
-- **Not registry-wired on purpose** — it's a custom-engine (vLLM-Omni) exploratory deploy. No `compose_registry.py` entry, no `switch.sh`/`launch.sh` integration; direct `docker compose` only.
-- Co-locating an **image-generation** model on GPU1 alongside the audio stages was investigated and shelved: every quality image model drags an ~8 GB text encoder that blows the co-located budget. Image gen wants a dedicated card (time-share), not co-residence.
+- **Not registry-wired on purpose** — custom-engine (vLLM-Omni) exploratory deploy. No `compose_registry.py` entry, no `switch.sh`/`launch.sh`; direct `docker compose` only.
