@@ -82,11 +82,12 @@ curl localhost:8042/v1/chat/completions -H 'Content-Type: application/json' -d '
 ## Performance (measured on this rig)
 
 - **Context:** full **65,536** (native max) on the single-card thinker via fp8 KV. NIAH recall PASS at 60 K (50 % & 90 % depth).
-- **Decode:** ~12 tok/s single-stream (the multi-stage omni wrapper adds overhead vs a plain text model; this is expected).
+- **Decode (text, `modalities:["text"]`):** **~164 tok/s** single-stream (3 runs, rock-steady) — the thinker's true text rate.
+- **Decode (full speech pipeline, no `modalities:text`):** ~12 tok/s — vocoder-bound (Code2Wav, `enforce_eager`). This is the *audio-synthesis* rate, **not** a text number.
 - **Prefill:** ~1,800 tok/s (a 60 K prompt ≈ 34 s).
 - **VRAM:** GPU0 ~23 GB (thinker), GPU1 ~16 GB (talker + code2wav).
 
-For pure text speed/quality the rig's Qwen3.6 / Gemma models are better — Qwen3-Omni earns its place for **multimodal understanding + speech**, not plain text.
+At ~164 tok/s + full 65 K context, Qwen3-Omni is a genuinely **fast text / understanding** model on this rig (in line with our A3B-class models) — and it adds vision/audio input + speech output on top.
 
 ---
 

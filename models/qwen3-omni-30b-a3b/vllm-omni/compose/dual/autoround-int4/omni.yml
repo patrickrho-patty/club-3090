@@ -8,8 +8,11 @@
 #   KV:        fp8 (default — full 65K ctx on the single-card thinker). ⚠️ fp8 breaks the Code2Wav
 #              vocoder → for SPEECH output set KV_CACHE_DTYPE=auto (bf16, lower ctx).
 #   Vision:    input only (sees image/audio/video); does NOT generate images/video
-#   Max ctx:   262144? NO — 65536 (the model's native max). Validated single-card via fp8 KV
+#   Max ctx:   65536 (the model's native max). Validated single-card via fp8 KV
 #              (NIAH recall PASS @ 60K, depth 50% & 90%).
+#   Perf:      ~164 tok/s TEXT decode (modalities:["text"], single-stream, 3-run steady) +
+#              ~1800 tok/s prefill. The full SPEECH pipeline is vocoder-bound (~12 tok/s) — that
+#              is the audio-synthesis rate, NOT a text number.
 #   Genesis:   N/A — this is the omni multi-stage pipeline, not the Qwen3-Next text engine
 #   Status:    🧪 Experimental — TEXT path validated (full 65K, NIAH @60K, coherent). Audio/speech
 #              output is architecturally present but UNVALIDATED. NOT in the central registry
