@@ -104,6 +104,11 @@ services:
       - --enable-auto-tool-choice
       - --tool-call-parser
       - gemma4
+      # Route Gemma-4's <|channel>thought…<channel|> trace into reasoning_content
+      # (vLLM Gemma4ReasoningParser). No-ops with thinking OFF (no channel tokens);
+      # required for verify-full check 6. Matches gemma-4-31b/12b composes.
+      - --reasoning-parser
+      - gemma4
       - --chat-template
       - /vllm-workspace/examples/tool_chat_template_gemma4.jinja
       - --enable-prefix-caching
