@@ -9,12 +9,15 @@
 #   Template:  native (GGUF-embedded)
 #   Max ctx:   131072 (q8_0 KV; 192K OOMs on the dual split)
 #   Genesis:   N/A — llama.cpp engine
-#   Status:    🧪 Experimental
-#   Caveats:   Dual-only (31 GB > 24 GB, no single-card); both-cards → mutually
-#              exclusive with the image-studio. 8-pack 105/150 (MTP lossless) +
-#              soak PASS; 🧪 pending profile config.json arch confirm before ✅.
+#   Status:    ✅ Production
 #   Engine-profile: llama-cpp-local
-#   Best for:  Uncensored dual-card chat/agentic; ~41 tok/s (MTP n=2), 128K ctx.
+#   Quality:   core 8-pack 105/150 (70%) think-off, MTP off==on (spec-dec
+#              lossless); det 62/75 · sandbox 43/75 (--medium, 2026-06-09).
+#   Best for:  Uncensored dual-card chat/agentic; ~41 tok/s (MTP n=2), 128K ctx. ⭐
+# NOTE: dual-only (the 31 GB Q6_K can't fit one 24 GB card); on a 2-GPU box it's
+# mutually exclusive with single-card / image-studio work — that's a topology
+# fact, not a defect, so it ships ✅ (not ⚠️). Arch CONFIRMED qwen35-dense
+# (standard GQA, 97 layers) from the GGUF header.
 # ---------------------------------------------------------------------------
 # Qwen3.6-40B-Deckard on llama.cpp — dual 3090, MTP n=2, 128K ctx, no vision.
 #
@@ -47,7 +50,7 @@
 #
 # Override defaults via .env or shell:
 #   MODEL_DIR              host dir to mount as /models  (default: ../../../../../../models-cache)
-#   GGUF_FILE              path under /models  (default: qwen3.6-40b-deckard-gguf/mtp-q6k/Qwen3.6-40B-Deckard-MTP-Q6_K.gguf)
+#   GGUF_FILE              path under /models  (default: qwen3.6-40b-deckard-gguf/piehsoft-q6k/Qwen3.6-40B-Deckard-MTP-Q6_K.gguf)
 #   CTX_SIZE               KV pool size        (default: 131072; 192K OOMs at q8_0 KV)
 #   BATCH_SIZE             llama.cpp -b        (default: 4096)
 #   UBATCH_SIZE            llama.cpp -ub       (default: 512)
@@ -64,7 +67,7 @@
 # Quick start:
 #   1. Get the MTP-enabled GGUF (setup.sh/launch.sh auto-fetch it, or manually):
 #        hf download PiehSoft/Qwen3.6-40B-Deckard-MTP-Q6_K \
-#          Qwen3.6-40B-Deckard-MTP-Q6_K.gguf --local-dir <MODEL_DIR>/qwen3.6-40b-deckard-gguf/mtp-q6k
+#          Qwen3.6-40B-Deckard-MTP-Q6_K.gguf --local-dir <MODEL_DIR>/qwen3.6-40b-deckard-gguf/piehsoft-q6k
 #   2. From this directory:
 #        MODEL_DIR=/your/models/dir docker compose -f mtp.yml up -d
 #   3. curl http://localhost:8199/v1/models  → should list deckard-40b.
@@ -83,7 +86,7 @@ services:
     command: >-
       --host 0.0.0.0
       --port 8080
-      -m /models/${GGUF_FILE:-qwen3.6-40b-deckard-gguf/mtp-q6k/Qwen3.6-40B-Deckard-MTP-Q6_K.gguf}
+      -m /models/${GGUF_FILE:-qwen3.6-40b-deckard-gguf/piehsoft-q6k/Qwen3.6-40B-Deckard-MTP-Q6_K.gguf}
       --alias ${SERVED_NAME:-deckard-40b}
       -c ${CTX_SIZE:-131072}
       -b ${BATCH_SIZE:-4096}

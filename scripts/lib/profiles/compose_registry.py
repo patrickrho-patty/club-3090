@@ -643,14 +643,14 @@ COMPOSE_REGISTRY = {
     # cards; layer-split via -ts 1,1. MTP n=2 sweet spot (41.6 tok/s, 0.81 accept).
     # kv_format q8_0 (K+V). kvcalc SKIP (llama.cpp family — no vLLM kv-calc).
     "llamacpp/deckard40B-dual-mtp": _entry(
-        model="qwen3.6-40b-deckard", weights_variant="mtp-q6k", workload="fast-chat",
+        model="qwen3.6-40b-deckard", weights_variant="piehsoft-q6k", workload="fast-chat",
         engine="llama-cpp-local", drafter="qwen-mtp-builtin", kv_format="q8_0",
         tp=2, max_ctx=131072, max_num_seqs=1, mem_util=None,
-        compose_path="models/qwen3.6-40b-deckard/llama-cpp/compose/dual/mtp-q6k/mtp.yml",
+        compose_path="models/qwen3.6-40b-deckard/llama-cpp/compose/dual/piehsoft-q6k/mtp.yml",
         default_port=8199,
         kvcalc_key="SKIP",
-        status="experimental",
-        status_note="Dense 40B uncensored Qwen3.6 merge (Q6_K MTP GGUF, 31 GB) on dual 3090 llama.cpp. MTP n=2 sweet spot (~41.6 tok/s, 0.81 accept). 128K ctx ceiling @q8_0 KV (192K OOMs). Dual-only. verify-full 8/8, 8-pack 105/150 (MTP off==on, spec-dec lossless), soak-continuous PASS (0 MiB growth, 0/25 silent-empty). 🧪 pending profile config.json arch confirm before ✅.",
+        status="production",
+        status_note="Dense 40B uncensored Qwen3.6 merge (Q6_K MTP GGUF, 31 GB) on dual 3090 llama.cpp. Arch CONFIRMED qwen35-dense (standard GQA, 97 layers) from the GGUF header. MTP n=2 sweet spot (~41.6 tok/s, 0.81 accept). 128K ctx ceiling @q8_0 KV (192K OOMs). Dual-only. verify-full 8/8, verify-stress 8/8, 8-pack 105/150 (MTP off==on, spec-dec lossless), soak-continuous PASS (0 MiB growth, 0/25 silent-empty). First uncensored + first dual-llama.cpp compose in the catalog.",
         category="uncensored",
     ),
 }
