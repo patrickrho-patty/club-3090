@@ -15,6 +15,9 @@ COMPOSE_BASE="$CLUB3090_DIR/services"
 DUAL_27B_DIR="$CLUB3090_DIR/models/qwen3.6-27b/vllm/compose/dual/autoround-int4"
 GEMMA_DUAL_DIR="$CLUB3090_DIR/models/gemma-4-31b/vllm/compose/dual/autoround-int4"
 GEMMA_DUAL_AWQ_DIR="$CLUB3090_DIR/models/gemma-4-31b/vllm/compose/dual/awq"
+# Qwen3.6-40B-Deckard: uncensored dense 40B, Q6_K GGUF + embedded MTP head,
+# layer-split across both cards (llama.cpp). Dual-only — see `gpu-mode deckard`.
+DECKARD_DIR="$CLUB3090_DIR/models/qwen3.6-40b-deckard/llama-cpp/compose/dual/piehsoft-q6k"
 # Image-studio chat brain: gemma-4-12b single-card (llama.cpp), pinned to the spare GPU
 # so it coexists with ComfyUI image gen (different card). See `gpu-mode image-studio`.
 GEMMA_12B_DIR="$CLUB3090_DIR/models/gemma-4-12b/llama-cpp/compose/single/unsloth-q8kxl"
@@ -193,6 +196,15 @@ stop_all_gemma() {
     stop_gemma_int8
 }
 
+start_deckard() {
+    printf "  ${GREEN}▲${NC} Starting deckard-40b..."
+    compose_at "$DECKARD_DIR" "up -d" mtp.yml && echo "done" || echo "failed"
+}
+stop_deckard() {
+    printf "  ${RED}▼${NC} Stopping deckard-40b..."
+    compose_at "$DECKARD_DIR" "down" mtp.yml && echo "done" || echo "skipped"
+}
+
 show_status() {
     echo ""
     echo -e "${CYAN}═══ Service Status ═══${NC}"
@@ -350,6 +362,7 @@ mode_chat() {
     echo "Stopping: all GPU-served model containers (Qwen + Gemma)"
     echo ""
     stop_all_27b
+    stop_deckard
     stop_all_gemma
     stop_comfyui
     start_service openwebui
@@ -393,6 +406,7 @@ mode_gemma() {
     echo ""
     stop_service ollama
     stop_all_27b
+    stop_deckard
     stop_gemma_int8
     start_gemma_mtp
     start_service litellm
@@ -412,6 +426,7 @@ mode_gemma_dflash() {
     echo ""
     stop_service ollama
     stop_all_27b
+    stop_deckard
     stop_gemma_mtp
     stop_gemma_int8
     stop_gemma_dflash_int8
@@ -432,6 +447,7 @@ mode_gemma_int8() {
     echo ""
     stop_service ollama
     stop_all_27b
+    stop_deckard
     stop_gemma_mtp
     stop_gemma_dflash
     stop_gemma_dflash_int8
@@ -445,6 +461,33 @@ mode_gemma_int8() {
     echo -e "${GREEN}Gemma 4 31B INT8 PTH mode active.${NC} API: http://192.168.86.33:8032"
     echo -e "${YELLOW}Tail: sudo docker logs -f vllm-gemma-4-31b-mtp-int8${NC}"
 }
+mode_deckard() {
+    echo -e "${CYAN}═══ Switching to DECKARD-40B mode (uncensored, dual-card) ═══${NC}"
+    echo "Starting: Qwen3.6-40B-Deckard Q6_K + MTP n=2 + q8_0 KV + 128K ctx (llama.cpp, :8199)"
+    echo "Stopping: all other GPU models (Deckard layer-splits across both cards)"
+    echo ""
+    stop_service ollama
+    stop_all_27b
+    stop_all_gemma
+    stop_gemma_12b_chat
+    stop_comfyui
+    start_deckard
+    start_service litellm
+    start_service qdrant
+    start_service openwebui
+    start_service searxng
+    # Deckard isn't in the LiteLLM gateway config, so wire it into Open WebUI
+    # directly as an OpenAI connection (reuses switch.sh --owui's helper).
+    # Best-effort: a no-op if OWUI isn't running / not ready yet.
+    if [ -x "$CLUB3090_DIR/scripts/lib/owui-register.sh" ]; then
+        bash "$CLUB3090_DIR/scripts/lib/owui-register.sh" 8199 || true
+    fi
+    echo ""
+    echo -e "${GREEN}Deckard-40B mode active.${NC} API: http://192.168.86.33:8199  (model: deckard-40b)"
+    echo -e "${YELLOW}MTP n=2: ~36 narr / 46 code TPS · 128K ctx @ q8_0 KV · uncensored, text-only.${NC}"
+    echo -e "${YELLOW}First boot ~1-2 min (31 GB GGUF load + 128K KV alloc across both cards).${NC}"
+    echo -e "${YELLOW}Tail: sudo docker logs -f llama-cpp-deckard-40b${NC}"
+}
 
 mode_gemma_dflash_int8() {
     echo -e "${CYAN}═══ Switching to Gemma 4 31B DFlash + INT8 PTH mode ═══${NC}"
@@ -452,6 +495,7 @@ mode_gemma_dflash_int8() {
     echo ""
     stop_service ollama
     stop_all_27b
+    stop_deckard
     stop_gemma_mtp
     stop_gemma_dflash
     stop_gemma_int8
@@ -472,6 +516,7 @@ mode_gemma_awq() {
     echo ""
     stop_service ollama
     stop_all_27b
+    stop_deckard
     stop_gemma_mtp
     stop_gemma_dflash
     stop_gemma_int8
@@ -493,6 +538,7 @@ mode_comfyui() {
     echo ""
     stop_service ollama
     stop_all_27b
+    stop_deckard
     stop_all_gemma
     start_comfyui
     echo ""
@@ -511,6 +557,7 @@ mode_image_studio() {
     ngpu=$(nvidia-smi -L 2>/dev/null | wc -l)
     stop_service ollama
     stop_all_27b
+    stop_deckard
     stop_all_gemma
     if [ "${ngpu:-0}" -lt 2 ]; then
         echo -e "${YELLOW}⚠ Only ${ngpu:-0} GPU detected — image gen + a local chat model can't coexist"
@@ -541,6 +588,7 @@ mode_bigmodel() {
     echo "Stopping ALL containers to maximize RAM + VRAM..."
     echo ""
     stop_all_27b
+    stop_deckard
     stop_all_gemma
     stop_comfyui
     for svc in "${SERVICES[@]}"; do
@@ -690,6 +738,7 @@ mode_powercap() {
 mode_off() {
     echo -e "${CYAN}═══ Stopping ALL services ═══${NC}"
     stop_all_27b
+    stop_deckard
     stop_all_gemma
     stop_comfyui
     stop_estate
@@ -716,6 +765,9 @@ usage() {
     echo "  gemma              ⭐ DEFAULT — Gemma 4 31B INT8 PTH KV + 262K + vision (:8032)"
     echo "  gemma-int8         alias for 'gemma' (INT8 PTH KV; 98K default, CTX=262144 MAX_NUM_SEQS=1 for native 262K)"
     echo "  gemma-mtp          bf16 KV fallback — 32K, stock vLLM v0.22.0, no overlay (:8030)"
+    echo ""
+    echo "  Qwen 3.6 40B Deckard (uncensored, dual 3090, llama.cpp):"
+    echo "  deckard            Q6_K + MTP n=2 + q8_0 KV + 128K ctx (:8199) — text-only, both cards"
     echo ""
     echo "  Image / Video Gen:"
     echo "  image-studio       ⭐ Ideogram-4 image gen (GPU0) + gemma-4-12b chat (GPU1) + Open WebUI"
@@ -745,6 +797,7 @@ case "${1:-}" in
     gemma)              mode_gemma_int8 ;;
     gemma-int8)         mode_gemma_int8 ;;
     gemma-mtp)          mode_gemma ;;
+    deckard)            mode_deckard ;;
     comfyui)            mode_comfyui ;;
     image-studio|imagestudio) mode_image_studio ;;
     bigmodel)           mode_bigmodel ;;
