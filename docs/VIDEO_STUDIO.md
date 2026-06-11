@@ -12,29 +12,36 @@ This is the **P2 / video** sibling of [IMAGE_STUDIO.md](IMAGE_STUDIO.md) (Ideogr
 ## Architecture
 
 ```
-  You (browser)
-      │  "a fox in a neon city"
-      ▼
-  Open WebUI  :8080  ──pick "🎬 Studio · LTX" or "🔓 Studio · Sulphur"
-      │
-      │ (1) Studio pipe (an OWUI Function) calls the director…
-      ▼
-  Director LLM  :8090   qwen3.5-4b-uncensored (llama.cpp, ~4 GB, GPU0)
-      │  returns ONE rich cinematic prompt
-      │ (2) …then submits a single-stage graph to ComfyUI
-      ▼
-  ComfyUI  :8188   LTX-2.3 / Sulphur 22B GGUF, DisTorch across BOTH 3090s
-      │  renders .mp4 (video + audio) → /output/video/
-      │
-      │  (long clip >15s? the pipe instead POSTs to…)
-      ▼
-  Orchestrator :8190   chains ~10s segments (seg1 t2v → segN i2v from prev last frame),
-      │                ffmpeg-concats → one clip; reports "segment k/N" (host-side, no GPU)
-      ▼
-  Gallery  :8189   always-on nginx over the output dir (survives ComfyUI down)
-      │  ◀── the pipe returns a link here
-      ▼
-  You: ▶️ play / download   ·   reply "make it night" to refine
+                          Browser
+                             │  "a 40-second drone shot over a coastline"
+                             ▼
+              ┌──────────────────────────────────────────────┐
+              │  Open WebUI   :8080   (the front-end)         │
+              │    lanes:   🎬 Studio · LTX   ·   🔓 Sulphur   │
+              └───────┬────────────────────────────┬──────────┘
+                  (1) │ craft the prompt        (2) │ render
+                      ▼                             ▼
+        ┌──────────────────────────┐   ┌───────────────────────────┐
+        │ Director   :8090         │   │ ComfyUI        :8188       │
+        │ qwen3.5-4b · llama.cpp   │   │ LTX-2.3 / Sulphur 22B GGUF │
+        │ GPU0 · ~4.5 GB           │   │ DisTorch · BOTH 3090s      │
+        │ casual idea → pro prompt │   │ → .mp4 (video + audio)     │
+        └──────────────────────────┘   └─────────────┬─────────────┘
+                                       long clip >15s │ (else straight to gallery)
+                                                      ▼
+                                        ┌───────────────────────────┐
+                                        │ Orchestrator   :8190       │
+                                        │ chain ~10s segments →      │
+                                        │ one combined clip · no GPU │
+                                        └─────────────┬─────────────┘
+                                                      ▼
+                                        ┌───────────────────────────┐
+                                        │ Gallery   :8189            │
+                                        │ nginx over /output —       │
+                                        │ links survive ComfyUI down │
+                                        └─────────────┬─────────────┘
+                                                      ▼  ▶️ link back in chat
+                                                   Browser   (reply "make it night" to refine)
 ```
 
 - **Studio pipe** (`services/studio/build_studio_pipe.py` → `studio_pipe.py`): the OWUI
@@ -46,6 +53,49 @@ This is the **P2 / video** sibling of [IMAGE_STUDIO.md](IMAGE_STUDIO.md) (Ideogr
   by `UnetLoaderGGUFDisTorch2MultiGPU` (compute on GPU0, weights donated from GPU1).
 - **Gallery** (`services/studio/gallery/`): always-on nginx serving ComfyUI's output dir,
   so media + links stay alive even when ComfyUI is stopped.
+
+## Quickstart
+
+No one-shot installer yet (the models are large + sourced separately) — three steps:
+
+**1. Get the models.** Diffusion weights → `/mnt/models/comfyui/models/...` (see the
+**Models** manifest near the end of this doc); the director GGUF →
+`/mnt/models/huggingface/qwen3.5-4b-gguf/...`.
+
+**2. Bring the stack up:**
+
+```bash
+bash scripts/gpu-mode.sh video-studio
+```
+
+Stops the GPU LLMs and starts ComfyUI (both cards) + director (`:8090`) + gallery
+(`:8189`) + orchestrator (`:8190`) + Open WebUI. `gpu-mode off` (or any LLM mode) tears the
+video model down again — it's GPU-mutex with the dual-card LLMs.
+
+**3. Install the pipe into Open WebUI** (once):
+
+```bash
+python3 services/studio/build_studio_pipe.py     # writes services/studio/studio_pipe.py
+```
+
+In Open WebUI → **Admin → Functions → +**, paste `services/studio/studio_pipe.py`, save,
+enable. Two models appear: **🎬 Studio · LTX-2.3** and **🔓 Studio · Sulphur**. Set the
+pipe's **`browser_base`** valve to your host's LAN IP (`http://<your-host>:8189`) so the
+returned video links open from your browser. Then open **Open WebUI** → `http://<your-host>:8080`.
+
+### First run
+
+1. **Create your account** — the first signup becomes admin (no hardcoded secret; Open WebUI
+   generates its own per deployment).
+2. **Pick a Studio lane** in the model selector — 🎬 LTX-2.3 (video + audio) or 🔓 Sulphur.
+3. **Type a scene** — *"a fox padding through a neon alley at night"* — and send. The director
+   crafts a cinematic prompt and it renders; you get a ▶️ link to the clip.
+4. **Refine** by replying (*"more moody"*, *"make it night"*); for a **long clip**, include a
+   duration (*"a 40-second…"*) and it auto-chains segments into one combined video.
+
+> First render after a cold ComfyUI takes a few minutes (loads the 22B DiT + first-boot node
+> deps). A 10 s clip is ~2.5 min warm; longer clips scale ~linearly per segment. See
+> [How to prompt](#how-to-prompt) for what works best.
 
 ## The UX: craft-and-go, refine anytime (no approval gate)
 
@@ -163,17 +213,6 @@ mode: GPU1 holds the 22B DiT weights (~22 GB, DisTorch donor); GPU0 does compute
 **and** hosts the ~4 GB director — they coexist comfortably on one card. The 🖼️ Ideogram
 image button (see IMAGE_STUDIO.md) also uses this ComfyUI but will swap the video model out
 of VRAM, so alternating image/video costs a model reload each switch.
-
-## Bring it up
-
-```bash
-bash scripts/gpu-mode.sh video-studio
-```
-
-Stops the GPU LLMs, starts ComfyUI (both cards) + the director (:8090) + the gallery
-(:8189) + Open WebUI, then you generate from chat. `gpu-mode off` (or any LLM mode) tears
-the video model down again. See [`services/studio/README.md`](../services/studio/README.md)
-for installing the pipe into Open WebUI and per-piece startup.
 
 ## Models (obtain separately → `/mnt/models/comfyui/models/...`)
 
