@@ -4,7 +4,7 @@ title: Studio (text/image -> video · image · music)
 author: club-3090
 description: Type a rough idea — the studio director (qwen) crafts it and generates. Video: LTX (video+audio) or Sulphur (uncensored), text->video or attach an image, with optional voiceover. Image: HiDream-O1 (top quality), Ideogram-4 (design/logo/photo/text), or Chroma (uncensored). Music: ACE-Step (songs + instrumentals). SFX: Stable Audio (sound effects + ambient). Voice: Step-Audio-EditX (premium cloned voice + emotion/style). Refine anytime by just saying what to change.
 required_open_webui_version: 0.5.0
-version: 0.13.1
+version: 0.13.2
 """
 # ── Pipeline defaults (this rig, 2x 3090, measured 2026-06-11) ──────────────────
 #  Video lanes: ltx = LTX-2.3-distilled (video+audio) · sulphur = uncensored dev fine-tune
@@ -249,20 +249,19 @@ class Pipe:
         return fallback_text, "[instrumental]"
 
     def _prior_spec(self, body):
-        # Read the crafted prompt the pipe embedded in its most recent reply, so a
-        # follow-up message can refine that spec instead of starting from scratch.
+        # Recover the prompt the pipe used in its most recent reply — from the VISIBLE
+        # "**Prompt used:**" / "**Style:**" line — so a follow-up ("make it night") refines
+        # that instead of starting over. (Was a hidden <!--SPEC--> HTML comment, but OWUI's
+        # renderer showed it as text; the visible line carries the same context, no marker.)
         for m in reversed(body.get("messages", [])):
             if m.get("role") != "assistant":
                 continue
             c = m.get("content") or ""
             if isinstance(c, list):
                 c = " ".join(p.get("text", "") for p in c if isinstance(p, dict))
-            mt = re.search(r"<!--SPEC:([A-Za-z0-9+/=]+)-->", c)
+            mt = re.search(r"\*\*(?:Prompt used|Style):\*\*\s*(.+)", c)
             if mt:
-                try:
-                    return base64.b64decode(mt.group(1)).decode("utf-8", "replace")
-                except Exception:
-                    return None
+                return mt.group(1).strip()
         return None
 
     def _enhance(self, user_prompt, i2v, prior_spec=None, kind="video"):
@@ -515,13 +514,12 @@ class Pipe:
                 return "Generation finished but no audio output was found."
             base = self.valves.browser_base.rstrip("/")
             url = base + "/" + ((sub + "/") if sub else "") + fn
-            marker = "<!--SPEC:" + base64.b64encode(prompt_used.encode()).decode() + "-->"
             return ("**\U0001F50A " + label + " · ~" + str(int(secs)) + "s**\n\n"
                     "**Prompt used:** " + prompt_used + "\n\n"
                     "\U0001F3A7 **[Open / download the sound](" + url + ")**\n\n"
                     "_Want changes? Just say what to tweak — e.g. “more distant”, “add reverb”, "
                     "“heavier rain” — and I’ll re-craft and regenerate._ "
-                    "_(Browse all media: " + base + "/ )_" + marker)
+                    "_(Browse all media: " + base + "/ )_")
 
         # ── VOICE LANE (Step-Audio-EditX premium clone, via the isolated step-voice service :8193) ──
         if lane == "voice":
@@ -588,7 +586,6 @@ class Pipe:
                 return "Generation finished but no audio output was found."
             base = self.valves.browser_base.rstrip("/")
             url = base + "/" + ((sub + "/") if sub else "") + fn
-            marker = "<!--SPEC:" + base64.b64encode(json.dumps({"tags": tags, "lyrics": lyrics}).encode()).decode() + "-->"
             inst = lyrics.strip().lower().startswith("[instrumental")
             return ("**\U0001F3B5 " + label + " · ~" + str(int(secs)) + "s · " + ("instrumental" if inst else "with vocals") + "**\n\n"
                     "**Style:** " + tags + "\n\n"
@@ -596,7 +593,7 @@ class Pipe:
                     + "\U0001F3A7 **[Open / download the track](" + url + ")**\n\n"
                     "_Want changes? Just say what to tweak — e.g. “more upbeat”, “add a sax solo”, "
                     "“make it instrumental” — and I’ll re-craft and regenerate._ "
-                    "_(Browse all media: " + base + "/ )_" + marker)
+                    "_(Browse all media: " + base + "/ )_")
 
         # ── STILL-IMAGE LANES (HiDream-O1 prose · Ideogram-4 JSON caption · Chroma prose · single still) ──
         if lane in ("image", "chroma", "hidream"):
@@ -652,13 +649,12 @@ class Pipe:
                 return "Generation finished but no image output was found."
             base = self.valves.browser_base.rstrip("/")
             url = base + "/" + ((sub + "/") if sub else "") + fn
-            marker = "<!--SPEC:" + base64.b64encode(spec_text.encode()).decode() + "-->"
             tweaks = "“more dramatic”, “at night”, “close-up”" if lane in ("chroma", "hidream") else "“monochrome”, “tighter crop”, “flat vector style”"
             return ("**\U0001F5BC️ " + label + " · " + str(w) + "x" + str(h) + "**\n\n"
                     "**Prompt used:** " + human + "\n\n"
                     "\U0001F5BC️ **[Open / download the image](" + url + ")**\n\n"
                     "_Want changes? Just say what to tweak — e.g. " + tweaks + " — and I’ll re-craft from this and regenerate._ "
-                    "_(Browse all media: " + base + "/ )_" + marker)
+                    "_(Browse all media: " + base + "/ )_")
 
         data_uri = self._extract_image(body)
         user_prompt = ""
@@ -737,13 +733,12 @@ class Pipe:
                                 pass
                         await status("Done", True)
                         url = base + "/" + ((sub + "/") if sub else "") + fn
-                        marker = "<!--SPEC:" + base64.b64encode(final_prompt.encode()).decode() + "-->"
                         return ("**" + label + " · text→video · " + str(segments) + " segments (~" + str(segments * 10) + "s)" + nlabel + "**\n\n"
                                 "**Prompt used:** " + final_prompt + "\n\n"
                                 + (("**Narration:** “" + narration + "”\n\n") if (narration and nlabel) else "")
                                 + "▶️ **[Open / download the video](" + url + ")**\n\n"
                                 "_Want changes? Just say what to tweak and I’ll re-craft and regenerate._ "
-                                "_(Browse all media: " + base + "/ )_" + marker)
+                                "_(Browse all media: " + base + "/ )_")
                     if j.get("status") == "error":
                         await status("Failed", True)
                         return "⚠️ Long-clip generation failed: " + str(j.get("error"))
@@ -771,7 +766,6 @@ class Pipe:
         await status("Done", True)
         base = self.valves.browser_base.rstrip("/")
         url = base + "/" + ((sub + "/") if sub else "") + fn
-        marker = "<!--SPEC:" + base64.b64encode(final_prompt.encode()).decode() + "-->"
         secs = int(round(fr / 24))
         return ("**" + label + " · " + kind + " · " + str(fr) + " frames (~" + str(secs) + "s)" + nlabel + "**\n\n"
                 "**Prompt used:** " + final_prompt + "\n\n"
@@ -779,4 +773,4 @@ class Pipe:
                 + "▶️ **[Open / download the video](" + url + ")**\n\n"
                 "_Want changes? Just say what to tweak — e.g. “more moody”, “make it night”, "
                 "“slower camera”, or “voiceover: …” — and I’ll re-craft from this and regenerate._ "
-                "_(Browse all media: " + base + "/ )_" + marker)
+                "_(Browse all media: " + base + "/ )_")
