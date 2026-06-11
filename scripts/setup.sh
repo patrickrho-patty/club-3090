@@ -66,6 +66,7 @@ model_label() {
     qwen3.6-35b-a3b) echo "Qwen 3.6 35B-A3B" ;;
     gemma-4-31b) echo "Gemma 4 31B" ;;
     gemma-4-26b-a4b) echo "Gemma 4 26B-A4B" ;;
+    diffusiongemma-26b-a4b) echo "DiffusionGemma 26B-A4B (dLLM)" ;;
     *) echo "$1" ;;
   esac
 }
@@ -202,9 +203,14 @@ case "${MODEL_NAME}" in
   gemma-4-26b-a4b)
     PRIMARY_WEIGHT_KEY="gemma-4-26b-a4b:autoround-int4-mixed"
     ;;
+  diffusiongemma-26b-a4b)
+    # dLLM, fp8 only (no autoround variant). Default WEIGHTS=autoround is a no-op
+    # here — the fp8 key set below is what's fetched.
+    PRIMARY_WEIGHT_KEY="diffusiongemma-26b-a4b:fp8"
+    ;;
   *)
     echo "ERROR: unsupported model '${MODEL_NAME}'."
-    echo "Supported: qwen3.6-27b, qwen3.6-35b-a3b, gemma-4-31b, gemma-4-26b-a4b"
+    echo "Supported: qwen3.6-27b, qwen3.6-35b-a3b, gemma-4-31b, gemma-4-26b-a4b, diffusiongemma-26b-a4b"
     echo "(To add a new model, extend the model dispatch in scripts/setup.sh and profiles/models/*.yml)"
     exit 1
     ;;
@@ -650,6 +656,15 @@ case "${MODEL_NAME}" in
     NEXT_STEPS_NOTE="Available variants:
   bash scripts/switch.sh vllm/gemma-26b-awq
   WITH_ASSISTANT_DRAFT=1 bash scripts/setup.sh gemma-4-26b-a4b  # fetch MTP assistant if using awq-mtp"
+    ;;
+  diffusiongemma-26b-a4b)
+    SAMPLE_CONTAINER="vllm-diffusiongemma-26b-a4b-fp8-tp2"
+    SAMPLE_COMPOSE_FLAGS_DUAL=""
+    SAMPLE_PORT="8042"
+    SAMPLE_MODEL_NAME="diffusiongemma-26b-a4b"
+    NEXT_STEPS_NOTE="🧪 experimental dLLM (vLLM's first), dual-card. Launch needs --force (non-functional status):
+  bash scripts/switch.sh --force vllm/diffusiongemma-dual
+  # or: gpu-mode dgemma   (stops other GPU models, serves on :8199)"
     ;;
   qwen3.6-35b-a3b)
     SAMPLE_CONTAINER="vllm-qwen36-35b-a3b"
