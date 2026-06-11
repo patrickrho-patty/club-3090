@@ -619,6 +619,20 @@ COMPOSE_REGISTRY = {
         status="experimental",
         status_note="AWQ + external MTP (gemma-26b-it-assistant n=4) on stock v0.22.0 — MTP +55% TPS (134->208, AL 3.55) validated 2026-06-05. Max ctx 262K (model max; KV pool 806,821 tok at 262144/0.92, 2x 3090) boot+coherence validated 2026-06-06. Promote after rebench-full + soak.",
     ),
+    "vllm/diffusiongemma-dual": _entry(
+        model="diffusiongemma-26b-a4b", weights_variant="fp8", workload="fast-chat",
+        engine="vllm-diffusion-gemma", drafter=None, kv_format="bf16",
+        tp=2, max_ctx=262144, max_num_seqs=1, mem_util=0.82,
+        compose_path="models/diffusiongemma-26b-a4b/vllm/compose/dual/fp8/base.yml",
+        default_port=8042,
+        kvcalc_key="SKIP",
+        status="upstream-gated",
+        status_note="DiffusionGemma dLLM (vLLM's first) on Ampere via vllm#45163 (UNMERGED) sideloaded onto a stock PULLABLE nightly — install_script overlay (full branch delta + Codex marlin-K-pad/TP-vocab/dtype fixes), NOT a baked image. Eager-only, gemma4 tool+reasoning parsers. 262K (NIAH->250K), 8-pack 100/150 (5-pack 84%), ~150-200 tok/s (peak ~490). max_new_tokens lifted 256->16384 (the model self-terminates ~1.2-1.8K words; no one-shot 10K). Upstream-gated: base nightly may be purged -> re-pin + regenerate overlay; promote when #45163 merges. 2026-06-11.",
+    ),
+    # DEFAULTS: intentionally NOT added — 'upstream-gated' is non-functional, so it
+    # degrades out of the curated <model>/default walk; reachable only by explicit
+    # slug `vllm/diffusiongemma-dual` (a DEFAULTS row would hand users a gated config
+    # via <engine>/default, which does NOT status-filter).
     "vllm/qwen-a3b-preview-single": _entry(
         model="qwen3.6-35b-a3b", weights_variant="autoround-int4", workload="fast-chat",
         engine="vllm-stable", drafter=None, kv_format="fp8_e5m2",

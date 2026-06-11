@@ -1,9 +1,11 @@
 # =============================================================================
-# vLLM PR #45163 (DiffusionGemma — `dgemma` branch) overlaid on the June-10 nightly.
+# OVERLAY-REGENERATION HELPER — NOT the runtime engine.
 #
-# COMPOSE-ONLY, untracked, fully ISOLATED from the vllm-stable / vllm-gemma-stable
-# engine pins and the compose_registry. Build a local image, point the standalone
-# compose at it; nothing in the launchers/registry/tests references this.
+# The shipped compose (base.yml) does NOT use this image. It runs a STOCK pullable
+# nightly + sideloads the vendored ../dgemma-overlay/ at boot (install_script). This
+# Dockerfile exists only to REGENERATE that overlay when the base nightly is re-pinned:
+# build this branch image, then diff its vllm/ tree against the NEW stock nightly to
+# get the fresh ADD+CHG file set. See ../dgemma-overlay/README.md → "Regenerate".
 #
 # Method — cp-over-python overlay (NO recompile):
 #   PR #45163 changes 49 files, but ALL are .py / Triton kernels except one
@@ -13,10 +15,10 @@
 #   bump transformers to main (for models/diffusion_gemma). The final RUN asserts
 #   the arch registered, so the build fails fast if the overlay didn't take.
 #
-# Build:  docker build -t vllm-dgemma:pr45163 \
+# Build (regeneration only):  docker build -t vllm-dgemma:pr45163 \
 #           models/diffusiongemma-26b-a4b/vllm/patches/dgemma-pr45163/
-# Re-pin: bump BASE to a newer nightly SHA if the branch rebases.
-# Retire: delete this dir + the compose once #45163 merges into a nightly we pin.
+# Re-pin: bump BASE to the newer nightly SHA, rebuild, re-diff → new overlay.
+# Retire: delete this dir + ../dgemma-overlay + the compose once #45163 merges.
 # =============================================================================
 ARG BASE=vllm/vllm-openai:nightly-2c9c07c85e56c799afffd5a671a8a0bace377a39
 FROM ${BASE}

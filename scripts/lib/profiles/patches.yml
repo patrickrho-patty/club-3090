@@ -585,6 +585,38 @@ patches:
       drop_when: "merged into selected nightly and Gemma A4B AWQ composes boot without the sidecar"
     status: verified
 
+  - id: dgemma-vllm45163-sideload
+    model: [diffusiongemma-26b-a4b]
+    files:
+      - models/diffusiongemma-26b-a4b/vllm/patches/dgemma-overlay
+    load_bearing_when:
+      - composes:
+          - vllm/diffusiongemma-dual
+        reason: "DiffusionGemma's arch exists in no released/nightly vLLM — it lives only in the UNMERGED PR vllm#45163. The vendored overlay (the full stock-nightly-vs-dgemma-branch vllm/ delta + Codex's marlin-k-pad K-pad / TP-vocab soft-embed / dtype fixes) IS the engine: without it the stock nightly cannot register or load DiffusionGemmaForBlockDiffusion. install.sh cp's it over the installed vllm pkg at boot."
+        evidence: "models/diffusiongemma-26b-a4b/vllm/patches/dgemma-overlay/README.md"
+    delivery:               # DEPRECATED/READ-ONLY (test-only) — see header
+      dockerfile_bake: false
+      entrypoint_invoke: true
+      genesis: false
+    delivery_gaps: []
+    delivery_mechanism: install_script
+    delivery_spec:
+      script: models/diffusiongemma-26b-a4b/vllm/patches/dgemma-overlay/install.sh
+      invoke: "boot-time: cp's the vendored overlay (123-file branch delta + 3 Codex fixes) over the stock-nightly vllm pkg, drops stale bytecode, fail-loud arch assert (idempotent)"
+      invoked_before: vllm-import
+      wired_at: [volumes, entrypoint]
+    drift_guard:
+      kind: behavioral
+      check: "DiffusionGemmaForBlockDiffusion registers AND the model serves coherent output on the pinned stock nightly after install.sh applies the overlay"
+      on_fail: capability-degraded
+    capability: diffusion-gemma-arch
+    foundational: true
+    upstream:
+      ref: vllm-project/vllm#45163
+      status: open
+      drop_when: "merged into a pinnable vLLM nightly/release that natively registers DiffusionGemmaForBlockDiffusion"
+    status: verified
+
   - id: gemma4-unified-vision-unquant
     model: [gemma-4-12b]
     files:

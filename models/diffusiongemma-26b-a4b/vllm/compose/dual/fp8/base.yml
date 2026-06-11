@@ -8,22 +8,25 @@
 #   Vision:    no (text diffusion)
 #   Max ctx:   262144 (NIAH retrieval validated to ~250K)
 #   Genesis:   N/A — Genesis is Qwen3-Next-specific
-#   Status:    🧪 Experimental — WORKS on Ampere, but draft-PR + local image + eager-only
-#   Caveats:   Engine is a LOCAL image built from UNMERGED PRs + vendored patches:
-#              base = `vllm-dgemma:pr45163` (nightly + vllm#45163 dgemma overlay;
-#              build via ../../../patches/dgemma-pr45163/Dockerfile) THEN this
-#              compose mounts 3 fix-overlays from ../../../patches/marlin-k-pad/:
-#                • marlin.py + marlin_utils_fp8.py = Codex's Marlin sub-tile-K pad
-#                  (lets fp8 Marlin W8A16 tile DiffusionGemma's K=352/1056 dims
-#                  within Ampere's 99 KB shared mem — the original "fp8 dead on
-#                  Ampere" blocker, now SOLVED).
-#                • diffusion_gemma.py = Codex's TP-vocab soft-embedding fix
-#                  (slice probs to the rank's vocab shard → local-embed matmul →
-#                  TP all-reduce) + Claude's :656 dtype cast (.to(sc_embeds.dtype)).
-#              Runs EAGER-ONLY (TORCHDYNAMO/COMPILE disabled): `_compiled_sample_step`
-#              threw a Dynamo fake-tensor error; torch.compile headroom is unexplored.
-#              NOT pinnable/reproducible for other rigs until vllm#45163 merges into
-#              a nightly. Do NOT promote past 🧪 until then.
+#   Status:    ⏸️ Upstream-gated — works on Ampere, but boots only via the vendored
+#              overlay until vllm#45163 merges into a pinnable engine.
+#   Caveats:   The DiffusionGemma arch exists in NO released/nightly vLLM — only in
+#              the UNMERGED PR vllm#45163 (https://github.com/vllm-project/vllm/pull/45163).
+#              Delivery = stock PULLABLE nightly + a SIDELOADED overlay applied at
+#              boot (install_script), NOT a baked custom image:
+#                • image = stock `vllm/vllm-openai:nightly-2c9c07c8…` (everyone can pull it)
+#                • ../../../patches/dgemma-overlay/ = the vendored payload: the full
+#                  stock-nightly-vs-dgemma-branch delta (123 vllm/*.py files — the
+#                  PR's formal 41-file set version-skews, since load-bearing dgemma
+#                  changes like build_attn_metadata's `causal` kwarg live outside the
+#                  PR diff) + Codex's 3 fixes (marlin.py + marlin_utils_fp8.py K-pad
+#                  for fp8 Marlin W8A16 on sm_86's 99 KB shared mem; diffusion_gemma.py
+#                  TP-vocab soft-embed + :656 dtype cast). install.sh cp's it over the
+#                  installed vllm pkg before the server starts (fail-loud arch assert).
+#              REBASE when the nightly moves/is purged: re-pin the image + regenerate
+#              the overlay (see ../../../patches/dgemma-overlay/README.md). Not
+#              pinnable-stable until #45163 merges — then this collapses to one pin.
+#              Runs EAGER-ONLY (torch.compile works but gives no throughput gain).
 #   Quality:   8-pack 100/150 (67%) — toolcall 13/15 · instructfollow 13-15/15 ·
 #              structoutput 14/15 · dataextract 10/15 · reasonmath 11/15 ·
 #              bugfind 11/15 · hermesagent-20 14/20 (agentic tool-use works) ·
@@ -42,15 +45,15 @@
 # --enable-auto-tool-choice; with the gemma4 parsers, tool-calling + reasoning-field
 # routing both function (the 5-pack jumped 57%→84%).
 #
-# Thinking: NO separate budget — thinking + answer SHARE max_tokens. The model's
-# generation_config defaults max_new_tokens=256, which vLLM applies as the default
-# max_tokens cap → truncated answers + next-turn echo for clients (OWUI) that omit
-# max_tokens. We lift it to 16384 via --override-generation-config (see the command
-# section); the diffusion denoising params in generation_config are preserved because
-# we keep --generation-config auto rather than the nuclear --generation-config vllm.
+# Output length: the model's generation_config caps max_new_tokens at 256, which vLLM
+# applies as the default max_tokens → truncated answers + next-turn echo for clients
+# (OWUI) that omit max_tokens. We lift it to 16384 via --override-generation-config
+# (NOT --generation-config vllm, which would strip the diffusion denoising params).
+# Note 16384 is a CAP only — the instruct model self-terminates ~1.2–1.8K words; it
+# will not one-shot 10K words (use multi-turn).
 #
-# Build the engine image first:
-#   docker build -t vllm-dgemma:pr45163 ../../../patches/dgemma-pr45163/
+# Engine: NO build step. The overlay is applied at container start by install.sh
+# (entrypoint). Just `docker compose up` (or switch.sh / launch.sh).
 # ===========================================================================
 # Hardware metadata (parsed by scripts/preflight.sh):
 # Requires-min-vram-gb: 24
@@ -60,17 +63,18 @@
 # Requires-sm: 8.0+
 services:
   vllm-diffusiongemma-26b-a4b-fp8-tp2:
-    image: ${VLLM_IMAGE:-vllm-dgemma:pr45163}
+    image: ${VLLM_IMAGE:-vllm/vllm-openai:nightly-2c9c07c85e56c799afffd5a671a8a0bace377a39}
     container_name: "${ESTATE_CONTAINER:-vllm-diffusiongemma-26b-a4b-fp8-tp2}"
     restart: ${CLUB3090_RESTART:-unless-stopped}
     ports:
       - "${ESTATE_PORT:-${PORT:-8042}}:8000"
     volumes:
       - ${MODEL_DIR:-../../../../../../models-cache}:/root/.cache/huggingface
-      # Codex's fix-overlays (Marlin sub-tile-K pad + TP-vocab soft-embed + dtype cast):
-      - ../../../patches/marlin-k-pad/marlin.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/kernels/linear/scaled_mm/marlin.py:ro
-      - ../../../patches/marlin-k-pad/marlin_utils_fp8.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/quantization/utils/marlin_utils_fp8.py:ro
-      - ../../../patches/marlin-k-pad/diffusion_gemma.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/diffusion_gemma.py:ro
+      # ---- vllm#45163 DiffusionGemma overlay — SIDELOADED (install_script) ----
+      # The vendored payload (the dgemma-branch vllm/ delta + Codex's marlin-k-pad +
+      # TP-vocab/dtype fixes). install.sh cp's it over the stock-nightly vllm pkg at
+      # boot — no baked image. Regenerate on a nightly re-pin (see the dir README).
+      - ../../../patches/dgemma-overlay:/etc/club3090/dgemma-overlay:ro
     environment:
       - NVIDIA_VISIBLE_DEVICES=${ESTATE_GPUS:-${NVIDIA_VISIBLE_DEVICES:-all}}
       - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
@@ -85,10 +89,11 @@ services:
       - VLLM_DISABLE_CUSTOM_ALL_REDUCE=1
       - VLLM_NO_USAGE_STATS=1
       - OMP_NUM_THREADS=1
-      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:512
+      - PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True,max_split_size_mb:512}
       - VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
       - VLLM_ATTENTION_BACKEND=TRITON_ATTN
       - TRITON_CACHE_DIR=/root/.triton/cache
+      - DGEMMA_OVERLAY_DIR=/etc/club3090/dgemma-overlay
     shm_size: "16gb"
     ipc: host
     deploy:
@@ -98,6 +103,16 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        # Apply the vllm#45163 DiffusionGemma overlay to the stock nightly BEFORE
+        # vllm imports. Fail-loud: a non-zero exit (arch didn't register) aborts boot
+        # rather than serving a half-patched engine.
+        bash /etc/club3090/dgemma-overlay/install.sh
+        exec python3 -m vllm.entrypoints.openai.api_server "$@"
+      - --
     command:
       - --host
       - 0.0.0.0
@@ -127,21 +142,10 @@ services:
       - TRITON_ATTN
       - --hf-overrides
       - '{"diffusion_sampler":"entropy_bound","diffusion_entropy_bound":0.1}'
-      # Lift the model's default-answer-length cap. generation_config.json ships
-      # max_new_tokens=256; vLLM applies that as the DEFAULT max_tokens for any
-      # request that omits one (OWUI does) → answers truncate at 256 with
-      # finish_reason=length, mid-sentence. Worse, a truncated (no-EOS) assistant
-      # turn left in the history makes the NEXT turn continue/echo it instead of
-      # answering ("say 'hi' → model re-emits the previous answer"). Both symptoms,
-      # one cause. We override ONLY max_new_tokens via --override-generation-config
-      # (NOT --generation-config vllm, which would also strip the diffusion denoising
-      # params max_denoising_steps/t_max/t_min/confidence_threshold the model needs).
-      # 16384 = generous default ceiling (~12K words); clients may still pass a
-      # larger/smaller max_tokens. NOTE: this is only a CAP — the model self-
-      # terminates (emits EOS) well before it on most prompts (e.g. a "write 10,000
-      # words" ask stops ~1.2K words, finish_reason=stop), so raising the cap does
-      # not force longer output; use min_tokens/ignore_eos or a continuation loop for
-      # genuinely long generations.
+      # Lift the model's 256-tok default-answer cap (truncation + next-turn echo for
+      # clients that omit max_tokens). Override ONLY max_new_tokens; keep
+      # --generation-config auto so the diffusion denoising params survive.
+      # 16384 ≈ 12K words; it's a CAP, the model self-terminates well before it.
       - --generation-config
       - auto
       - --override-generation-config
@@ -154,12 +158,10 @@ services:
       - gemma4
       - --chat-template
       - /vllm-workspace/examples/tool_chat_template_gemma4.jinja
-      # Thinking: left at the model/template natural default (NOT force-disabled).
-      # The earlier "OWUI stuck in thinking / empty answer" symptom was the 256-tok
-      # cap above (thinking ate the whole budget), NOT thinking itself — once the
-      # budget is lifted, thinking + answer both fit. The reasoning parser routes any
-      # thinking into the `reasoning` field; clients can still pass
-      # enable_thinking via chat_template_kwargs per request.
+      # Thinking: left at the model/template natural default (NOT force-disabled) — the
+      # earlier "stuck in thinking / empty answer" was the 256-tok cap above, not thinking.
+      # The reasoning parser routes any thinking into the `reasoning` field; clients can
+      # still pass enable_thinking via chat_template_kwargs per request.
       # NOTE: torch.compile (drop the TORCHDYNAMO/COMPILE-disable envs + --enforce-eager)
       # WORKS (Codex+Claude validated 2026-06-11) but gave NO throughput gain (~164 vs
-      # ~172 tok/s eager — diffusion is denoising-step-bound) + 28s boot cost → eager stays default.
+      # ~172 tok/s eager — diffusion is denoising-step-bound) + boot cost → eager stays default.
