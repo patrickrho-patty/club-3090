@@ -19,16 +19,17 @@
 #   Genesis:   N/A — llama.cpp engine; Genesis is vLLM/Qwen3-Next-specific
 #   Status:    🧪 EXPERIMENTAL — boot + bench validated 2026-06-17 on mainline b9246: loads the
 #              fine-tune's EMBEDDED MTP head clean (draft-mtp, n_max=2, spec context initialized),
-#              q4_0/q4_0 KV, serves coherent output. Canonical bench.sh (n=3, thinking-off):
-#              NARRATIVE 28.5 wall / 28.7 decode TPS · CODE 32.9 wall / 33.4 decode · PP 743 tok/s.
-#              ~45% BELOW the base-model llamacpp/default (50.3/58.9 narr/code, same engine/KV/MTP)
-#              — identical setup, so the gap is this fine-tune's WEAKER embedded MTP head (lower
-#              draft acceptance on prose), not the engine. Still ~25% faster than the beellama
-#              q4_0/q4_1 path on identical weights → mainline chosen. verify-stress / soak ladder
-#              PENDING before promotion.
-#   Caveats:   (1) ~45% slower than the base llamacpp/default — the fine-tune's MTP head is weak;
-#                  pays off only if its reasoning quality (NOT yet benched) justifies the speed cost.
-#                  verify-stress / soak / quality ladder pending. Launch requires --force.
+#              q4_0/q4_0 KV, serves coherent output. Canonical bench.sh (n=3, thinking-off) at the
+#              rig's 230W default cap: NARRATIVE 28.5/28.7 · CODE 32.9/33.4 wall/decode · PP 743 tok/s.
+#              MATCHED-POWER A/B (230W, same engine/KV/n=2/prompt): the MTP head performs IDENTICALLY
+#              to the BASE Qwen3.6-27B MTP head — 73% vs 72% draft acceptance, 41.2 vs 41.2 t/s. The
+#              head is NOT weaker than base (an earlier "~45% below base" note here was a power-cap
+#              artifact: base llamacpp/default's 50.3/58.9 BENCHMARKS row is a 370W number; mainline
+#              is -42% from 370->230W — comparison only valid at matched power). MTP gives ~+43% over
+#              no-MTP. verify-stress / soak / quality ladder PENDING before promotion.
+#   Caveats:   (1) Numbers above are at the rig's 230W cap (the operational default); they are NOT
+#                  comparable to 370W BENCHMARKS rows. verify-stress / soak / quality ladder pending.
+#                  Launch requires --force.
 #              (2) ships 200K-alloc → ~188K usable (MEASURED, needle-recalled), but that is past
 #                  the author's 128K tested window — retrieval works to ~188K, full generative
 #                  quality >128K is unverified (CTX_SIZE=131072 for the strict card window). The
