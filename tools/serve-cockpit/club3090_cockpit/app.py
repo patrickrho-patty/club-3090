@@ -717,22 +717,24 @@ class ValidateBenchmarksPane(Container):
 
     def on_mount(self) -> None:
         t = self.query_one("#bench-table", DataTable)
-        t.add_columns("Model", "Engine", "Topo", "TPS (n/c)", "ctx", "8pk")
+        # Every cell + a trailing src column marks these as fabricated, so a
+        # row copied out of a screenshot can't be mistaken for a measurement.
+        t.add_columns("Model", "Engine", "Topo", "TPS (n/c)", "ctx", "8pk", "src")
         t.add_row(
             "qwen3.6-27b", "vllm", "dual",
-            "[dim]174 / 42[/dim]", "295K", "[dim]109[/dim]",
+            "[dim]174 / 42[/dim]", "295K", "[dim]109[/dim]", "[dim]mock[/dim]",
         )
         t.add_row(
             "qwen3.6-27b", "beellama", "dual",
-            "[dim]155 / 38[/dim]", "102K", "[dim]107[/dim]",
+            "[dim]155 / 38[/dim]", "102K", "[dim]107[/dim]", "[dim]mock[/dim]",
         )
         t.add_row(
             "gemma-4-31b", "vllm", "dual",
-            "[dim]112 / 29[/dim]", "192K", "[dim]103[/dim]",
+            "[dim]112 / 29[/dim]", "192K", "[dim]103[/dim]", "[dim]mock[/dim]",
         )
         t.add_row(
             "qwen3.6-35b-a3b", "vllm", "dual",
-            "[dim]178 / 44[/dim]", "262K", "[dim]90[/dim]",
+            "[dim]178 / 44[/dim]", "262K", "[dim]90[/dim]", "[dim]mock[/dim]",
         )
 
 

@@ -98,13 +98,15 @@ def load_catalog_sync(repo_root: Path) -> tuple[list[VariantRow], Optional[str]]
     Used from on_mount workers and the ``r`` refresh action.
     This is the only subprocess invocation in the entire Phase 1 app.
     """
+    # Pass repo_root as a positional ($1), never interpolated into the shell
+    # string — so a quoted/pathological C3_REPO_ROOT can't break the boundary.
     cmd = (
-        f'source "{repo_root}/scripts/lib/registry-emit.sh" '
-        f'&& registry_variant_rows "{repo_root}"'
+        'source "$1/scripts/lib/registry-emit.sh" '
+        '&& registry_variant_rows "$1"'
     )
     try:
         result = subprocess.run(
-            ["bash", "-c", cmd],
+            ["bash", "-c", cmd, "bash", str(repo_root)],
             capture_output=True,
             text=True,
             timeout=15,
