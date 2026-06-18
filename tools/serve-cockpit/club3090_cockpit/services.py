@@ -265,36 +265,51 @@ class CockpitData:
             return [], res.stderr.strip()[:200] or "no rows"
         return parse_variant_rows(res.stdout), None
 
+    # Catalog enrichment fans out one subprocess per slug (kv-calc --fit, then
+    # switch --explain). Serially awaited over ~50 variants that is ~45 s (the
+    # explain leg alone is ~0.7 s × N). A cap-bounded asyncio.gather cuts it to a
+    # few seconds without flooding the box with N concurrent bash+python procs.
+    _ENRICH_CONCURRENCY = 12
+
     async def _enrich_fits(self, entries: list[CatalogEntry]) -> None:
-        for e in entries:
+        sem = asyncio.Semaphore(self._ENRICH_CONCURRENCY)
+
+        async def _one(e: CatalogEntry) -> None:
             # ik/llama composes use kvcalc_key "SKIP" → no vLLM kv-calc fit.
             if (e.row.kvcalc_key or "").upper() == "SKIP":
                 e.fit = FitVerdict(verdict="skip", card=self.card)
-                continue
-            fit = await self.fit(e.slug, self.card)
-            e.fit = fit
+                return
+            async with sem:
+                e.fit = await self.fit(e.slug, self.card)
+
+        await asyncio.gather(*(_one(e) for e in entries))
 
     async def _enrich_measurements(self, entries: list[CatalogEntry]) -> None:
-        bench_md: Optional[str] = None
-        for e in entries:
+        # Read BENCHMARKS.md once up front — the per-slug md fallback below is
+        # then a pure in-memory parse (no I/O per slug).
+        bench_md = self._read_benchmarks_md()
+        sem = asyncio.Semaphore(self._ENRICH_CONCURRENCY)
+
+        async def _one(e: CatalogEntry) -> None:
             # Preferred: structured benchmarks from the explain contract.  The
             # REAL shape is [{"row","columns"}]; measurement_from_explain_*
             # parses TPS out of columns[].  Only COMMIT the explain result when
             # it actually yields a TPS — otherwise an empty benchmarks[] (or a
             # row that is stress/soak-only) must NOT suppress the markdown
             # fallback (the `continue`-suppresses-fallback bug this fixes).
-            explain, _err = await self.explain(e.slug)
+            async with sem:
+                explain, _err = await self.explain(e.slug)
             if explain and explain.get("benchmarks"):
                 m = measurement_from_explain_benchmarks(explain["benchmarks"])
                 if m.narr_tps is not None or m.code_tps is not None:
                     e.measurement = m
-                    continue
+                    return
             # Fallback: coarse BENCHMARKS.md scrape (flagged in source).
-            if bench_md is None:
-                bench_md = self._read_benchmarks_md()
             m = parse_benchmarks_md_for_slug(bench_md or "", e.slug)
             if m:
                 e.measurement = m
+
+        await asyncio.gather(*(_one(e) for e in entries))
 
     def _read_benchmarks_md(self) -> str:
         path = self.repo_root / "BENCHMARKS.md"
