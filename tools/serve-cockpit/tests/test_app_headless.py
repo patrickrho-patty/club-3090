@@ -517,7 +517,9 @@ class TestModeNavigation:
 
     @pytest.mark.asyncio
     async def test_switch_to_validate_mode(self):
-        app, _, _ = make_app()
+        # Validate is the producer Bring & Validate lane (R3a) — reachable only
+        # on the producer surface.
+        app, _, _ = make_app(surface="producer")
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.press("3")
             assert "active" in app.query_one("#panel-validate").classes
@@ -549,7 +551,8 @@ class TestModeNavigation:
 
     @pytest.mark.asyncio
     async def test_all_three_modes_cycle(self):
-        app, _, _ = make_app()
+        # All three modes (incl. the producer Validate lane) on the producer surface.
+        app, _, _ = make_app(surface="producer")
         async with app.run_test(size=(120, 40)) as pilot:
             for key, expected_active in [("1", 0), ("2", 1), ("3", 2), ("1", 0)]:
                 await pilot.press(key)
@@ -1269,7 +1272,8 @@ class TestPrimaryActionSafe:
 
     @pytest.mark.asyncio
     async def test_enter_in_validate_is_safe(self):
-        app, _, _ = make_app()
+        # Validate (mode 2) is the producer lane (R3a).
+        app, _, _ = make_app(surface="producer")
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.press("3")
             await pilot.press("enter")
@@ -1454,7 +1458,8 @@ class TestCrossRigBenchmarksViaExplain:
 class TestValidateEvidenceWired:
     @pytest.mark.asyncio
     async def test_evidence_list_populates_from_rebench_dir(self, tmp_path):
-        app, _, _ = make_app(repo_root=tmp_path)
+        # Validate (mode 2) is the producer lane (R3a) — enter on producer.
+        app, _, _ = make_app(repo_root=tmp_path, surface="producer")
         seed_repo(tmp_path)
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.press("3")
@@ -1467,7 +1472,7 @@ class TestValidateEvidenceWired:
 
     @pytest.mark.asyncio
     async def test_evidence_enter_opens_report_modal(self, tmp_path):
-        app, _, _ = make_app(repo_root=tmp_path)
+        app, _, _ = make_app(repo_root=tmp_path, surface="producer")
         seed_repo(tmp_path)
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.press("3")
@@ -1486,7 +1491,7 @@ class TestValidateEvidenceWired:
         """[s] in Evidence stages the OUTWARD submit behind a confirm modal —
         the network is NEVER auto-fired."""
         wr = FakeWriteRunner()
-        app, _, _ = make_app(repo_root=tmp_path, write_runner=wr)
+        app, _, _ = make_app(repo_root=tmp_path, write_runner=wr, surface="producer")
         seed_repo(tmp_path)
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.press("3")
@@ -1709,7 +1714,8 @@ class TestShareBackR2b:
 class TestValidateRunWired:
     @pytest.mark.asyncio
     async def test_run_enter_opens_confirm_modal(self):
-        app, _, _ = make_app()
+        # Validate · Run is the producer lane (R3a) — enter on producer.
+        app, _, _ = make_app(surface="producer")
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.press("3")
             await _settle(pilot)
@@ -1726,7 +1732,7 @@ class TestValidateRunWired:
         """Confirming a Run step streams via run_validation → the MOCKED write
         runner.  NO live process is spawned (conftest blocks it)."""
         wr = FakeWriteRunner()
-        app, _, _ = make_app(write_runner=wr)
+        app, _, _ = make_app(write_runner=wr, surface="producer")
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.press("3")
             await _settle(pilot)
@@ -1750,7 +1756,7 @@ class TestValidateRunWired:
         async def detect_should_not_be_called():
             raise AssertionError("a validation run must not reconcile")
 
-        app, _, _ = make_app(write_runner=wr)
+        app, _, _ = make_app(write_runner=wr, surface="producer")
         # Swap the detect to one that screams if the reconcile gate runs on confirm.
         app._data._detect_endpoint = detect_should_not_be_called
         async with app.run_test(size=(120, 40)) as pilot:
@@ -1888,7 +1894,8 @@ class TestValidateNoLiveWriteOrNetwork:
     @pytest.mark.asyncio
     async def test_full_validate_browse_touches_only_fakes(self, tmp_path):
         wr = FakeWriteRunner()
-        app, runner, _ = make_app(repo_root=tmp_path, write_runner=wr)
+        # Validate (mode 2) is the producer lane (R3a).
+        app, runner, _ = make_app(repo_root=tmp_path, write_runner=wr, surface="producer")
         seed_repo(tmp_path)
         async with app.run_test(size=(120, 40)) as pilot:
             # Browse every Validate tab + Operate (incl. Doctor) — pure reads,
@@ -1998,7 +2005,9 @@ class TestPromoteHookWired:
 
     @pytest.mark.asyncio
     async def test_promote_without_byo_notifies(self):
-        app, _, _ = make_app()
+        # [P] promote is producer-gated (R3a) — exercise the no-BYO branch on
+        # the producer surface where the action is reachable.
+        app, _, _ = make_app(surface="producer")
         async with app.run_test(size=(120, 40)) as pilot:
             await _settle(pilot)
             # No BYO fit-check yet → nothing to promote.
@@ -2008,7 +2017,8 @@ class TestPromoteHookWired:
 
     @pytest.mark.asyncio
     async def test_promote_previews_scaffold_after_byo_check(self):
-        app, _, _ = make_app()
+        # [P] promote is producer-gated (R3a).
+        app, _, _ = make_app(surface="producer")
         async with app.run_test(size=(120, 40)) as pilot:
             await _settle(pilot)
             # Run a BYO fit-check (Run · BYO) — fills the arch facts.
@@ -2029,7 +2039,8 @@ class TestPromoteHookWired:
         """Staging the write opens the standard confirm gate; the plan is
         mock-only and writes nothing into scripts/ (no auto-fire)."""
         wr = FakeWriteRunner()
-        app, _, _ = make_app(write_runner=wr)
+        # [P] promote is producer-gated (R3a).
+        app, _, _ = make_app(write_runner=wr, surface="producer")
         async with app.run_test(size=(120, 40)) as pilot:
             await _settle(pilot)
             app.run_byo_check("unsloth/Qwen3-27B-abliterated", "vllm/dual")
@@ -2248,7 +2259,9 @@ class TestCheckActionPerModeSubtab:
 
     @pytest.mark.asyncio
     async def test_run_catalog_enables_explain_and_filter(self):
-        app, _, _ = make_app()
+        # promote_catalog ([P]) is producer-gated (R3a); assert its enabled
+        # (context-True) path on the producer surface where it's reachable.
+        app, _, _ = make_app(surface="producer")
         async with app.run_test(size=(120, 40)) as pilot:
             await _settle(pilot)
             assert app._active_mode == 0
@@ -2323,7 +2336,8 @@ class TestCheckActionPerModeSubtab:
     async def test_run_catalog_enables_filter_and_validate_drops_old_bmk_keys(self):
         """Fold 3: [/] filter lives on Run · Catalog; the old Benchmarks sort
         ([t]) is gone, so context_t is disabled in Validate mode."""
-        app, _, _ = make_app()
+        # Validate (mode 2) is the producer lane (R3a).
+        app, _, _ = make_app(surface="producer")
         async with app.run_test(size=(120, 40)) as pilot:
             await _settle(pilot)
             # Run · Catalog (default mode/tab): filter enabled.
@@ -2339,7 +2353,8 @@ class TestCheckActionPerModeSubtab:
 
     @pytest.mark.asyncio
     async def test_validate_evidence_enables_s_key(self):
-        app, _, _ = make_app()
+        # Validate (mode 2) is the producer lane (R3a).
+        app, _, _ = make_app(surface="producer")
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.press("3")
             await _settle(pilot)
@@ -2363,8 +2378,12 @@ class TestCheckActionPerModeSubtab:
 
     @pytest.mark.asyncio
     async def test_always_on_keys_active_in_every_mode(self):
-        """quit/help/refresh/mode-switch must be True in every mode."""
-        app, _, _ = make_app()
+        """quit/help/refresh/mode-switch must be True in every mode.
+
+        Run on the producer surface so all three mode switches (incl.
+        mode_validate, which the R3a surface gate hides on consumer) are
+        genuinely always-on across every mode."""
+        app, _, _ = make_app(surface="producer")
         async with app.run_test(size=(120, 40)) as pilot:
             for mode_key in ("1", "2", "3"):
                 await pilot.press(mode_key)
@@ -2493,7 +2512,8 @@ class TestModalKeyCapture:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             seed_repo(root)
-            app, _, _ = make_app(repo_root=root)
+            # Validate (mode 2) is the producer lane (R3a).
+            app, _, _ = make_app(repo_root=root, surface="producer")
             async with app.run_test(size=(120, 40)) as pilot:
                 await pilot.press("3")
                 await _settle(pilot)
@@ -2575,7 +2595,8 @@ class TestSubtabCycling:
 
     @pytest.mark.asyncio
     async def test_subtab_key_cycles_validate_tabs(self):
-        app, _, _ = make_app()
+        # Validate (mode 2) is the producer lane (R3a).
+        app, _, _ = make_app(surface="producer")
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.press("3")
             await _settle(pilot)
@@ -2588,8 +2609,11 @@ class TestSubtabCycling:
     @pytest.mark.asyncio
     async def test_subtab_key_active_in_all_three_modes(self):
         """After R1 all three modes (Run · Operate · Validate) have sub-tabs, so
-        the cycle keys are active (check_action True) in each."""
-        app, _, _ = make_app()
+        the cycle keys are active (check_action True) in each.
+
+        Run on the producer surface so the Validate (mode 2) lane is reachable
+        (R3a gates it on consumer)."""
+        app, _, _ = make_app(surface="producer")
         async with app.run_test(size=(120, 40)) as pilot:
             for key, mode in (("1", 0), ("2", 1), ("3", 2)):
                 await pilot.press(key)
@@ -2627,7 +2651,8 @@ class TestModeSwitchFocus:
 
     @pytest.mark.asyncio
     async def test_switch_to_validate_focuses_run_ladder(self):
-        app, _, _ = make_app()
+        # Validate (mode 2) is the producer lane (R3a).
+        app, _, _ = make_app(surface="producer")
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.press("3")
             await _settle(pilot)
@@ -2639,7 +2664,8 @@ class TestModeSwitchFocus:
     async def test_tab_change_on_validate_refocuses_relevant_table(self):
         """Using the sub-tab cycle key on Validate must move focus to the
         relevant DataTable for the newly active tab."""
-        app, _, _ = make_app()
+        # Validate (mode 2) is the producer lane (R3a).
+        app, _, _ = make_app(surface="producer")
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.press("3")
             await _settle(pilot)
@@ -2752,7 +2778,8 @@ class TestEscClosesFilter:
     async def test_no_bmk_filter_in_validate_after_fold(self):
         """Fold 3: the Benchmarks filter is gone — `/` in Validate opens no
         filter Input and Esc remains a harmless no-op (the app stays running)."""
-        app, _, _ = make_app()
+        # Validate (mode 2) is the producer lane (R3a).
+        app, _, _ = make_app(surface="producer")
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.press("3")  # Validate
             await _settle(pilot)
@@ -2776,14 +2803,15 @@ class TestEscClosesFilter:
 
 
 class TestSurfaceScaffold:
-    """R0 — the surface flag + `--contribute` indicator + the (permissive) producer gate.
+    """R0/R3a — the surface flag + `--contribute` indicator + the producer gate.
 
-    No behavior change ships in R0: _PRODUCER_ONLY is empty, so the surface gate
-    is a no-op. These tests prove (a) the flag defaults to consumer, (b) producer
-    surfaces the CONTRIBUTE indicator, and (c) the gate LOGIC hides a producer-only
-    action on consumer / shows it on producer — including for _ALWAYS_ON actions
-    (the gate is checked BEFORE _ALWAYS_ON, so R3 can hide the producer MODE
-    switch) — so R3 can populate _PRODUCER_ONLY and have it take effect.
+    R0 wired the surface flag with an EMPTY _PRODUCER_ONLY (no-op gate); R3a
+    POPULATES it ({"mode_validate", "promote_catalog"}) so the consumer/producer
+    split is real. These tests prove (a) the flag defaults to consumer, (b)
+    producer surfaces the CONTRIBUTE indicator, and (c) the gate LOGIC hides a
+    producer-only action on consumer / shows it on producer — including for
+    _ALWAYS_ON actions (the gate is checked BEFORE _ALWAYS_ON, so it can hide the
+    producer Bring & Validate MODE switch).
 
     The gate-logic tests patch the *class* attr `_PRODUCER_ONLY` via monkeypatch
     BEFORE the app mounts (auto-restored after), rather than mutating a live
@@ -2815,14 +2843,32 @@ class TestSurfaceScaffold:
             assert app._surface == "consumer"
 
     @pytest.mark.asyncio
-    async def test_shipped_producer_set_is_empty_noop(self):
-        # The shipped _PRODUCER_ONLY is empty → no existing action is surface-gated.
-        app, _, _ = make_app()
+    async def test_shipped_producer_set_is_mode_validate_and_promote(self):
+        # R3a: the shipped _PRODUCER_ONLY now gates the producer lane
+        # (mode_validate) + the [P] promote action.
+        assert CockpitApp._PRODUCER_ONLY == frozenset({"mode_validate", "promote_catalog"})
+
+    @pytest.mark.asyncio
+    async def test_shipped_producer_set_hidden_on_consumer(self):
+        # On the consumer surface the shipped producer-only actions are gated off.
+        app, _, _ = make_app(surface="consumer")
         async with app.run_test(size=(120, 40)) as pilot:
             await _settle(pilot)
-            assert app._PRODUCER_ONLY == frozenset()
+            assert app.check_action("mode_validate", ()) is False
+            assert app.check_action("promote_catalog", ()) is False
             # a normal Run/mode-0 context key is unaffected by the surface gate
             assert app.check_action("explain", ()) is True
+
+    @pytest.mark.asyncio
+    async def test_shipped_producer_set_shown_on_producer(self):
+        # On the producer surface they fall through to their normal context
+        # result: mode_validate is always-on (True), promote is a mode-0 Run key
+        # (default mode is 0 → True).
+        app, _, _ = make_app(surface="producer")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            assert app.check_action("mode_validate", ()) is True
+            assert app.check_action("promote_catalog", ()) is True
 
     @pytest.mark.asyncio
     async def test_producer_gate_hides_on_consumer(self, monkeypatch):
@@ -2864,6 +2910,117 @@ class TestSurfaceScaffold:
         async with app.run_test(size=(120, 40)) as pilot:
             await _settle(pilot)
             assert app.check_action("help", ()) is True
+
+
+def _mode_switcher_item_count(app) -> int:
+    """How many mode rows the ModeSwitcher actually rendered (its mode-N Labels).
+
+    Match only the numbered ``mode-<N>`` row ids — NOT the ``mode-action-hint``
+    Label (which also starts with ``mode-``)."""
+    ms = app.query_one("#mode-switcher", ModeSwitcher)
+    return len([
+        lbl for lbl in ms.query(Label)
+        if (lbl.id or "").startswith("mode-") and (lbl.id or "")[len("mode-"):].isdigit()
+    ])
+
+
+class TestProducerLaneGatedR3a:
+    """R3a — the producer Bring & Validate lane (mode 2 / key 3) + [P] promote are
+    PRODUCER-only: hidden + unreachable on the consumer surface, reachable on
+    producer. The ModeSwitcher is surface-aware (2 rows consumer, 3 producer)."""
+
+    @pytest.mark.asyncio
+    async def test_consumer_cannot_reach_validate_via_key_3(self):
+        """On consumer: mode_validate is gated off and pressing 3 does NOT switch
+        to the producer lane (stays in Run, mode 0)."""
+        app, _, _ = make_app(surface="consumer")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            assert app._active_mode == 0
+            assert app.check_action("mode_validate", ()) is False
+            await pilot.press("3")
+            await _settle(pilot)
+            # Did NOT enter the producer Validate lane.
+            assert app._active_mode == 0
+            assert "active" not in app.query_one("#panel-validate").classes
+            assert "active" in app.query_one("#panel-run").classes
+
+    @pytest.mark.asyncio
+    async def test_consumer_action_mode_validate_guard_is_noop(self):
+        """Belt-and-suspenders: even a direct programmatic call to
+        action_mode_validate does not switch a consumer into the producer lane."""
+        app, _, _ = make_app(surface="consumer")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            app.action_mode_validate()
+            await _settle(pilot)
+            assert app._active_mode == 0
+            assert "active" not in app.query_one("#panel-validate").classes
+
+    @pytest.mark.asyncio
+    async def test_consumer_promote_is_gated_off(self):
+        """On consumer: [P] promote_catalog is gated off (producer activity)."""
+        app, _, _ = make_app(surface="consumer")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            assert app._active_mode == 0  # Run, where [P] would otherwise be live
+            assert app.check_action("promote_catalog", ()) is False
+
+    @pytest.mark.asyncio
+    async def test_consumer_mode_switcher_shows_two_modes(self):
+        """The consumer ModeSwitcher renders Run + Operate only (no Validate row)."""
+        app, _, _ = make_app(surface="consumer")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            assert _mode_switcher_item_count(app) == 2
+
+    @pytest.mark.asyncio
+    async def test_producer_can_reach_validate_via_key_3(self):
+        """On producer: pressing 3 enters the Validate lane (mode 2)."""
+        app, _, _ = make_app(surface="producer")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            assert app.check_action("mode_validate", ()) is True
+            await pilot.press("3")
+            await _settle(pilot)
+            assert app._active_mode == 2
+            assert "active" in app.query_one("#panel-validate").classes
+
+    @pytest.mark.asyncio
+    async def test_producer_promote_is_reachable(self):
+        """On producer: [P] promote_catalog falls through to its Run-context True."""
+        app, _, _ = make_app(surface="producer")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            assert app._active_mode == 0
+            assert app.check_action("promote_catalog", ()) is True
+
+    @pytest.mark.asyncio
+    async def test_producer_mode_switcher_shows_three_modes(self):
+        """The producer ModeSwitcher renders all three modes (incl. Validate)."""
+        app, _, _ = make_app(surface="producer")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            assert _mode_switcher_item_count(app) == 3
+
+    @pytest.mark.asyncio
+    async def test_consumer_share_back_not_over_gated(self):
+        """The consumer share-back (rig_report / submit_bench / report_problem) is
+        NOT producer-gated and stays check_action-True on consumer in its modes."""
+        app, _, _ = make_app(surface="consumer")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            for a in ("rig_report", "submit_bench", "report_problem"):
+                assert a not in app._PRODUCER_ONLY
+            # Run (mode 0): rig_report + report_problem live.
+            assert app.check_action("rig_report", ()) is True
+            assert app.check_action("report_problem", ()) is True
+            # Operate (mode 1): all three live (submit_bench is Operate-only).
+            await pilot.press("2")
+            await _settle(pilot)
+            assert app.check_action("rig_report", ()) is True
+            assert app.check_action("submit_bench", ()) is True
+            assert app.check_action("report_problem", ()) is True
 
 
 class TestResolveSurface:

@@ -1872,13 +1872,24 @@ class ModeSwitcher(Static):
     }
     """
 
-    def __init__(self, **kwargs):
+    def __init__(self, *, surface: str = "consumer", **kwargs):
         super().__init__("", **kwargs)
         self._active = 0
+        # Surface-aware (R3a): the CONSUMER surface renders Run + Operate only;
+        # PRODUCER additionally renders Validate (the Bring & Validate lane, key
+        # 3).  Keys 1/2 = Run/Operate on both; key 3 is only meaningful on
+        # producer (gated by check_action's surface gate on consumer).
+        self._surface = surface if surface in ("consumer", "producer") else "consumer"
+
+    @property
+    def _modes(self) -> list[tuple[str, str]]:
+        """The modes to render for this surface — all three on producer, the
+        first two (Run + Operate) on consumer."""
+        return list(MODES) if self._surface == "producer" else list(MODES[:2])
 
     def compose(self) -> ComposeResult:
         yield Label("Modes", classes="mode-title")
-        for i, (name, digit) in enumerate(MODES):
+        for i, (name, digit) in enumerate(self._modes):
             classes = "mode-item-active" if i == 0 else "mode-item"
             yield Label(f"▸ {name} [{digit}]" if i == 0 else f"  {name} [{digit}]",
                         id=f"mode-{i}", classes=classes)
@@ -1887,7 +1898,7 @@ class ModeSwitcher(Static):
 
     def set_active(self, index: int) -> None:
         self._active = index
-        for i, (name, digit) in enumerate(MODES):
+        for i, (name, digit) in enumerate(self._modes):
             try:
                 lbl = self.query_one(f"#mode-{i}", Label)
                 lbl.remove_class("mode-item-active")
@@ -2056,10 +2067,18 @@ class CockpitApp(App):
         "report_problem":   ({0, 1}, None),
     }
 
-    # Producer-only actions — hidden on the consumer surface (R0 surface scaffold).
-    # Empty until R3 adds the Bring & Validate lane, so the surface gate in
-    # check_action is a no-op today (no behavior change) — just the wired predicate.
-    _PRODUCER_ONLY: frozenset[str] = frozenset()
+    # Producer-only actions — hidden on the consumer surface (R3a makes the
+    # consumer/producer split REAL).  The gate fires in check_action BEFORE
+    # _ALWAYS_ON, so listing ``mode_validate`` here hides the ENTIRE producer
+    # "Bring & Validate" lane (its mode switch + ladder + evidence) on the
+    # consumer surface; the producer surface (``c3 --contribute``) falls through
+    # to the normal context result.  ``promote_catalog`` ([P]) is a producer
+    # activity still surfaced in Run · Catalog today — hidden on consumer, still
+    # reachable on producer (it relocates into the lane in R3b).
+    #   NOT gated: the consumer share-back (rig_report / submit_bench /
+    #   report_problem) is CONSUMER-resident and stays reachable; evaluate_target
+    #   stays in Operate for now (R3b relocates it).
+    _PRODUCER_ONLY: frozenset[str] = frozenset({"mode_validate", "promote_catalog"})
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         """Return True (enabled + shown in footer), False (disabled + hidden in footer).
@@ -2067,9 +2086,9 @@ class CockpitApp(App):
         Rules (in priority order):
         0. Surface gate — producer-only actions are hidden on the consumer
            surface, checked BEFORE the always-on set so it wins for EVERY action
-           class (including mode_* switches, which live in _ALWAYS_ON; R3 hides
-           the producer Bring & Validate MODE on consumer this way). No-op today
-           (_PRODUCER_ONLY is empty until R3).
+           class (including mode_* switches, which live in _ALWAYS_ON; R3a hides
+           the producer Bring & Validate MODE (mode_validate) + [P] promote on
+           consumer this way).
         1. Always-on set — True unconditionally.
         2. A filter Input is focused — Textual's Input.is_printable already calls
            event.stop() for letter/digit keys, so they never reach app bindings.
@@ -2084,11 +2103,11 @@ class CockpitApp(App):
         """
         from textual.widgets import Input as _Input
 
-        # Surface gate (R0): producer-only actions are hidden on the consumer
+        # Surface gate (R3a): producer-only actions are hidden on the consumer
         # surface — checked BEFORE _ALWAYS_ON so it wins for EVERY action class,
-        # including mode_* switches (which live in _ALWAYS_ON). R3 hides the
-        # producer Bring & Validate MODE on consumer via this gate, so it MUST
-        # beat _ALWAYS_ON. Permissive today — _PRODUCER_ONLY is empty until R3.
+        # including mode_* switches (which live in _ALWAYS_ON). R3a hides the
+        # producer Bring & Validate MODE (mode_validate) + [P] promote on
+        # consumer via this gate, so it MUST beat _ALWAYS_ON.
         if self._surface != "producer" and action in self._PRODUCER_ONLY:
             return False
 
@@ -2179,7 +2198,7 @@ class CockpitApp(App):
         yield Header(show_clock=True)
         with Horizontal(id="main-layout"):
             with Vertical(id="left-rail"):
-                yield ModeSwitcher(id="mode-switcher")
+                yield ModeSwitcher(id="mode-switcher", surface=self._surface)
                 yield RailStatus(id="rail-status")
             with Container(id="content-area"):
                 # Mode 0 — Run (Discover + Serve + Benchmarks folded in)
@@ -2565,6 +2584,12 @@ class CockpitApp(App):
         self._switch_mode(1)
 
     def action_mode_validate(self) -> None:
+        # Belt-and-suspenders surface guard (R3a): Validate is the producer
+        # Bring & Validate lane.  The binding is already gated by check_action's
+        # surface gate, but guard the action too so no programmatic / edge path
+        # can land a consumer in the producer mode.
+        if self._surface != "producer":
+            return
         self._switch_mode(2)
 
     def action_refresh(self) -> None:
