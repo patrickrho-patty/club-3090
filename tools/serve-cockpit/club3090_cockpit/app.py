@@ -199,6 +199,11 @@ class HelpScreen(ModalScreen):
   Run: [cyan]⏎[/cyan] launch step (gated)
   Evidence: [cyan]⏎[/cyan] open report   [cyan]s[/cyan] submit to localmaxxing (gated · never auto)
 
+[bold]Share back[/bold] (Run + Operate — lightweight, no surface switch)
+  [cyan]R[/cyan] rig report — paste-ready rig/bench snapshot (read · no network)
+  [cyan]B[/cyan] submit bench — submit the latest benched result (Operate · gated · never auto)
+  [cyan]![/cyan] report a problem — paste-ready issue from the failure context (read · surfaced at a failed serve)
+
 [bold]Safety — the reconcile gate[/bold]
 
   Every write (serve, scene-switch, estate-down, container restart/stop/rm,
@@ -1497,6 +1502,75 @@ class EvidenceReportScreen(ModalScreen):
         self.app.pop_screen()
 
 
+# ── Phase R / R2b · Share-back paste-ready report modal (design §3.2 / §9.4 R2) ───
+
+
+class ShareBackReportScreen(ModalScreen):
+    """Generic paste-ready report overlay for the consumer share-back affordances
+    (rig report [R] / problem report [!]).  READ-only — it loads its body on
+    mount via a worker (mirrors EvidenceReportScreen) and renders it verbatim for
+    the user to copy.  NO ConfirmActionScreen, NO network: these are reads that
+    gather LOCAL context; the user copies the text and posts it themselves.
+
+    ``loader`` is an async callable returning ``{"report", "error"}`` (e.g.
+    ``CockpitData.rig_report`` / ``problem_report``); the app's worker invokes it
+    and pushes the result back via ``set_report``."""
+
+    DEFAULT_CSS = """
+    ShareBackReportScreen {
+        align: center middle;
+    }
+    ShareBackReportScreen > Vertical {
+        width: 96;
+        height: 80%;
+        border: thick $accent;
+        background: $surface;
+        padding: 1 2;
+    }
+    ShareBackReportScreen .share-report-title {
+        text-style: bold;
+        color: $accent;
+        margin-bottom: 1;
+    }
+    ShareBackReportScreen #share-report-scroll {
+        height: 1fr;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "dismiss", "Close"),
+    ]
+
+    def __init__(self, title: str, kind: str, **kwargs):
+        super().__init__(**kwargs)
+        self._title = title
+        self._kind = kind  # "rig" | "problem" — selects the loader in the app
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Label(self._title, classes="share-report-title")
+            with ScrollableContainer(id="share-report-scroll"):
+                yield Static("Generating report (local read — no network)…", id="share-report-body")
+            yield Label("[dim]Esc to close · copy the text above to share[/dim]")
+
+    def on_mount(self) -> None:
+        # Load once the modal is mounted (so set_report's query resolves) —
+        # mirrors EvidenceReportScreen's load-on-mount.
+        self.app.run_share_back_report(self, self._kind)  # type: ignore[attr-defined]
+
+    def set_report(self, report: str, error: Optional[str]) -> None:
+        body = self.query_one("#share-report-body", Static)
+        if error and not report:
+            body.update(f"[red]report unavailable:[/red] {error}")
+            return
+        from rich.markup import escape
+
+        body.update(escape(report))
+
+    def action_dismiss(self) -> None:
+        self.app.pop_screen()
+
+
 # ── Phase 5 · Promote-to-catalog scaffold preview modal (design §3.5b) ────────────
 
 
@@ -1882,6 +1956,13 @@ class CockpitApp(App):
         Binding("v", "evaluate_target", "Evaluate", show=False),
         Binding("P", "promote_catalog", "Promote", show=False),
         Binding("O", "optimize_card", "Optimize", show=False),
+        # Phase R / R2b — consumer share-back affordances (NOT producer-gated):
+        #   [R] rig report (READ · paste-ready)     — Run + Operate
+        #   [B] submit bench (OUTWARD write · gated) — Operate
+        #   [!] report a problem (READ · paste-ready, surfaced at a failed serve)
+        Binding("R", "rig_report", "Rig report", show=False),
+        Binding("B", "submit_bench", "Submit bench", show=False),
+        Binding("exclamation_mark", "report_problem", "Report problem", show=False),
     ]
 
     CSS = """
@@ -1962,6 +2043,17 @@ class CockpitApp(App):
         # [t] only has the Containers (docker top) role now — the Benchmarks tab
         # and its sort-cycle are gone (folded into Run); not wired on Run rows.
         "context_t":        ({1}, {"tab-containers"}),
+        # Phase R / R2b — consumer share-back (CONSUMER-resident — NOT producer-
+        # gated; absent from _PRODUCER_ONLY so they work on the default surface):
+        #   rig_report   — Run + Operate (a rig/bench snapshot is meaningful from
+        #                  either the catalog or the live estate, any sub-tab).
+        #   submit_bench — Operate only (you submit measured results once a bench
+        #                  exists; Operate is where the live estate / evidence is).
+        #   report_problem — Run + Operate (surfaced AT a failed serve in Run, and
+        #                  reachable while operating; any sub-tab).
+        "rig_report":       ({0, 1}, None),
+        "submit_bench":     ({1}, None),
+        "report_problem":   ({0, 1}, None),
     }
 
     # Producer-only actions — hidden on the consumer surface (R0 surface scaffold).
@@ -2076,6 +2168,12 @@ class CockpitApp(App):
         # Phase 5: the last BYO fit-check result (Run · BYO) — the arch facts
         # the Promote-to-catalog scaffold computes from.
         self._last_byo: Optional[ByoResult] = None
+        # Phase R / R2b: failure context for the [!] problem report — captured AT
+        # a failed serve in dispatch_action (the slug + the boot-log lines that
+        # were streamed into the serve-live pane) so problem_report can assemble
+        # a paste-ready issue with the readily-available context.
+        self._problem_slug: str = ""
+        self._problem_boot_log: str = ""
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -2327,6 +2425,11 @@ class CockpitApp(App):
             if live is not None and plan.kind == "serve":
                 self._reveal_serve_live()
                 live.append_line(f"[red]✗ refused[/red] — {plan.description} (gate unsafe: {summary})")
+                # Surface the problem-report affordance AT the failure (design:
+                # "surfaced *at* the failure") and capture the failure context so
+                # [!] assembles a paste-ready issue with the readily-available log.
+                self._capture_serve_failure(plan, f"✗ refused — {plan.description} (gate unsafe: {summary})")
+                live.append_line("[dim]press ! to report this[/dim]")
             return
         self.notify(
             f"{plan.description} dispatched.",
@@ -2334,6 +2437,11 @@ class CockpitApp(App):
             severity="information",
             timeout=4,
         )
+        if plan.kind == "serve":
+            # A successful serve clears any stale failed-serve context so a later
+            # [!] reports THIS state, not a PRIOR failure (R2b verify fix).
+            self._problem_slug = ""
+            self._problem_boot_log = ""
         if live is not None and plan.kind == "serve":
             # Reveal the transient Run boot pane (Fold 2) and stream the boot log.
             self._reveal_serve_live()
@@ -2353,6 +2461,26 @@ class CockpitApp(App):
             self.query_one("#serve-live", LivePane).add_class("serving")
         except Exception:
             pass
+
+    def _capture_serve_failure(self, plan: ActionPlan, last_line: str) -> None:
+        """Capture a failed serve's context for the [!] problem report (R2b).
+
+        Records the slug being served + the boot-log line(s) that describe the
+        failure so ``problem_report`` can assemble a paste-ready issue from the
+        readily-available context.  Best-effort: slug from the staged entry, else
+        the last cmd arg of the serve plan (``switch.sh <slug>``)."""
+        slug = ""
+        if self._staged_entry is not None:
+            slug = getattr(self._staged_entry, "slug", "") or ""
+        if not slug:
+            slug = self._target_slug or ""
+        if not slug and plan.cmd:
+            # The slug is the LAST arg of a serve plan — handles both
+            # `switch.sh <slug>` and `switch.sh --force <slug>` (where cmd[2]
+            # would wrongly be "--force").
+            slug = plan.cmd[-1]
+        self._problem_slug = slug
+        self._problem_boot_log = last_line
 
     # ── Mode switching ───────────────────────────────────────────────────────────────
 
@@ -2787,6 +2915,77 @@ class CockpitApp(App):
             screen.set_report(report)
         except Exception:
             pass
+
+    # ── Phase R / R2b · Consumer share-back (READ paste-ready + outward submit) ────
+
+    @work(group="share-back-report")
+    async def run_share_back_report(self, screen: "ShareBackReportScreen", kind: str) -> None:
+        """Load a consumer share-back report (READ — local context, no network).
+
+        ``kind`` selects the loader: ``"rig"`` → rig_report (bare report.sh, a
+        ~2 s snapshot); ``"problem"`` → problem_report (boot-log + compose + rig
+        snapshot from the failure context the app captured).  Neither touches the
+        network or a GPU."""
+        if kind == "rig":
+            res = await self._data.rig_report()
+        elif kind == "problem":
+            res = await self._data.problem_report(
+                self._problem_slug,
+                boot_log=self._problem_boot_log,
+                url=self._target_url or None,
+                variants=self._variants or None,
+            )
+        else:  # pragma: no cover - defensive
+            res = {"report": "", "error": f"unknown report kind {kind!r}"}
+        try:
+            screen.set_report(res.get("report", ""), res.get("error"))
+        except Exception:
+            pass
+
+    def action_rig_report(self) -> None:
+        """[R] (Run + Operate): open the paste-ready rig/bench report.
+
+        CONSUMER-resident share-back — NOT producer-gated.  It is a READ (bare
+        report.sh generates a redacted ~2 s rig/stack snapshot; no network, no
+        GPU write — the heavy --full validation battery is the producer Gate's
+        job, R3), so there is NO ConfirmActionScreen: the user copies the text
+        and posts it themselves."""
+        self.push_screen(ShareBackReportScreen("Rig report · paste-ready", "rig"))
+
+    def action_report_problem(self) -> None:
+        """[!] (Run + Operate): open the paste-ready problem report.
+
+        CONSUMER-resident share-back — NOT producer-gated.  READ-only: it gathers
+        LOCAL failure context (the last serve's slug + captured boot-log + a rig
+        snapshot) into a paste-ready issue; the user copies + opens the issue.
+        Surfaced AT a failed serve via the affordance line in dispatch_action."""
+        self.push_screen(ShareBackReportScreen("Report a problem · paste-ready", "problem"))
+
+    def action_submit_bench(self) -> None:
+        """[B] (Operate): stage the OUTWARD submit-to-localmaxxing for the most
+        recent benched run tag.  This is the ONLY outward write of the three
+        share-back affordances — it keeps its confirm + network gate (the
+        existing submit_bench ActionPlan: requires_confirm + network=True).  The
+        network is mocked in tests; NEVER auto-fired."""
+        if self._active_mode != 1:
+            return
+        self.resolve_and_submit_bench()
+
+    @work(group="submit-bench-resolve")
+    async def resolve_and_submit_bench(self) -> None:
+        """Resolve the most-recent evidence tag, then stage the gated submit."""
+        tags = await self._data.evidence_list()
+        if not tags:
+            self.notify(
+                "No benched results to submit — run a bench first.",
+                title="Submit bench",
+                severity="warning",
+                timeout=4,
+            )
+            return
+        tag = tags[0].tag  # evidence_list is newest-first
+        plan = self._data.submit_bench(tag)
+        self.push_screen(ConfirmActionScreen(plan))
 
     def action_evidence_submit(self) -> None:
         """[s] in Validate · Evidence: stage the gated submit-to-localmaxxing for

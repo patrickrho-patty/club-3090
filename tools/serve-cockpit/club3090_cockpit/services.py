@@ -1327,6 +1327,123 @@ class CockpitData:
             network=True,
         )
 
+    # ── Share-back (R2b): rig report + problem report (READ — paste-ready) ────────
+
+    async def rig_report(self) -> dict[str, Any]:
+        """Generate a paste-ready rig/bench report (READ — no network/GPU write).
+
+        Bare ``scripts/report.sh`` assembles a redacted, paste-ready snapshot
+        (hardware + stack + boot-log highlights, ~2 s) that a consumer can drop
+        into a GitHub ``numbers-from-your-rig`` issue — the lightweight "one
+        keystroke while running" affordance.  We DO NOT pass ``--full``: that is
+        the ~43-min verify+stress+soak+bench+agentic battery, a producer-lane
+        Gate action (R3), NOT a lightweight share-back — it would contend with
+        the user's running model for the GPU.  Nor ``--submit`` / ``--auto`` —
+        generation is a local read; the user copies the text and posts it.
+        Returns ``{"report", "error"}``."""
+        res = await self._runner.run(
+            ["bash", "scripts/report.sh"],
+            cwd=str(self.repo_root),
+            timeout=60.0,
+        )
+        if res.timed_out:
+            return {"report": "", "error": "timed out generating rig report"}
+        body = (res.stdout or "").strip()
+        if not body:
+            return {
+                "report": "",
+                "error": (res.stderr.strip()[:300] or f"report.sh failed (rc={res.returncode})"),
+            }
+        return {"report": body, "error": None}
+
+    async def problem_report(
+        self,
+        slug: str,
+        *,
+        boot_log: str = "",
+        url: Optional[str] = None,
+        variants: Optional[list[VariantRow]] = None,
+    ) -> dict[str, Any]:
+        """Assemble a paste-ready problem/issue report from readily-available
+        failure context (READ — gathers LOCAL context only, no auto-network).
+
+        Pulls together: (a) the recent boot-log lines passed in (from the
+        serve-live LivePane) and, when a container is resolvable, a ``docker
+        logs`` tail of the failed container; (b) the slug's compose path
+        (best-effort from the registry/variants); (c) a rig snapshot (GPU cards
+        + driver from ``estate_state``/detect).  The user copies the text and
+        opens the issue themselves — nothing leaves the rig."""
+        sections: list[str] = []
+        sections.append("## Problem report")
+        sections.append(f"- **Slug:** `{slug or '—'}`")
+
+        # (b) compose path (best-effort, registry/variants).
+        variant = None
+        if variants:
+            variant = next((v for v in variants if getattr(v, "slug", "") == slug), None)
+        compose_path = getattr(variant, "compose_path", "") if variant is not None else ""
+        sections.append(f"- **Compose:** `{compose_path or '—'}`")
+        if variant is not None:
+            eng = getattr(variant, "engine", "") or getattr(variant, "switch_engine", "")
+            sections.append(f"- **Engine:** `{eng or '—'}`")
+
+        # (c) rig snapshot — GPU cards + driver.
+        try:
+            state = await self.estate_state(variants=variants)
+        except Exception:  # pragma: no cover - defensive
+            state = EstateState()
+        gpus = list(getattr(state, "gpus", []) or [])
+        sections.append("")
+        sections.append("### Rig snapshot")
+        driver = self._driver_version_from_gpus(gpus)
+        sections.append(f"- **GPUs:** {len(gpus)} card(s)")
+        if driver:
+            sections.append(f"- **Driver:** {driver}")
+        for g in gpus:
+            idx = getattr(g, "index", "?")
+            tot = getattr(g, "mem_total_mib", None)
+            tot_s = f"{tot} MiB" if tot else "unknown"
+            sections.append(f"  - GPU {idx}: {tot_s} total")
+
+        # (a) boot log — passed-in lines first, then docker logs of the failed
+        # container if one is resolvable (READ, never a write).
+        log_lines: list[str] = []
+        if boot_log.strip():
+            log_lines.extend(boot_log.strip().splitlines())
+        container = getattr(variant, "container", "") if variant is not None else ""
+        if container:
+            try:
+                res = await self.container_logs(container, tail=50)
+            except Exception:  # pragma: no cover - defensive
+                res = {"lines": [], "error": "log read failed"}
+            if res.get("error"):
+                log_lines.append(f"[docker logs unavailable: {res['error']}]")
+            else:
+                log_lines.extend(res.get("lines", [])[-50:])
+        sections.append("")
+        sections.append("### Boot / failure log")
+        if log_lines:
+            sections.append("```")
+            sections.extend(log_lines[-80:])
+            sections.append("```")
+        else:
+            sections.append("(no boot-log context captured)")
+
+        return {"report": "\n".join(sections), "error": None}
+
+    def _driver_version_from_gpus(self, gpus: list[Any]) -> str:
+        """Best-effort NVIDIA driver version from a GpuInfo list.
+
+        GpuInfo carries no driver field today, so we read whatever attribute the
+        core detect may have attached (``driver`` / ``driver_version``) and
+        degrade to '' silently — the report stays useful without it."""
+        for g in gpus:
+            for attr in ("driver_version", "driver"):
+                v = getattr(g, attr, None)
+                if v:
+                    return str(v)
+        return ""
+
     # ── Power cap: read (safe) + write/sweep (WIRED, mock-only, confirm) ──────────
 
     async def power_cap_get(self) -> PowerCapState:

@@ -47,6 +47,7 @@ from club3090_cockpit.app import (
     DoctorPane,
     ValidateEvidencePane,
     EvidenceReportScreen,
+    ShareBackReportScreen,
     RailStatus,
 )
 from club3090_cockpit.services import CockpitData, RunResult
@@ -1514,6 +1515,190 @@ class TestValidateEvidenceWired:
             await _settle(pilot)
             assert len(wr.started) == 1
             assert "--auto-submit" in wr.started[0]["cmd"]
+
+
+# ===========================================================================
+# Phase R / R2b — consumer share-back affordances (R [rig] · B [submit] · ! [problem])
+#
+# These are LIGHTWEIGHT, CONSUMER-RESIDENT contributions: a consumer shares a
+# rig report / bench / problem report WITHOUT switching to the producer surface.
+# So they are CONSUMER actions — NOT in _PRODUCER_ONLY — and work on the default
+# (consumer) surface.  rig_report + problem_report are READS (no confirm/network);
+# ONLY submit_bench [B] is an outward write and keeps its confirm + network gate.
+# All backends are mocked through the injected runner — the network is never hit.
+# ===========================================================================
+
+
+RIG_REPORT_TEXT = (
+    "# Rig report (paste-ready)\n"
+    "- GPUs: 2x RTX 3090\n"
+    "- decode 178 TPS @ 262K ctx\n"
+)
+
+
+class TestShareBackR2b:
+    @pytest.mark.asyncio
+    async def test_rig_report_modal_renders_mocked_report_sh(self):
+        """[R] in Run opens the paste-ready rig-report modal, which loads
+        bare report.sh snapshot output (mocked) — a READ, no ConfirmActionScreen."""
+        responses = fake_responses(**{"scripts/report.sh": ok(RIG_REPORT_TEXT)})
+        app, _, wr = make_app(responses=responses)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            await pilot.press("R")
+            await _settle(pilot)
+            assert isinstance(app.screen, ShareBackReportScreen)
+            # READ — never a confirm/network write.
+            assert not isinstance(app.screen, ConfirmActionScreen)
+            assert wr.started == []
+            body = str(app.screen.query_one("#share-report-body", Static).render())
+            assert "Rig report (paste-ready)" in body
+            assert "178 TPS" in body
+
+    @pytest.mark.asyncio
+    async def test_rig_report_invokes_bare_report_sh_no_full_no_submit(self):
+        """[R] shells the LIGHTWEIGHT bare report.sh (~2 s snapshot) — NOT
+        report.sh --full (the ~43-min verify+stress+soak+bench+agentic battery,
+        a producer-Gate action that would contend with the running model) — and
+        never a submit/auto flag."""
+        responses = fake_responses(**{"scripts/report.sh": ok(RIG_REPORT_TEXT)})
+        app, runner, _ = make_app(responses=responses)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            await pilot.press("R")
+            await _settle(pilot)
+            report_calls = [c for c in runner.calls if "report.sh" in " ".join(c)]
+            assert report_calls, "report.sh was not invoked"
+            for c in report_calls:
+                joined = " ".join(c)
+                assert "--full" not in joined    # lightweight, not the 43-min battery
+                assert "--submit" not in joined
+                assert "--auto" not in joined
+
+    @pytest.mark.asyncio
+    async def test_submit_bench_operate_opens_gated_confirm_never_auto(self, tmp_path):
+        """[B] in Operate resolves the latest evidence tag and stages the OUTWARD
+        submit behind a confirm modal — the network is NEVER auto-fired."""
+        wr = FakeWriteRunner()
+        app, _, _ = make_app(repo_root=tmp_path, write_runner=wr)
+        seed_repo(tmp_path)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("2")  # Operate
+            await _settle(pilot)
+            await pilot.press("B")
+            await _settle(pilot)
+            assert isinstance(app.screen, ConfirmActionScreen)
+            assert app.screen._plan.network is True
+            assert app.screen._plan.requires_confirm is True
+            assert "--auto-submit" in app.screen._plan.cmd
+            # Resolved to the most-recent (only) tag in results/rebench/.
+            assert "vllm-dual-test" in app.screen._plan.cmd
+            assert wr.started == []  # nothing fired — only the modal opened
+
+    @pytest.mark.asyncio
+    async def test_submit_bench_no_tags_notifies(self, tmp_path):
+        """[B] with no benched results notifies and opens no confirm modal."""
+        # tmp_path has NO results/rebench/ tree → evidence_list is empty.
+        wr = FakeWriteRunner()
+        app, _, _ = make_app(repo_root=tmp_path, write_runner=wr)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("2")  # Operate
+            await _settle(pilot)
+            await pilot.press("B")
+            await _settle(pilot)
+            assert not isinstance(app.screen, ConfirmActionScreen)
+            assert wr.started == []
+
+    @pytest.mark.asyncio
+    async def test_problem_report_modal_renders(self):
+        """[!] opens the paste-ready problem-report modal — a READ, no confirm."""
+        app, _, wr = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            await pilot.press("exclamation_mark")
+            await _settle(pilot)
+            assert isinstance(app.screen, ShareBackReportScreen)
+            assert not isinstance(app.screen, ConfirmActionScreen)
+            assert wr.started == []
+            body = str(app.screen.query_one("#share-report-body", Static).render())
+            assert "Problem report" in body
+            assert "Rig snapshot" in body
+
+    @pytest.mark.asyncio
+    async def test_failed_serve_surfaces_report_affordance(self):
+        """A FAILED (gate-refused) serve surfaces the 'press !' affordance in the
+        serve-live pane AND captures the failure context for [!]."""
+        wr = FakeWriteRunner()
+        # Make the gate unsafe: a live engine container + a busy GPU.
+        responses = fake_responses(**{"docker ps": ok(DOCKER_PS_ENGINE)})
+        gpus = [GpuInfo(index=0, mem_used_mib=22000), GpuInfo(index=1, mem_used_mib=1)]
+        app, _, _ = make_app(
+            responses=responses, gpus=gpus, target=ServingTarget(gpus=gpus), write_runner=wr
+        )
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            # Spy on the serve-live pane's append_line to capture emitted lines.
+            live = app.query_one("#serve-live")
+            emitted: list[str] = []
+            orig = live.append_line
+            live.append_line = lambda line, _o=orig, _e=emitted: (_e.append(line), _o(line))[1]
+            plan = app._data.serve("vllm/dual")  # not forced → gate refuses
+            app.dispatch_action(plan)
+            await _settle(pilot)
+            assert wr.started == []  # refused at the gate (failure)
+            assert any("press ! to report this" in ln for ln in emitted)
+            # Failure context captured for the [!] problem report.
+            assert app._problem_slug == "vllm/dual"
+            assert app._problem_boot_log
+
+    @pytest.mark.asyncio
+    async def test_problem_report_uses_captured_failure_context(self):
+        """After a failed serve, [!] assembles the report from the captured slug
+        + boot-log context (READ — local context, no network)."""
+        wr = FakeWriteRunner()
+        responses = fake_responses(**{"docker ps": ok(DOCKER_PS_ENGINE)})
+        gpus = [GpuInfo(index=0, mem_used_mib=22000), GpuInfo(index=1, mem_used_mib=1)]
+        app, _, _ = make_app(
+            responses=responses, gpus=gpus, target=ServingTarget(gpus=gpus), write_runner=wr
+        )
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            plan = app._data.serve("vllm/dual")
+            app.dispatch_action(plan)
+            await _settle(pilot)
+            await pilot.press("exclamation_mark")
+            await _settle(pilot)
+            assert isinstance(app.screen, ShareBackReportScreen)
+            body = str(app.screen.query_one("#share-report-body", Static).render())
+            assert "vllm/dual" in body  # the failed slug
+            assert "Boot / failure log" in body
+
+    @pytest.mark.asyncio
+    async def test_share_back_actions_enabled_on_consumer_surface(self):
+        """The 3 share-back actions are CONSUMER actions — check_action returns
+        True on the default consumer surface in their modes (NOT producer-gated)."""
+        app, _, _ = make_app(surface="consumer")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            assert app._surface == "consumer"
+            # NOT producer-gated.
+            assert "rig_report" not in app._PRODUCER_ONLY
+            assert "submit_bench" not in app._PRODUCER_ONLY
+            assert "report_problem" not in app._PRODUCER_ONLY
+            # Run (mode 0): rig_report + report_problem enabled.
+            assert app._active_mode == 0
+            assert app.check_action("rig_report", ()) is True
+            assert app.check_action("report_problem", ()) is True
+            # Operate (mode 1): all three enabled.
+            await pilot.press("2")
+            await _settle(pilot)
+            assert app.check_action("rig_report", ()) is True
+            assert app.check_action("submit_bench", ()) is True
+            assert app.check_action("report_problem", ()) is True
+            # submit_bench is Operate-only — hidden in Run.
+            await pilot.press("1")
+            await _settle(pilot)
+            assert app.check_action("submit_bench", ()) is False
 
 
 # ===========================================================================
