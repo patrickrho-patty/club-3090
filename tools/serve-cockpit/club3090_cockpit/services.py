@@ -741,6 +741,94 @@ class CockpitData:
             requires_reconcile=True,
         )
 
+    # ── Producer lane ② Serve — generate a compose, then serve it untested ─────────
+
+    async def generate_compose(
+        self, slug: str, *, accept_degraded: bool = False
+    ) -> dict[str, Any]:
+        """Generate a minimal compose for the CATALOG profile ``slug`` via
+        scripts/generate-compose.sh.
+
+        Producer-lane ② Serve step.  Shells ``generate-compose.sh --profile <slug>
+        --out <tmpfile> [--accept-degraded]`` (cwd repo_root, via the injected read
+        runner — it is a generation step that writes only a TEMP compose: no GPU, no
+        network), then reads the generated YAML back.
+
+        ⚠️  HONESTY (R3b-1): ``slug`` is a CATALOG profile slug.  generate-compose.sh
+        has no --repo / weight-swap, so the emitted compose is a reproduction of the
+        resolved CATALOG profile's compose — NOT a brought (BYO) model's weights.
+        The brought-model serve (pull-to-disk + a generate-compose.sh --repo
+        extension) is a deferred follow-up.
+
+        Mission (locked decision #2 in generate-compose.sh): reproduce + flag,
+        NEVER repair — the emitted compose is returned VERBATIM; the caller shows
+        it as an untested config reproduction and does NOT fit-adapt it.
+
+        Returns ``{"compose_path", "compose_yaml", "error"}``.  On a failed /
+        drift-guard-flagged generation, ``error`` is set and ``compose_yaml`` is
+        empty (the generator's stderr is surfaced).  The temp compose PERSISTS on
+        success (``serve_generated`` serves it via ``docker compose -f <path>``);
+        it is unlinked on every error path AND when the preview is declined without
+        serving (the app unlinks it on dismiss)."""
+        import os
+        import tempfile
+
+        def _fail(msg: str) -> dict[str, Any]:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            return {"compose_path": "", "compose_yaml": "", "error": msg}
+
+        # A temp file under the repo root so the generator's relative ../ mount
+        # paths (if any are emitted) resolve the same as a real compose would.
+        fd, tmp_path = tempfile.mkstemp(
+            prefix="c3-genc-", suffix=".yml", dir=str(self.repo_root)
+        )
+        os.close(fd)
+        cmd = [
+            "bash",
+            "scripts/generate-compose.sh",
+            "--profile",
+            slug,
+            "--out",
+            tmp_path,
+        ]
+        if accept_degraded:
+            cmd.append("--accept-degraded")
+        res = await self._runner.run(cmd, cwd=str(self.repo_root), timeout=60.0)
+        if res.timed_out:
+            return _fail(f"generate-compose timed out for {slug}")
+        if not res.ok:
+            err = (res.stderr.strip() or res.stdout.strip())[:300]
+            return _fail(err or f"generate-compose failed (rc={res.returncode})")
+        try:
+            yaml_text = Path(tmp_path).read_text(encoding="utf-8")
+        except OSError as exc:
+            return _fail(f"generated compose unreadable: {exc}")
+        if not yaml_text.strip():
+            # Generator returned 0 but emitted nothing to --out: surface its
+            # stdout (a convenience-tuple / candidate list, or a soft refuse).
+            return _fail(res.stdout.strip()[:300] or "generator emitted no compose")
+        return {"compose_path": tmp_path, "compose_yaml": yaml_text, "error": ""}
+
+    def serve_generated(self, compose_path: str) -> ActionPlan:
+        """Serve a GENERATED (producer-lane ②) compose, badged untested.
+
+        Serving a generated compose CLAIMS the GPU exactly like any serve, so the
+        plan is ``requires_reconcile=True`` + ``requires_confirm=True`` and routes
+        through the SAME ConfirmActionScreen → run_reconcile_for_modal →
+        dispatch_action gate (the dual-writer lease MUST hold).  We launch it via
+        ``docker compose -f <path> up`` — the generated compose is a verbatim
+        minimal reproduction, NOT a registry slug switch.sh knows about."""
+        return ActionPlan(
+            kind="serve",
+            cmd=["docker", "compose", "-f", compose_path, "up", "-d"],
+            description=f"serve generated compose {Path(compose_path).name} (untested)",
+            requires_reconcile=True,
+            requires_confirm=True,
+        )
+
     def set_default(self, slug: str) -> ActionPlan:
         return ActionPlan(
             kind="set_default",

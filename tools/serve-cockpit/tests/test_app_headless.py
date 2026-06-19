@@ -102,6 +102,31 @@ class FakeWriteRunner:
         return {"mock_state": True, "cmd": cmd}
 
 
+class FakeGenComposeRunner(FakeRunner):
+    """A FakeRunner that, on a generate-compose.sh call, writes a canned compose
+    to the ``--out`` path (mocking the real generator's file emit) so the data
+    layer's read-back of the temp file returns YAML — no real subprocess.  Other
+    commands fall through to the canned-response behaviour."""
+
+    def __init__(self, compose_yaml: str, responses=None):
+        # Default to the standard canned read responses so non-generate reads
+        # (pull.sh for byo_check, registry-emit for the catalog, etc.) still work.
+        super().__init__(responses if responses is not None else fake_responses())
+        self._compose_yaml = compose_yaml
+
+    async def run(self, cmd, *, cwd, timeout=30.0) -> RunResult:
+        self.calls.append(list(cmd))
+        if "generate-compose.sh" in " ".join(cmd):
+            # Write the canned compose to the --out path the data layer chose.
+            try:
+                out_idx = cmd.index("--out")
+                Path(cmd[out_idx + 1]).write_text(self._compose_yaml, encoding="utf-8")
+            except (ValueError, IndexError, OSError):
+                pass
+            return RunResult(returncode=0, stdout="", stderr="")
+        return await super().run(cmd, cwd=cwd, timeout=timeout)
+
+
 def ok(stdout: str) -> RunResult:
     return RunResult(returncode=0, stdout=stdout, stderr="")
 
@@ -412,16 +437,18 @@ def make_app(
     write_runner: Optional[FakeWriteRunner] = None,
     repo_root: Optional[Path] = None,
     surface: str = "consumer",
+    runner: Optional[FakeRunner] = None,
 ) -> tuple[CockpitApp, FakeRunner, FakeWriteRunner]:
     """Build a CockpitApp wired to a fully-faked CockpitData.
 
     Returns (app, read_runner, write_runner) so tests can assert on calls.
     ``repo_root`` overrides the fake root for the filesystem-backed reads
     (benchmarks explorer / evidence list) — seed it with BENCHMARKS.md and a
-    results/rebench/ tree for those panes.
+    results/rebench/ tree for those panes.  ``runner`` injects a custom read
+    runner (e.g. FakeGenComposeRunner for the ② Serve generate path).
     """
     root = repo_root or FAKE_REPO_ROOT
-    runner = FakeRunner(responses or fake_responses())
+    runner = runner or FakeRunner(responses or fake_responses())
     gpus = gpus if gpus is not None else [GpuInfo(index=0, mem_used_mib=1), GpuInfo(index=1, mem_used_mib=1)]
     target = target if target is not None else ServingTarget(gpus=gpus)
     write_runner = write_runner or FakeWriteRunner()
@@ -593,11 +620,18 @@ class TestNavNodesExist:
         app, _, _ = make_app()
         async with app.run_test(size=(120, 40)) as pilot:
             tc = app.query_one("#validate-tabs", TabbedContent)
+            # R3b-1: the producer lane is the ordered ①→⑤ pipeline.  ③ Gate keeps
+            # the tab id tab-run, ④ Measure keeps tab-evidence (grandfathered);
+            # ① Bring / ② Serve / ⑤ Promote are the new stage tabs.
+            app.query_one("#tab-bring", TabPane)
+            app.query_one("#tab-serve", TabPane)
             app.query_one("#tab-run", TabPane)
             app.query_one("#tab-evidence", TabPane)
-            # R2a moved Doctor out of Validate → only Run + Evidence remain.
+            app.query_one("#tab-promote", TabPane)
             pane_ids = [p.id for p in tc.query(TabPane)]
-            assert pane_ids == ["tab-run", "tab-evidence"], pane_ids
+            assert pane_ids == [
+                "tab-bring", "tab-serve", "tab-run", "tab-evidence", "tab-promote"
+            ], pane_ids
 
     @pytest.mark.asyncio
     async def test_doctor_renders_under_operate_not_validate(self):
@@ -1719,6 +1753,10 @@ class TestValidateRunWired:
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.press("3")
             await _settle(pilot)
+            # R3b-1: ③ Gate (the ladder) is no longer the lane's default tab (① Bring
+            # is) — activate it explicitly.
+            app.query_one("#validate-tabs", TabbedContent).active = "tab-run"
+            await pilot.pause()
             app.query_one("#run-ladder-table", DataTable).move_cursor(row=0)  # verify-full
             await pilot.press("enter")
             await pilot.pause()
@@ -1736,6 +1774,9 @@ class TestValidateRunWired:
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.press("3")
             await _settle(pilot)
+            # R3b-1: activate ③ Gate (no longer the lane default tab).
+            app.query_one("#validate-tabs", TabbedContent).active = "tab-run"
+            await pilot.pause()
             app.query_one("#run-ladder-table", DataTable).move_cursor(row=2)  # bench
             await pilot.press("enter")
             await _settle(pilot)
@@ -1902,7 +1943,8 @@ class TestValidateNoLiveWriteOrNetwork:
             # no writes.  R2a: Doctor lives under Operate now (tab-doctor).
             await pilot.press("3")
             await _settle(pilot)
-            for tab in ("tab-evidence", "tab-run"):
+            # R3b-1: browse every lane stage ①→⑤ — all pure reads, no writes.
+            for tab in ("tab-bring", "tab-serve", "tab-run", "tab-evidence", "tab-promote"):
                 app.query_one("#validate-tabs", TabbedContent).active = tab
                 await pilot.pause()
             await pilot.press("2")
@@ -1922,7 +1964,14 @@ class TestValidateNoLiveWriteOrNetwork:
 # ===========================================================================
 
 
-from club3090_cockpit.app import PromoteScaffoldScreen, OptimizeScreen  # noqa: E402
+from club3090_cockpit.app import (  # noqa: E402
+    PromoteScaffoldScreen,
+    OptimizeScreen,
+    UntestedComposePreviewScreen,
+    LaneBringPane,
+    LaneServePane,
+    LanePromotePane,
+)
 
 
 SERVING_TARGET = ServingTarget(
@@ -1939,10 +1988,16 @@ class TestEvaluateHookWired:
 
     @pytest.mark.asyncio
     async def test_evaluate_opens_confirm_when_target_running(self):
+        # R3b-1: [v] Evaluate relocated into the producer Bring & Validate lane
+        # (mode 2).  The Operate estate poll still captures the live target
+        # (_target_obj); the lane consumes it.
         app, _, _ = make_app(target=SERVING_TARGET,
-                             gpus=list(SERVING_TARGET.gpus))
+                             gpus=list(SERVING_TARGET.gpus),
+                             surface="producer")
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.press("2")          # Operate — poll captures the target
+            await _settle(pilot)
+            await pilot.press("3")          # Bring & Validate lane (where [v] lives)
             await _settle(pilot)
             await pilot.press("v")          # ▸ Evaluate
             await pilot.pause()
@@ -1971,9 +2026,11 @@ class TestEvaluateHookWired:
     async def test_evaluate_confirm_launches_mock_only_scoped_to_target(self):
         wr = FakeWriteRunner()
         app, _, _ = make_app(target=SERVING_TARGET, gpus=list(SERVING_TARGET.gpus),
-                             write_runner=wr)
+                             write_runner=wr, surface="producer")
         async with app.run_test(size=(120, 40)) as pilot:
-            await pilot.press("2")
+            await pilot.press("2")          # Operate — capture the live target
+            await _settle(pilot)
+            await pilot.press("3")          # lane — [v] Evaluate lives here (R3b-1)
             await _settle(pilot)
             await pilot.press("v")
             await _settle(pilot)
@@ -1989,10 +2046,14 @@ class TestEvaluateHookWired:
     @pytest.mark.asyncio
     async def test_evaluate_no_target_notifies_and_does_not_launch(self):
         wr = FakeWriteRunner()
-        # No serving target (empty url) → nothing to evaluate.
-        app, _, _ = make_app(target=ServingTarget(), write_runner=wr)
+        # No serving target (empty url) → nothing to evaluate.  [v] lives in the
+        # producer lane (R3b-1): poll Operate (no target), enter the lane, press v.
+        app, _, _ = make_app(target=ServingTarget(), write_runner=wr,
+                             surface="producer")
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.press("2")
+            await _settle(pilot)
+            await pilot.press("3")
             await _settle(pilot)
             await pilot.press("v")
             await pilot.pause()
@@ -2005,10 +2066,12 @@ class TestPromoteHookWired:
 
     @pytest.mark.asyncio
     async def test_promote_without_byo_notifies(self):
-        # [P] promote is producer-gated (R3a) — exercise the no-BYO branch on
-        # the producer surface where the action is reachable.
+        # R3b-1: [P] promote relocated into the producer Bring & Validate lane
+        # (mode 2, ⑤ Promote).  Exercise the no-BYO branch in the lane.
         app, _, _ = make_app(surface="producer")
         async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            await pilot.press("3")          # enter the lane (where [P] lives)
             await _settle(pilot)
             # No BYO fit-check yet → nothing to promote.
             await pilot.press("P")
@@ -2017,15 +2080,17 @@ class TestPromoteHookWired:
 
     @pytest.mark.asyncio
     async def test_promote_previews_scaffold_after_byo_check(self):
-        # [P] promote is producer-gated (R3a).
+        # R3b-1: [P] promote lives in the lane (mode 2).
         app, _, _ = make_app(surface="producer")
         async with app.run_test(size=(120, 40)) as pilot:
             await _settle(pilot)
-            # Run a BYO fit-check (Run · BYO) — fills the arch facts.
+            # Run a BYO fit-check (① Bring / Run · BYO share byo_check) — fills facts.
             app.run_byo_check("unsloth/Qwen3-27B-abliterated", "vllm/dual")
             await _settle(pilot)
             assert app._last_byo is not None
-            await pilot.press("P")          # ▸ Promote to catalog
+            await pilot.press("3")          # enter the lane
+            await _settle(pilot)
+            await pilot.press("P")          # ⑤ Promote to catalog
             await pilot.pause()
             assert isinstance(app.screen, PromoteScaffoldScreen)
             body = str(app.screen.query_one("#promote-body", Static).render())
@@ -2044,6 +2109,8 @@ class TestPromoteHookWired:
         async with app.run_test(size=(120, 40)) as pilot:
             await _settle(pilot)
             app.run_byo_check("unsloth/Qwen3-27B-abliterated", "vllm/dual")
+            await _settle(pilot)
+            await pilot.press("3")          # enter the lane (R3b-1)
             await _settle(pilot)
             await pilot.press("P")
             await pilot.pause()
@@ -2072,6 +2139,273 @@ class TestPromoteHookWired:
             await _settle(pilot)
             assert len(wr.started) == 1
             assert "scripts/tests/*.sh" in " ".join(wr.started[0]["cmd"])
+
+
+# ===========================================================================
+# PHASE R / R3b-1 — the Bring & Validate producer lane (ordered ①→⑤ pipeline)
+# ===========================================================================
+
+
+GENERATED_COMPOSE_YAML = (
+    "# Profile (at-a-glance):\n"
+    "#   Model:     Qwen3.6-27B (BYO)\n"
+    "#   Status:    🧪 Experimental\n"
+    "services:\n"
+    "  vllm:\n"
+    "    image: vllm/vllm-openai:v0.22.0\n"
+    "    command: [--model, /models/byo, --tensor-parallel-size, '2']\n"
+)
+
+
+class TestLaneStructureR3b1:
+    """The producer lane reads as the ordered ① → ⑤ pipeline."""
+
+    @pytest.mark.asyncio
+    async def test_lane_renders_ordered_stages(self):
+        app, _, _ = make_app(surface="producer")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            tc = app.query_one("#validate-tabs", TabbedContent)
+            pane_ids = [p.id for p in tc.query(TabPane)]
+            assert pane_ids == [
+                "tab-bring", "tab-serve", "tab-run", "tab-evidence", "tab-promote"
+            ], pane_ids
+            # The reused panes are wired into the stage layout (③ Gate / ④ Measure)
+            # and the new lane stages exist.
+            app.query_one("#lane-bring-pane", LaneBringPane)
+            app.query_one("#lane-serve-pane", LaneServePane)
+            app.query_one("#validate-run-pane", ValidateRunPane)        # ③ Gate
+            app.query_one("#validate-evidence-pane", ValidateEvidencePane)  # ④ Measure
+            app.query_one("#lane-promote-pane", LanePromotePane)
+
+    @pytest.mark.asyncio
+    async def test_lane_label_is_bring_and_validate(self):
+        from club3090_cockpit.app import MODES
+        assert MODES[2][0] == "Bring & Validate"
+        assert MODES[2][1] == "3"        # key 3, no renumber (still index 2)
+
+    @pytest.mark.asyncio
+    async def test_bring_stage_reuses_byo_check(self):
+        """① Bring renders the byo_check verdict (route / sibling) like Run · BYO."""
+        app, _, _ = make_app(surface="producer")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            await pilot.press("3")
+            await _settle(pilot)
+            app.run_byo_check("unsloth/Qwen3-27B-abliterated", "vllm/dual")
+            await _settle(pilot)
+            card = str(app.query_one("#lane-bring-result-card", Static).render())
+            # The shared verdict text (route block) is rendered into the lane card.
+            assert "Route" in card or "eligible" in card
+
+
+class TestLaneServeR3b1:
+    """② Serve — the critical new link: generate compose → preview → reconcile-gated."""
+
+    @pytest.mark.asyncio
+    async def test_generate_compose_shells_right_argv_and_reads_back(self, tmp_path):
+        runner = FakeGenComposeRunner(GENERATED_COMPOSE_YAML)
+        app, _, _ = make_app(repo_root=tmp_path, surface="producer", runner=runner)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            res = await app._data.generate_compose("vllm/dual")
+            # Shelled generate-compose.sh with --profile <slug> --out <tmp>.
+            gen_calls = [c for c in runner.calls if "generate-compose.sh" in " ".join(c)]
+            assert len(gen_calls) == 1
+            call = gen_calls[0]
+            assert call[:4] == ["bash", "scripts/generate-compose.sh", "--profile", "vllm/dual"]
+            assert "--out" in call
+            assert "--accept-degraded" not in call
+            # Read the generated YAML back verbatim.
+            assert res["error"] == ""
+            assert res["compose_yaml"] == GENERATED_COMPOSE_YAML
+            assert res["compose_path"]
+
+    @pytest.mark.asyncio
+    async def test_generate_compose_accept_degraded_passes_flag(self, tmp_path):
+        runner = FakeGenComposeRunner(GENERATED_COMPOSE_YAML)
+        app, _, _ = make_app(repo_root=tmp_path, surface="producer", runner=runner)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            await app._data.generate_compose("vllm/dual", accept_degraded=True)
+            gen = [c for c in runner.calls if "generate-compose.sh" in " ".join(c)][0]
+            assert "--accept-degraded" in gen
+
+    @pytest.mark.asyncio
+    async def test_generate_compose_failure_surfaces_error(self, tmp_path):
+        # A runner that returns rc!=0 for generate-compose (drift-guard / refuse).
+        class _FailRunner(FakeRunner):
+            async def run(self, cmd, *, cwd, timeout=30.0):
+                self.calls.append(list(cmd))
+                if "generate-compose.sh" in " ".join(cmd):
+                    return RunResult(returncode=2, stdout="", stderr="refuse: drift-guard failed")
+                return await super().run(cmd, cwd=cwd, timeout=timeout)
+        app, _, _ = make_app(repo_root=tmp_path, surface="producer", runner=_FailRunner())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            res = await app._data.generate_compose("vllm/dual")
+            assert res["compose_yaml"] == ""
+            assert "drift-guard" in res["error"]
+
+    @pytest.mark.asyncio
+    async def test_serve_untested_without_bring_notifies(self):
+        app, _, _ = make_app(surface="producer")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            await pilot.press("3")
+            await _settle(pilot)
+            app.query_one("#validate-tabs", TabbedContent).active = "tab-serve"
+            await pilot.pause()
+            # No ① Bring fit-check yet → ② Serve no-ops (no preview modal).
+            app.action_serve_untested()
+            await pilot.pause()
+            assert not isinstance(app.screen, UntestedComposePreviewScreen)
+
+    @pytest.mark.asyncio
+    async def test_serve_untested_previews_compose_badged_untested(self, tmp_path):
+        runner = FakeGenComposeRunner(GENERATED_COMPOSE_YAML)
+        app, _, _ = make_app(repo_root=tmp_path, surface="producer", runner=runner)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            # ① Bring first (fills _last_byo).
+            app.run_byo_check("unsloth/Qwen3-27B-abliterated", "vllm/dual")
+            await _settle(pilot)
+            await pilot.press("3")
+            await _settle(pilot)
+            app.query_one("#validate-tabs", TabbedContent).active = "tab-serve"
+            await pilot.pause()
+            # ② Serve — generate + preview.
+            app.action_serve_untested()
+            await _settle(pilot)
+            assert isinstance(app.screen, UntestedComposePreviewScreen)
+            title = str(app.screen.query_one(".untested-title", Label).render())
+            assert "untested" in title           # badged 👤 untested
+            body = str(app.screen.query_one("#untested-body", Static).render())
+            # The compose is shown VERBATIM (a distinctive line from the YAML).
+            assert "vllm/vllm-openai:v0.22.0" in body
+
+    @pytest.mark.asyncio
+    async def test_serve_untested_serve_goes_through_reconcile_gate(self, tmp_path):
+        """The preview's Serve hands serve_generated to the reconcile-gated
+        ConfirmActionScreen — it is NOT auto-fired, and the plan claims the GPU."""
+        wr = FakeWriteRunner()
+        runner = FakeGenComposeRunner(GENERATED_COMPOSE_YAML)
+        app, _, _ = make_app(repo_root=tmp_path, surface="producer",
+                             runner=runner, write_runner=wr)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            app.run_byo_check("unsloth/Qwen3-27B-abliterated", "vllm/dual")
+            await _settle(pilot)
+            await pilot.press("3")
+            await _settle(pilot)
+            app.query_one("#validate-tabs", TabbedContent).active = "tab-serve"
+            await pilot.pause()
+            app.action_serve_untested()
+            await _settle(pilot)
+            assert isinstance(app.screen, UntestedComposePreviewScreen)
+            # Confirm the preview → opens the reconcile-gated confirm (NOT a serve).
+            app.screen.query_one("#untested-serve-btn", Button).press()
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmActionScreen)
+            plan = app.screen._plan
+            assert plan.kind == "serve"
+            assert plan.requires_reconcile is True     # claims the GPU → gated
+            assert plan.requires_confirm is True
+            assert "docker" in plan.cmd and "compose" in plan.cmd
+            # Nothing served yet — the reconcile gate has NOT been committed.
+            assert wr.started == []
+
+    @pytest.mark.asyncio
+    async def test_serve_generated_plan_is_gpu_claiming(self):
+        app, _, _ = make_app(surface="producer")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            plan = app._data.serve_generated("/tmp/some-generated.yml")
+            assert plan.kind == "serve"
+            assert plan.requires_reconcile is True
+            assert plan.requires_confirm is True
+
+
+class TestLaneRelocationR3b1:
+    """[P] Promote + [v] Evaluate relocated OUT of consumer modes INTO the lane."""
+
+    @pytest.mark.asyncio
+    async def test_promote_reachable_in_lane_not_in_run(self):
+        app, _, _ = make_app(surface="producer")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            # In Run (mode 0): [P] is disabled (relocated out).
+            assert app._active_mode == 0
+            assert app.check_action("promote_catalog", ()) is False
+            # In the lane (mode 2): [P] is enabled.
+            await pilot.press("3")
+            await _settle(pilot)
+            assert app.check_action("promote_catalog", ()) is True
+
+    @pytest.mark.asyncio
+    async def test_evaluate_reachable_in_lane_not_in_operate(self):
+        app, _, _ = make_app(surface="producer", target=SERVING_TARGET,
+                             gpus=list(SERVING_TARGET.gpus))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("2")          # Operate
+            await _settle(pilot)
+            # In Operate (mode 1): [v] is disabled (relocated out).
+            assert app.check_action("evaluate_target", ()) is False
+            # In the lane (mode 2): [v] is enabled.
+            await pilot.press("3")
+            await _settle(pilot)
+            assert app.check_action("evaluate_target", ()) is True
+
+    @pytest.mark.asyncio
+    async def test_serve_untested_is_producer_only_and_lane_scoped(self):
+        # Hidden on consumer.
+        app, _, _ = make_app(surface="consumer")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            assert "serve_untested" in CockpitApp._PRODUCER_ONLY
+            assert app.check_action("serve_untested", ()) is False
+
+
+class TestLaneHelpSurfaceThreadedR3b1:
+    """Consumer help OMITS the producer lane; producer help INCLUDES it."""
+
+    @pytest.mark.asyncio
+    async def test_consumer_help_omits_lane(self):
+        app, _, _ = make_app(surface="consumer")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            await pilot.press("question_mark")
+            await pilot.pause()
+            assert isinstance(app.screen, HelpScreen)
+            text = app.screen.help_text
+            assert "Bring & Validate" not in text
+            assert "Promote" not in text
+            assert "Evaluate" not in text
+            # The consumer mode line stops at Operate (no [3]).
+            assert "[3]" not in text
+
+    @pytest.mark.asyncio
+    async def test_producer_help_includes_lane(self):
+        app, _, _ = make_app(surface="producer")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            await pilot.press("question_mark")
+            await pilot.pause()
+            assert isinstance(app.screen, HelpScreen)
+            text = app.screen.help_text
+            assert "Bring & Validate" in text
+            assert "Promote" in text
+            assert "Evaluate" in text
+
+    @pytest.mark.asyncio
+    async def test_help_screen_threads_surface(self):
+        # action_help passes the app surface into HelpScreen.
+        app, _, _ = make_app(surface="producer")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            await pilot.press("question_mark")
+            await pilot.pause()
+            assert app.screen._surface == "producer"
 
 
 class TestOptimizeHookWired:
@@ -2259,15 +2593,16 @@ class TestCheckActionPerModeSubtab:
 
     @pytest.mark.asyncio
     async def test_run_catalog_enables_explain_and_filter(self):
-        # promote_catalog ([P]) is producer-gated (R3a); assert its enabled
-        # (context-True) path on the producer surface where it's reachable.
+        # R3b-1: [P] promote relocated OUT of Run into the lane (mode 2), so on
+        # Run · Catalog it is now context-False; explain + filter stay True.
         app, _, _ = make_app(surface="producer")
         async with app.run_test(size=(120, 40)) as pilot:
             await _settle(pilot)
             assert app._active_mode == 0
             assert app.check_action("explain", ()) is True
             assert app.check_action("filter_catalog", ()) is True
-            assert app.check_action("promote_catalog", ()) is True
+            # promote is a lane (mode 2) key now — disabled in Run.
+            assert app.check_action("promote_catalog", ()) is False
 
     @pytest.mark.asyncio
     async def test_run_catalog_disables_estate_keys(self):
@@ -2650,42 +2985,46 @@ class TestModeSwitchFocus:
             assert app.focused.id == "scene-table"
 
     @pytest.mark.asyncio
-    async def test_switch_to_validate_focuses_run_ladder(self):
-        # Validate (mode 2) is the producer lane (R3a).
+    async def test_switch_to_validate_lands_on_bring_stage(self):
+        # R3b-1: the producer lane's first stage is ① Bring.  Focus is deliberately
+        # NOT forced into its HF-repo Input (an Input would swallow the global
+        # 1/2/3 + [ ] keys); the lane lands on ① Bring with focus on the tab bar so
+        # those keys keep routing to the app.
         app, _, _ = make_app(surface="producer")
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.press("3")
             await _settle(pilot)
-            # Validate/Run tab is default → run-ladder-table should be focused.
-            assert isinstance(app.focused, DataTable)
-            assert app.focused.id == "run-ladder-table"
+            assert app._active_mode == 2
+            assert app.query_one("#validate-tabs", TabbedContent).active == "tab-bring"
+            # The bring input is NOT auto-focused (so digit/bracket keys work).
+            assert not (isinstance(app.focused, Input)
+                        and app.focused.id == "lane-bring-url-input")
 
     @pytest.mark.asyncio
     async def test_tab_change_on_validate_refocuses_relevant_table(self):
-        """Using the sub-tab cycle key on Validate must move focus to the
-        relevant DataTable for the newly active tab."""
-        # Validate (mode 2) is the producer lane (R3a).
+        """Cycling the lane's stages moves focus to the relevant widget for the
+        newly active stage (R3b-1 — ① Bring → ② Serve → ③ Gate → ④ Measure → ⑤)."""
         app, _, _ = make_app(surface="producer")
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.press("3")
             await _settle(pilot)
-            # Default tab is Run → run-ladder-table.
-            assert isinstance(app.focused, DataTable)
-            assert app.focused.id == "run-ladder-table"
-            # R2a: Validate is now Run + Evidence only (Doctor moved to Operate).
-            # Cycle forward once → Evidence tab → evidence-table.
-            await pilot.press("right_square_bracket")
-            await pilot.pause()
-            await pilot.pause()  # extra cycle for call_after_refresh
             tc = app.query_one("#validate-tabs", TabbedContent)
-            assert tc.active == "tab-evidence"
-            # Cycle forward again → wraps back to Run → run-ladder-table.
-            await pilot.press("right_square_bracket")
+            # Default stage is ① Bring (no DataTable focus — its input is not
+            # auto-focused so global keys still route to the app).
+            assert tc.active == "tab-bring"
+            # Activate ③ Gate directly → run-ladder-table is focused.
+            tc.active = "tab-run"
             await pilot.pause()
             await pilot.pause()  # extra cycle for call_after_refresh
-            assert tc.active == "tab-run"
             assert isinstance(app.focused, DataTable)
             assert app.focused.id == "run-ladder-table"
+            # Cycle forward → ④ Measure (Evidence) → evidence-table.
+            await pilot.press("right_square_bracket")
+            await pilot.pause()
+            await pilot.pause()
+            assert tc.active == "tab-evidence"
+            assert isinstance(app.focused, DataTable)
+            assert app.focused.id == "evidence-table"
 
 
 class TestContainerAutoLoad:
@@ -2844,9 +3183,11 @@ class TestSurfaceScaffold:
 
     @pytest.mark.asyncio
     async def test_shipped_producer_set_is_mode_validate_and_promote(self):
-        # R3a: the shipped _PRODUCER_ONLY now gates the producer lane
-        # (mode_validate) + the [P] promote action.
-        assert CockpitApp._PRODUCER_ONLY == frozenset({"mode_validate", "promote_catalog"})
+        # R3b-1: the shipped _PRODUCER_ONLY gates the producer lane (mode_validate)
+        # + the relocated-into-the-lane [P] promote + [v] evaluate + ② serve_untested.
+        assert CockpitApp._PRODUCER_ONLY == frozenset({
+            "mode_validate", "promote_catalog", "evaluate_target", "serve_untested",
+        })
 
     @pytest.mark.asyncio
     async def test_shipped_producer_set_hidden_on_consumer(self):
@@ -2862,12 +3203,14 @@ class TestSurfaceScaffold:
     @pytest.mark.asyncio
     async def test_shipped_producer_set_shown_on_producer(self):
         # On the producer surface they fall through to their normal context
-        # result: mode_validate is always-on (True), promote is a mode-0 Run key
-        # (default mode is 0 → True).
+        # result: mode_validate is always-on (True).  R3b-1: promote_catalog is a
+        # mode-2 (lane) context key now, so enter the lane before asserting True.
         app, _, _ = make_app(surface="producer")
         async with app.run_test(size=(120, 40)) as pilot:
             await _settle(pilot)
             assert app.check_action("mode_validate", ()) is True
+            await pilot.press("3")          # enter the lane (mode 2)
+            await _settle(pilot)
             assert app.check_action("promote_catalog", ()) is True
 
     @pytest.mark.asyncio
@@ -2988,11 +3331,13 @@ class TestProducerLaneGatedR3a:
 
     @pytest.mark.asyncio
     async def test_producer_promote_is_reachable(self):
-        """On producer: [P] promote_catalog falls through to its Run-context True."""
+        """On producer: [P] promote_catalog is reachable in the lane (R3b-1 mode 2)."""
         app, _, _ = make_app(surface="producer")
         async with app.run_test(size=(120, 40)) as pilot:
             await _settle(pilot)
-            assert app._active_mode == 0
+            await pilot.press("3")          # enter the lane (mode 2)
+            await _settle(pilot)
+            assert app._active_mode == 2
             assert app.check_action("promote_catalog", ()) is True
 
     @pytest.mark.asyncio

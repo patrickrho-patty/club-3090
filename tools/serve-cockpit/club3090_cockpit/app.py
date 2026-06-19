@@ -173,61 +173,93 @@ class HelpScreen(ModalScreen):
         Binding("question_mark", "dismiss", "Close"),
     ]
 
-    HELP_TEXT = """\
-[bold]Keybindings[/bold]
+    # Surface-threaded (R3b-1): the consumer help OMITS every producer-lane token
+    # (the [3] Bring & Validate mode, [P] Promote, [v] Evaluate, the lane section)
+    # so it shows only the consumer affordances (Run + Operate + share-back).  The
+    # producer help INCLUDES the lane section.
 
-  [cyan]1[/cyan]  Run    [cyan]2[/cyan]  Operate    [cyan]3[/cyan]  Validate
-  [cyan]r[/cyan]  Refresh (re-reads the live data layer for the active mode)
-  [cyan]/[/cyan]  Filter (Run · Catalog)
-  [cyan]e[/cyan]  Explain selected slug (Run · Catalog — incl. cross-rig benchmarks)
-  [cyan]⏎[/cyan]  Primary action (serve / switch scene / run step / open report)
-  [cyan]?[/cyan]  This help        [cyan]q[/cyan]  Quit
+    # The mode line: consumer sees Run + Operate; producer additionally sees [3].
+    _MODE_LINE_CONSUMER = "  [cyan]1[/cyan]  Run    [cyan]2[/cyan]  Operate"
+    _MODE_LINE_PRODUCER = (
+        "  [cyan]1[/cyan]  Run    [cyan]2[/cyan]  Operate    "
+        "[cyan]3[/cyan]  Bring & Validate"
+    )
 
-[bold]Run · Catalog[/bold]
-  [cyan]⏎[/cyan] serve selected slug (reconcile-gated confirm; F to Force the teardown)
-  [cyan]d[/cyan] set-default   [cyan]D[/cyan] clear-default
-  [cyan]P[/cyan] ▸ Promote a fit-checked BYO model to the catalog (scaffold + gated write)
-  [cyan]O[/cyan] ▸ Optimize for my card (v0.10.0 seam — not available yet)
-[bold]Operate · Orchestration[/bold]
-  [cyan]o[/cyan] stop all   [cyan]c[/cyan] power-cap on/off   [cyan]w[/cyan] cap sweep   [cyan]p[/cyan] prune images   (all gated)
+    # The producer Bring & Validate lane section — rendered ONLY on producer.
+    _LANE_SECTION = """\
+[bold]Bring & Validate[/bold] (producer lane — the ① → ⑤ pipeline)
+  ① Bring:   fit-check an HF model (pull.sh --dry-run)
+  ② Serve:   [cyan]⏎[/cyan]/[cyan]g[/cyan] generate a compose + serve it untested (reconcile-gated)
+  ③ Gate:    [cyan]⏎[/cyan] launch validation step (gated)
+  ④ Measure: [cyan]⏎[/cyan] open report   [cyan]s[/cyan] submit to localmaxxing (gated · never auto)
+  ⑤ Promote: [cyan]P[/cyan] ▸ Promote a fit-checked model to the catalog (scaffold + gated write)
   [cyan]v[/cyan] ▸ Evaluate the running target via c3t (confirm-gated · mock-only this phase)
-[bold]Operate · Containers[/bold]
-  [cyan]l[/cyan] logs   [cyan]t[/cyan] top (read)   [cyan]s[/cyan] restart   [cyan]x[/cyan] stop   [cyan]X[/cyan] rm   (writes gated)
-[bold]Operate · Doctor[/bold]
-  read-only — health + diagnose-estate + diagnose-profile cards ([cyan]r[/cyan] refreshes)
-[bold]Validate[/bold]
-  Run: [cyan]⏎[/cyan] launch step (gated)
-  Evidence: [cyan]⏎[/cyan] open report   [cyan]s[/cyan] submit to localmaxxing (gated · never auto)
-
-[bold]Share back[/bold] (Run + Operate — lightweight, no surface switch)
-  [cyan]R[/cyan] rig report — paste-ready rig/bench snapshot (read · no network)
-  [cyan]B[/cyan] submit bench — submit the latest benched result (Operate · gated · never auto)
-  [cyan]![/cyan] report a problem — paste-ready issue from the failure context (read · surfaced at a failed serve)
-
-[bold]Safety — the reconcile gate[/bold]
-
-  Every write (serve, scene-switch, estate-down, container restart/stop/rm,
-  power-cap, prune, submit-bench) goes through a confirm modal.  GPU-claiming
-  writes re-run a FRESH detect immediately before executing and refuse if a
-  running container / busy GPU / active estate claim would collide; the modal
-  shows exactly what a write would tear down.  Validation launches and the
-  outward submit are heavy / network — confirmed, never auto-fired.  Nothing is
-  ever forced silently — F surfaces the override with its reason.
-
-[bold]Status glyphs[/bold]
-
-  ✅ production   ⚠️  caveats   🧪 experimental
-  🐣 incubating  👁️  preview   ⏸️  upstream-gated   🗑️  deprecated
-
-[bold]Fit glyphs (local card)[/bold]
-
-  ● fits-clean   ◐ fits-constrained   ○ won't-fit   · skip / unknown
 """
+
+    def __init__(self, *, surface: str = "consumer", **kwargs):
+        super().__init__(**kwargs)
+        self._surface = surface if surface in ("consumer", "producer") else "consumer"
+
+    @property
+    def help_text(self) -> str:
+        producer = self._surface == "producer"
+        mode_line = self._MODE_LINE_PRODUCER if producer else self._MODE_LINE_CONSUMER
+        parts: list[str] = [
+            "[bold]Keybindings[/bold]",
+            "",
+            mode_line,
+            "  [cyan]r[/cyan]  Refresh (re-reads the live data layer for the active mode)",
+            "  [cyan]/[/cyan]  Filter (Run · Catalog)",
+            "  [cyan]e[/cyan]  Explain selected slug (Run · Catalog — incl. cross-rig benchmarks)",
+            "  [cyan]⏎[/cyan]  Primary action (serve / switch scene / run step / open report)",
+            "  [cyan]?[/cyan]  This help        [cyan]q[/cyan]  Quit",
+            "",
+            "[bold]Run · Catalog[/bold]",
+            "  [cyan]⏎[/cyan] serve selected slug (reconcile-gated confirm; F to Force the teardown)",
+            "  [cyan]d[/cyan] set-default   [cyan]D[/cyan] clear-default",
+            "  [cyan]O[/cyan] ▸ Optimize for my card (v0.10.0 seam — not available yet)",
+            "[bold]Operate · Orchestration[/bold]",
+            "  [cyan]o[/cyan] stop all   [cyan]c[/cyan] power-cap on/off   [cyan]w[/cyan] cap sweep   [cyan]p[/cyan] prune images   (all gated)",
+            "[bold]Operate · Containers[/bold]",
+            "  [cyan]l[/cyan] logs   [cyan]t[/cyan] top (read)   [cyan]s[/cyan] restart   [cyan]x[/cyan] stop   [cyan]X[/cyan] rm   (writes gated)",
+            "[bold]Operate · Doctor[/bold]",
+            "  read-only — health + diagnose-estate + diagnose-profile cards ([cyan]r[/cyan] refreshes)",
+        ]
+        # Producer-only lane section — OMITTED on consumer (clean consumer help).
+        if producer:
+            parts.append(self._LANE_SECTION.rstrip("\n"))
+        parts.extend([
+            "",
+            "[bold]Share back[/bold] (Run + Operate — lightweight, no surface switch)",
+            "  [cyan]R[/cyan] rig report — paste-ready rig/bench snapshot (read · no network)",
+            "  [cyan]B[/cyan] submit bench — submit the latest benched result (Operate · gated · never auto)",
+            "  [cyan]![/cyan] report a problem — paste-ready issue from the failure context (read · surfaced at a failed serve)",
+            "",
+            "[bold]Safety — the reconcile gate[/bold]",
+            "",
+            "  Every write (serve, scene-switch, estate-down, container restart/stop/rm,",
+            "  power-cap, prune, submit-bench) goes through a confirm modal.  GPU-claiming",
+            "  writes re-run a FRESH detect immediately before executing and refuse if a",
+            "  running container / busy GPU / active estate claim would collide; the modal",
+            "  shows exactly what a write would tear down.  Validation launches and the",
+            "  outward submit are heavy / network — confirmed, never auto-fired.  Nothing is",
+            "  ever forced silently — F surfaces the override with its reason.",
+            "",
+            "[bold]Status glyphs[/bold]",
+            "",
+            "  ✅ production   ⚠️  caveats   🧪 experimental",
+            "  🐣 incubating  👁️  preview   ⏸️  upstream-gated   🗑️  deprecated",
+            "",
+            "[bold]Fit glyphs (local card)[/bold]",
+            "",
+            "  ● fits-clean   ◐ fits-constrained   ○ won't-fit   · skip / unknown",
+        ])
+        return "\n".join(parts)
 
     def compose(self) -> ComposeResult:
         with Vertical():
             yield Label("club3090 serve cockpit — Help", classes="help-title")
-            yield Static(self.HELP_TEXT)
+            yield Static(self.help_text)
 
     def action_dismiss(self) -> None:
         self.app.pop_screen()
@@ -606,8 +638,9 @@ class ByoPane(Container):
         yield Label(
             "[dim]Routes:  A = new curated profile   ·   B = serve-locally   ·   "
             "C = reuse a sibling compose + swap weights\n"
-            "\\[P] ▸ Promote to catalog (scaffold + gated write)   "
-            "\\[O] ▸ Optimize for my card (v0.10.0 seam)[/dim]",
+            "\\[O] ▸ Optimize for my card (v0.10.0 seam)\n"
+            "[dim](Promote to the catalog lives in the producer Bring & Validate "
+            "lane — c3 --contribute)[/dim][/dim]",
             id="byo-hint",
         )
 
@@ -617,38 +650,9 @@ class ByoPane(Container):
         )
 
     def populate(self, res: ByoResult) -> None:
-        card = self.query_one("#byo-result-card", Static)
-        if res.error:
-            card.update(f"[red]Fit-check failed:[/red] {res.error}")
-            return
-        lines: list[str] = []
-        elig = "[green]eligible[/green]" if res.eligible else "[red]not eligible[/red]"
-        lines.append(f"  [bold]{res.repo}[/bold]   {elig}")
-        lines.append(f"  [bold]arch[/bold]     [cyan]{res.arch or '—'}[/cyan]")
-        fitc = {
-            "fits-clean": "[green]● fits-clean[/green]",
-            "fits-constrained": "[yellow]◐ fits-constrained[/yellow]",
-            "wont-fit": "[red]○ won't-fit[/red]",
-        }.get(res.fit_verdict, res.fit_verdict or "—")
-        lines.append(f"  [bold]fit[/bold]      {fitc}")
-        if res.route:
-            route_label = {
-                "A": "Route A — author a new curated profile",
-                "B": "Route B — serve locally (no catalog entry)",
-                "C": "Route C — reuse a sibling compose + swap weights",
-            }.get(str(res.route).upper(), f"Route {res.route}")
-            lines.append("")
-            lines.append(f"  [bold]{route_label}[/bold]")
-            if res.sibling_slug:
-                lines.append(f"    • reuse compose for [green]{res.sibling_slug}[/green]")
-            if res.quant_match:
-                lines.append(f"    • match [yellow]--quantization[/yellow] → {res.quant_match}")
-            if res.drop_spec_config:
-                lines.append("    • drop [yellow]--speculative-config[/yellow] (no MTP head in fine-tune)")
-        if res.note:
-            lines.append("")
-            lines.append(f"  [dim]{res.note}[/dim]")
-        card.update("\n".join(lines))
+        # The verdict-card render is shared with the producer lane's ① Bring stage
+        # (LaneBringPane) — see _byo_result_text (defined below near the lane panes).
+        self.query_one("#byo-result-card", Static).update(_byo_result_text(res))
 
 
 # ── Confirm modal (used for serve + scene + container writes) ────────────────────
@@ -911,8 +915,7 @@ class OperateOrchPane(Container):
             yield Label(
                 "[dim]\\[⏎] switch scene (gated)   \\[o] stop all (gated)   "
                 "\\[c] cap on/off (gated)   \\[w] cap sweep (gated)   "
-                "\\[p] prune images (gated)\n"
-                "\\[v] ▸ Evaluate the running target via c3t (confirm-gated · mock-only)[/dim]",
+                "\\[p] prune images (gated)[/dim]",
                 id="orch-hint",
             )
 
@@ -1786,17 +1789,372 @@ class OptimizeScreen(ModalScreen):
         self.app.pop_screen()
 
 
+# ── Producer lane ② Serve — untested-compose preview modal (R3b-1) ─────────────────
+
+
+class UntestedComposePreviewScreen(ModalScreen):
+    """Preview a GENERATED compose VERBATIM, badged as an untested config
+    reproduction of a CATALOG slug, then a confirm to serve it through the
+    reconcile-gated path (producer lane ② Serve).
+
+    ⚠️  HONESTY (R3b-1): the previewed compose is a verbatim, UNTESTED reproduction
+    of the resolved CATALOG profile ``<slug>``'s compose — NOT the fit-checked
+    brought model's weights.  generate-compose.sh has no --repo / weight-swap yet;
+    that is a deferred follow-up.  The badge reads "untested config reproduction of
+    <slug>", not "your brought model".
+
+    Mission (generate-compose.sh locked decision #2): reproduce + flag, NEVER
+    repair — the compose is shown EXACTLY as generated; we do NOT fit-adapt it.
+    ``⏎`` hands the ``serve_generated`` ActionPlan to the app's reconcile gate
+    (the SAME ConfirmActionScreen every serve uses); ``Esc`` closes the preview
+    (and unlinks the temp compose, since it was NOT served)."""
+
+    DEFAULT_CSS = """
+    UntestedComposePreviewScreen {
+        align: center middle;
+    }
+    UntestedComposePreviewScreen > Vertical {
+        width: 100;
+        height: 84%;
+        border: thick $accent;
+        background: $surface;
+        padding: 1 2;
+    }
+    UntestedComposePreviewScreen .untested-title {
+        text-style: bold;
+        color: $accent;
+        margin-bottom: 1;
+    }
+    UntestedComposePreviewScreen #untested-scroll {
+        height: 1fr;
+    }
+    UntestedComposePreviewScreen #untested-btn-row {
+        height: 3;
+        margin-top: 1;
+    }
+    UntestedComposePreviewScreen Button {
+        margin-right: 1;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "dismiss", "Close"),
+    ]
+
+    def __init__(self, slug: str, compose_path: str, compose_yaml: str, *,
+                 on_serve=None, **kwargs):
+        super().__init__(**kwargs)
+        self._slug = slug
+        self._compose_path = compose_path
+        self._compose_yaml = compose_yaml
+        self._on_serve = on_serve
+
+    def compose(self) -> ComposeResult:
+        from rich.markup import escape
+
+        with Vertical():
+            yield Label(
+                f"② Serve · [yellow]untested config reproduction of "
+                f"{self._slug}[/yellow]",
+                classes="untested-title",
+            )
+            with ScrollableContainer(id="untested-scroll"):
+                header = (
+                    f"[yellow]⚠ This is an UNTESTED reproduction of the catalog\n"
+                    f"profile {escape(self._slug)}'s compose — NOT your brought\n"
+                    "model's weights (the bring-your-own weight-swap is a deferred\n"
+                    "follow-up).[/yellow]\n"
+                    "[dim]Generated VERBATIM by generate-compose.sh — reproduce +\n"
+                    "flag, NEVER repair.  This compose is shown exactly as emitted;\n"
+                    "it is NOT fit-adapted.  Serving it claims the GPU → the confirm\n"
+                    "below runs the reconcile gate like every serve.[/dim]\n"
+                    f"\n[dim]path:[/dim] {escape(self._compose_path)}\n\n"
+                )
+                yield Static(header + escape(self._compose_yaml), id="untested-body")
+            with Horizontal(id="untested-btn-row"):
+                yield Button(
+                    "⏎ Serve (untested · reconcile-gated)",
+                    id="untested-serve-btn",
+                    variant="warning",
+                )
+                yield Button("Esc Close", id="untested-close-btn")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "untested-serve-btn":
+            self._serve()
+        elif event.button.id == "untested-close-btn":
+            self.action_dismiss()
+
+    def on_key(self, event) -> None:
+        if event.key == "enter":
+            event.stop()
+            self._serve()
+
+    def _serve(self) -> None:
+        """Hand the serve_generated plan to the app's reconcile gate.  Routes
+        through the standard ConfirmActionScreen — NEVER auto-fired, NEVER live."""
+        self.app.pop_screen()
+        if self._on_serve is not None and self._compose_path:
+            self._on_serve(self._compose_path)
+
+    def action_dismiss(self) -> None:
+        self.app.pop_screen()
+
+
+# ── Producer "Bring & Validate" lane stage panes (R3b-1) ──────────────────────────
+#
+# The producer lane (mode 2) presents the ADDING_MODELS stage machine as an
+# ORDERED, numbered pipeline: ① Bring → ② Serve → ③ Gate → ④ Measure → ⑤ Promote.
+# It reuses the existing TabbedContent pattern (lighter than a full wizard widget)
+# with numbered tab labels so it reads as an ordered pipeline.  ① Bring REUSES the
+# byo_check fit-check; ③ Gate is the existing ValidateRunPane ladder; ④ Measure is
+# the existing ValidateEvidencePane; ⑤ Promote hosts the [P] promote action.
+
+
+class LaneBringPane(Container):
+    """① Bring — the producer lane's own fit-check entry.
+
+    REUSES ``byo_check`` (pull.sh --dry-run --json → ByoResult: supported? fits?
+    the swap_path route) exactly like Run · BYO, but as the lane's first stage:
+    paste an HF repo / slug, Fit-check, read the route + sibling_slug + quant_match.
+    Distinct widget IDs from Run · ByoPane so both can coexist (the consumer
+    Run · BYO 'run-another' stays as-is; this is the producer lane's Bring entry).
+    The cached ``_last_byo`` it produces feeds ② Serve and ⑤ Promote."""
+
+    DEFAULT_CSS = """
+    LaneBringPane {
+        height: 1fr;
+        padding: 1 2;
+    }
+    LaneBringPane #lane-bring-heading {
+        text-style: bold;
+        margin-bottom: 1;
+    }
+    LaneBringPane #lane-bring-input-row {
+        height: 3;
+        margin-bottom: 1;
+    }
+    LaneBringPane #lane-bring-url-input {
+        width: 1fr;
+    }
+    LaneBringPane #lane-bring-profile-input {
+        width: 28;
+        margin-left: 1;
+    }
+    LaneBringPane #lane-bring-fit-btn {
+        width: 14;
+        margin-left: 1;
+    }
+    LaneBringPane #lane-bring-result-card {
+        border: solid $primary;
+        padding: 1 2;
+        margin-top: 1;
+        height: auto;
+    }
+    LaneBringPane #lane-bring-hint {
+        color: $text-muted;
+        margin-top: 1;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        yield Label("① Bring — fit-check an HF model", id="lane-bring-heading")
+        with Horizontal(id="lane-bring-input-row"):
+            yield Input(
+                placeholder="org/Model  (e.g. unsloth/Qwen3-27B-abliterated-GGUF)",
+                id="lane-bring-url-input",
+            )
+            yield Input(
+                placeholder="profile-like (vllm/dual)",
+                value="vllm/dual",
+                id="lane-bring-profile-input",
+            )
+            yield Button("Fit-check", id="lane-bring-fit-btn", variant="primary")
+        yield Static(
+            "[dim]Stage ① of the Bring & Validate pipeline.  Enter an HF repo + a\n"
+            "profile-like slug, then Fit-check — pull.sh --dry-run (Path B, never\n"
+            "downloads).  A successful fit-check unlocks ② Serve (generate + serve\n"
+            "the untested compose) and ⑤ Promote.[/dim]",
+            id="lane-bring-result-card",
+        )
+        yield Label(
+            "[dim]Routes:  A = new curated profile   ·   B = serve-locally   ·   "
+            "C = reuse a sibling compose + swap weights\n"
+            "next: \\[2/]] ② Serve   ·   ③ Gate   ·   ④ Measure   ·   "
+            "\\[P] ⑤ Promote[/dim]",
+            id="lane-bring-hint",
+        )
+
+    def set_checking(self, repo: str) -> None:
+        self.query_one("#lane-bring-result-card", Static).update(
+            f"[dim]Checking[/dim] [cyan]{repo}[/cyan] [dim](pull.sh --dry-run --json)…[/dim]"
+        )
+
+    def populate(self, res: ByoResult) -> None:
+        card = self.query_one("#lane-bring-result-card", Static)
+        card.update(_byo_result_text(res))
+
+
+def _byo_result_text(res: ByoResult) -> str:
+    """Render a ByoResult into the verdict card text (shared by Run · BYO + the
+    producer lane's ① Bring stage)."""
+    if res.error:
+        return f"[red]Fit-check failed:[/red] {res.error}"
+    lines: list[str] = []
+    elig = "[green]eligible[/green]" if res.eligible else "[red]not eligible[/red]"
+    lines.append(f"  [bold]{res.repo}[/bold]   {elig}")
+    lines.append(f"  [bold]arch[/bold]     [cyan]{res.arch or '—'}[/cyan]")
+    fitc = {
+        "fits-clean": "[green]● fits-clean[/green]",
+        "fits-constrained": "[yellow]◐ fits-constrained[/yellow]",
+        "wont-fit": "[red]○ won't-fit[/red]",
+    }.get(res.fit_verdict, res.fit_verdict or "—")
+    lines.append(f"  [bold]fit[/bold]      {fitc}")
+    if res.route:
+        route_label = {
+            "A": "Route A — author a new curated profile",
+            "B": "Route B — serve locally (no catalog entry)",
+            "C": "Route C — reuse a sibling compose + swap weights",
+        }.get(str(res.route).upper(), f"Route {res.route}")
+        lines.append("")
+        lines.append(f"  [bold]{route_label}[/bold]")
+        if res.sibling_slug:
+            lines.append(f"    • reuse compose for [green]{res.sibling_slug}[/green]")
+        if res.quant_match:
+            lines.append(f"    • match [yellow]--quantization[/yellow] → {res.quant_match}")
+        if res.drop_spec_config:
+            lines.append("    • drop [yellow]--speculative-config[/yellow] (no MTP head in fine-tune)")
+    if res.note:
+        lines.append("")
+        lines.append(f"  [dim]{res.note}[/dim]")
+    return "\n".join(lines)
+
+
+class LaneServePane(Container):
+    """② Serve — generate a minimal compose for the resolved CATALOG profile, then
+    serve it (untested) through the reconcile-gated path (R3b-1, the critical new
+    link).
+
+    ⚠️  HONESTY (R3b-1): this serves a verbatim, UNTESTED reproduction of the
+    resolved CATALOG slug's compose (the Route-C sibling, else the profile-like the
+    fit-check ran against) — NOT the brought model's weights.  generate-compose.sh
+    has no --repo / weight-swap yet; the full brought-model serve is a deferred
+    follow-up.
+
+    After a successful ① Bring fit-check, ⏎ here (action_serve_untested) runs
+    ``generate-compose.sh`` for the resolved catalog slug, previews the compose
+    VERBATIM badged "untested config reproduction of <slug>", and a confirm serves
+    it through the SAME reconcile gate every serve uses (the generated compose
+    CLAIMS the GPU).  Mission: reproduce + flag, never repair — the compose is
+    shown as generated, NOT fit-adapted."""
+
+    DEFAULT_CSS = """
+    LaneServePane {
+        height: 1fr;
+        padding: 1 2;
+    }
+    LaneServePane #lane-serve-heading {
+        text-style: bold;
+        margin-bottom: 1;
+    }
+    LaneServePane #lane-serve-body {
+        border: solid $primary;
+        padding: 1 2;
+        margin-top: 1;
+        height: 1fr;
+    }
+    LaneServePane #lane-serve-hint {
+        color: $text-muted;
+        margin-top: 1;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        yield Label("② Serve — reproduce + serve the resolved catalog compose (untested)", id="lane-serve-heading")
+        yield Static(
+            "[dim]Stage ② of the Bring & Validate pipeline.\n"
+            "\n"
+            "Run ① Bring first to fit-check a model.  Then ⏎ here generates a\n"
+            "minimal compose (generate-compose.sh — reproduce + flag, never\n"
+            "repair) for the RESOLVED CATALOG slug (the Route-C sibling, else the\n"
+            "profile-like the fit-check ran against), previews it VERBATIM, and\n"
+            "serves it through the reconcile-gated confirm (the generated compose\n"
+            "claims the GPU like any serve).\n"
+            "\n"
+            "[yellow]Note: this serves an UNTESTED reproduction of the catalog\n"
+            "profile's compose — NOT your brought model's weights.  The bring-your-\n"
+            "own weight-swap (generate-compose.sh --repo) is a deferred follow-up.\n"
+            "[/yellow][/dim]",
+            id="lane-serve-body",
+        )
+        yield Label(
+            "[dim]\\[⏎] generate + preview + serve (reconcile-gated · untested)[/dim]",
+            id="lane-serve-hint",
+        )
+
+    def set_status(self, text: str) -> None:
+        self.query_one("#lane-serve-body", Static).update(text)
+
+
+class LanePromotePane(Container):
+    """⑤ Promote — promote the fit-checked + measured model into the catalog.
+
+    Hosts the [P] promote affordance relocated out of Run · Catalog (R3b-1).  The
+    action (``action_promote_catalog`` → PromoteScaffoldScreen) is unchanged and
+    producer-gated; this stage is its home in the lane."""
+
+    DEFAULT_CSS = """
+    LanePromotePane {
+        height: 1fr;
+        padding: 1 2;
+    }
+    LanePromotePane #lane-promote-heading {
+        text-style: bold;
+        margin-bottom: 1;
+    }
+    LanePromotePane #lane-promote-body {
+        border: solid $primary;
+        padding: 1 2;
+        margin-top: 1;
+        height: 1fr;
+    }
+    LanePromotePane #lane-promote-hint {
+        color: $text-muted;
+        margin-top: 1;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        yield Label("⑤ Promote — scaffold a curated catalog entry", id="lane-promote-heading")
+        yield Static(
+            "[dim]Final stage of the Bring & Validate pipeline.\n"
+            "\n"
+            "Once the model is fit-checked (① Bring), served (② Serve), gated\n"
+            "(③ Gate) and measured (④ Measure), \\[P] computes a SCAFFOLD + GATE:\n"
+            "a ModelProfile YAML skeleton + a compose_registry entry COMPUTED from\n"
+            "the BYO arch facts + Evidence numbers, previewed before the gated\n"
+            "(mock-only this phase) write into scripts/ + the guard suite.[/dim]",
+            id="lane-promote-body",
+        )
+        yield Label(
+            "[dim]\\[P] compute + preview the catalog-promotion scaffold (gated write)[/dim]",
+            id="lane-promote-hint",
+        )
+
+
 # ── Mode switcher (left rail) ─────────────────────────────────────────────────────
 
 
 MODES = [
     ("Run", "1"),
     ("Operate", "2"),
-    ("Validate", "3"),
+    # R3b-1: mode 2 is the producer "Bring & Validate" lane (key 3, producer-only).
+    # The mode index stays 2 (NO renumber) — only the LABEL changed from "Validate".
+    ("Bring & Validate", "3"),
 ]
 
 # Per-mode primary action (what ⏎ does), by mode index.
-PRIMARY_ACTIONS = ["Serve", "Switch scene", "Run"]
+PRIMARY_ACTIONS = ["Serve", "Switch scene", "Run stage"]
 
 
 class RailStatus(Static):
@@ -1966,6 +2324,9 @@ class CockpitApp(App):
         #   [O] Run · optimize for my card (dormant v0.10.0 seam)
         Binding("v", "evaluate_target", "Evaluate", show=False),
         Binding("P", "promote_catalog", "Promote", show=False),
+        # R3b-1 — producer lane ② Serve: generate a compose + serve it untested
+        # (also reachable via ⏎ on the ② Serve stage).
+        Binding("g", "serve_untested", "Serve untested", show=False),
         Binding("O", "optimize_card", "Optimize", show=False),
         # Phase R / R2b — consumer share-back affordances (NOT producer-gated):
         #   [R] rig report (READ · paste-ready)     — Run + Operate
@@ -2036,14 +2397,17 @@ class CockpitApp(App):
         "explain":          ({0}, None),          # Run (any sub-tab — no-ops on BYO, harmless)
         "set_default":      ({0}, None),          # Run · Catalog (guards inside action)
         "clear_default":    ({0}, None),          # Run · Catalog
-        "promote_catalog":  ({0}, None),          # Run
+        # R3b-1: [P] promote + [v] evaluate relocated OUT of consumer modes INTO
+        # the producer Bring & Validate lane (mode 2).  Both producer-gated.
+        "promote_catalog":  ({2}, None),          # Bring & Validate lane (⑤ Promote)
+        "evaluate_target":  ({2}, None),          # Bring & Validate lane (the c3t hook)
+        "serve_untested":   ({2}, {"tab-serve"}), # Bring & Validate lane (② Serve)
         "optimize_card":    ({0}, None),          # Run
         # Operate · Orchestration
         "estate_off":       ({1}, {"tab-orchestration"}),
         "power_cap_toggle": ({1}, {"tab-orchestration"}),
         "power_cap_sweep":  ({1}, {"tab-orchestration"}),
         "prune_images":     ({1}, {"tab-orchestration"}),
-        "evaluate_target":  ({1}, None),          # Operate (any tab)
         # Operate · Containers
         "container_logs":   ({1}, {"tab-containers"}),
         # [s] restart only on Operate (any tab, action guards internally) +
@@ -2078,7 +2442,11 @@ class CockpitApp(App):
     #   NOT gated: the consumer share-back (rig_report / submit_bench /
     #   report_problem) is CONSUMER-resident and stays reachable; evaluate_target
     #   stays in Operate for now (R3b relocates it).
-    _PRODUCER_ONLY: frozenset[str] = frozenset({"mode_validate", "promote_catalog"})
+    #   R3b-1: [v] evaluate_target + [serve_untested] (② Serve) joined the lane,
+    #   so they are producer-only too ([P] promote was already here).
+    _PRODUCER_ONLY: frozenset[str] = frozenset({
+        "mode_validate", "promote_catalog", "evaluate_target", "serve_untested",
+    })
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         """Return True (enabled + shown in footer), False (disabled + hidden in footer).
@@ -2114,11 +2482,18 @@ class CockpitApp(App):
         if action in self._ALWAYS_ON:
             return True
 
-        # When a filter Input is focused, hide all context-key bindings from the
-        # footer.  The Input's own _on_key stops printable characters before they
-        # reach app bindings, but we hide them for footer accuracy.
+        # When the catalog FILTER Input is focused, hide all context-key bindings
+        # from the footer.  The Input's own _on_key stops printable characters
+        # before they reach app bindings, but we hide them for footer accuracy
+        # (the filter shares letters with hotkeys q/e/s/w/c/p/o).
+        #
+        # R3b-1: scope this to the catalog-filter id ONLY.  The producer lane's
+        # ① Bring stage auto-focuses its HF-repo Input on entry, and the lane's
+        # own context keys ([P] promote / [v] evaluate / ② serve_untested) MUST
+        # stay enabled there — a blanket "any Input focused" gate would wrongly
+        # hide the entire lane's affordances the moment the stage is opened.
         focused = self.focused
-        if isinstance(focused, _Input):
+        if isinstance(focused, _Input) and getattr(focused, "id", "") == "catalog-filter":
             if action in self._CONTEXT_KEYS:
                 return False
             if action in ("prev_subtab", "next_subtab"):
@@ -2223,14 +2598,27 @@ class CockpitApp(App):
                         with TabPane("Doctor", id="tab-doctor"):
                             yield DoctorPane(id="doctor-pane")
 
-                # Mode 2 — Validate (Benchmarks folded into Run · Catalog + explain;
-                # R2a moved Doctor out to Operate, so Validate is Run + Evidence).
+                # Mode 2 — Bring & Validate (producer lane, R3b-1).  Presented as
+                # an ORDERED, numbered pipeline reusing the TabbedContent pattern:
+                #   ① Bring  → LaneBringPane (reuses byo_check fit-check)
+                #   ② Serve  → LaneServePane (NEW — generate compose + serve untested)
+                #   ③ Gate   → ValidateRunPane (the existing 9-step ladder)
+                #   ④ Measure→ ValidateEvidencePane (the existing evidence list)
+                #   ⑤ Promote→ LanePromotePane (hosts the [P] promote action)
+                # Tab IDs encode the ordinal so the focus map / sub-tab cycle read
+                # the stages in pipeline order.
                 with Container(id="panel-validate", classes="mode-panel"):
                     with TabbedContent(id="validate-tabs"):
-                        with TabPane("Run", id="tab-run"):
+                        with TabPane("① Bring", id="tab-bring"):
+                            yield LaneBringPane(id="lane-bring-pane")
+                        with TabPane("② Serve", id="tab-serve"):
+                            yield LaneServePane(id="lane-serve-pane")
+                        with TabPane("③ Gate", id="tab-run"):
                             yield ValidateRunPane(id="validate-run-pane")
-                        with TabPane("Evidence", id="tab-evidence"):
+                        with TabPane("④ Measure", id="tab-evidence"):
                             yield ValidateEvidencePane(id="validate-evidence-pane")
+                        with TabPane("⑤ Promote", id="tab-promote"):
+                            yield LanePromotePane(id="lane-promote-pane")
         yield Footer()
 
     # ── Mount / startup ────────────────────────────────────────────────────────────
@@ -2357,12 +2745,27 @@ class CockpitApp(App):
 
     @work(exclusive=True, group="byo")
     async def run_byo_check(self, repo: str, profile_like: str) -> None:
-        pane = self.query_one("#byo-panel", ByoPane)
-        pane.set_checking(repo)
+        # The fit-check can be triggered from EITHER Run · BYO (consumer) OR the
+        # producer lane's ① Bring stage; render the verdict into whichever panes
+        # exist (both share byo_check + the verdict text).  R3b-1.
+        run_pane = lane_pane = None
+        try:
+            run_pane = self.query_one("#byo-panel", ByoPane)
+            run_pane.set_checking(repo)
+        except Exception:
+            run_pane = None
+        try:
+            lane_pane = self.query_one("#lane-bring-pane", LaneBringPane)
+            lane_pane.set_checking(repo)
+        except Exception:
+            lane_pane = None
         res = await self._data.byo_check(repo, profile_like)
-        # Cache the arch facts for the Promote-to-catalog scaffold (Phase 5).
+        # Cache the arch facts for the lane ② Serve + the Promote scaffold (Phase 5).
         self._last_byo = res
-        pane.populate(res)
+        if run_pane is not None:
+            run_pane.populate(res)
+        if lane_pane is not None:
+            lane_pane.populate(res)
 
     # ── Explain ──────────────────────────────────────────────────────────────────────
 
@@ -2530,9 +2933,15 @@ class CockpitApp(App):
         # AFTER the poll, not race it as a sibling worker).
         if index == 1:
             self.load_estate()
-        # Validate is live too — load the evidence read (Run is launch-driven).
+        # Bring & Validate lane is live too — load the evidence read AND prime the
+        # live target (R3b-1 fix): [v] Evaluate consumes _target_obj, which only
+        # load_estate writes.  Without this, entering the lane directly (key 3,
+        # never visiting Operate) leaves _target_obj=None → "nothing to evaluate"
+        # even with a model live.  load_estate best-effort-guards every Operate
+        # pane query_one, so it is safe to call when those panes aren't mounted.
         elif index == 2:
             self._load_validate()
+            self.load_estate()
 
     def _focus_mode_primary(self, index: int) -> None:
         """Move focus to the mode's primary interactive widget after a mode switch.
@@ -2555,7 +2964,13 @@ class CockpitApp(App):
                             self.query_one("#scene-table", DataTable).focus()
                     except Exception:
                         pass
-                elif index == 2:  # Validate — run ladder table
+                elif index == 2:  # Bring & Validate lane — focus the active stage's
+                    # primary DATA TABLE (③ Gate ladder / ④ Measure list).  ① Bring /
+                    # ② Serve / ⑤ Promote have no focusable table (① Bring's only
+                    # focusable is an Input, which would swallow the global digit /
+                    # bracket keys), so leave focus on the tab bar there — matching
+                    # how Doctor (read-only) leaves focus unset — so 1/2/3 + [ ]
+                    # still route to the app.
                     try:
                         tc = self.query_one("#validate-tabs", TabbedContent)
                         if tc.active == "tab-run":
@@ -2598,6 +3013,9 @@ class CockpitApp(App):
             self.load_estate()
         elif self._active_mode == 2:
             self._load_validate()
+            # R3b-1: re-prime the live target so [v] Evaluate stays wired to the
+            # currently-serving model on a lane refresh (mirrors _switch_mode).
+            self.load_estate()
         else:
             try:
                 self.query_one("#catalog-pane", CatalogPane).query_one(
@@ -2652,16 +3070,26 @@ class CockpitApp(App):
             self._validate_primary()
 
     def _validate_primary(self) -> None:
-        """⏎ in Validate — context-specific per tab:
-          - Run        : launch the selected ladder/extra step (confirm-gated).
-          - Evidence   : open the paste-ready report for the selected tag.
+        """⏎ in the Bring & Validate lane — context-specific per stage (R3b-1):
+          - ① Bring   : trigger the lane fit-check (byo_check).
+          - ② Serve   : generate the compose for the fit-checked slug + serve it
+                        untested (reconcile-gated).
+          - ③ Gate    : launch the selected ladder/extra step (confirm-gated).
+          - ④ Measure : open the paste-ready report for the selected tag.
+          - ⑤ Promote : compute + preview the catalog scaffold ([P] also does this).
           (Doctor moved to Operate in R2a — it's a read-only view with no
           primary action.)"""
         tab = self._active_validate_tab()
-        if tab == "tab-run":
+        if tab == "tab-bring":
+            self._trigger_lane_bring()
+        elif tab == "tab-serve":
+            self.action_serve_untested()
+        elif tab == "tab-run":
             self._run_validation_selected()
         elif tab == "tab-evidence":
             self._open_evidence_report()
+        elif tab == "tab-promote":
+            self.action_promote_catalog()
 
     def _run_validation_selected(self) -> None:
         """Stage the selected Run step as a confirm-gated validation launch."""
@@ -2730,7 +3158,8 @@ class CockpitApp(App):
         self.push_screen(ConfirmActionScreen(plan))
 
     def action_help(self) -> None:
-        self.push_screen(HelpScreen())
+        # Thread the surface so the consumer help OMITS the producer lane (R3b-1).
+        self.push_screen(HelpScreen(surface=self._surface))
 
     # ── Default-pin management (Run · Catalog) ──────────────────────────────────
 
@@ -3080,14 +3509,17 @@ class CockpitApp(App):
     # ── Phase 5 · Hook 1: Evaluate the running target via c3t (design §4) ──────────────
 
     def action_evaluate_target(self) -> None:
-        """[v] in Operate: hand the SHARED ServingTarget to c3t (▸ Evaluate).
+        """[v] in the Bring & Validate lane: hand the SHARED ServingTarget to c3t
+        (▸ Evaluate).  R3b-1 relocated the c3t hook into the lane (design: the c3t
+        hook lives here); the live target is captured by the Operate estate poll
+        and remains available via ``_target_obj``.
 
         Confirm-gated, MOCK-ONLY launch — c3t runs the post-boot evaluator
         against the live serving model (heavy).  The hand-off carries the SAME
         ``ServingTarget`` object the Estate poll detected (design §4/§6.6); the
         launch streams via ``launch_evaluate`` (write runner, NEVER live this
         phase — conftest blocks the spawn, tests fake it)."""
-        if self._active_mode != 1:
+        if self._active_mode != 2:
             return
         handoff = self._data.evaluate_handoff(self._target_obj)
         if not handoff.available:
@@ -3128,17 +3560,136 @@ class CockpitApp(App):
         await self._data.launch_evaluate(self._target_obj, on_line=_on_line)
         self.notify("c3t evaluate launched.", title="Evaluate", severity="information", timeout=4)
 
+    # ── Phase R / R3b-1 · Bring & Validate lane ① Bring + ② Serve ──────────────────────
+
+    def _trigger_lane_bring(self) -> None:
+        """⏎ / Fit-check on the lane's ① Bring stage: run the lane fit-check
+        (reuses byo_check) from the lane's own inputs."""
+        try:
+            repo = self.query_one("#lane-bring-url-input", Input).value.strip()
+            profile = (
+                self.query_one("#lane-bring-profile-input", Input).value.strip()
+                or "vllm/dual"
+            )
+        except Exception:
+            return
+        if not repo:
+            self.notify("Enter an HF repo (org/Model).", title="① Bring", severity="warning", timeout=3)
+            return
+        self.run_byo_check(repo, profile)
+
+    def action_serve_untested(self) -> None:
+        """[g] / ⏎ in the Bring & Validate lane ② Serve: serve an untested
+        REPRODUCTION of the resolved CATALOG profile's compose (R3b-1).
+
+        ⚠️  HONESTY (R3b-1 fix): this does NOT serve the brought model's weights.
+        ``generate-compose.sh`` has no --repo / weights-swap, so ② Serve generates
+        + serves a verbatim reproduction of the *resolved catalog slug*'s compose
+        (the Route-C sibling, else the profile-like the fit-check ran against) —
+        the BYO repo / quant_match / drop_spec_config are NOT applied.  The full
+        brought-model serve (pull-to-disk + a generate-compose.sh --repo extension)
+        is a DEFERRED follow-up.
+
+        Requires a successful ① Bring fit-check first (the cached ``_last_byo``).
+        If no servable catalog slug resolves we do NOT fall back to a generic
+        profile — we notify that this route has no servable target yet.  Otherwise
+        we generate the catalog slug's minimal compose via ``generate_compose``
+        (reproduce + flag, never repair), preview it VERBATIM badged "untested
+        config reproduction", and — on confirm — serve it through the SAME
+        reconcile-gated path every serve uses (the generated compose claims the
+        GPU)."""
+        if self._active_mode != 2:
+            return
+        if self._last_byo is None or getattr(self._last_byo, "error", ""):
+            self.notify(
+                "Run ① Bring fit-check first — no fit-checked model to serve.",
+                title="② Serve",
+                severity="warning",
+                timeout=4,
+            )
+            return
+        # The CATALOG slug whose compose we reproduce: the Route-C sibling, else
+        # the profile-like the fit-check was run against.  We do NOT swap in the
+        # brought model's weights (no --repo on generate-compose.sh yet) and we do
+        # NOT fall back to a generic profile — if neither resolves, this route has
+        # no servable target yet (the bring-your-own weight-swap is a pending
+        # follow-up).
+        slug = (
+            getattr(self._last_byo, "sibling_slug", "")
+            or getattr(self._last_byo, "profile_like", "")
+        )
+        if not slug:
+            self.notify(
+                "② Serve has no servable catalog target yet — the fit-check "
+                "resolved no sibling/profile slug, and the bring-your-own "
+                "weight-swap is a pending follow-up.",
+                title="② Serve",
+                severity="warning",
+                timeout=5,
+            )
+            return
+        self.generate_and_preview_compose(slug)
+
+    @work(exclusive=True, group="generate-compose")
+    async def generate_and_preview_compose(self, slug: str) -> None:
+        """Generate the compose for ``slug`` (read-ish — writes only a temp file)
+        and open the untested-compose preview modal.  The preview's confirm serves
+        it through the reconcile gate; nothing auto-fires."""
+        try:
+            self.query_one("#lane-serve-pane", LaneServePane).set_status(
+                f"[dim]Generating compose for[/dim] [cyan]{slug}[/cyan] "
+                "[dim](generate-compose.sh)…[/dim]"
+            )
+        except Exception:
+            pass
+        res = await self._data.generate_compose(slug)
+        if res.get("error") or not res.get("compose_yaml"):
+            err = res.get("error") or "generator emitted no compose"
+            try:
+                self.query_one("#lane-serve-pane", LaneServePane).set_status(
+                    f"[red]generate-compose failed:[/red] {err}"
+                )
+            except Exception:
+                pass
+            self.notify(f"② Serve: {err}", title="② Serve", severity="warning", timeout=5)
+            return
+        try:
+            self.query_one("#lane-serve-pane", LaneServePane).set_status(
+                f"[green]✓ generated[/green] compose for [cyan]{slug}[/cyan] — "
+                "preview open (👤 untested)"
+            )
+        except Exception:
+            pass
+        self.push_screen(
+            UntestedComposePreviewScreen(
+                slug,
+                res["compose_path"],
+                res["compose_yaml"],
+                on_serve=self._serve_generated_compose,
+            )
+        )
+
+    def _serve_generated_compose(self, compose_path: str) -> None:
+        """Stage the serve of a GENERATED compose through the reconcile gate.
+
+        The serve_generated plan claims the GPU (``requires_reconcile=True``), so
+        it routes through the SAME ConfirmActionScreen → run_reconcile_for_modal →
+        dispatch_action gate as every serve — the dual-writer lease holds."""
+        plan = self._data.serve_generated(compose_path)
+        self.push_screen(ConfirmActionScreen(plan))
+
     # ── Phase 5 · Hook 2: Promote the BYO model to the catalog (design §3.5b) ──────────
 
     def action_promote_catalog(self) -> None:
-        """[P] in Run: compute + preview the catalog-promotion scaffold.
+        """[P] in the Bring & Validate lane (⑤ Promote): compute + preview the
+        catalog-promotion scaffold (R3b-1 relocated it out of Run · Catalog).
 
         Design §3.5b — a SCAFFOLD + GATE, not a YAML IDE.  Computes a ModelProfile
         YAML skeleton + a compose_registry row from the last BYO fit-check arch
         facts + any measured Evidence numbers, and previews them.  The write into
         scripts/ + the guard suite is the GATED write_plan on the scaffold —
         MOCK-ONLY this phase, never auto-fired."""
-        if self._active_mode != 0:
+        if self._active_mode != 2:
             return
         if self._last_byo is None:
             self.notify(
@@ -3279,11 +3830,17 @@ class CockpitApp(App):
         _mode_tabs: dict[int, set[str]] = {
             0: {"tab-catalog", "tab-byo"},
             1: {"tab-orchestration", "tab-containers", "tab-doctor"},
-            2: {"tab-run", "tab-evidence"},
+            # R3b-1: the producer lane's ordered stages ①→⑤.
+            2: {"tab-bring", "tab-serve", "tab-run", "tab-evidence", "tab-promote"},
         }
         allowed_tabs = _mode_tabs.get(self._active_mode, set())
         if tab_id not in allowed_tabs:
             return
+        # NOTE (R3b-1): the lane's ① Bring / ② Serve / ⑤ Promote stages are NOT in
+        # this map on purpose — ① Bring's only focusable widget is an Input, which
+        # would swallow the global digit (1/2/3) + bracket ([ ]) keys.  Leaving
+        # focus on the tab bar there keeps those keys routed to the app; the user
+        # Tab/clicks into the HF-repo input to type.
         _focus_map: dict[str, str] = {
             "tab-catalog":        "#catalog-table",
             "tab-run":            "#run-ladder-table",
@@ -3395,6 +3952,8 @@ class CockpitApp(App):
         bid = event.button.id
         if bid == "byo-fit-btn":
             self._trigger_byo()
+        elif bid == "lane-bring-fit-btn":
+            self._trigger_lane_bring()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id == "catalog-filter":
@@ -3407,6 +3966,8 @@ class CockpitApp(App):
                 pass
         elif event.input.id in ("byo-url-input", "byo-profile-input"):
             self._trigger_byo()
+        elif event.input.id in ("lane-bring-url-input", "lane-bring-profile-input"):
+            self._trigger_lane_bring()
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "catalog-filter":
