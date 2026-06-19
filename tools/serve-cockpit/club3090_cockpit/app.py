@@ -1,9 +1,10 @@
 """club3090 serve cockpit — main Textual application.
 
-The three modes (Run · Estate · Validate) are wired to the real data layer
+The three modes (Run · Operate · Validate) are wired to the real data layer
 (``services.CockpitData`` + ``data.py`` shapes), reusing the shared core
 (``club3090_tui_core``) for detect / streaming / widgets.  (R1 folded the former
-Discover + Serve + Benchmarks modes into a single Run mode.)
+Discover + Serve + Benchmarks modes into a single Run mode; R2a renamed the
+Estate mode to Operate and moved the Doctor surface into it.)
 
   - Run / Catalog        : real enriched rows from ``CockpitData.load_catalog``;
                           ``e`` opens ``explain`` (incl. the folded-in cross-rig
@@ -12,17 +13,17 @@ Discover + Serve + Benchmarks modes into a single Run mode.)
                           ConfirmActionScreen — on confirm the boot streams into
                           the transient Run LivePane (#serve-live).
   - Run / BYO            : ``CockpitData.byo_check`` → fit verdict + swap_path.
-  - Estate / Orch        : ``estate_state`` live (GPU cards, Doctor, scenes,
+  - Operate / Orch       : ``estate_state`` live (GPU cards, Doctor, scenes,
                           services, power-cap); scene-switch → confirm modal that
                           FIRST calls ``reconcile_before_write`` then ``scene_switch``;
                           ``c`` cap on/off, ``w`` cap sweep, ``p`` prune (all gated).
-  - Estate / Containers  : ``containers`` real list; drill into Logs/Top/Config;
+  - Operate / Containers : ``containers`` real list; drill into Logs/Top/Config;
                           restart/stop/rm behind the reconcile-gated confirm.
+  - Operate / Doctor     : real cards from ``doctor()`` (health + diagnose-estate
+                          + diagnose-profile) — live-state, READ-only.
   - Validate / Run       : launchable ladder + extra tools (``run_validation``,
                           confirm-gated, streamed into a LivePane) + §3.5 *tune*
                           gotchas inline.
-  - Validate / Doctor    : real cards from ``doctor()`` (health + diagnose-estate
-                          + diagnose-profile).
   - Validate / Evidence  : ``evidence_list()`` run tags; ``⏎`` opens the
                           ``evidence_report()`` modal; ``s`` stages the gated
                           submit-to-localmaxxing (outward NETWORK write, never auto).
@@ -175,7 +176,7 @@ class HelpScreen(ModalScreen):
     HELP_TEXT = """\
 [bold]Keybindings[/bold]
 
-  [cyan]1[/cyan]  Run    [cyan]2[/cyan]  Estate    [cyan]3[/cyan]  Validate
+  [cyan]1[/cyan]  Run    [cyan]2[/cyan]  Operate    [cyan]3[/cyan]  Validate
   [cyan]r[/cyan]  Refresh (re-reads the live data layer for the active mode)
   [cyan]/[/cyan]  Filter (Run · Catalog)
   [cyan]e[/cyan]  Explain selected slug (Run · Catalog — incl. cross-rig benchmarks)
@@ -187,11 +188,13 @@ class HelpScreen(ModalScreen):
   [cyan]d[/cyan] set-default   [cyan]D[/cyan] clear-default
   [cyan]P[/cyan] ▸ Promote a fit-checked BYO model to the catalog (scaffold + gated write)
   [cyan]O[/cyan] ▸ Optimize for my card (v0.10.0 seam — not available yet)
-[bold]Estate · Orchestration[/bold]
+[bold]Operate · Orchestration[/bold]
   [cyan]o[/cyan] stop all   [cyan]c[/cyan] power-cap on/off   [cyan]w[/cyan] cap sweep   [cyan]p[/cyan] prune images   (all gated)
   [cyan]v[/cyan] ▸ Evaluate the running target via c3t (confirm-gated · mock-only this phase)
-[bold]Estate · Containers[/bold]
+[bold]Operate · Containers[/bold]
   [cyan]l[/cyan] logs   [cyan]t[/cyan] top (read)   [cyan]s[/cyan] restart   [cyan]x[/cyan] stop   [cyan]X[/cyan] rm   (writes gated)
+[bold]Operate · Doctor[/bold]
+  read-only — health + diagnose-estate + diagnose-profile cards ([cyan]r[/cyan] refreshes)
 [bold]Validate[/bold]
   Run: [cyan]⏎[/cyan] launch step (gated)
   Evidence: [cyan]⏎[/cyan] open report   [cyan]s[/cyan] submit to localmaxxing (gated · never auto)
@@ -818,63 +821,63 @@ def _with_force(plan: ActionPlan) -> list[str]:
     return cmd
 
 
-# ── Estate · Orchestration ───────────────────────────────────────────────────────
+# ── Operate · Orchestration ───────────────────────────────────────────────────────
 
 
-class EstateOrchPane(Container):
-    """Estate / Orchestration tab: GPU cards, Doctor, scene table, services."""
+class OperateOrchPane(Container):
+    """Operate / Orchestration tab: GPU cards, Doctor, scene table, services."""
 
     DEFAULT_CSS = """
-    EstateOrchPane {
+    OperateOrchPane {
         height: 1fr;
     }
-    EstateOrchPane #orch-scroll {
+    OperateOrchPane #orch-scroll {
         height: 1fr;
     }
-    EstateOrchPane .gpu-card {
+    OperateOrchPane .gpu-card {
         border: solid $primary;
         padding: 0 1;
         margin: 0 1 1 1;
         height: auto;
     }
-    EstateOrchPane .gpu-card-title {
+    OperateOrchPane .gpu-card-title {
         text-style: bold;
         color: $accent;
     }
-    EstateOrchPane #doctor-line {
+    OperateOrchPane #doctor-line {
         padding: 0 1;
         margin: 0 1 1 1;
         color: $text;
     }
-    EstateOrchPane #scene-heading {
+    OperateOrchPane #scene-heading {
         text-style: bold;
         padding: 0 1;
         margin: 0 1 0 1;
     }
-    EstateOrchPane DataTable {
+    OperateOrchPane DataTable {
         height: auto;
         margin: 0 1 1 1;
     }
-    EstateOrchPane #services-heading {
+    OperateOrchPane #services-heading {
         text-style: bold;
         padding: 0 1;
         margin: 0 1 0 1;
     }
-    EstateOrchPane #services-strip {
+    OperateOrchPane #services-strip {
         padding: 0 1;
         margin: 0 1 1 1;
     }
-    EstateOrchPane #powercap-heading {
+    OperateOrchPane #powercap-heading {
         text-style: bold;
         padding: 0 1;
         margin: 0 1 0 1;
     }
-    EstateOrchPane #powercap-strip {
+    OperateOrchPane #powercap-strip {
         padding: 0 1;
         margin: 0 1 1 1;
         color: $text;
     }
-    EstateOrchPane #orch-hint {
+    OperateOrchPane #orch-hint {
         padding: 0 1;
         margin: 0 1;
         color: $text-muted;
@@ -1007,43 +1010,43 @@ class EstateOrchPane(Container):
         return None
 
 
-# ── Estate · Containers ──────────────────────────────────────────────────────────
+# ── Operate · Containers ──────────────────────────────────────────────────────────
 
 
-class EstateContainersPane(Container):
-    """Estate / Containers tab: container list + drill-down area."""
+class OperateContainersPane(Container):
+    """Operate / Containers tab: container list + drill-down area."""
 
     DEFAULT_CSS = """
-    EstateContainersPane {
+    OperateContainersPane {
         height: 1fr;
     }
-    EstateContainersPane #containers-heading {
+    OperateContainersPane #containers-heading {
         text-style: bold;
         padding: 0 1;
         margin: 0 1 0 1;
     }
-    EstateContainersPane #containers-table {
+    OperateContainersPane #containers-table {
         height: auto;
         margin: 0 1 0 1;
         max-height: 12;
     }
-    EstateContainersPane #drill-tabs {
+    OperateContainersPane #drill-tabs {
         height: 1fr;
         margin: 1 1 0 1;
         border: solid $primary;
     }
-    EstateContainersPane #drill-logs {
+    OperateContainersPane #drill-logs {
         height: 1fr;
     }
-    EstateContainersPane #drill-stats {
+    OperateContainersPane #drill-stats {
         padding: 1;
         color: $text;
     }
-    EstateContainersPane #drill-config {
+    OperateContainersPane #drill-config {
         padding: 1;
         color: $text-muted;
     }
-    EstateContainersPane #containers-hint {
+    OperateContainersPane #containers-hint {
         padding: 0 1;
         margin: 0 1;
         color: $text-muted;
@@ -1244,39 +1247,41 @@ class ValidateRunPane(Container):
         return None
 
 
-class ValidateDoctorPane(Container):
-    """Validate / Doctor tab: real health / diagnose-estate / diagnose-profile
-    cards from ``CockpitData.doctor()``.
+class DoctorPane(Container):
+    """Operate / Doctor tab: real health / diagnose-estate / diagnose-profile
+    cards from ``CockpitData.doctor()``.  Mode-agnostic Doctor surface — R2a
+    moved it out of Validate into Operate (it reports live state, not a
+    validation artifact).
 
-    The health line also updates live from the Estate poll (``populate``); the
-    estate + profile cards fill from the dedicated ``doctor()`` read (``r`` /
-    on entering the tab) since diagnose-estate / diagnose-profile are heavier
-    reads than the per-poll health probe."""
+    The health line also updates live from the Operate estate poll
+    (``populate``); the estate + profile cards fill from the dedicated
+    ``doctor()`` read (``r`` / on entering Operate) since diagnose-estate /
+    diagnose-profile are heavier reads than the per-poll health probe."""
 
     DEFAULT_CSS = """
-    ValidateDoctorPane {
+    DoctorPane {
         height: 1fr;
     }
-    ValidateDoctorPane #doctor-scroll {
+    DoctorPane #doctor-scroll {
         height: 1fr;
         padding: 1 2;
     }
-    ValidateDoctorPane #doctor-heading {
+    DoctorPane #doctor-heading {
         text-style: bold;
         margin-bottom: 1;
     }
-    ValidateDoctorPane .doctor-card {
+    DoctorPane .doctor-card {
         border: solid $primary;
         padding: 1 2;
         margin-bottom: 1;
         height: auto;
     }
-    ValidateDoctorPane .doctor-card-title {
+    DoctorPane .doctor-card-title {
         text-style: bold;
         color: $accent;
         margin-bottom: 1;
     }
-    ValidateDoctorPane #doctor-hint {
+    DoctorPane #doctor-hint {
         color: $text-muted;
         margin-top: 1;
     }
@@ -1300,7 +1305,7 @@ class ValidateDoctorPane(Container):
             )
 
     def populate(self, state: EstateState) -> None:
-        """Live health line from the Estate poll (the cheap per-poll probe)."""
+        """Live health line from the Operate estate poll (the cheap per-poll probe)."""
         self._render_health(state.doctor)
 
     def _render_health(self, dr) -> None:
@@ -1712,7 +1717,7 @@ class OptimizeScreen(ModalScreen):
 
 MODES = [
     ("Run", "1"),
-    ("Estate", "2"),
+    ("Operate", "2"),
     ("Validate", "3"),
 ]
 
@@ -1731,7 +1736,7 @@ class RailStatus(Static):
         "\n"
         "[dim]detecting…[/dim]\n"
         "\n"
-        "[dim]press 2 (Estate) to poll[/dim]"
+        "[dim]press 2 (Operate) to poll[/dim]"
     )
 
     def __init__(self, **kwargs):
@@ -1833,7 +1838,7 @@ class ModeSwitcher(Static):
 
 
 class CockpitApp(App):
-    """club3090 serve cockpit — all three modes (Run · Estate · Validate) wired to the live data layer."""
+    """club3090 serve cockpit — all three modes (Run · Operate · Validate) wired to the live data layer."""
 
     TITLE = "club3090 cockpit"
     SUB_TITLE = "wired"
@@ -1849,29 +1854,29 @@ class CockpitApp(App):
         Binding("slash", "filter_catalog", "Filter", show=False),
         Binding("e", "explain", "Explain", show=False),
         Binding("1", "mode_run", "Run", show=True),
-        Binding("2", "mode_estate", "Estate", show=True),
+        Binding("2", "mode_operate", "Operate", show=True),
         Binding("3", "mode_validate", "Validate", show=True),
         Binding("enter", "primary_action", "Select", show=True),
         # Catalog (Run) — default pin management (.env write, gated=no GPU).
         Binding("d", "set_default", "Set default", show=False),
         Binding("D", "clear_default", "Clear default", show=False),
-        # Estate · Containers — logs (read) + restart/stop (gated writes).
-        # [s] is context-sensitive: restart (Estate · Containers) vs submit
+        # Operate · Containers — logs (read) + restart/stop (gated writes).
+        # [s] is context-sensitive: restart (Operate · Containers) vs submit
         # (Validate · Evidence) — routed by mode/tab in action_s_key.
         Binding("l", "container_logs", "Logs", show=False),
         Binding("s", "s_key", "Restart / Submit", show=False),
         Binding("x", "container_stop", "Stop", show=False),
         Binding("X", "container_rm", "Remove", show=False),
-        # Estate · Orchestration — stop all (estate down, gated write).
+        # Operate · Orchestration — stop all (estate down, gated write).
         Binding("o", "estate_off", "Stop all", show=False),
-        # Estate · Orchestration — power cap + prune (gated rig writes).
+        # Operate · Orchestration — power cap + prune (gated rig writes).
         Binding("c", "power_cap_toggle", "Cap on/off", show=False),
         Binding("w", "power_cap_sweep", "Cap sweep", show=False),
         Binding("p", "prune_images", "Prune", show=False),
-        # Estate · Containers / Validate — context-sensitive read keys.
+        # Operate · Containers / Validate — context-sensitive read keys.
         Binding("t", "context_t", "Top / Sort", show=False),
         # Phase 5 — the three v2 hooks:
-        #   [v] Estate · evaluate the running target via c3t (confirm-gated, mock-only)
+        #   [v] Operate · evaluate the running target via c3t (confirm-gated, mock-only)
         #   [P] Run · promote the BYO model to the catalog (scaffold + gated write)
         #   [O] Run · optimize for my card (dormant v0.10.0 seam)
         Binding("v", "evaluate_target", "Evaluate", show=False),
@@ -1925,7 +1930,7 @@ class CockpitApp(App):
     # Actions that are always active regardless of mode or focused widget.
     _ALWAYS_ON: frozenset[str] = frozenset({
         "quit", "help", "refresh",
-        "mode_run", "mode_estate", "mode_validate",
+        "mode_run", "mode_operate", "mode_validate",
         "primary_action",
     })
 
@@ -1941,15 +1946,15 @@ class CockpitApp(App):
         "clear_default":    ({0}, None),          # Run · Catalog
         "promote_catalog":  ({0}, None),          # Run
         "optimize_card":    ({0}, None),          # Run
-        # Estate · Orchestration
+        # Operate · Orchestration
         "estate_off":       ({1}, {"tab-orchestration"}),
         "power_cap_toggle": ({1}, {"tab-orchestration"}),
         "power_cap_sweep":  ({1}, {"tab-orchestration"}),
         "prune_images":     ({1}, {"tab-orchestration"}),
-        "evaluate_target":  ({1}, None),          # Estate (either tab)
-        # Estate · Containers
+        "evaluate_target":  ({1}, None),          # Operate (any tab)
+        # Operate · Containers
         "container_logs":   ({1}, {"tab-containers"}),
-        # [s] restart only on Estate (any tab, action guards internally) +
+        # [s] restart only on Operate (any tab, action guards internally) +
         # [s] submit on Validate·Evidence; no sub-tab constraint at this level.
         "s_key":            ({1, 2}, None),  # Containers (restart) + Evidence (submit)
         "container_stop":   ({1}, {"tab-containers"}),
@@ -2029,7 +2034,7 @@ class CockpitApp(App):
         """Return the active tab ID for the current mode's TabbedContent, or ''."""
         tab_ids = {
             0: "#run-tabs",
-            1: "#estate-tabs",
+            1: "#operate-tabs",
             2: "#validate-tabs",
         }
         tc_id = tab_ids.get(self._active_mode, "")
@@ -2052,7 +2057,7 @@ class CockpitApp(App):
             self.sub_title = f"{self.SUB_TITLE} · ⚒ CONTRIBUTE"
         # Injectable service layer — defaults to the real (live-read) impl.
         self._data: CockpitData = data or CockpitData(repo_root)
-        self._active_mode = 0  # 0=Run 1=Estate 2=Validate
+        self._active_mode = 0  # 0=Run 1=Operate 2=Validate
         # Cache the last-loaded variants so detect/match + containers can match
         # running engines back to registry slugs.
         self._variants: list[VariantRow] = []
@@ -2091,21 +2096,22 @@ class CockpitApp(App):
                     # reconcile-gated confirm commits; then the boot log streams here.
                     yield LivePane(id="serve-live")
 
-                # Mode 1 — Estate
-                with Container(id="panel-estate", classes="mode-panel"):
-                    with TabbedContent(id="estate-tabs"):
+                # Mode 1 — Operate (Orchestration + Containers + Doctor)
+                with Container(id="panel-operate", classes="mode-panel"):
+                    with TabbedContent(id="operate-tabs"):
                         with TabPane("Orchestration", id="tab-orchestration"):
-                            yield EstateOrchPane(id="estate-orch-pane")
+                            yield OperateOrchPane(id="operate-orch-pane")
                         with TabPane("Containers", id="tab-containers"):
-                            yield EstateContainersPane(id="estate-containers-pane")
+                            yield OperateContainersPane(id="operate-containers-pane")
+                        with TabPane("Doctor", id="tab-doctor"):
+                            yield DoctorPane(id="doctor-pane")
 
-                # Mode 2 — Validate (Benchmarks folded into Run · Catalog + explain)
+                # Mode 2 — Validate (Benchmarks folded into Run · Catalog + explain;
+                # R2a moved Doctor out to Operate, so Validate is Run + Evidence).
                 with Container(id="panel-validate", classes="mode-panel"):
                     with TabbedContent(id="validate-tabs"):
                         with TabPane("Run", id="tab-run"):
                             yield ValidateRunPane(id="validate-run-pane")
-                        with TabPane("Doctor", id="tab-doctor"):
-                            yield ValidateDoctorPane(id="validate-doctor-pane")
                         with TabPane("Evidence", id="tab-evidence"):
                             yield ValidateEvidencePane(id="validate-evidence-pane")
         yield Footer()
@@ -2161,17 +2167,17 @@ class CockpitApp(App):
         # hand-off — design §4/§6.6 requires passing the SAME dataclass instance.
         self._target_obj = tgt
         try:
-            self.query_one("#estate-orch-pane", EstateOrchPane).populate(state)
+            self.query_one("#operate-orch-pane", OperateOrchPane).populate(state)
         except Exception:
             pass
         try:
-            self.query_one("#estate-containers-pane", EstateContainersPane).populate(
+            self.query_one("#operate-containers-pane", OperateContainersPane).populate(
                 state.containers
             )
         except Exception:
             pass
         try:
-            self.query_one("#validate-doctor-pane", ValidateDoctorPane).populate(state)
+            self.query_one("#doctor-pane", DoctorPane).populate(state)
         except Exception:
             pass
         try:
@@ -2181,9 +2187,17 @@ class CockpitApp(App):
         # Power-cap status (READ) for the orch pane.
         st = await self._data.power_cap_get()
         try:
-            self.query_one("#estate-orch-pane", EstateOrchPane).populate_power_cap(st)
+            self.query_one("#operate-orch-pane", OperateOrchPane).populate_power_cap(st)
         except Exception:
             pass
+        # Doctor lives in Operate (R2a) and its profile-triage consumes the
+        # _target_slug/_target_url THIS poll just captured — so chain the doctor
+        # read here rather than racing it as a sibling worker off the mode switch
+        # (which read _target_slug before this wrote it → empty profile card on
+        # first entry). Guarded to Operate; this also means action_refresh ([r],
+        # which re-runs load_estate) now refreshes the Doctor cards too.
+        if self._active_mode == 1:
+            self.load_doctor()
 
     # ── Validate-mode loaders ──────────────────────────────────────────────────────
 
@@ -2194,7 +2208,7 @@ class CockpitApp(App):
         slug = self._target_slug or (self._staged_entry.slug if self._staged_entry else None)
         report = await self._data.doctor(url=self._target_url or None, slug=slug)
         try:
-            self.query_one("#validate-doctor-pane", ValidateDoctorPane).populate_report(report)
+            self.query_one("#doctor-pane", DoctorPane).populate_report(report)
         except Exception:
             pass
 
@@ -2343,7 +2357,7 @@ class CockpitApp(App):
     # ── Mode switching ───────────────────────────────────────────────────────────────
 
     def _switch_mode(self, index: int) -> None:
-        panel_ids = ["panel-run", "panel-estate", "panel-validate"]
+        panel_ids = ["panel-run", "panel-operate", "panel-validate"]
         for i, pid in enumerate(panel_ids):
             try:
                 panel = self.query_one(f"#{pid}")
@@ -2363,10 +2377,13 @@ class CockpitApp(App):
         # Move focus to the mode's primary interactive widget so context
         # keys and ⏎ act on the right thing immediately.
         self._focus_mode_primary(index)
-        # Estate is live — poll on entry.
+        # Operate is live — poll the estate on entry.  load_estate chains the
+        # Doctor read at its END (Doctor lives in Operate as of R2a, and its
+        # profile-triage consumes the target the poll captures — so it must run
+        # AFTER the poll, not race it as a sibling worker).
         if index == 1:
             self.load_estate()
-        # Validate is live too — load the doctor/evidence reads.
+        # Validate is live too — load the evidence read (Run is launch-driven).
         elif index == 2:
             self._load_validate()
 
@@ -2380,12 +2397,14 @@ class CockpitApp(App):
             try:
                 if index == 0:  # Run — catalog table
                     self.query_one("#catalog-table", DataTable).focus()
-                elif index == 1:  # Estate — scene table (Orchestration) or containers table
+                elif index == 1:  # Operate — focus the active tab's table; Doctor
+                    # is read-only with no focusable table, so leave focus unset
+                    # there rather than grabbing the hidden Orchestration table.
                     try:
-                        tc = self.query_one("#estate-tabs", TabbedContent)
+                        tc = self.query_one("#operate-tabs", TabbedContent)
                         if tc.active == "tab-containers":
                             self.query_one("#containers-table", DataTable).focus()
-                        else:
+                        elif tc.active == "tab-orchestration":
                             self.query_one("#scene-table", DataTable).focus()
                     except Exception:
                         pass
@@ -2403,10 +2422,10 @@ class CockpitApp(App):
         self.call_after_refresh(_do)
 
     def _load_validate(self) -> None:
-        """Kick the Validate read workers (doctor / evidence).
-        Each is best-effort and independent — a failing leg doesn't block the
-        others.  The Run pane is launch-driven (no background read)."""
-        self.load_doctor()
+        """Kick the Validate read workers (evidence).
+        Best-effort — a failing leg doesn't block the rest.  The Run pane is
+        launch-driven (no background read).  R2a moved Doctor to Operate, so
+        Validate no longer kicks load_doctor here (that fires on Operate entry)."""
         self.load_evidence()
 
     # ── Actions ──────────────────────────────────────────────────────────────────────
@@ -2414,7 +2433,7 @@ class CockpitApp(App):
     def action_mode_run(self) -> None:
         self._switch_mode(0)
 
-    def action_mode_estate(self) -> None:
+    def action_mode_operate(self) -> None:
         self._switch_mode(1)
 
     def action_mode_validate(self) -> None:
@@ -2450,9 +2469,9 @@ class CockpitApp(App):
         except Exception:
             return ""
 
-    def _active_estate_tab(self) -> str:
+    def _active_operate_tab(self) -> str:
         try:
-            return self.query_one("#estate-tabs", TabbedContent).active
+            return self.query_one("#operate-tabs", TabbedContent).active
         except Exception:
             return ""
 
@@ -2475,7 +2494,7 @@ class CockpitApp(App):
         if self._active_mode == 0:
             self._run_primary()
         elif self._active_mode == 1:
-            self._estate_primary()
+            self._operate_primary()
         else:
             self._validate_primary()
 
@@ -2483,7 +2502,8 @@ class CockpitApp(App):
         """⏎ in Validate — context-specific per tab:
           - Run        : launch the selected ladder/extra step (confirm-gated).
           - Evidence   : open the paste-ready report for the selected tag.
-          - Doctor has no primary action (read-only view)."""
+          (Doctor moved to Operate in R2a — it's a read-only view with no
+          primary action.)"""
         tab = self._active_validate_tab()
         if tab == "tab-run":
             self._run_validation_selected()
@@ -2545,10 +2565,10 @@ class CockpitApp(App):
         except Exception:
             return ""
 
-    def _estate_primary(self) -> None:
-        """⏎ in Estate · Orchestration: confirm-gated scene switch."""
+    def _operate_primary(self) -> None:
+        """⏎ in Operate · Orchestration: confirm-gated scene switch."""
         try:
-            scene = self.query_one("#estate-orch-pane", EstateOrchPane).selected_scene()
+            scene = self.query_one("#operate-orch-pane", OperateOrchPane).selected_scene()
         except Exception:
             scene = None
         if scene is None:
@@ -2593,10 +2613,10 @@ class CockpitApp(App):
         except Exception:
             return None
 
-    # ── Containers (Estate · Containers) ──────────────────────────────────────────────
+    # ── Containers (Operate · Containers) ──────────────────────────────────────────────
 
     def action_container_logs(self) -> None:
-        """[l] in Estate · Containers: stream `docker logs` for the selected
+        """[l] in Operate · Containers: stream `docker logs` for the selected
         container into the drill Logs LivePane.  This is a READ — safe to run
         live (the conftest blocks an accidental write, not this read)."""
         if self._active_mode != 1:
@@ -2614,7 +2634,7 @@ class CockpitApp(App):
 
     def action_s_key(self) -> None:
         """[s] is context-sensitive:
-          - Estate · Containers : gated `docker restart <name>`.
+          - Operate · Containers : gated `docker restart <name>`.
           - Validate · Evidence : gated submit-to-localmaxxing for the tag.
         Other contexts ignore it."""
         if self._active_mode == 2 and self._active_validate_tab() == "tab-evidence":
@@ -2623,15 +2643,19 @@ class CockpitApp(App):
         self.action_container_restart()
 
     def action_container_restart(self) -> None:
-        """Gated `docker restart <name>` (Estate · Containers)."""
+        """Gated `docker restart <name>` (Operate · Containers)."""
         self._container_write("restart")
 
     def action_container_stop(self) -> None:
-        """[x] in Estate · Containers: gated `docker stop <name>`."""
+        """[x] in Operate · Containers: gated `docker stop <name>`."""
         self._container_write("stop")
 
     def _container_write(self, op: str) -> None:
-        if self._active_mode != 1:
+        # Operate · Containers ONLY.  [s] (restart) falls through here from
+        # action_s_key without a sub-tab gate, so guard the WRITE itself — Doctor
+        # (and Orchestration) are not container-write surfaces; Doctor is
+        # read-only, and a stray [s] there must not pop a `docker restart` confirm.
+        if self._active_mode != 1 or self._active_operate_tab() != "tab-containers":
             return
         con = self._selected_container()
         if con is None:
@@ -2645,7 +2669,7 @@ class CockpitApp(App):
     def _selected_container(self) -> Optional[ContainerInfo]:
         try:
             return self.query_one(
-                "#estate-containers-pane", EstateContainersPane
+                "#operate-containers-pane", OperateContainersPane
             ).selected_container()
         except Exception:
             return None
@@ -2672,7 +2696,7 @@ class CockpitApp(App):
             live.append_line(ln)
 
     def action_container_rm(self) -> None:
-        """[X] in Estate · Containers: reconcile-gated `docker rm <name>`.
+        """[X] in Operate · Containers: reconcile-gated `docker rm <name>`.
 
         Removing a container frees a GPU it held → the plan requires_reconcile,
         so it routes through the SAME ConfirmActionScreen → dispatch_action gate
@@ -2687,9 +2711,9 @@ class CockpitApp(App):
         self.push_screen(ConfirmActionScreen(plan))
 
     def action_context_t(self) -> None:
-        """[t] reads `docker top` for the selected container (Estate · Containers).
+        """[t] reads `docker top` for the selected container (Operate · Containers).
         The Benchmarks sort-cycle role was retired with the Benchmarks tab (Fold 3)."""
-        if self._active_mode == 1 and self._active_estate_tab() == "tab-containers":
+        if self._active_mode == 1 and self._active_operate_tab() == "tab-containers":
             self._container_top()
 
     def _container_top(self) -> None:
@@ -2713,7 +2737,7 @@ class CockpitApp(App):
         if con is not None and con.slug:
             variant = next((v for v in self._variants if getattr(v, "slug", "") == con.slug), None)
         try:
-            pane = self.query_one("#estate-containers-pane", EstateContainersPane)
+            pane = self.query_one("#operate-containers-pane", OperateContainersPane)
             pane.populate_top(top)
             pane.populate_config(con, variant)
         except Exception:
@@ -2780,15 +2804,15 @@ class CockpitApp(App):
         plan = self._data.submit_bench(tag.tag)
         self.push_screen(ConfirmActionScreen(plan))
 
-    # ── Estate · Orchestration: power-cap + prune (gated rig writes) ───────────────────
+    # ── Operate · Orchestration: power-cap + prune (gated rig writes) ───────────────────
 
     def action_power_cap_toggle(self) -> None:
-        """[c] in Estate · Orchestration: confirm-gated power-cap on/off.
+        """[c] in Operate · Orchestration: confirm-gated power-cap on/off.
 
         Reads the current cap state to decide the toggle direction (on→off /
         off→on), then routes the WRITE through the standard confirm gate.  A
         cap write is a rig mutation — NEVER auto-fired."""
-        if self._active_mode != 1 or self._active_estate_tab() != "tab-orchestration":
+        if self._active_mode != 1 or self._active_operate_tab() != "tab-orchestration":
             return
         self._toggle_power_cap()
 
@@ -2805,25 +2829,25 @@ class CockpitApp(App):
         self.push_screen(ConfirmActionScreen(plan))
 
     def action_power_cap_sweep(self) -> None:
-        """[w] in Estate · Orchestration: confirm-gated power-cap sweep (heavy +
+        """[w] in Operate · Orchestration: confirm-gated power-cap sweep (heavy +
         mutating — runs benches at each cap).  NEVER auto-fired."""
-        if self._active_mode != 1 or self._active_estate_tab() != "tab-orchestration":
+        if self._active_mode != 1 or self._active_operate_tab() != "tab-orchestration":
             return
         plan = self._data.power_cap_sweep()
         self.push_screen(ConfirmActionScreen(plan))
 
     def action_prune_images(self) -> None:
-        """[p] in Estate · Orchestration: confirm-gated image prune (DESTRUCTIVE —
+        """[p] in Operate · Orchestration: confirm-gated image prune (DESTRUCTIVE —
         deletes unreferenced images).  NEVER auto-fired."""
-        if self._active_mode != 1 or self._active_estate_tab() != "tab-orchestration":
+        if self._active_mode != 1 or self._active_operate_tab() != "tab-orchestration":
             return
         plan = self._data.prune()
         self.push_screen(ConfirmActionScreen(plan))
 
-    # ── Estate stop-all (Estate · Orchestration) ──────────────────────────────────────
+    # ── Estate stop-all (Operate · Orchestration) ──────────────────────────────────────
 
     def action_estate_off(self) -> None:
-        """[o] in Estate · Orchestration: gated estate-down (stop all)."""
+        """[o] in Operate · Orchestration: gated estate-down (stop all)."""
         if self._active_mode != 1:
             return
         plan = self._data.estate_down()
@@ -2832,7 +2856,7 @@ class CockpitApp(App):
     # ── Phase 5 · Hook 1: Evaluate the running target via c3t (design §4) ──────────────
 
     def action_evaluate_target(self) -> None:
-        """[v] in Estate: hand the SHARED ServingTarget to c3t (▸ Evaluate).
+        """[v] in Operate: hand the SHARED ServingTarget to c3t (▸ Evaluate).
 
         Confirm-gated, MOCK-ONLY launch — c3t runs the post-boot evaluator
         against the live serving model (heavy).  The hand-off carries the SAME
@@ -2974,7 +2998,7 @@ class CockpitApp(App):
         """Cycle the TabbedContent for the current mode by direction (+1 / -1)."""
         tab_widget_ids = {
             0: "#run-tabs",
-            1: "#estate-tabs",
+            1: "#operate-tabs",
             2: "#validate-tabs",
         }
         tc_id = tab_widget_ids.get(self._active_mode, "")
@@ -3014,7 +3038,7 @@ class CockpitApp(App):
         panel.  Events from mode panels that are currently hidden (display:none) are
         ignored so startup/background activations don't steal focus."""
         self.refresh_bindings()
-        # Nested Estate·Containers drill-tabs (Logs/Top/Config): load the newly
+        # Nested Operate·Containers drill-tabs (Logs/Top/Config): load the newly
         # active tab's content for the selected container, then stop — these are
         # NOT mode-level tabs and must not run the mode focus logic below.
         try:
@@ -3030,8 +3054,8 @@ class CockpitApp(App):
         # Only respond to tabs that belong to the current mode's active panel.
         _mode_tabs: dict[int, set[str]] = {
             0: {"tab-catalog", "tab-byo"},
-            1: {"tab-orchestration", "tab-containers"},
-            2: {"tab-run", "tab-doctor", "tab-evidence"},
+            1: {"tab-orchestration", "tab-containers", "tab-doctor"},
+            2: {"tab-run", "tab-evidence"},
         }
         allowed_tabs = _mode_tabs.get(self._active_mode, set())
         if tab_id not in allowed_tabs:
@@ -3050,7 +3074,7 @@ class CockpitApp(App):
                     self.query_one(widget_id, DataTable).focus()
                 except Exception:
                     pass
-                # Entering Estate·Containers auto-loads the detail for the
+                # Entering Operate·Containers auto-loads the detail for the
                 # already-highlighted container — switching tabs doesn't re-fire
                 # RowHighlighted (the cursor was set when the table populated),
                 # so trigger the load here.
@@ -3069,7 +3093,7 @@ class CockpitApp(App):
         self.action_primary_action()
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
-        """Estate · Containers: auto-load the drill detail for the highlighted
+        """Operate · Containers: auto-load the drill detail for the highlighted
         container (lazydocker-style). Config is a local read → immediate; the
         active live tab (Logs / Top) is a docker read → debounced ~250ms so
         arrowing through the list doesn't spawn a subprocess per row."""
@@ -3078,7 +3102,7 @@ class CockpitApp(App):
                 return
         except Exception:
             return
-        if self._active_mode != 1 or self._active_estate_tab() != "tab-containers":
+        if self._active_mode != 1 or self._active_operate_tab() != "tab-containers":
             return
         self._refresh_container_config()
         timer = getattr(self, "_drill_timer", None)
@@ -3103,7 +3127,7 @@ class CockpitApp(App):
         if con is not None and con.slug:
             variant = next((v for v in self._variants if getattr(v, "slug", "") == con.slug), None)
         try:
-            self.query_one("#estate-containers-pane", EstateContainersPane).populate_config(con, variant)
+            self.query_one("#operate-containers-pane", OperateContainersPane).populate_config(con, variant)
         except Exception:
             pass
 

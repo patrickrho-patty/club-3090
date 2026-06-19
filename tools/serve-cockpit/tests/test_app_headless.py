@@ -4,14 +4,15 @@ Verifies:
   1. The app mounts without error (no TTY, no GPU, no Docker, no live script).
      The data layer is a CockpitData backed by a FakeRunner + fake detect +
      a FakeWriteRunner, so NO subprocess is ever spawned.
-  2. All three modes (Run · Estate · Validate) are reachable via digit-key
+  2. All three modes (Run · Operate · Validate) are reachable via digit-key
      bindings 1/2/3; nav nodes exist.  (R1 folded Discover + Serve + Benchmarks
-     into a single Run mode.)
+     into a single Run mode; R2a renamed Estate → Operate and moved Doctor into it.)
   3. Run · Catalog populates from real enriched entries (fit glyph, TPS,
      8pk, source) and filters live.
   4. BYO renders the swap_path route from byo_check.
   5. ⏎ on a Run · Catalog row opens the reconcile-gated confirm modal directly.
-  6. Estate · Orchestration + Containers populate from estate_state.
+  6. Operate · Orchestration + Containers + Doctor populate from estate_state /
+     doctor().
   7. EVERY write path goes through the reconcile gate, and NO test ever
      executes a live write — the FakeWriteRunner records start_raw calls and
      never spawns a process; an unsafe gate refuses to even reach it.
@@ -40,10 +41,10 @@ from club3090_cockpit.app import (
     HelpScreen,
     ModeSwitcher,
     ByoPane,
-    EstateOrchPane,
-    EstateContainersPane,
+    OperateOrchPane,
+    OperateContainersPane,
     ValidateRunPane,
-    ValidateDoctorPane,
+    DoctorPane,
     ValidateEvidencePane,
     EvidenceReportScreen,
     RailStatus,
@@ -449,7 +450,7 @@ async def _settle(pilot) -> None:
     await pilot.pause()
 
 
-PANEL_IDS = ["panel-run", "panel-estate", "panel-validate"]
+PANEL_IDS = ["panel-run", "panel-operate", "panel-validate"]
 
 
 # ===========================================================================
@@ -482,7 +483,7 @@ class TestAppMounts:
     async def test_other_panels_hidden_on_start(self):
         app, _, _ = make_app()
         async with app.run_test(size=(120, 40)) as pilot:
-            for pid in ["panel-estate", "panel-validate"]:
+            for pid in ["panel-operate", "panel-validate"]:
                 assert "active" not in app.query_one(f"#{pid}").classes
 
     @pytest.mark.asyncio
@@ -503,7 +504,7 @@ class TestModeNavigation:
             await pilot.press("2")  # leave Run first
             await pilot.press("1")
             assert "active" in app.query_one("#panel-run").classes
-            assert "active" not in app.query_one("#panel-estate").classes
+            assert "active" not in app.query_one("#panel-operate").classes
 
     @pytest.mark.asyncio
     async def test_switch_to_estate_mode(self):
@@ -511,7 +512,7 @@ class TestModeNavigation:
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.press("2")
             await _settle(pilot)
-            assert "active" in app.query_one("#panel-estate").classes
+            assert "active" in app.query_one("#panel-operate").classes
 
     @pytest.mark.asyncio
     async def test_switch_to_validate_mode(self):
@@ -527,7 +528,7 @@ class TestModeNavigation:
             await pilot.press("2")
             await pilot.press("1")
             assert "active" in app.query_one("#panel-run").classes
-            assert "active" not in app.query_one("#panel-estate").classes
+            assert "active" not in app.query_one("#panel-operate").classes
 
     @pytest.mark.asyncio
     async def test_old_serve_mode_no_longer_exists(self):
@@ -538,7 +539,7 @@ class TestModeNavigation:
             assert not app.query("#panel-serve")
             # No serve mode action.
             assert not hasattr(app, "action_mode_serve")
-            # Pressing 1/2/3 only ever yields Run/Estate/Validate (never Serve);
+            # Pressing 1/2/3 only ever yields Run/Operate/Validate (never Serve);
             # there is no 4th mode key.
             await pilot.press("4")  # unbound now — should not switch anything
             await pilot.pause()
@@ -567,21 +568,56 @@ class TestNavNodesExist:
             app.query_one("#tab-byo", TabPane)
 
     @pytest.mark.asyncio
-    async def test_estate_tabs_exist(self):
+    async def test_operate_tabs_exist(self):
         app, _, _ = make_app()
         async with app.run_test(size=(120, 40)) as pilot:
-            app.query_one("#estate-tabs", TabbedContent)
+            tc = app.query_one("#operate-tabs", TabbedContent)
             app.query_one("#tab-orchestration", TabPane)
             app.query_one("#tab-containers", TabPane)
+            # R2a moved Doctor into Operate (Orchestration · Containers · Doctor).
+            app.query_one("#tab-doctor", TabPane)
+            # Only the operate-tabs' OWN tab panes (the Containers pane nests a
+            # drill TabbedContent of its own, so filter to the mode-level ids).
+            mode_tab_ids = [
+                p.id for p in tc.query(TabPane)
+                if p.id in {"tab-orchestration", "tab-containers", "tab-doctor"}
+            ]
+            assert mode_tab_ids == ["tab-orchestration", "tab-containers", "tab-doctor"], mode_tab_ids
 
     @pytest.mark.asyncio
     async def test_validate_tabs_exist(self):
         app, _, _ = make_app()
         async with app.run_test(size=(120, 40)) as pilot:
-            app.query_one("#validate-tabs", TabbedContent)
+            tc = app.query_one("#validate-tabs", TabbedContent)
             app.query_one("#tab-run", TabPane)
-            app.query_one("#tab-doctor", TabPane)
             app.query_one("#tab-evidence", TabPane)
+            # R2a moved Doctor out of Validate → only Run + Evidence remain.
+            pane_ids = [p.id for p in tc.query(TabPane)]
+            assert pane_ids == ["tab-run", "tab-evidence"], pane_ids
+
+    @pytest.mark.asyncio
+    async def test_doctor_renders_under_operate_not_validate(self):
+        """R2a structural: the Doctor surface lives under Operate (mode 1,
+        tab-doctor) and is GONE from Validate (mode 2)."""
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            # tab-doctor is a child of operate-tabs, NOT validate-tabs.
+            operate = app.query_one("#operate-tabs", TabbedContent)
+            validate = app.query_one("#validate-tabs", TabbedContent)
+            operate_panes = [p.id for p in operate.query(TabPane)]
+            validate_panes = [p.id for p in validate.query(TabPane)]
+            assert "tab-doctor" in operate_panes, operate_panes
+            assert "tab-doctor" not in validate_panes, validate_panes
+            # The Doctor pane itself renders under the Operate panel subtree.
+            doctor = app.query_one("#doctor-pane", DoctorPane)
+            panel_operate = app.query_one("#panel-operate")
+            assert doctor in panel_operate.query("#doctor-pane")
+            # Activate the Doctor tab in Operate and confirm it switches cleanly.
+            await pilot.press("2")
+            await _settle(pilot)
+            operate.active = "tab-doctor"
+            await pilot.pause()
+            assert operate.active == "tab-doctor"
 
     @pytest.mark.asyncio
     async def test_benchmarks_tab_is_gone(self):
@@ -811,7 +847,7 @@ class TestServeFoldedIntoRun:
 
 
 # ===========================================================================
-# Estate · Orchestration + Containers (wired to estate_state)
+# Operate · Orchestration + Containers (wired to estate_state)
 # ===========================================================================
 
 
@@ -822,7 +858,7 @@ class TestEstateWired:
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.press("2")
             await _settle(pilot)
-            app.query_one("#estate-orch-pane", EstateOrchPane)
+            app.query_one("#operate-orch-pane", OperateOrchPane)
             app.query_one("#gpu0-card")
             app.query_one("#gpu1-card")
             app.query_one("#doctor-line")
@@ -868,7 +904,7 @@ class TestEstateWired:
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.press("2")
             await _settle(pilot)
-            app.query_one("#estate-containers-pane", EstateContainersPane)
+            app.query_one("#operate-containers-pane", OperateContainersPane)
             app.query_one("#containers-table", DataTable)
             app.query_one("#drill-tabs", TabbedContent)
             app.query_one("#drill-tab-logs", TabPane)
@@ -882,7 +918,7 @@ class TestEstateWired:
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.press("2")
             await _settle(pilot)
-            pane = app.query_one("#estate-containers-pane", EstateContainersPane)
+            pane = app.query_one("#operate-containers-pane", OperateContainersPane)
             names = [c.name for c in pane._containers]
             assert "vllm-qwen36-27b-dual" in names
             assert "open-webui" not in names  # not an engine prefix
@@ -1034,7 +1070,12 @@ class TestAllPanesWired:
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.press("2")
             await _settle(pilot)
-            app.query_one("#estate-containers-pane", EstateContainersPane).query_one(
+            # Restart is a Containers-tab action — activate it. (R2a gates the
+            # container write to tab-containers so [s] can't restart from the
+            # read-only Doctor tab or from Orchestration.)
+            app.query_one("#operate-tabs", TabbedContent).active = "tab-containers"
+            await pilot.pause()
+            app.query_one("#operate-containers-pane", OperateContainersPane).query_one(
                 "#containers-table", DataTable
             ).move_cursor(row=0)
             await pilot.press("s")  # restart
@@ -1066,7 +1107,7 @@ class TestAllPanesWired:
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.press("2")
             await _settle(pilot)
-            app.query_one("#estate-containers-pane", EstateContainersPane).query_one(
+            app.query_one("#operate-containers-pane", OperateContainersPane).query_one(
                 "#containers-table", DataTable
             ).move_cursor(row=0)
             await pilot.press("l")  # logs (READ)
@@ -1176,19 +1217,19 @@ class TestValidatePanes:
             app.query_one("#run-output")     # core LivePane for streamed output
 
     @pytest.mark.asyncio
-    async def test_validate_doctor_pane_nodes(self):
+    async def test_operate_doctor_pane_nodes(self):
         app, _, _ = make_app()
         async with app.run_test(size=(120, 40)) as pilot:
-            app.query_one("#validate-doctor-pane", ValidateDoctorPane)
+            app.query_one("#doctor-pane", DoctorPane)
             app.query_one("#doctor-card-health")
             app.query_one("#doctor-card-estate")
             app.query_one("#doctor-card-profile")
 
     @pytest.mark.asyncio
-    async def test_validate_doctor_health_line_goes_live_on_estate_poll(self):
+    async def test_operate_doctor_health_line_goes_live_on_estate_poll(self):
         app, _, _ = make_app()
         async with app.run_test(size=(120, 40)) as pilot:
-            await pilot.press("2")  # estate poll feeds the doctor pane too
+            await pilot.press("2")  # Operate estate poll feeds the doctor pane too
             await _settle(pilot)
             body = str(app.query_one("#doctor-health-body", Static).render())
             assert "serving" in body.lower()
@@ -1234,18 +1275,20 @@ class TestPrimaryActionSafe:
 
 
 # ===========================================================================
-# Validate · Doctor (wired to doctor() — health + estate + profile cards)
+# Operate · Doctor (wired to doctor() — health + estate + profile cards)
+# R2a moved Doctor from Validate into Operate (mode 1); load_doctor fires on
+# Operate entry, alongside the estate poll.
 # ===========================================================================
 
 
-class TestValidateDoctorWired:
+class TestOperateDoctorWired:
     @pytest.mark.asyncio
     async def test_doctor_cards_populate_from_doctor_read(self):
-        """Entering Validate runs the full Doctor read → estate + profile cards
+        """Entering Operate runs the full Doctor read → estate + profile cards
         fill from diagnose-estate.sh --json + diagnose-profile.sh (text)."""
         app, runner, _ = make_app()
         async with app.run_test(size=(120, 40)) as pilot:
-            await pilot.press("3")
+            await pilot.press("2")
             await _settle(pilot)
             estate = str(app.query_one("#doctor-estate-body", Static).render())
             assert "GREEN" in estate and "2/2" in estate  # 2/2 instances fit
@@ -1256,20 +1299,42 @@ class TestValidateDoctorWired:
         """When a running engine is detected (matched slug), Doctor triages it
         via diagnose-profile.sh and renders the 6 steps + verdict."""
         # A detect target on port 8010 matches vllm/dual in the registry → the
-        # estate poll captures the slug, which the doctor read then triages.
+        # Operate estate poll captures the slug, and load_doctor (also fired on
+        # Operate entry) triages it — both happen in the SAME mode now (R2a).
         gpus = [GpuInfo(index=0, mem_used_mib=1), GpuInfo(index=1, mem_used_mib=1)]
         target = ServingTarget(container="vllm_qwen36_27b", host_port=8010, gpus=gpus)
         responses = fake_responses(**{"docker ps": ok(DOCKER_PS_ENGINE)})
         app, runner, _ = make_app(responses=responses, gpus=gpus, target=target)
         async with app.run_test(size=(120, 40)) as pilot:
-            await pilot.press("2")            # estate poll → captures target slug
+            await pilot.press("2")            # Operate: estate poll captures slug + doctor read
             await _settle(pilot)
             assert app._target_slug == "vllm/dual"
-            await pilot.press("3")            # validate → doctor read uses the slug
-            await _settle(pilot)
             profile = str(app.query_one("#doctor-profile-body", Static).render())
             assert "GREEN" in profile
             assert any("diagnose-profile.sh" in " ".join(c) for c in runner.calls)
+
+    @pytest.mark.asyncio
+    async def test_s_key_on_doctor_tab_does_not_restart(self):
+        """R2a put the READ-ONLY Doctor surface in Operate (mode 1).  [s] — whose
+        binding spans modes 1+2 with no sub-tab constraint — must NOT fire a
+        `docker restart` on the Doctor tab, even with a container selected in the
+        (hidden) Containers tab.  The container write is gated to tab-containers."""
+        responses = fake_responses(**{"docker ps": ok(DOCKER_PS_ENGINE)})
+        app, _, _ = make_app(responses=responses)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("2")            # Operate
+            await _settle(pilot)
+            # Select a container, so the ONLY thing preventing a restart is the
+            # sub-tab guard (not an empty selection)…
+            app.query_one("#operate-containers-pane", OperateContainersPane).query_one(
+                "#containers-table", DataTable
+            ).move_cursor(row=0)
+            # …then move to the read-only Doctor tab and press [s].
+            app.query_one("#operate-tabs", TabbedContent).active = "tab-doctor"
+            await pilot.pause()
+            await pilot.press("s")
+            await pilot.pause()
+            assert not isinstance(app.screen, ConfirmActionScreen)  # Doctor is read-only
 
 
 # ===========================================================================
@@ -1584,7 +1649,7 @@ class TestEstateExtrasWired:
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.press("2")
             await _settle(pilot)
-            app.query_one("#estate-tabs", TabbedContent).active = "tab-containers"
+            app.query_one("#operate-tabs", TabbedContent).active = "tab-containers"
             await pilot.pause()
             app.query_one("#containers-table", DataTable).move_cursor(row=0)
             await pilot.press("t")  # top (READ)
@@ -1604,7 +1669,7 @@ class TestEstateExtrasWired:
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.press("2")
             await _settle(pilot)
-            app.query_one("#estate-tabs", TabbedContent).active = "tab-containers"
+            app.query_one("#operate-tabs", TabbedContent).active = "tab-containers"
             await pilot.pause()
             app.query_one("#containers-table", DataTable).move_cursor(row=0)
             await pilot.press("X")  # rm
@@ -1641,14 +1706,18 @@ class TestValidateNoLiveWriteOrNetwork:
         app, runner, _ = make_app(repo_root=tmp_path, write_runner=wr)
         seed_repo(tmp_path)
         async with app.run_test(size=(120, 40)) as pilot:
-            # Browse every Validate tab + Estate extras — pure reads, no writes.
+            # Browse every Validate tab + Operate (incl. Doctor) — pure reads,
+            # no writes.  R2a: Doctor lives under Operate now (tab-doctor).
             await pilot.press("3")
             await _settle(pilot)
-            for tab in ("tab-doctor", "tab-evidence", "tab-run"):
+            for tab in ("tab-evidence", "tab-run"):
                 app.query_one("#validate-tabs", TabbedContent).active = tab
                 await pilot.pause()
             await pilot.press("2")
             await _settle(pilot)
+            for tab in ("tab-orchestration", "tab-containers", "tab-doctor"):
+                app.query_one("#operate-tabs", TabbedContent).active = tab
+                await pilot.pause()
             # Nothing was written; submit-bench / prune / power-cap never auto-fired.
             assert wr.started == []
             assert all("--auto-submit" not in " ".join(c) for c in runner.calls)
@@ -1674,14 +1743,14 @@ SERVING_TARGET = ServingTarget(
 
 
 class TestEvaluateHookWired:
-    """Hook 1 — Estate → ▸ Evaluate (c3t hand-off, confirm-gated, MOCK-ONLY)."""
+    """Hook 1 — Operate → ▸ Evaluate (c3t hand-off, confirm-gated, MOCK-ONLY)."""
 
     @pytest.mark.asyncio
     async def test_evaluate_opens_confirm_when_target_running(self):
         app, _, _ = make_app(target=SERVING_TARGET,
                              gpus=list(SERVING_TARGET.gpus))
         async with app.run_test(size=(120, 40)) as pilot:
-            await pilot.press("2")          # Estate — poll captures the target
+            await pilot.press("2")          # Operate — poll captures the target
             await _settle(pilot)
             await pilot.press("v")          # ▸ Evaluate
             await pilot.pause()
@@ -1880,7 +1949,7 @@ class TestPhase5NoLiveEffect:
             await pilot.press("P")
             await pilot.pause()
             await pilot.press("escape")
-            # Evaluate (Estate) — confirm modal staged, not committed.
+            # Evaluate (Operate) — confirm modal staged, not committed.
             await pilot.press("2")
             await _settle(pilot)
             await pilot.press("v")
@@ -1982,7 +2051,7 @@ class TestFilterInputSafety:
                     f"got {result!r}"
                 )
             # Always-on keys must still be enabled.
-            for action in ("quit", "help", "refresh", "mode_run", "mode_estate"):
+            for action in ("quit", "help", "refresh", "mode_run", "mode_operate"):
                 result = app.check_action(action, ())
                 assert result is True, (
                     f"check_action({action!r}) should return True (always-on), got {result!r}"
@@ -2023,13 +2092,13 @@ class TestCheckActionPerModeSubtab:
             await _settle(pilot)
             assert app._active_mode == 1
             # On orchestration tab (default first tab)
-            tc = app.query_one("#estate-tabs", TabbedContent)
+            tc = app.query_one("#operate-tabs", TabbedContent)
             tc.active = "tab-orchestration"
             await pilot.pause()
             for action in ("estate_off", "power_cap_toggle", "power_cap_sweep", "prune_images"):
                 result = app.check_action(action, ())
                 assert result is True, (
-                    f"Estate·Orchestration must enable {action!r}, got {result!r}"
+                    f"Operate·Orchestration must enable {action!r}, got {result!r}"
                 )
 
     @pytest.mark.asyncio
@@ -2039,13 +2108,13 @@ class TestCheckActionPerModeSubtab:
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.press("2")
             await _settle(pilot)
-            tc = app.query_one("#estate-tabs", TabbedContent)
+            tc = app.query_one("#operate-tabs", TabbedContent)
             tc.active = "tab-orchestration"
             await pilot.pause()
             for action in ("container_logs", "container_stop", "container_rm"):
                 result = app.check_action(action, ())
                 assert result is False, (
-                    f"Estate·Orchestration must disable container action {action!r}, "
+                    f"Operate·Orchestration must disable container action {action!r}, "
                     f"got {result!r}"
                 )
 
@@ -2056,13 +2125,13 @@ class TestCheckActionPerModeSubtab:
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.press("2")
             await _settle(pilot)
-            tc = app.query_one("#estate-tabs", TabbedContent)
+            tc = app.query_one("#operate-tabs", TabbedContent)
             tc.active = "tab-containers"
             await pilot.pause()
             for action in ("container_logs", "container_stop", "container_rm", "context_t"):
                 result = app.check_action(action, ())
                 assert result is True, (
-                    f"Estate·Containers must enable {action!r}, got {result!r}"
+                    f"Operate·Containers must enable {action!r}, got {result!r}"
                 )
 
     @pytest.mark.asyncio
@@ -2098,10 +2167,10 @@ class TestCheckActionPerModeSubtab:
     @pytest.mark.asyncio
     async def test_estate_mode_disables_explain_and_filter(self):
         """Outside Run · Catalog there is no catalog — explain and filter must be
-        off (e.g. in Estate mode)."""
+        off (e.g. in Operate mode)."""
         app, _, _ = make_app()
         async with app.run_test(size=(120, 40)) as pilot:
-            await pilot.press("2")  # Estate
+            await pilot.press("2")  # Operate
             await pilot.pause()
             assert app._active_mode == 1
             assert app.check_action("explain", ()) is False
@@ -2116,7 +2185,7 @@ class TestCheckActionPerModeSubtab:
                 await pilot.press(mode_key)
                 await pilot.pause()
                 for action in ("quit", "help", "refresh",
-                               "mode_run", "mode_estate", "mode_validate"):
+                               "mode_run", "mode_operate", "mode_validate"):
                     result = app.check_action(action, ())
                     assert result is True, (
                         f"Always-on {action!r} must be True in mode {mode_key}, got {result!r}"
@@ -2313,7 +2382,7 @@ class TestSubtabCycling:
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.press("2")
             await _settle(pilot)
-            tc = app.query_one("#estate-tabs", TabbedContent)
+            tc = app.query_one("#operate-tabs", TabbedContent)
             first = tc.active
             await pilot.press("right_square_bracket")
             await pilot.pause()
@@ -2333,7 +2402,7 @@ class TestSubtabCycling:
 
     @pytest.mark.asyncio
     async def test_subtab_key_active_in_all_three_modes(self):
-        """After R1 all three modes (Run · Estate · Validate) have sub-tabs, so
+        """After R1 all three modes (Run · Operate · Validate) have sub-tabs, so
         the cycle keys are active (check_action True) in each."""
         app, _, _ = make_app()
         async with app.run_test(size=(120, 40)) as pilot:
@@ -2367,7 +2436,7 @@ class TestModeSwitchFocus:
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.press("2")
             await _settle(pilot)
-            # Estate/Orchestration tab is default → scene-table should be focused.
+            # Operate/Orchestration tab is default → scene-table should be focused.
             assert isinstance(app.focused, DataTable)
             assert app.focused.id == "scene-table"
 
@@ -2392,23 +2461,24 @@ class TestModeSwitchFocus:
             # Default tab is Run → run-ladder-table.
             assert isinstance(app.focused, DataTable)
             assert app.focused.id == "run-ladder-table"
-            # Cycle forward once → Doctor tab (no table, focus stays somewhere).
+            # R2a: Validate is now Run + Evidence only (Doctor moved to Operate).
+            # Cycle forward once → Evidence tab → evidence-table.
             await pilot.press("right_square_bracket")
             await pilot.pause()
             await pilot.pause()  # extra cycle for call_after_refresh
             tc = app.query_one("#validate-tabs", TabbedContent)
-            assert tc.active == "tab-doctor"
-            # Cycle forward again → Evidence tab → evidence-table (Benchmarks gone).
+            assert tc.active == "tab-evidence"
+            # Cycle forward again → wraps back to Run → run-ladder-table.
             await pilot.press("right_square_bracket")
             await pilot.pause()
             await pilot.pause()  # extra cycle for call_after_refresh
-            assert tc.active == "tab-evidence"
+            assert tc.active == "tab-run"
             assert isinstance(app.focused, DataTable)
-            assert app.focused.id == "evidence-table"
+            assert app.focused.id == "run-ladder-table"
 
 
 class TestContainerAutoLoad:
-    """Estate·Containers drill detail auto-loads on selection (lazydocker-style)
+    """Operate·Containers drill detail auto-loads on selection (lazydocker-style)
     — no [l]/[t] keypress needed."""
 
     @pytest.mark.asyncio
@@ -2420,7 +2490,7 @@ class TestContainerAutoLoad:
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.press("2")
             await _settle(pilot)
-            app.query_one("#estate-tabs", TabbedContent).active = "tab-containers"
+            app.query_one("#operate-tabs", TabbedContent).active = "tab-containers"
             await _settle(pilot)
             cfg = str(app.query_one("#drill-config", Static).render())
             assert "vllm-qwen36-27b-dual" in cfg  # config loaded with no [t]
@@ -2434,7 +2504,7 @@ class TestContainerAutoLoad:
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.press("2")
             await _settle(pilot)
-            app.query_one("#estate-tabs", TabbedContent).active = "tab-containers"
+            app.query_one("#operate-tabs", TabbedContent).active = "tab-containers"
             await _settle(pilot)
             assert any("docker logs" in " ".join(c) for c in runner.calls)
 
@@ -2447,7 +2517,7 @@ class TestContainerAutoLoad:
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.press("2")
             await _settle(pilot)
-            app.query_one("#estate-tabs", TabbedContent).active = "tab-containers"
+            app.query_one("#operate-tabs", TabbedContent).active = "tab-containers"
             await _settle(pilot)
             app.query_one("#drill-tabs", TabbedContent).active = "drill-tab-stats"
             await _settle(pilot)
@@ -2463,7 +2533,7 @@ class TestContainerAutoLoad:
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.press("2")
             await _settle(pilot)
-            app.query_one("#estate-tabs", TabbedContent).active = "tab-containers"
+            app.query_one("#operate-tabs", TabbedContent).active = "tab-containers"
             await _settle(pilot)
             tbl = app.query_one("#containers-table", DataTable)
             tbl.focus()
