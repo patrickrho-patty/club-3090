@@ -49,6 +49,7 @@ from club3090_cockpit.app import (
     RailStatus,
 )
 from club3090_cockpit.services import CockpitData, RunResult
+from club3090_cockpit.__main__ import resolve_surface
 
 
 FAKE_REPO_ROOT = Path("/tmp/fake-club-3090-test-root")
@@ -2386,8 +2387,14 @@ class TestSurfaceScaffold:
     No behavior change ships in R0: _PRODUCER_ONLY is empty, so the surface gate
     is a no-op. These tests prove (a) the flag defaults to consumer, (b) producer
     surfaces the CONTRIBUTE indicator, and (c) the gate LOGIC hides a producer-only
-    action on consumer / shows it on producer — so R3 can populate _PRODUCER_ONLY
-    and have it take effect.
+    action on consumer / shows it on producer — including for _ALWAYS_ON actions
+    (the gate is checked BEFORE _ALWAYS_ON, so R3 can hide the producer MODE
+    switch) — so R3 can populate _PRODUCER_ONLY and have it take effect.
+
+    The gate-logic tests patch the *class* attr `_PRODUCER_ONLY` via monkeypatch
+    BEFORE the app mounts (auto-restored after), rather than mutating a live
+    instance attr mid-test — the latter raced under accumulated full-suite
+    asyncio state and flaked.
     """
 
     @pytest.mark.asyncio
@@ -2424,20 +2431,62 @@ class TestSurfaceScaffold:
             assert app.check_action("explain", ()) is True
 
     @pytest.mark.asyncio
-    async def test_producer_gate_hides_on_consumer(self):
-        # Inject a producer-only action to prove the gate fires on the consumer surface.
+    async def test_producer_gate_hides_on_consumer(self, monkeypatch):
+        # Patch the CLASS attr before mount (stable, race-free) to prove the gate
+        # fires on the consumer surface.
+        monkeypatch.setattr(CockpitApp, "_PRODUCER_ONLY", frozenset({"explain"}))
         app, _, _ = make_app(surface="consumer")
         async with app.run_test(size=(120, 40)) as pilot:
             await _settle(pilot)
-            app._PRODUCER_ONLY = frozenset({"explain"})  # instance override for the test
             assert app.check_action("explain", ()) is False  # surface-gated off
 
     @pytest.mark.asyncio
-    async def test_producer_gate_passes_on_producer(self):
+    async def test_producer_gate_passes_on_producer(self, monkeypatch):
+        monkeypatch.setattr(CockpitApp, "_PRODUCER_ONLY", frozenset({"explain"}))
         app, _, _ = make_app(surface="producer")
         async with app.run_test(size=(120, 40)) as pilot:
             await _settle(pilot)
-            app._PRODUCER_ONLY = frozenset({"explain"})
             # producer is not surface-gated → falls through to the normal context
             # check (explain is a mode-0 Discover key; default mode is 0 → True)
             assert app.check_action("explain", ()) is True
+
+    @pytest.mark.asyncio
+    async def test_producer_gate_beats_always_on_on_consumer(self, monkeypatch):
+        # The gate is checked BEFORE _ALWAYS_ON, so an _ALWAYS_ON action (here
+        # "help") placed in _PRODUCER_ONLY is still hidden on consumer. This is the
+        # property R3 relies on to hide the producer Bring & Validate MODE switch.
+        assert "help" in CockpitApp._ALWAYS_ON  # guard: "help" is always-on
+        monkeypatch.setattr(CockpitApp, "_PRODUCER_ONLY", frozenset({"help"}))
+        app, _, _ = make_app(surface="consumer")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            assert app.check_action("help", ()) is False  # gate beats _ALWAYS_ON
+
+    @pytest.mark.asyncio
+    async def test_always_on_action_shows_on_producer_when_gated(self, monkeypatch):
+        # Same injection, producer surface: gate is skipped → _ALWAYS_ON wins.
+        monkeypatch.setattr(CockpitApp, "_PRODUCER_ONLY", frozenset({"help"}))
+        app, _, _ = make_app(surface="producer")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            assert app.check_action("help", ()) is True
+
+
+class TestResolveSurface:
+    """R0 — resolve_surface(argv, env): CLI/env opt-in, pure (no event loop)."""
+
+    def test_default_is_consumer(self):
+        assert resolve_surface(["c3"], {}) == "consumer"
+
+    def test_contribute_flag_opts_in(self):
+        assert resolve_surface(["c3", "--contribute"], {}) == "producer"
+
+    def test_env_producer_opts_in(self):
+        assert resolve_surface(["c3"], {"C3_SURFACE": "producer"}) == "producer"
+
+    def test_env_is_case_and_space_insensitive(self):
+        assert resolve_surface(["c3"], {"C3_SURFACE": "  Producer "}) == "producer"
+
+    def test_env_other_value_is_consumer(self):
+        assert resolve_surface(["c3"], {"C3_SURFACE": "1"}) == "consumer"
+        assert resolve_surface(["c3"], {"C3_SURFACE": ""}) == "consumer"

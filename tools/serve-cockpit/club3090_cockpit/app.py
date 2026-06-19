@@ -2114,6 +2114,11 @@ class CockpitApp(App):
         """Return True (enabled + shown in footer), False (disabled + hidden in footer).
 
         Rules (in priority order):
+        0. Surface gate — producer-only actions are hidden on the consumer
+           surface, checked BEFORE the always-on set so it wins for EVERY action
+           class (including mode_* switches, which live in _ALWAYS_ON; R3 hides
+           the producer Bring & Validate MODE on consumer this way). No-op today
+           (_PRODUCER_ONLY is empty until R3).
         1. Always-on set — True unconditionally.
         2. A filter Input is focused — Textual's Input.is_printable already calls
            event.stop() for letter/digit keys, so they never reach app bindings.
@@ -2128,14 +2133,16 @@ class CockpitApp(App):
         """
         from textual.widgets import Input as _Input
 
-        if action in self._ALWAYS_ON:
-            return True
-
         # Surface gate (R0): producer-only actions are hidden on the consumer
-        # surface. Permissive today — _PRODUCER_ONLY is empty until R3 wires the
-        # Bring & Validate lane.
+        # surface — checked BEFORE _ALWAYS_ON so it wins for EVERY action class,
+        # including mode_* switches (which live in _ALWAYS_ON). R3 hides the
+        # producer Bring & Validate MODE on consumer via this gate, so it MUST
+        # beat _ALWAYS_ON. Permissive today — _PRODUCER_ONLY is empty until R3.
         if self._surface != "producer" and action in self._PRODUCER_ONLY:
             return False
+
+        if action in self._ALWAYS_ON:
+            return True
 
         # When a filter Input is focused, hide all context-key bindings from the
         # footer.  The Input's own _on_key stops printable characters before they
@@ -2188,7 +2195,7 @@ class CockpitApp(App):
         # _PRODUCER_ONLY in check_action, and surfaces a CONTRIBUTE indicator.
         self._surface = surface if surface in ("consumer", "producer") else "consumer"
         if self._surface == "producer":
-            self.sub_title = "wired · ⚒ CONTRIBUTE"
+            self.sub_title = f"{self.SUB_TITLE} · ⚒ CONTRIBUTE"
         # Injectable service layer — defaults to the real (live-read) impl.
         self._data: CockpitData = data or CockpitData(repo_root)
         self._active_mode = 0  # 0=Discover 1=Serve 2=Estate 3=Validate
