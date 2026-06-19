@@ -488,6 +488,75 @@ class EvidenceReport:
     error: str = ""
 
 
+# ── Phase R / R3b-2: ④ Measure-vs-curated-bar (READ) ──────────────────────────────
+
+
+@dataclass
+class MeasuredNumbers:
+    """The producer's MEASURED numbers parsed from a rebench tag dir.
+
+    Best-effort: from ``_internal.json`` (authoritative — the rebench sidecar)
+    with a ``REPORT.md`` TL;DR scrape as fallback.  ``narr_tps`` / ``code_tps``
+    are decode TPS (the per-token rate, matching how the catalog bar reports);
+    ``quality_8pk`` is "<passed>/<total>" when a quality battery was run."""
+
+    narr_tps: Optional[float] = None
+    code_tps: Optional[float] = None
+    quality_8pk: str = ""               # e.g. "118/150" or ""
+    model: str = ""                     # resolved from REPORT.md Meta, best-effort
+    engine: str = ""                    # engine-FAMILY of the RUN, from REPORT.md
+                                        # Meta (Container / vLLM-image), best-effort
+    source: str = ""                    # "_internal.json" | "REPORT.md" | ""
+
+    @property
+    def tps_label(self) -> str:
+        if self.narr_tps is None and self.code_tps is None:
+            return "—"
+        n = f"{self.narr_tps:.0f}" if self.narr_tps is not None else "—"
+        c = f"{self.code_tps:.0f}" if self.code_tps is not None else "—"
+        return f"{n}/{c}"
+
+    @property
+    def quality_label(self) -> str:
+        return self.quality_8pk or "—"
+
+    @property
+    def has_any(self) -> bool:
+        return (
+            self.narr_tps is not None
+            or self.code_tps is not None
+            or bool(self.quality_8pk)
+        )
+
+
+@dataclass
+class MeasureVsBar:
+    """Apples-to-apples comparison of the producer's MEASURED numbers against the
+    curated catalog's published bar for the same (model, engine-family) class.
+
+    HONESTY (R3b-2): the cockpit FLAGS the protocol, it does NOT fabricate a
+    "catalog-grade" verdict — ``verdict`` is a simple heuristic over whatever
+    numbers parsed, and ``protocol_caveats`` lists what the cockpit cannot verify
+    (matched power? same harness? same prompts?).  ``bar_source`` discloses where
+    the bar came from (the #249 corpus vs the BENCHMARKS.md scrape)."""
+
+    tag: str
+    measured: MeasuredNumbers = field(default_factory=MeasuredNumbers)
+    bar: Optional[BenchRow] = None      # the matched curated row (None if no match)
+    bar_source: str = ""                # "corpus" | "benchmarks.md" | ""
+    # The engine-family resolved for THIS run (from REPORT.md Meta / variants),
+    # used to discriminate the bar.  "" when it could not be resolved → the bar
+    # was picked deterministically on model alone (surfaced as a caveat).
+    run_engine: str = ""
+    engine_resolved: bool = False       # True when run_engine drove bar selection
+    # Per-metric measured−bar deltas (None when either side is missing).
+    narr_tps_delta: Optional[float] = None
+    code_tps_delta: Optional[float] = None
+    verdict: str = "insufficient data"  # see _measure_verdict for the enum
+    protocol_caveats: list[str] = field(default_factory=list)
+    error: str = ""
+
+
 # ── Phase 4: Power cap ────────────────────────────────────────────────────────────
 
 
@@ -1034,6 +1103,253 @@ def _ctx_label(max_model_len: Any) -> str:
         k = n / 1024.0
         return f"{k:.0f}K" if k == int(k) else f"{k:.1f}K"
     return str(n)
+
+
+# ── Phase R / R3b-2: ④ Measure — parse a rebench tag's MEASURED numbers ───────────
+
+
+def measured_from_internal_json(blob: Any) -> MeasuredNumbers:
+    """Parse the rebench ``_internal.json`` sidecar into MeasuredNumbers.
+
+    REAL shape (verified against ``scripts/rebench-report.py``'s sidecar write):
+    ``{"bench":{"narrative":{"decode_tps_mean","wall_tps_mean",...},
+    "code":{...}},"quality":{"total_passed","total_total","total_pct"}}``.
+    We surface the DECODE TPS (the per-token rate the catalog bar reports), not
+    wall TPS.  Returns an empty MeasuredNumbers (``has_any`` False) when nothing
+    parses — the honest "insufficient data" signal."""
+    m = MeasuredNumbers(source="_internal.json")
+    if not isinstance(blob, dict):
+        return MeasuredNumbers()
+    bench = blob.get("bench") or {}
+    if isinstance(bench, dict):
+        narr = bench.get("narrative") or {}
+        code = bench.get("code") or {}
+        if isinstance(narr, dict):
+            m.narr_tps = _as_float(narr.get("decode_tps_mean"))
+        if isinstance(code, dict):
+            m.code_tps = _as_float(code.get("decode_tps_mean"))
+    quality = blob.get("quality") or {}
+    if isinstance(quality, dict):
+        passed = _as_int(quality.get("total_passed"))
+        total = _as_int(quality.get("total_total"))
+        if passed is not None and total:
+            m.quality_8pk = f"{passed}/{total}"
+    return m if m.has_any else MeasuredNumbers()
+
+
+# REPORT.md TL;DR / per-section fallbacks (when _internal.json is absent/empty).
+_REPORT_TLDR_TPS_RE = re.compile(
+    r"narrative\s*\*\*([\d.]+)\*\*\s*/\s*code\s*\*\*([\d.]+)\*\*", re.IGNORECASE
+)
+_REPORT_DECODE_ROW_RE = re.compile(
+    r"^\|\s*(narrative|code)\s*\|.*?\|\s*\*\*([\d.]+)\*\*\s*\|", re.IGNORECASE
+)
+_REPORT_QUALITY_RE = re.compile(
+    r"\*\*\s*(\d+)\s*/\s*(\d+)\s*\*\*", re.IGNORECASE
+)
+# REPORT.md Meta line:  - **Served as:** `qwen3.6-27b-autoround` from `…`
+_REPORT_SERVED_RE = re.compile(r"\*\*Served as:\*\*\s*`([^`]+)`")
+# REPORT.md Meta line:  - **Model arch:** qwen3_next (Qwen3NextForCausalLM)
+_REPORT_ARCH_RE = re.compile(r"\*\*Model arch:\*\*\s*([^\s(]+)")
+# REPORT.md Meta line:  - **Container:** `vllm-qwen36-dual`  (the engine prefix
+# is the most reliable run-engine signal: vllm- / llama-cpp- / ik-llama- / …)
+_REPORT_CONTAINER_RE = re.compile(r"\*\*Container:\*\*\s*`([^`]+)`")
+# REPORT.md Meta line:  - **vLLM image:** `vllm/vllm-openai:vX` — its presence is
+# itself a strong vLLM signal even when the Container line is absent.
+_REPORT_VLLM_IMAGE_RE = re.compile(r"\*\*vLLM image:\*\*\s*`([^`]+)`")
+
+
+def measured_from_report_md(text: str) -> MeasuredNumbers:
+    """Parse measured numbers from a rebench ``REPORT.md`` (the fallback).
+
+    Prefers the headline ``## TL;DR`` ``narrative **N** / code **M**`` bullet;
+    falls back to the per-bench ``| narrative | … | **decode** |`` table rows.
+    Quality is the ``## Quality`` TOTAL row (``**P / T**``).  Also resolves the
+    model best-effort from the Meta ``Served as`` / ``Model arch`` lines."""
+    m = MeasuredNumbers(source="REPORT.md")
+    if not text:
+        return MeasuredNumbers()
+    tldr = _REPORT_TLDR_TPS_RE.search(text)
+    if tldr:
+        m.narr_tps = _as_float(tldr.group(1))
+        m.code_tps = _as_float(tldr.group(2))
+    else:
+        for line in text.splitlines():
+            row = _REPORT_DECODE_ROW_RE.match(line.strip())
+            if row:
+                val = _as_float(row.group(2))
+                if row.group(1).lower() == "narrative":
+                    m.narr_tps = val
+                else:
+                    m.code_tps = val
+    # Quality TOTAL row (scoped to the Quality section so a stray bold N/M in
+    # prose doesn't masquerade as the 8-pack).
+    in_quality = False
+    for line in text.splitlines():
+        s = line.strip()
+        if s.lower().startswith("## quality"):
+            in_quality = True
+            continue
+        if in_quality:
+            if s.startswith("## "):
+                break
+            if "total" in s.lower():
+                q = _REPORT_QUALITY_RE.search(s)
+                if q:
+                    m.quality_8pk = f"{q.group(1)}/{q.group(2)}"
+                    break
+    served = _REPORT_SERVED_RE.search(text)
+    if served:
+        m.model = served.group(1).strip()
+    else:
+        arch = _REPORT_ARCH_RE.search(text)
+        if arch:
+            m.model = arch.group(1).strip()
+    m.engine = _engine_family_from_report_md(text)
+    return m if (m.has_any or m.model) else MeasuredNumbers()
+
+
+def _engine_family_from_report_md(text: str) -> str:
+    """Resolve the RUN's engine-FAMILY from a rebench REPORT.md Meta block.
+
+    The rebench sidecar (_internal.json) carries NO engine info — it is only in
+    the rendered REPORT.md Meta.  The most reliable signal is the ``Container``
+    name's engine prefix (``vllm-`` / ``llama-cpp-`` / ``ik-llama-`` /
+    ``beellama-`` / ``sglang-``); a present ``vLLM image`` line is itself a vLLM
+    tell.  Returns a coarse family token (``vllm`` / ``llama-cpp`` / …) via
+    ``_canon_engine_family``, or "" when nothing resolves (the caller then picks
+    the bar deterministically and flags that it could not discriminate engine)."""
+    if not text:
+        return ""
+    cm = _REPORT_CONTAINER_RE.search(text)
+    if cm:
+        from club3090_tui_core.detect import _classify_engine_from_container
+
+        fam = _canon_engine_family(_classify_engine_from_container(cm.group(1).strip()))
+        if fam:
+            return fam
+    if _REPORT_VLLM_IMAGE_RE.search(text):
+        return "vllm"
+    return ""
+
+
+def _canon_engine_family(label: str) -> str:
+    """Collapse an engine label to a coarse FAMILY key so the registry's
+    slug-engine space and the BENCHMARKS.md scrape space compare equal.
+
+    The registry emits e.g. ``llama-cpp-local`` (for BOTH llamacpp/* and
+    ik-llama/* slugs), ``vllm-stable``, ``vllm-gemma-stable``, ``beellama-local``;
+    the BENCHMARKS.md scrape derives ``llamacpp`` / ``ik-llama`` / ``vllm`` /
+    ``beellama`` from the compose-cell prefix.  A raw substring test misses the
+    llama.cpp family entirely (``"llama-cpp-local" in "llamacpp"`` is False in
+    both directions), silently dropping every llama.cpp cross-rig row — so reduce
+    both sides to a shared family token instead.  Returns "" for blank/unknown."""
+    norm = (label or "").strip().lower().replace("_", "").replace("-", "")
+    if not norm:
+        return ""
+    if "ikllama" in norm or "llamacpp" in norm:
+        return "llama-cpp"
+    if norm.startswith("vllm"):
+        return "vllm"
+    if norm.startswith("beellama"):
+        return "beellama"
+    if norm.startswith("sglang"):
+        return "sglang"
+    return norm
+
+
+def _bench_row_matches(row: "BenchRow", model: str, engine: str) -> bool:
+    """Whether a cross-rig BenchRow belongs to a slug's (model, engine).
+
+    Model must match exactly (the catalog slug and the BENCHMARKS.md scrape use
+    the same model id).  Engine is matched by FAMILY (see _canon_engine_family):
+    the registry label (``llama-cpp-local`` / ``vllm-stable``) and the scrape
+    engine (``llamacpp`` / ``ik-llama`` / ``vllm``) live in different label
+    spaces, so both are reduced to a coarse family key before comparing.  A blank
+    engine on either side (e.g. a bare ``*.yml`` scrape cell with no prefix)
+    matches on model alone — the row is still that model's data, shown in the
+    clearly-labelled cross-rig section."""
+    if model and row.model != model:
+        return False
+    rf, sf = _canon_engine_family(row.engine), _canon_engine_family(engine)
+    if not rf or not sf:
+        return True
+    return rf == sf
+
+
+def _canon_model_key(model: str) -> str:
+    """Reduce a model id / served-name to a coarse comparable token.
+
+    The curated bar's model is a registry slug (``qwen3.6-27b``); a rebench
+    REPORT.md's ``Served as`` is a served-model-name (``qwen3.6-27b-autoround``).
+    Strip non-alnum + a trailing weights-variant tail so both reduce to the same
+    family token for the loose match."""
+    norm = re.sub(r"[^a-z0-9.]", "", (model or "").lower())
+    # Drop a trailing quant/variant tail (autoround / awq / int4 / fp8 / gguf …).
+    norm = re.sub(
+        r"(autoround|awq|gptq|int4|int8|fp8|fp16|bf16|gguf|mtp|dflash|q\d.*)$",
+        "",
+        norm,
+    )
+    return norm
+
+
+def _measure_verdict(vsbar: "MeasureVsBar") -> str:
+    """A SIMPLE, honest verdict heuristic (never claims 'catalog-grade').
+
+    Enum:
+      - ``"insufficient data"`` — no measured numbers OR no curated bar matched;
+      - ``"under the bar"``     — measured decode TPS materially below the bar
+                                  (>10% lower on a comparable metric);
+      - ``"within tolerance of the bar"`` — measured ≥ ~90% of the bar (incl.
+                                  meeting/beating it).
+    Deliberately coarse — it is a flag, not a grade; protocol_caveats carries the
+    "we can't actually certify this" disclosure."""
+    m = vsbar.measured
+    bar = vsbar.bar
+    if bar is None or not m.has_any:
+        return "insufficient data"
+    # Compare on whichever TPS metric both sides carry.  A CORPUS bar's narr_tps
+    # is WALL (not decode), so it is NOT comparable to the measured narrative
+    # DECODE — drop the narrative pair for a corpus bar (Fix 2) and grade on the
+    # decode pair (corpus code_tps is the canonical-short decode).
+    pairs: list[tuple[Optional[float], Optional[float]]] = [
+        (m.code_tps, bar.code_tps),
+    ]
+    if vsbar.bar_source != "corpus":
+        pairs.insert(0, (m.narr_tps, bar.narr_tps))
+    ratios = [meas / ref for meas, ref in pairs if meas is not None and ref]
+    if not ratios:
+        # No comparable TPS pair — fall back to the 8-pack when BOTH sides carry
+        # one, applying the SAME ~0.90 tolerance gate.  Never return "within
+        # tolerance" without an actual comparison (a 50/150 measured vs 140/150
+        # bar is materially UNDER the bar, not within it).
+        mq = _quality_fraction(m.quality_8pk)
+        bq = _quality_fraction(bar.quality_8pk)
+        if mq is not None and bq:
+            return "under the bar" if (mq / bq) < 0.90 else "within tolerance of the bar"
+        return "insufficient data"
+    worst = min(ratios)
+    if worst < 0.90:
+        return "under the bar"
+    return "within tolerance of the bar"
+
+
+def _quality_fraction(quality_8pk: str) -> Optional[float]:
+    """Parse a ``"<passed>/<total>"`` 8-pack string to a pass-rate fraction.
+
+    Returns ``passed/total`` (0..1), or None when unparseable / total is 0 — so
+    the verdict can compare two 8-packs on the same scale instead of treating
+    "both have a pack" as "within tolerance"."""
+    if not quality_8pk:
+        return None
+    m = re.match(r"\s*(\d+)\s*/\s*(\d+)\s*$", quality_8pk)
+    if not m:
+        return None
+    passed, total = int(m.group(1)), int(m.group(2))
+    if total <= 0:
+        return None
+    return passed / total
 
 
 # Section header → (model, topology) for the BENCHMARKS.md fallback parse.

@@ -47,6 +47,7 @@ from club3090_cockpit.app import (
     DoctorPane,
     ValidateEvidencePane,
     EvidenceReportScreen,
+    MeasureVsBarScreen,
     ShareBackReportScreen,
     RailStatus,
 )
@@ -402,6 +403,53 @@ REBENCH_REPORT_MD = (
     "\n"
     "- **Date:** 2026-06-18\n"
 )
+
+# R3b-2 — a rebench tag with a resolvable MODEL (Meta `Served as`) so
+# measure_vs_bar can match the curated bar.  The decode numbers (150/40) are
+# BELOW the BENCHMARKS_MD bar (174/42) → "under the bar".
+MEASURE_REPORT_MD = (
+    "# Rebench report — measure-tag\n"
+    "\n"
+    "## TL;DR\n"
+    "\n"
+    "- TPS narrative **150.0** / code **40.0**.\n"
+    "\n"
+    "## Meta\n"
+    "\n"
+    "- **Served as:** `qwen3.6-27b-autoround` from `/mnt/models/x`\n"
+    "- **Model arch:** qwen3_next (Qwen3NextForCausalLM)\n"
+    "- **vLLM image:** `vllm/vllm-openai:v0.22.0`\n"
+    "- **Container:** `vllm-qwen36-dual`\n"
+    "- **Date:** 2026-06-18\n"
+    "\n"
+    "## Quality — `quality-test.sh --full`\n"
+    "\n"
+    "| Pack | passed | pct |\n"
+    "|---|---|---|\n"
+    "| **TOTAL** | **100 / 150** | **67%** |\n"
+)
+
+MEASURE_INTERNAL_JSON = json.dumps(
+    {
+        "bench": {
+            "narrative": {"decode_tps_mean": 150.0, "wall_tps_mean": 148.0},
+            "code": {"decode_tps_mean": 40.0, "wall_tps_mean": 39.0},
+        },
+        "quality": {"total_passed": 100, "total_total": 150, "total_pct": 67},
+    }
+)
+
+
+def seed_measure_tag(root: Path, tag: str = "measure-tag", *, internal: bool = True) -> None:
+    """Seed a rebench tag with a resolvable model + measured numbers for the
+    ④ Measure-vs-bar read.  ``internal=False`` omits _internal.json (forces the
+    REPORT.md fallback)."""
+    (root / "BENCHMARKS.md").write_text(BENCHMARKS_MD, encoding="utf-8")
+    d = root / "results" / "rebench" / tag
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "REPORT.md").write_text(MEASURE_REPORT_MD, encoding="utf-8")
+    if internal:
+        (d / "_internal.json").write_text(MEASURE_INTERNAL_JSON, encoding="utf-8")
 
 
 def fake_responses(**overrides) -> dict[str, RunResult]:
@@ -1554,6 +1602,372 @@ class TestValidateEvidenceWired:
             await _settle(pilot)
             assert len(wr.started) == 1
             assert "--auto-submit" in wr.started[0]["cmd"]
+
+
+# ===========================================================================
+# Phase R / R3b-2 — ④ Measure-vs-curated-bar (READ · producer-only)
+#
+# The producer's MEASURED numbers (rebench tag) compared apples-to-apples to the
+# curated catalog's published bar for the same class.  A READ: parses the tag's
+# _internal.json / REPORT.md + the benchmarks explorer; NO GPU / network / write.
+# The cockpit FLAGS the protocol (matched power? same harness? same prompts?) —
+# it does NOT fabricate a "catalog-grade" verdict.
+# ===========================================================================
+
+
+class TestMeasureVsBarData:
+    """The CockpitData.measure_vs_bar READ — parses + matches + verdicts honestly."""
+
+    @pytest.mark.asyncio
+    async def test_measure_vs_bar_parses_and_matches_curated_bar(self, tmp_path):
+        app, _, _ = make_app(repo_root=tmp_path, surface="producer")
+        seed_measure_tag(tmp_path)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            vsbar = await app._data.measure_vs_bar("measure-tag")
+            # Measured numbers parsed from _internal.json (authoritative source).
+            assert vsbar.measured.source == "_internal.json"
+            assert vsbar.measured.narr_tps == 150.0
+            assert vsbar.measured.code_tps == 40.0
+            assert vsbar.measured.quality_8pk == "100/150"
+            assert vsbar.measured.model == "qwen3.6-27b-autoround"
+            # Matched the curated bar (qwen3.6-27b vllm/dual @ 174/42) by
+            # canon-model AND the run's engine-family (vllm, resolved from the
+            # REPORT.md Meta Container/vLLM-image) — NOT the single-card
+            # llamacpp 53/30 row that shares the model.
+            assert vsbar.bar is not None
+            assert vsbar.bar.model == "qwen3.6-27b"
+            assert vsbar.run_engine == "vllm"
+            assert vsbar.engine_resolved is True
+            assert vsbar.bar.engine == "vllm"        # the engine-matched bar
+            assert vsbar.bar.topology == "dual"
+            assert vsbar.bar_source == "benchmarks.md"
+            # Deltas: 150−174 = −24, 40−42 = −2.
+            assert vsbar.narr_tps_delta == -24.0
+            assert vsbar.code_tps_delta == -2.0
+            # 150/174 = 0.86 < 0.90 → under the bar.
+            assert vsbar.verdict == "under the bar"
+            # Protocol caveats FLAG what the cockpit can't verify (power/harness/
+            # prompts) + disclose the bar source — never a fabricated grade.
+            joined = " ".join(vsbar.protocol_caveats).lower()
+            assert "matched power" in joined
+            assert "harness" in joined
+            assert "prompts" in joined
+            assert "not a catalog-grade" in joined
+
+    @pytest.mark.asyncio
+    async def test_measure_vs_bar_report_md_fallback(self, tmp_path):
+        """With no _internal.json the numbers come from REPORT.md (less precise)."""
+        app, _, _ = make_app(repo_root=tmp_path, surface="producer")
+        seed_measure_tag(tmp_path, internal=False)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            vsbar = await app._data.measure_vs_bar("measure-tag")
+            assert vsbar.measured.source == "REPORT.md"
+            assert vsbar.measured.narr_tps == 150.0
+            assert vsbar.measured.code_tps == 40.0
+            assert vsbar.measured.quality_8pk == "100/150"
+            assert vsbar.bar is not None
+            assert any("REPORT.md" in c for c in vsbar.protocol_caveats)
+
+    @pytest.mark.asyncio
+    async def test_measure_vs_bar_insufficient_data_is_honest(self, tmp_path):
+        """Unparseable numbers / no resolvable model → 'insufficient data', no
+        fabricated bar match, and an honest caveat (no false catalog-grade)."""
+        app, _, _ = make_app(repo_root=tmp_path, surface="producer")
+        # REPORT.md with NO TL;DR TPS, NO model — and no _internal.json.
+        d = tmp_path / "results" / "rebench" / "blank-tag"
+        d.mkdir(parents=True)
+        (d / "REPORT.md").write_text("# Rebench report\n\n## Meta\n\n- **Date:** 2026-01-01\n")
+        (tmp_path / "BENCHMARKS.md").write_text(BENCHMARKS_MD)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            vsbar = await app._data.measure_vs_bar("blank-tag")
+            assert vsbar.verdict == "insufficient data"
+            assert vsbar.bar is None
+            assert not vsbar.measured.has_any
+            # Honest: it says it couldn't resolve / match — NOT a fabricated grade.
+            joined = " ".join(vsbar.protocol_caveats).lower()
+            assert "could not resolve" in joined or "no curated catalog bar" in joined
+
+    @pytest.mark.asyncio
+    async def test_measure_vs_bar_missing_tag_dir_errors(self, tmp_path):
+        app, _, _ = make_app(repo_root=tmp_path, surface="producer")
+        (tmp_path / "BENCHMARKS.md").write_text(BENCHMARKS_MD)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            vsbar = await app._data.measure_vs_bar("does-not-exist")
+            assert vsbar.error
+            assert "no run dir" in vsbar.error
+
+    @pytest.mark.asyncio
+    async def test_measure_vs_bar_engine_match_is_order_independent(self, tmp_path):
+        """Reorder the BENCHMARKS.md sections so the single-card llamacpp 53/30
+        row comes FIRST: the vLLM-dual run must STILL match the vLLM 174/42 bar
+        (engine-discriminated, not document-order) — no verdict flip, no
+        fabricated '+97 narr' delta."""
+        # llamacpp single-card section first, vLLM-dual second (reversed order).
+        reordered = (
+            "# BENCHMARKS\n\n"
+            "## Qwen3.6-27B\n\n"
+            "### Single-card (1× RTX 3090)\n\n"
+            "| Compose | Rig | KV | Max ctx | Narr / Code TPS | PP | VRAM | Date | Notes |\n"
+            "|---|---|---|---|---|---|---|---|---|\n"
+            "| `llamacpp/mtp` | @somerig | q8 | 262K | **53.0 / 30.0** | — | 15.0 GB | 2026-06-03 | 8-pack 99/150 |\n\n"
+            "### Dual-card (2× RTX 3090, TP=2)\n\n"
+            "| Compose | Rig | KV | Max ctx | Narr / Code TPS | PP | VRAM | Date | Notes |\n"
+            "|---|---|---|---|---|---|---|---|---|\n"
+            "| `vllm/dual` | @noonghunna | fp8 | 262K | **174.0 / 42.0** | — | 23.6 GB | 2026-05-30 | 8-pack 109/150 |\n"
+        )
+        app, _, _ = make_app(repo_root=tmp_path, surface="producer")
+        seed_measure_tag(tmp_path)
+        (tmp_path / "BENCHMARKS.md").write_text(reordered, encoding="utf-8")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            vsbar = await app._data.measure_vs_bar("measure-tag")
+            # Engine-matched the vLLM-dual bar despite the llamacpp row being first.
+            assert vsbar.bar is not None
+            assert vsbar.bar.engine == "vllm"
+            assert vsbar.bar.topology == "dual"
+            assert vsbar.bar.narr_tps == 174.0
+            # Honest delta + verdict — NOT the +97 narr / 'within tolerance' flip
+            # the llamacpp 53/30 bar would have fabricated.
+            assert vsbar.narr_tps_delta == -24.0
+            assert vsbar.verdict == "under the bar"
+
+    @pytest.mark.asyncio
+    async def test_measure_vs_bar_corpus_suppresses_narrative_delta(self, tmp_path):
+        """A corpus bar's narr_tps is WALL, not decode — the narrative-TPS delta
+        is SUPPRESSED (no fabricated green +N) + a wall-vs-decode caveat is added;
+        the decode (code) delta is kept (both decode)."""
+        app, _, _ = make_app(repo_root=tmp_path, surface="producer")
+        seed_measure_tag(tmp_path)
+        # Seed a #249 corpus record: wall_tps 200 (would fake a +50 narr delta vs
+        # measured narrative-decode 150) + canonical-short decode 45.
+        recdir = tmp_path / "results" / "measurement-records"
+        recdir.mkdir(parents=True, exist_ok=True)
+        rec = {
+            "model_slug": "qwen3.6-27b",
+            "engine_id": "vllm-stable",
+            "topology": "dual",
+            "max_model_len": 262144,
+            "measured_extensions": {
+                "decode_tps_by_ctx": {"canonical-short": 45.0},
+                "wall_tps": 200.0,
+            },
+            "provenance": {"last_confirmed": "2026-06-10"},
+            "_tag": "corpus-run",
+        }
+        (recdir / "qwen.jsonl").write_text(json.dumps(rec) + "\n", encoding="utf-8")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            vsbar = await app._data.measure_vs_bar("measure-tag")
+            assert vsbar.bar is not None
+            assert vsbar.bar_source == "corpus"
+            # Narrative delta SUPPRESSED (not 150−200=−50, not a +N) ...
+            assert vsbar.narr_tps_delta is None
+            # ... decode delta kept: 40 − 45 = −5.
+            assert vsbar.code_tps_delta == -5.0
+            joined = " ".join(vsbar.protocol_caveats).lower()
+            assert "wall" in joined and "decode" in joined
+
+    @pytest.mark.asyncio
+    async def test_measure_vs_bar_quality_only_below_bar_is_honest(self, tmp_path):
+        """When only quality (no comparable TPS) is present, the 8-pack pass
+        counts ARE compared — 50/150 measured vs 140/150 bar is materially UNDER
+        the bar, NOT 'within tolerance'."""
+        from club3090_cockpit.data import MeasureVsBar, MeasuredNumbers, BenchRow, _measure_verdict
+
+        vsbar = MeasureVsBar(
+            tag="q",
+            measured=MeasuredNumbers(quality_8pk="50/150", model="qwen3.6-27b"),
+            bar=BenchRow(model="qwen3.6-27b", quality_8pk="140/150", source="benchmarks.md"),
+            bar_source="benchmarks.md",
+        )
+        assert _measure_verdict(vsbar) == "under the bar"
+        # And a near-match (130/150 vs 140/150 = 0.93 ≥ 0.90) is within tolerance.
+        vsbar.measured.quality_8pk = "130/150"
+        assert _measure_verdict(vsbar) == "within tolerance of the bar"
+
+
+class TestMeasureVsBarUI:
+    """The ④ Measure 'vs catalog bar' view (producer-only key [m])."""
+
+    @pytest.mark.asyncio
+    async def test_measure_vs_bar_action_is_producer_only(self):
+        """[m] measure_vs_bar is gated off on the consumer surface."""
+        app, _, _ = make_app(surface="consumer")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            assert "measure_vs_bar" in app._PRODUCER_ONLY
+            assert app.check_action("measure_vs_bar", ()) is False
+
+    @pytest.mark.asyncio
+    async def test_measure_vs_bar_enabled_on_producer_measure_tab(self):
+        app, _, _ = make_app(surface="producer")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("3")
+            await _settle(pilot)
+            app.query_one("#validate-tabs", TabbedContent).active = "tab-evidence"
+            await pilot.pause()
+            assert app.check_action("measure_vs_bar", ()) is True
+
+    @pytest.mark.asyncio
+    async def test_m_key_opens_vs_bar_view_with_verdict_and_caveats(self, tmp_path):
+        """[m] on a selected ④ Measure tag opens the vs-bar modal rendering the
+        measured-vs-bar comparison + honest verdict + protocol caveats."""
+        app, _, _ = make_app(repo_root=tmp_path, surface="producer")
+        seed_measure_tag(tmp_path)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("3")
+            await _settle(pilot)
+            app.query_one("#validate-tabs", TabbedContent).active = "tab-evidence"
+            await pilot.pause()
+            app.query_one("#evidence-table", DataTable).move_cursor(row=0)
+            await pilot.press("m")
+            await _settle(pilot)
+            assert isinstance(app.screen, MeasureVsBarScreen)
+            body = str(app.screen.query_one("#vsbar-body", Static).render())
+            # The verdict + the side-by-side measured/bar + a protocol caveat.
+            assert "under the bar" in body
+            assert "Catalog bar" in body
+            assert "150" in body and "174" in body
+            assert "cannot verify" in body.lower()
+
+    @pytest.mark.asyncio
+    async def test_m_key_no_selection_notifies(self, tmp_path):
+        """No selectable tag → [m] notifies, no modal."""
+        app, _, _ = make_app(repo_root=tmp_path, surface="producer")
+        (tmp_path / "BENCHMARKS.md").write_text(BENCHMARKS_MD)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("3")
+            await _settle(pilot)
+            app.query_one("#validate-tabs", TabbedContent).active = "tab-evidence"
+            await pilot.pause()
+            await pilot.press("m")
+            await pilot.pause()
+            # No tags seeded → the "—" placeholder row → no real selection → no modal.
+            assert not isinstance(app.screen, MeasureVsBarScreen)
+
+
+# ===========================================================================
+# Phase R / R3b-2 — producer FULL validation battery (report.sh --full)
+#
+# A PRODUCER-lane action ([F] on ③ Gate): the ~43-min verify+stress+soak+bench+
+# agentic battery against the SERVING model.  Confirm-gated (heavy + needs a
+# model serving), bg-streamed into the Gate LivePane, uses the serving model
+# (claims NO GPU), NEVER auto-fired, MOCK-ONLY in tests (conftest blocks the
+# real spawn — the FakeWriteRunner records start_raw without spawning).
+# ===========================================================================
+
+
+class TestFullValidationReport:
+    @pytest.mark.asyncio
+    async def test_full_report_plan_is_confirm_gated_no_reconcile(self):
+        app, _, _ = make_app(surface="producer")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            plan = app._data.full_validation_report_plan(model="qwen3.6-27b")
+            assert plan.cmd == ["bash", "scripts/report.sh", "--full"]
+            assert plan.requires_confirm is True       # heavy — confirm
+            assert plan.requires_reconcile is False     # uses serving model; no GPU claim
+            assert "--full" in plan.description
+
+    @pytest.mark.asyncio
+    async def test_full_report_action_is_producer_only(self):
+        """[F] full_report is gated off on the consumer surface."""
+        app, _, _ = make_app(surface="consumer")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            assert "full_report" in app._PRODUCER_ONLY
+            assert app.check_action("full_report", ()) is False
+
+    @pytest.mark.asyncio
+    async def test_full_report_enabled_on_producer_gate_tab(self):
+        app, _, _ = make_app(surface="producer")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("3")
+            await _settle(pilot)
+            app.query_one("#validate-tabs", TabbedContent).active = "tab-run"
+            await pilot.pause()
+            assert app.check_action("full_report", ()) is True
+
+    @pytest.mark.asyncio
+    async def test_full_report_opens_confirm_never_auto_fires(self):
+        """[F] on ③ Gate opens a confirm modal and does NOT fire the battery
+        until confirmed (the heavy ~43-min run is never auto-launched)."""
+        wr = FakeWriteRunner()
+        # A serving target is required (the battery hits the serving model); the
+        # no-target guard is covered by test_full_report_no_serving_model_notifies.
+        app, _, _ = make_app(write_runner=wr, surface="producer", target=SERVING_TARGET)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("3")
+            await _settle(pilot)
+            app.query_one("#validate-tabs", TabbedContent).active = "tab-run"
+            await pilot.pause()
+            await pilot.press("F")
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmActionScreen)
+            assert app.screen._plan.cmd == ["bash", "scripts/report.sh", "--full"]
+            assert app.screen._plan.requires_confirm is True
+            assert app.screen._plan.requires_reconcile is False
+            assert wr.started == []  # nothing fired — only the modal opened
+
+    @pytest.mark.asyncio
+    async def test_full_report_no_serving_model_notifies_no_confirm(self):
+        """[F] with NO serving target → notify + return, NO ConfirmActionScreen
+        (the ~43-min battery must not run against an empty MODEL=/URL=)."""
+        wr = FakeWriteRunner()
+        # An empty ServingTarget → _target_url / _target_model resolve blank.
+        app, _, _ = make_app(
+            write_runner=wr, surface="producer", target=ServingTarget(gpus=[])
+        )
+        notes: list[str] = []
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("3")
+            await _settle(pilot)
+            app.query_one("#validate-tabs", TabbedContent).active = "tab-run"
+            await pilot.pause()
+            assert not app._target_url and not app._target_model
+            orig_notify = app.notify
+            app.notify = lambda *a, **k: (notes.append((a[0] if a else k.get("message", ""))), orig_notify(*a, **k))[1]
+            await pilot.press("F")
+            await pilot.pause()
+            assert not isinstance(app.screen, ConfirmActionScreen)
+            assert wr.started == []
+            assert any("no serving model" in n.lower() for n in notes)
+
+    @pytest.mark.asyncio
+    async def test_full_report_confirm_launches_via_mocked_write_runner(self):
+        """Confirming streams the battery via the MOCKED write runner — NO live
+        process is spawned (conftest blocks it)."""
+        wr = FakeWriteRunner()
+        app, _, _ = make_app(write_runner=wr, surface="producer")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("3")
+            await _settle(pilot)
+            app.query_one("#validate-tabs", TabbedContent).active = "tab-run"
+            await pilot.pause()
+            # Drive the launch directly (mirrors the run_validation_launch test —
+            # the confirm modal's reconcile-on-mount is exercised separately).
+            app.run_full_report_launch()
+            await _settle(pilot)
+            assert len(wr.started) == 1
+            assert wr.started[0]["cmd"] == ["bash", "scripts/report.sh", "--full"]
+            assert wr.started[0]["run_type"] == "full_report"
+
+    @pytest.mark.asyncio
+    async def test_full_report_distinct_from_consumer_bare_rig_report(self):
+        """R2b consumer [R] rig_report stays BARE report.sh (no --full); the
+        producer --full battery is a SEPARATE action."""
+        app, _, _ = make_app(surface="producer")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            bare = app._data.full_validation_report_plan()
+            assert "--full" in bare.cmd
+            # The consumer rig_report path shells bare report.sh (asserted by the
+            # R2b suite); here we assert the two cmds differ.
+            assert bare.cmd != ["bash", "scripts/report.sh"]
 
 
 # ===========================================================================
@@ -3203,8 +3617,10 @@ class TestSurfaceScaffold:
     async def test_shipped_producer_set_is_mode_validate_and_promote(self):
         # R3b-1: the shipped _PRODUCER_ONLY gates the producer lane (mode_validate)
         # + the relocated-into-the-lane [P] promote + [v] evaluate + ② serve_untested.
+        # R3b-2: + [m] measure_vs_bar (④ Measure) + [F] full_report (③ Gate battery).
         assert CockpitApp._PRODUCER_ONLY == frozenset({
             "mode_validate", "promote_catalog", "evaluate_target", "serve_untested",
+            "measure_vs_bar", "full_report",
         })
 
     @pytest.mark.asyncio

@@ -73,11 +73,14 @@ from .data import (
     EvidenceReport,
     EvidenceTag,
     Measurement,
+    MeasureVsBar,
     OptimizerReport,
     PowerCapState,
     PromoteScaffold,
     ReconcileResult,
     Scene,
+    _bench_row_matches,
+    _canon_engine_family,
     measurement_from_explain_columns,
 )
 from .services import CockpitData
@@ -99,48 +102,10 @@ def _status_glyph(status: str) -> str:
     return _STATUS_GLYPH.get(status.lower(), status)
 
 
-def _canon_engine_family(label: str) -> str:
-    """Collapse an engine label to a coarse FAMILY key so the registry's
-    slug-engine space and the BENCHMARKS.md scrape space compare equal.
-
-    The registry emits e.g. ``llama-cpp-local`` (for BOTH llamacpp/* and
-    ik-llama/* slugs), ``vllm-stable``, ``vllm-gemma-stable``, ``beellama-local``;
-    the BENCHMARKS.md scrape derives ``llamacpp`` / ``ik-llama`` / ``vllm`` /
-    ``beellama`` from the compose-cell prefix.  A raw substring test misses the
-    llama.cpp family entirely (``"llama-cpp-local" in "llamacpp"`` is False in
-    both directions), silently dropping every llama.cpp cross-rig row — so reduce
-    both sides to a shared family token instead.  Returns "" for blank/unknown."""
-    norm = (label or "").strip().lower().replace("_", "").replace("-", "")
-    if not norm:
-        return ""
-    if "ikllama" in norm or "llamacpp" in norm:
-        return "llama-cpp"
-    if norm.startswith("vllm"):
-        return "vllm"
-    if norm.startswith("beellama"):
-        return "beellama"
-    if norm.startswith("sglang"):
-        return "sglang"
-    return norm
-
-
-def _bench_row_matches(row: BenchRow, model: str, engine: str) -> bool:
-    """Whether a cross-rig BenchRow belongs to a slug's (model, engine).
-
-    Model must match exactly (the catalog slug and the BENCHMARKS.md scrape use
-    the same model id).  Engine is matched by FAMILY (see _canon_engine_family):
-    the registry label (``llama-cpp-local`` / ``vllm-stable``) and the scrape
-    engine (``llamacpp`` / ``ik-llama`` / ``vllm``) live in different label
-    spaces, so both are reduced to a coarse family key before comparing.  A blank
-    engine on either side (e.g. a bare ``*.yml`` scrape cell with no prefix)
-    matches on model alone — the row is still that model's data, shown in the
-    clearly-labelled cross-rig section."""
-    if model and row.model != model:
-        return False
-    rf, sf = _canon_engine_family(row.engine), _canon_engine_family(engine)
-    if not rf or not sf:
-        return True
-    return rf == sf
+# NOTE (R3b-2): _canon_engine_family / _bench_row_matches moved to data.py (pure)
+# so the data layer's measure_vs_bar can reuse them without a services→app import
+# cycle.  They are re-exported here (imported above) so existing app-level callers
+# and tests that reference app._bench_row_matches keep working.
 
 
 # ── Help modal ────────────────────────────────────────────────────────────────
@@ -190,8 +155,8 @@ class HelpScreen(ModalScreen):
 [bold]Bring & Validate[/bold] (producer lane — the ① → ⑤ pipeline)
   ① Bring:   fit-check an HF model (pull.sh --dry-run)
   ② Serve:   [cyan]⏎[/cyan]/[cyan]g[/cyan] generate a compose + serve it untested (reconcile-gated)
-  ③ Gate:    [cyan]⏎[/cyan] launch validation step (gated)
-  ④ Measure: [cyan]⏎[/cyan] open report   [cyan]s[/cyan] submit to localmaxxing (gated · never auto)
+  ③ Gate:    [cyan]⏎[/cyan] launch validation step (gated)   [cyan]F[/cyan] full battery report.sh --full (~43-min · confirm · uses serving model)
+  ④ Measure: [cyan]⏎[/cyan] open report   [cyan]m[/cyan] vs catalog bar (read · flags protocol)   [cyan]s[/cyan] submit to localmaxxing (gated · never auto)
   ⑤ Promote: [cyan]P[/cyan] ▸ Promote a fit-checked model to the catalog (scaffold + gated write)
   [cyan]v[/cyan] ▸ Evaluate the running target via c3t (confirm-gated · mock-only this phase)
 """
@@ -1411,7 +1376,7 @@ class ValidateEvidencePane(Container):
         et.cursor_type = "row"
         yield et
         yield Label(
-            "[dim]\\[⏎] open report   \\[s] submit to localmaxxing (gated · never auto)[/dim]",
+            "[dim]\\[⏎] open report   \\[m] vs catalog bar   \\[s] submit to localmaxxing (gated · never auto)[/dim]",
             id="evidence-hint",
         )
 
@@ -1500,6 +1465,130 @@ class EvidenceReportScreen(ModalScreen):
         from rich.markup import escape
 
         body.update(escape(report.body))
+
+    def action_dismiss(self) -> None:
+        self.app.pop_screen()
+
+
+# ── Phase R / R3b-2 · ④ Measure-vs-curated-bar modal (design §3.3 ④) ──────────────
+
+
+class MeasureVsBarScreen(ModalScreen):
+    """The ④ Measure "vs catalog bar" view for a selected evidence tag (READ).
+
+    Shows the producer's MEASURED numbers next to the curated catalog's published
+    bar for the same class — measured-vs-bar side by side + deltas + the honest
+    verdict + the protocol caveats.  READ-only: it loads on mount via a worker
+    (mirrors EvidenceReportScreen) and renders the comparison.  NO GPU / network /
+    write — the cockpit FLAGS the protocol, it does not fabricate "catalog-grade"."""
+
+    DEFAULT_CSS = """
+    MeasureVsBarScreen {
+        align: center middle;
+    }
+    MeasureVsBarScreen > Vertical {
+        width: 92;
+        height: 80%;
+        border: thick $accent;
+        background: $surface;
+        padding: 1 2;
+    }
+    MeasureVsBarScreen .vsbar-title {
+        text-style: bold;
+        color: $accent;
+        margin-bottom: 1;
+    }
+    MeasureVsBarScreen #vsbar-scroll {
+        height: 1fr;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "dismiss", "Close"),
+    ]
+
+    def __init__(self, tag: str, **kwargs):
+        super().__init__(**kwargs)
+        self._tag = tag
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Label(f"Measure vs catalog bar · {self._tag}", classes="vsbar-title")
+            with ScrollableContainer(id="vsbar-scroll"):
+                yield Static("Comparing measured numbers to the curated bar (local read)…", id="vsbar-body")
+            yield Label("[dim]Esc to close · this FLAGS the protocol — it is not a catalog-grade certification[/dim]")
+
+    def on_mount(self) -> None:
+        # Load once mounted (so set_result's query resolves) — mirrors
+        # EvidenceReportScreen's load-on-mount.
+        self.app.run_measure_vs_bar(self, self._tag)  # type: ignore[attr-defined]
+
+    def set_result(self, vsbar: MeasureVsBar) -> None:
+        body = self.query_one("#vsbar-body", Static)
+        if vsbar.error:
+            body.update(f"[red]unavailable:[/red] {vsbar.error}")
+            return
+        m = vsbar.measured
+        bar = vsbar.bar
+        lines: list[str] = []
+
+        verdict_color = {
+            "within tolerance of the bar": "green",
+            "under the bar": "yellow",
+            "insufficient data": "dim",
+        }.get(vsbar.verdict, "dim")
+        lines.append(f"  Verdict: [{verdict_color}]{vsbar.verdict}[/{verdict_color}]")
+        if m.model:
+            lines.append(f"  Model:   [bold]{m.model}[/bold]")
+        lines.append("")
+
+        # Side-by-side table.
+        bar_src = vsbar.bar_source or "—"
+        lines.append("  [bold]Metric        Measured        Catalog bar      Δ[/bold]")
+        lines.append("  " + "─" * 56)
+        m_tps = m.tps_label
+        b_tps = bar.tps_label if bar else "—"
+
+        def _d(v):
+            if v is None:
+                return "—"
+            sign = "+" if v >= 0 else ""
+            color = "green" if v >= 0 else "red"
+            return f"[{color}]{sign}{v:.0f}[/{color}]"
+
+        lines.append(
+            f"  Narr TPS      {self._cell(m.narr_tps)}{self._cell(bar.narr_tps if bar else None)}{_d(vsbar.narr_tps_delta)}"
+        )
+        lines.append(
+            f"  Code TPS      {self._cell(m.code_tps)}{self._cell(bar.code_tps if bar else None)}{_d(vsbar.code_tps_delta)}"
+        )
+        lines.append(
+            f"  8-pack        {m.quality_label:<16}{(bar.quality_label if bar else '—'):<17}—"
+        )
+        lines.append("")
+        # Surface WHICH bar was matched (engine + topology) so the comparison is
+        # legible — and whether the run's engine actually drove the selection.
+        bar_eng = (bar.engine if bar else "") or "—"
+        bar_topo = (bar.topology if bar else "") or "—"
+        match_note = "engine-matched" if vsbar.engine_resolved else "[yellow]engine NOT matched[/yellow]"
+        lines.append(
+            f"  Bar:          [dim]{bar_eng} · {bar_topo}[/dim] ({match_note})"
+        )
+        lines.append(f"  Bar source:   [dim]{bar_src}[/dim]   Measured from: [dim]{m.source or '—'}[/dim]")
+        lines.append("")
+
+        # Protocol caveats — the honesty section.
+        lines.append("  [bold yellow]What the cockpit cannot verify (flags, not a grade):[/bold yellow]")
+        if vsbar.protocol_caveats:
+            for c in vsbar.protocol_caveats:
+                lines.append(f"    [yellow]•[/yellow] {c}")
+        else:
+            lines.append("    [dim](none)[/dim]")
+        body.update("\n".join(lines))
+
+    @staticmethod
+    def _cell(v: Optional[float]) -> str:
+        return f"{v:.0f}".ljust(16) if v is not None else "—".ljust(16)
 
     def action_dismiss(self) -> None:
         self.app.pop_screen()
@@ -2344,6 +2433,13 @@ class CockpitApp(App):
         # (also reachable via ⏎ on the ② Serve stage).
         Binding("g", "serve_untested", "Serve untested", show=False),
         Binding("O", "optimize_card", "Optimize", show=False),
+        # R3b-2 — producer lane ④ Measure: compare the selected tag's measured
+        # numbers to the curated catalog bar (READ · producer-only).
+        Binding("m", "measure_vs_bar", "vs catalog bar", show=False),
+        # R3b-2 — producer lane: the ~43-min FULL validation battery
+        # (report.sh --full) — confirm-gated, bg-streamed, producer-only, uses the
+        # serving model (claims no GPU); NEVER auto-fired.
+        Binding("F", "full_report", "Full report", show=False),
         # Phase R / R2b — consumer share-back affordances (NOT producer-gated):
         #   [R] rig report (READ · paste-ready)     — Run + Operate
         #   [B] submit bench (OUTWARD write · gated) — Operate
@@ -2418,6 +2514,10 @@ class CockpitApp(App):
         "promote_catalog":  ({2}, None),          # Bring & Validate lane (⑤ Promote)
         "evaluate_target":  ({2}, None),          # Bring & Validate lane (the c3t hook)
         "serve_untested":   ({2}, {"tab-serve"}), # Bring & Validate lane (② Serve)
+        # R3b-2: [m] vs-bar on ④ Measure (tab-evidence); [F] full battery on
+        # ③ Gate (tab-run — the lane's gate stage hosts the heavy validation).
+        "measure_vs_bar":   ({2}, {"tab-evidence"}),
+        "full_report":      ({2}, {"tab-run"}),
         "optimize_card":    ({0}, None),          # Run
         # Operate · Orchestration
         "estate_off":       ({1}, {"tab-orchestration"}),
@@ -2460,8 +2560,11 @@ class CockpitApp(App):
     #   stays in Operate for now (R3b relocates it).
     #   R3b-1: [v] evaluate_target + [serve_untested] (② Serve) joined the lane,
     #   so they are producer-only too ([P] promote was already here).
+    #   R3b-2: [m] measure_vs_bar (④ Measure, a READ) + [F] full_report (③ Gate,
+    #   the ~43-min battery) are producer-lane actions too.
     _PRODUCER_ONLY: frozenset[str] = frozenset({
         "mode_validate", "promote_catalog", "evaluate_target", "serve_untested",
+        "measure_vs_bar", "full_report",
     })
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
@@ -3385,6 +3488,95 @@ class CockpitApp(App):
             screen.set_report(report)
         except Exception:
             pass
+
+    # ── Phase R / R3b-2 · ④ Measure-vs-curated-bar (READ — producer-only) ──────────
+
+    def action_measure_vs_bar(self) -> None:
+        """[m] in the lane's ④ Measure tab: open the "vs catalog bar" view for the
+        selected evidence tag.  PRODUCER-only (gated in check_action); READ-only —
+        no ConfirmActionScreen, no GPU / network.  Compares the producer's measured
+        numbers to the curated catalog bar + flags the protocol it can't verify."""
+        if self._active_mode != 2 or self._active_validate_tab() != "tab-evidence":
+            return
+        try:
+            tag = self.query_one("#validate-evidence-pane", ValidateEvidencePane).selected_tag()
+        except Exception:
+            tag = None
+        if tag is None:
+            self.notify("No run tag selected.", title="Measure", severity="warning", timeout=3)
+            return
+        self.push_screen(MeasureVsBarScreen(tag.tag))
+
+    @work(group="measure-vs-bar")
+    async def run_measure_vs_bar(self, screen: "MeasureVsBarScreen", tag: str) -> None:
+        """Compute the measured-vs-bar comparison for a tag (READ) + push it to
+        the modal.  No GPU / network / write — pure filesystem reads + the
+        benchmarks explorer."""
+        vsbar = await self._data.measure_vs_bar(tag, variants=self._variants or None)
+        try:
+            screen.set_result(vsbar)
+        except Exception:
+            pass
+
+    # ── Phase R / R3b-2 · Full validation battery (report.sh --full — producer) ────
+
+    def action_full_report(self) -> None:
+        """[F] in the lane's ③ Gate tab: launch the ~43-min FULL validation battery
+        (report.sh --full).  PRODUCER-only (gated in check_action).  CONFIRM-gated
+        (heavy + long-running, and it needs a model serving), then bg-streamed into
+        the ③ Gate LivePane.  It uses the SERVING model and does NOT claim a GPU
+        (requires_confirm=True, requires_reconcile=False) → NEVER auto-fired."""
+        if self._active_mode != 2 or self._active_validate_tab() != "tab-run":
+            return
+        # Guard on a resolved serving target — the ~43-min battery hits the
+        # SERVING model; with nothing serving it would run against an empty
+        # MODEL=/URL=.  Refuse + tell the user, never open the confirm.
+        if not self._target_url and not self._target_model:
+            self.notify(
+                "No serving model — start a model before the full battery.",
+                title="Full report",
+                severity="warning",
+                timeout=4,
+            )
+            return
+        plan = self._data.full_validation_report_plan(
+            model=self._target_model or None,
+            url=self._target_url or None,
+        )
+        self.push_screen(ConfirmActionScreen(plan, on_confirm=lambda p: self.run_full_report_launch()))
+
+    @work(exclusive=True, group="full-report")
+    async def run_full_report_launch(self) -> None:
+        """Launch the confirmed report.sh --full battery, streamed into the ③ Gate
+        LivePane.
+
+        ⚠️  WIRED-BUT-MOCK-ONLY.  The ~43-min battery hits the serving model; the
+        write runner is NEVER executed live this phase — conftest blocks the real
+        spawn and tests inject a FakeWriteRunner.  Uses the serving model; claims
+        no GPU."""
+        live = self._run_output_pane()
+        if live is not None:
+            live.clear_log()
+            live.append_line(
+                "[green]▶ launching[/green] report.sh --full "
+                "(~43-min full battery · streams below)"
+            )
+
+        def _on_line(text: str) -> None:
+            if live is not None:
+                live.append_line(text)
+
+        await self._data.run_full_validation_report(
+            model=self._target_model or None,
+            url=self._target_url or None,
+            on_line=_on_line,
+        )
+        self.notify(
+            "report.sh --full launched (~43-min battery).",
+            title="Full report",
+            severity="information",
+            timeout=4,
+        )
 
     # ── Phase R / R2b · Consumer share-back (READ paste-ready + outward submit) ────
 

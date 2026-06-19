@@ -61,15 +61,23 @@ from .data import (
     FitVerdict,
     GpuConflict,
     Measurement,
+    MeasuredNumbers,
+    MeasureVsBar,
     OptimizerReport,
     PowerCapState,
     ProfileTriage,
     PromoteScaffold,
     ReconcileResult,
     Scene,
+    _bench_row_matches,
+    _canon_engine_family,
+    _canon_model_key,
+    _measure_verdict,
     bench_row_from_corpus_record,
     bench_rows_from_benchmarks_md,
     compute_promote_scaffold,
+    measured_from_internal_json,
+    measured_from_report_md,
     measurement_from_explain_benchmarks,
     parse_benchmarks_md_for_slug,
     parse_docker_top,
@@ -1136,6 +1144,68 @@ class CockpitData:
             plan.cmd, env=env, run_type=plan.kind, parser=parser
         )
 
+    # ── Producer / ③ Gate: the FULL validation battery (report.sh --full) ─────────
+
+    def full_validation_report_plan(
+        self, *, model: Optional[str] = None, url: Optional[str] = None
+    ) -> ActionPlan:
+        """Build the ActionPlan for ``report.sh --full`` — the ~43-min
+        verify+stress+soak+bench+agentic PRODUCER battery (Q1 maintainer call).
+
+        Distinct from the consumer share-back ``rig_report`` (bare ``report.sh``,
+        a ~2 s redacted snapshot, R2b).  ``--full`` runs the heavy battery against
+        the ALREADY-SERVING model, so it does NOT claim a GPU
+        (``requires_reconcile=False``) but is HEAVY + long-running and MUST be
+        confirm-gated (``requires_confirm=True``).  ``MODEL`` / ``URL`` are
+        injected into the child env at execution time (NOT baked into the cmd) so
+        the plan stays inspectable without leaking the target."""
+        target_bits: list[str] = []
+        if model:
+            target_bits.append(f"MODEL={model}")
+        if url:
+            target_bits.append(f"URL={url}")
+        target = (" → " + " ".join(target_bits)) if target_bits else ""
+        return ActionPlan(
+            kind="full_report",
+            cmd=["bash", "scripts/report.sh", "--full"],
+            description=f"report.sh --full (~43-min full validation battery){target}".strip(),
+            requires_reconcile=False,   # hits the serving model; does not claim a GPU
+            requires_confirm=True,      # heavy + long-running — confirm before launching
+        )
+
+    async def run_full_validation_report(
+        self,
+        *,
+        model: Optional[str] = None,
+        url: Optional[str] = None,
+        on_event: Optional[Callable[[Any], None]] = None,
+        on_line: Optional[Callable[[str], None]] = None,
+    ) -> Any:
+        """Launch ``report.sh --full`` as a BACKGROUND streaming worker.
+
+        ⚠️  WIRED-BUT-MOCK-ONLY.  The ~43-min battery stresses the serving model;
+        the write runner is NEVER executed live this phase — conftest blocks the
+        real spawn and tests inject a FakeWriteRunner.  Streams raw output (no
+        dedicated core parser — it is a multi-stage shell battery) so the UI shows
+        live progress over the long run; it does NOT block the event loop.  Uses
+        the SERVING model (injects ``MODEL`` / ``URL`` into the child env) and does
+        NOT claim a GPU.  Confirmation is the CALLER's job."""
+        import os as _os
+
+        plan = self.full_validation_report_plan(model=model, url=url)
+        env = dict(_os.environ)
+        if model:
+            env["MODEL"] = model
+        if url:
+            env["URL"] = url
+        if on_event is not None or on_line is not None:
+            self._write_runner.set_callbacks(on_event=on_event, on_line=on_line)
+        # No reconcile gate (uses the serving model; claims no GPU); straight to
+        # the streamer.  In tests this is the FakeWriteRunner; live it is blocked.
+        return await self._write_runner.start_raw(
+            plan.cmd, env=env, run_type=plan.kind, parser=_NullParser()
+        )
+
     # ── Validate / Doctor: health + estate-diagnose + profile-triage (READS) ──────
 
     async def doctor(
@@ -1362,6 +1432,235 @@ class CockpitData:
             tag=tag,
             error=(res.stderr.strip()[:200] or f"report generation failed (rc={res.returncode})"),
         )
+
+    # ── Validate / ④ Measure: producer-measured vs the curated catalog bar (READ) ─
+
+    async def measure_vs_bar(
+        self, tag: str, *, variants: Optional[list[VariantRow]] = None
+    ) -> MeasureVsBar:
+        """Compare a rebench tag's MEASURED numbers against the curated catalog's
+        published bar for the SAME class — "did this config earn catalog-grade?"
+        (design §3.3 ④).  READ-only: pure filesystem reads (the tag dir) + the
+        existing benchmarks explorer; NO GPU / network / write.
+
+        Steps:
+          1. parse the producer's MEASURED numbers from ``results/rebench/<tag>/``
+             — ``_internal.json`` (authoritative) with a ``REPORT.md`` TL;DR
+             scrape fallback (reuses the same artifacts evidence_report reads);
+          2. resolve the tag's MODEL **and engine-FAMILY** (from REPORT.md Meta —
+             Container/vLLM-image — then the served slug → registry-variant
+             engine, best-effort) and fetch the CURATED bar via
+             ``benchmarks_explorer()`` (prefer the #249 corpus rows, BENCHMARKS.md
+             fallback), matched by ``_bench_row_matches`` on (model, engine-family)
+             so a vLLM-dual run is NOT graded against a single-card llama.cpp row.
+             When the engine can't be resolved (or no bar exists for it) the bar is
+             picked DETERMINISTICALLY and the matched row's engine/topology is
+             surfaced in the struct + caveats so the user sees which bar was used;
+          3. return a structured comparison with a SIMPLE, honest ``verdict`` and
+             ``protocol_caveats`` LISTING what the cockpit cannot verify (matched
+             power? same harness? same prompts?).  It FLAGS the protocol — it
+             NEVER fabricates a "catalog-grade" it can't substantiate, and
+             discloses the bar's source (corpus vs BENCHMARKS.md)."""
+        base = self.repo_root / "results" / "rebench" / tag
+        if not base.is_dir():
+            return MeasureVsBar(tag=tag, error=f"no run dir results/rebench/{tag}")
+
+        # (1) MEASURED numbers — _internal.json first, REPORT.md fallback.
+        measured = MeasuredNumbers()
+        report_md_text = ""
+        report_md = base / "REPORT.md"
+        if report_md.is_file():
+            try:
+                report_md_text = report_md.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                report_md_text = ""
+        internal = base / "_internal.json"
+        if internal.is_file():
+            try:
+                blob = json.loads(internal.read_text(encoding="utf-8", errors="replace"))
+            except (OSError, json.JSONDecodeError):
+                blob = None
+            measured = measured_from_internal_json(blob)
+        # If the sidecar gave nothing usable, fall back to REPORT.md numbers.
+        if not measured.has_any and report_md_text:
+            measured = measured_from_report_md(report_md_text)
+        # The model AND engine-family are only carried in REPORT.md Meta (the
+        # _internal.json sidecar has neither) — resolve them from there even when
+        # the numbers came from the sidecar.
+        if report_md_text:
+            from_report = measured_from_report_md(report_md_text)
+            if not measured.model:
+                measured.model = from_report.model
+            if not measured.engine:
+                measured.engine = from_report.engine
+
+        # (2) Resolve the curated bar for this model — ENGINE-AWARE so a vLLM-dual
+        # run is not graded against a single-card llama.cpp row just because they
+        # share a model.  Resolve the RUN's engine-family from the rebench
+        # artifacts (REPORT.md Meta Container/vLLM-image first; then the served
+        # slug → registry-variant engine), and pass THAT as the engine arg to
+        # _bench_row_matches.  When the engine genuinely can't be resolved we pick
+        # deterministically (corpus-then-doc-order) BUT flag it + surface the
+        # matched bar's engine/topology so the user sees which bar was used.
+        run_engine = self._resolve_run_engine(measured, variants)
+        rows, _err = await self.benchmarks_explorer()
+        bar: Optional[BenchRow] = None
+        engine_resolved = False
+        if measured.model and rows:
+            mkey = _canon_model_key(measured.model)
+            # Model-matched candidates first (served-name → slug via canon).
+            model_rows = [r for r in rows if _bench_row_matches(r, measured.model, "")]
+            if not model_rows:
+                model_rows = [r for r in rows if _canon_model_key(r.model) == mkey and mkey]
+            # Engine discrimination: among the model-matched rows, keep only those
+            # of the run's engine-family.  (We compare families directly here, NOT
+            # via _bench_row_matches, because that re-checks the served-name model
+            # which differs from the slug — model-matching was already done above.)
+            # If that empties the set (no published bar for this engine) we fall
+            # back to the model-only set and flag that we could not engine-match.
+            if run_engine:
+                eng_rows = [
+                    r for r in model_rows
+                    if _canon_engine_family(r.engine) == run_engine
+                ]
+                if eng_rows:
+                    model_rows = eng_rows
+                    engine_resolved = True
+            # Prefer a corpus row (authoritative TPS) over a BENCHMARKS.md row.
+            model_rows.sort(key=lambda r: 0 if r.source == "corpus" else 1)
+            bar = model_rows[0] if model_rows else None
+
+        vsbar = MeasureVsBar(
+            tag=tag,
+            measured=measured,
+            bar=bar,
+            bar_source=(bar.source if bar else ""),
+            run_engine=run_engine,
+            engine_resolved=engine_resolved,
+        )
+        if bar is not None:
+            # Fix 2 (corpus metric mismatch): a corpus bar's narr_tps is WALL TPS
+            # (bench_row_from_corpus_record maps wall_tps→narr_tps) while the
+            # measured narr_tps is narrative DECODE — subtracting them shows a
+            # fabricated green delta.  The corpus carries a single canonical-short
+            # bench (no narrative/code split), so SUPPRESS the narrative-TPS delta
+            # for a corpus bar and flag it in protocol_caveats; the code/decode
+            # delta is left (both decode).  A BENCHMARKS.md bar carries the proper
+            # narrative/code decode pair → keep its narrative delta.
+            corpus_bar = vsbar.bar_source == "corpus"
+            if (not corpus_bar) and measured.narr_tps is not None and bar.narr_tps is not None:
+                vsbar.narr_tps_delta = measured.narr_tps - bar.narr_tps
+            if measured.code_tps is not None and bar.code_tps is not None:
+                vsbar.code_tps_delta = measured.code_tps - bar.code_tps
+
+        # (3) honest verdict + protocol caveats (FLAG, never fabricate).
+        vsbar.verdict = _measure_verdict(vsbar)
+        vsbar.protocol_caveats = self._measure_protocol_caveats(vsbar)
+        return vsbar
+
+    @staticmethod
+    def _resolve_run_engine(
+        measured: MeasuredNumbers, variants: Optional[list[VariantRow]]
+    ) -> str:
+        """Resolve the RUN's engine-FAMILY so the curated bar is engine-matched.
+
+        Two signals, best-first:
+          1. REPORT.md Meta carried it (``measured.engine`` — the Container prefix
+             / vLLM-image tell, parsed in ``measured_from_report_md``);
+          2. else map the run's served slug/name to a registry variant and take
+             that variant's engine-family.  The served-name (``qwen3.6-27b-…``)
+             rarely equals a slug, so match by canon-model AND require a UNIQUE
+             engine across that model's variants — if a model has variants on
+             multiple engines (e.g. vllm + ik-llama), the served-name alone can't
+             disambiguate, so return "" (the caller picks deterministically and
+             flags that it could not engine-match).
+        Returns a coarse family token via ``_canon_engine_family``, or ""."""
+        if measured.engine:
+            return _canon_engine_family(measured.engine)
+        if not variants or not measured.model:
+            return ""
+        mkey = _canon_model_key(measured.model)
+        fams: set[str] = set()
+        for v in variants:
+            vmodel = getattr(v, "model", "") or ""
+            if mkey and _canon_model_key(vmodel) == mkey:
+                fam = _canon_engine_family(getattr(v, "engine", "") or "")
+                if fam:
+                    fams.add(fam)
+        # Only confident when the model's variants are all one engine-family.
+        return next(iter(fams)) if len(fams) == 1 else ""
+
+    @staticmethod
+    def _measure_protocol_caveats(vsbar: MeasureVsBar) -> list[str]:
+        """List what the cockpit CANNOT verify about the comparison — so the
+        verdict is read as a flag, not a certification.  Honesty over a fabricated
+        "catalog-grade"."""
+        caveats: list[str] = []
+        if vsbar.bar is None:
+            if not vsbar.measured.model:
+                caveats.append(
+                    "Could not resolve this run's MODEL from REPORT.md — no curated bar matched."
+                )
+            else:
+                caveats.append(
+                    f"No curated catalog bar found for model '{vsbar.measured.model}'."
+                )
+            return caveats
+        # We have a bar — surface WHICH bar was used (engine + topology) so the
+        # comparison is legible, then flag every protocol dimension we can't
+        # confirm.
+        src = "the #249 measurement corpus" if vsbar.bar_source == "corpus" else "BENCHMARKS.md"
+        bar_eng = _canon_engine_family(vsbar.bar.engine) or vsbar.bar.engine or "?"
+        bar_topo = vsbar.bar.topology or "?"
+        caveats.append(
+            f"Bar source: {src} — matched row: engine '{bar_eng}', topology "
+            f"'{bar_topo}', published by another run, not this one."
+        )
+        # Whether the run's engine actually drove the bar selection.
+        if not vsbar.engine_resolved:
+            if vsbar.run_engine:
+                caveats.append(
+                    f"No curated bar matched this run's engine '{vsbar.run_engine}' — "
+                    f"compared against an engine '{bar_eng}' bar instead (deterministic "
+                    "fallback; NOT an engine-matched grade)."
+                )
+            else:
+                caveats.append(
+                    "Could NOT resolve this run's ENGINE from REPORT.md — the bar was "
+                    f"picked deterministically (engine '{bar_eng}', topology '{bar_topo}'); "
+                    "it may be a different engine/topology than this run."
+                )
+        # Corpus bar carries a single canonical-short bench (wall-vs-decode, no
+        # narrative/code split) — the narrative-TPS delta is suppressed (Fix 2).
+        if vsbar.bar_source == "corpus":
+            caveats.append(
+                "Bar is a #249 corpus row: a single canonical-short bench (its "
+                "narr_tps is WALL, not decode, and it carries no narrative/code "
+                "split) — the narrative-TPS delta is SUPPRESSED to avoid a "
+                "wall-vs-decode comparison; only the decode delta is shown."
+            )
+        caveats.append(
+            "Cannot verify MATCHED POWER CAP — the bar may have been measured at a "
+            "different W/card (this rig systemd-caps to 230W; bench scripts record "
+            "but do not enforce power)."
+        )
+        caveats.append(
+            "Cannot verify SAME HARNESS / engine pin — a TPS gap can be an image / "
+            "flag delta, not a config regression."
+        )
+        caveats.append(
+            "Cannot verify SAME PROMPTS / sampling — the 8-pack + bench prompts must "
+            "match for an apples-to-apples grade."
+        )
+        if vsbar.measured.source == "REPORT.md":
+            caveats.append(
+                "Measured numbers scraped from REPORT.md (no _internal.json) — less precise."
+            )
+        caveats.append(
+            "This is a FLAG, not a catalog-grade certification — run the full gate "
+            "(③) + measure (rebench) at matched power before promoting."
+        )
+        return caveats
 
     # ── Validate / Evidence: submit-bench (OUTWARD-FACING WRITE — gated) ───────────
 
