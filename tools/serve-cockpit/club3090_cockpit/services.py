@@ -650,14 +650,39 @@ class CockpitData:
             # detect may not populate GPUs if no engine running; query directly.
             try:
                 state.gpus = await self._get_gpu_info()
-            except Exception:
+            except Exception as exc:
                 state.gpus = []
+                # NH4: a pure nvidia-smi failure would otherwise leave the rail
+                # silently GPU-less with no cue.  Record a cue (don't clobber a
+                # docker/detect error that's already more specific).
+                if not state.error:
+                    state.error = (
+                        "nvidia-smi unreachable — GPU read failed "
+                        f"({str(exc).strip()[:120]})"
+                    )
 
         # containers — running stack containers, plus the KNOWN supporting
         # services (services/<name>/docker-compose.yml) that are NOT currently
         # running, rendered as stopped so the user sees the full estate.
-        running = await self.containers(variants=variants)
-        state.containers = await self._merge_known_services(running)
+        #
+        # A2/N2: this is the READ path.  ``containers()`` →
+        # ``_docker_ps_stack_containers`` RAISES on a failed/timed-out docker ps
+        # (fail-closed — load-bearing for the reconcile WRITE gate, which catches
+        # it itself).  Here on the READ side a raise would crash the load_estate
+        # worker and leave the panes blank (or worse, show a calm "no model
+        # serving" false-idle).  CATCH it, record state.error, and return a
+        # PARTIAL snapshot (GPUs/doctor/scenes still rendered) so the UI can show
+        # an honest "docker unreachable" strip instead of crashing or lying.  The
+        # WRITE gate keeps its own raise → writes still fail loudly.
+        try:
+            running = await self.containers(variants=variants)
+            state.containers = await self._merge_known_services(running)
+        except Exception as exc:
+            state.error = (
+                "docker unreachable — daemon running? in the docker group? "
+                f"({str(exc).strip()[:120]})"
+            )
+            state.containers = []
 
         # scenes (gpu-mode --list-modes --json)
         state.scenes = await self.scenes()

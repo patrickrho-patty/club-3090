@@ -51,6 +51,7 @@ from club3090_cockpit.app import (
     ShareBackReportScreen,
     RailStatus,
 )
+from club3090_cockpit.data import ContainerInfo, EstateState
 from club3090_cockpit.services import CockpitData, RunResult
 from club3090_cockpit.__main__ import (
     resolve_surface,
@@ -4303,3 +4304,643 @@ class TestContributeDoor:
             assert app._surface == "consumer"
             assert _mode_switcher_item_count(app) == 2
             assert app.check_action("mode_validate", ()) is False
+
+
+# ===========================================================================
+# UX Batch 2 — the "perception loop": live surfaces + honest failure
+# ===========================================================================
+
+
+def _count_load_estate(monkeypatch):
+    """Wrap CockpitApp.load_estate so a test can count how many times it fired.
+    Returns the counter dict (``{"n": int}``)."""
+    import club3090_cockpit.app as appmod
+
+    calls = {"n": 0}
+    orig = appmod.CockpitApp.load_estate
+
+    def counting(self):
+        calls["n"] += 1
+        return orig(self)
+
+    monkeypatch.setattr(appmod.CockpitApp, "load_estate", counting)
+    return calls
+
+
+class TestBatch2A1RepollAfterEveryWrite:
+    """A1 — every SUCCESSFUL GPU-mutating write re-polls the estate; a REFUSED
+    write does not."""
+
+    @pytest.mark.asyncio
+    async def test_scene_switch_repolls_estate(self, monkeypatch):
+        wr = FakeWriteRunner()
+        app, _, _ = make_app(write_runner=wr)
+        calls = _count_load_estate(monkeypatch)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("2")          # Operate entry → 1 poll
+            await _settle(pilot)
+            before = calls["n"]
+            plan = app._data.scene_switch("dual-qwen")
+            assert plan.kind == "scene"
+            app.dispatch_action(plan)
+            await _settle(pilot)
+            assert calls["n"] > before      # the scene WRITE re-polled
+            assert len(wr.started) == 1     # gate intact — write went through
+
+    @pytest.mark.asyncio
+    async def test_estate_down_repolls_estate(self, monkeypatch):
+        wr = FakeWriteRunner()
+        app, _, _ = make_app(write_runner=wr)
+        calls = _count_load_estate(monkeypatch)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("2")
+            await _settle(pilot)
+            before = calls["n"]
+            plan = app._data.estate_down()
+            assert plan.kind == "estate_down"
+            app.dispatch_action(plan)
+            await _settle(pilot)
+            assert calls["n"] > before
+            assert len(wr.started) == 1
+
+    @pytest.mark.asyncio
+    async def test_container_rm_repolls_estate(self, monkeypatch):
+        wr = FakeWriteRunner()
+        app, _, _ = make_app(write_runner=wr)
+        calls = _count_load_estate(monkeypatch)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("2")
+            await _settle(pilot)
+            before = calls["n"]
+            plan = app._data.container_rm("vllm-qwen36-27b-dual")
+            assert plan.kind == "container_rm"
+            app.dispatch_action(plan)
+            await _settle(pilot)
+            assert calls["n"] > before
+            assert len(wr.started) == 1
+
+    @pytest.mark.asyncio
+    async def test_serve_repolls_estate_deferred(self, monkeypatch):
+        """A serve arms the DEFERRED re-poll: load_estate fires again after the
+        dispatch (the immediate poll inside the pending-serve watcher)."""
+        wr = FakeWriteRunner()
+        app, _, _ = make_app(write_runner=wr)
+        calls = _count_load_estate(monkeypatch)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            before = calls["n"]
+            plan = app._data.serve("vllm/dual")
+            app.dispatch_action(plan)
+            await _settle(pilot)
+            assert calls["n"] > before      # the deferred watcher re-polled
+            assert len(wr.started) == 1
+
+    @pytest.mark.asyncio
+    async def test_refused_write_does_not_repoll(self, monkeypatch):
+        """A REFUSED write (unsafe gate, not forced) must NOT re-poll the estate."""
+        wr = FakeWriteRunner()
+        responses = fake_responses(**{"docker ps": ok(DOCKER_PS_ENGINE)})
+        gpus = [GpuInfo(index=0, mem_used_mib=22000), GpuInfo(index=1, mem_used_mib=1)]
+        app, _, _ = make_app(
+            responses=responses, gpus=gpus, target=ServingTarget(gpus=gpus), write_runner=wr
+        )
+        calls = _count_load_estate(monkeypatch)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("2")
+            await _settle(pilot)
+            before = calls["n"]
+            plan = app._data.serve("vllm/dual")  # not forced → refused
+            app.dispatch_action(plan)
+            await _settle(pilot)
+            assert wr.started == []          # refused at the gate
+            assert calls["n"] == before      # NO re-poll on a refused write
+
+
+class TestBatch2A3PeriodicRefresh:
+    """A3 — the periodic refresh interval polls ONLY in Operate (mode 1), never
+    in Run / Validate."""
+
+    @pytest.mark.asyncio
+    async def test_interval_polls_in_operate(self):
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("2")           # Operate
+            await _settle(pilot)
+            assert app._active_mode == 1
+            calls = {"n": 0}
+            orig = app.load_estate
+            app.load_estate = lambda _o=orig, _c=calls: (_c.__setitem__("n", _c["n"] + 1), _o())[1]
+            app._periodic_estate_refresh()   # fire the gated tick directly
+            assert calls["n"] == 1           # polled in Operate
+
+    @pytest.mark.asyncio
+    async def test_interval_does_not_poll_in_run(self):
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            assert app._active_mode == 0     # Run
+            calls = {"n": 0}
+            orig = app.load_estate
+            app.load_estate = lambda _o=orig, _c=calls: (_c.__setitem__("n", _c["n"] + 1), _o())[1]
+            app._periodic_estate_refresh()
+            assert calls["n"] == 0           # NOT polled in Run
+
+    @pytest.mark.asyncio
+    async def test_interval_does_not_poll_in_validate(self):
+        app, _, _ = make_app(surface="producer")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("3")           # Validate (producer lane)
+            await _settle(pilot)
+            assert app._active_mode == 2
+            calls = {"n": 0}
+            orig = app.load_estate
+            app.load_estate = lambda _o=orig, _c=calls: (_c.__setitem__("n", _c["n"] + 1), _o())[1]
+            app._periodic_estate_refresh()
+            assert calls["n"] == 0           # NOT polled in Validate
+
+    @pytest.mark.asyncio
+    async def test_rail_shows_as_of_stamp(self):
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("2")
+            await _settle(pilot)
+            rail = str(app.query_one("#rail-status", RailStatus).render())
+            assert "as of" in rail           # freshness stamp rendered
+
+
+class TestBatch2A2DockerFailureRenders:
+    """A2 + N2 — a docker / nvidia-smi failure on the READ path sets state.error
+    and renders (no crash, not false-idle)."""
+
+    @pytest.mark.asyncio
+    async def test_docker_read_failure_sets_state_error(self):
+        """estate_state catches the docker ps raise on the READ path → partial
+        EstateState with .error set (does NOT crash the worker)."""
+        responses = fake_responses(
+            **{"docker ps": RunResult(returncode=1, stdout="", stderr="docker daemon not running")}
+        )
+        app, _, _ = make_app(responses=responses)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("2")
+            await _settle(pilot)
+            state = await app._data.estate_state(variants=app._variants or None)
+            assert state.error                       # error recorded
+            assert "docker unreachable" in state.error
+            assert state.containers == []            # partial — no containers
+
+    @pytest.mark.asyncio
+    async def test_docker_failure_renders_red_strip_not_false_idle(self):
+        responses = fake_responses(
+            **{"docker ps": RunResult(returncode=1, stdout="", stderr="daemon down")}
+        )
+        app, _, _ = make_app(responses=responses)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("2")
+            await _settle(pilot)
+            # The orch pane shows the distinct docker-unreachable strip.
+            strip = app.query_one("#estate-error-strip", Static)
+            assert "visible" in strip.classes
+            assert "docker unreachable" in str(strip.render())
+            # The Containers table says "docker unreachable", NOT the calm idle.
+            tbl = app.query_one("#containers-table", DataTable)
+            blob = " ".join(str(tbl.get_row_at(r)) for r in range(tbl.row_count))
+            assert "docker unreachable" in blob
+            assert "no stack containers" not in blob
+            # The rail is honest too.
+            rail = str(app.query_one("#rail-status", RailStatus).render())
+            assert "docker unreachable" in rail
+
+    @pytest.mark.asyncio
+    async def test_no_gpus_renders_nvidia_smi_message(self):
+        """When nvidia-smi returns nothing, the GPU card says so — distinct from
+        the calm idle, never a blank/'not present' that hides the failure."""
+        app, _, _ = make_app(
+            gpus=[], target=ServingTarget(gpus=[]),
+        )
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("2")
+            await _settle(pilot)
+            bar = str(app.query_one("#gpu0-bar", Static).render())
+            assert "nvidia-smi returned nothing" in bar
+
+    @pytest.mark.asyncio
+    async def test_healthy_estate_has_no_error_strip(self):
+        """No false positives: a healthy estate keeps the error strip hidden."""
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("2")
+            await _settle(pilot)
+            strip = app.query_one("#estate-error-strip", Static)
+            assert "visible" not in strip.classes
+
+
+class TestBatch2A10ServeLiveTerminalState:
+    """A10 — the serve LivePane resolves to ✓ serving / still booting / ✗ via the
+    deferred re-poll, not an inert 'boot log streams here'."""
+
+    @pytest.mark.asyncio
+    async def test_serve_live_shows_watching_not_inert_placeholder(self):
+        """On dispatch the pane says it's WATCHING (honest) — never the old inert
+        '(boot log streams here)'."""
+        wr = FakeWriteRunner()
+        app, _, _ = make_app(write_runner=wr)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            live = app.query_one("#serve-live")
+            emitted: list[str] = []
+            orig = live.append_line
+            live.append_line = lambda line, _o=orig, _e=emitted: (_e.append(line), _o(line))[1]
+            plan = app._data.serve("vllm/dual")
+            app.dispatch_action(plan)
+            await _settle(pilot)
+            joined = " ".join(emitted)
+            assert "watching for it to come up" in joined
+            assert "boot log streams here" not in joined
+
+    @pytest.mark.asyncio
+    async def test_serve_live_shows_serving_when_slug_matches(self):
+        """When the estate's matched_slug becomes the served slug, the pane stamps
+        '✓ serving <model> · :<port>'."""
+        wr = FakeWriteRunner()
+        tgt = ServingTarget(
+            url="http://localhost:8010", model="qwen3.6-27b", host_port=8010,
+            gpus=[GpuInfo(index=0, mem_used_mib=1), GpuInfo(index=1, mem_used_mib=1)],
+        )
+        app, _, _ = make_app(target=tgt, write_runner=wr)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            live = app.query_one("#serve-live")
+            emitted: list[str] = []
+            orig = live.append_line
+            live.append_line = lambda line, _o=orig, _e=emitted: (_e.append(line), _o(line))[1]
+            plan = app._data.serve("vllm/dual")
+            app.dispatch_action(plan)
+            await _settle(pilot)
+            joined = " ".join(emitted)
+            assert "serving" in joined
+            assert "qwen3.6-27b" in joined
+            assert ":8010" in joined
+            # The pending-serve watcher resolved + stopped.
+            assert app._pending_serve_slug == ""
+
+    @pytest.mark.asyncio
+    async def test_serve_live_still_booting_on_timeout(self):
+        """If the slug never matches, the deferred watcher times out → an honest
+        'still booting — press r to refresh' (driven directly, no real wait)."""
+        wr = FakeWriteRunner()
+        # A target that does NOT match vllm/dual (no port 8010) → never resolves.
+        tgt = ServingTarget(gpus=[GpuInfo(index=0, mem_used_mib=1), GpuInfo(index=1, mem_used_mib=1)])
+        app, _, _ = make_app(target=tgt, write_runner=wr)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            live = app.query_one("#serve-live")
+            emitted: list[str] = []
+            orig = live.append_line
+            live.append_line = lambda line, _o=orig, _e=emitted: (_e.append(line), _o(line))[1]
+            plan = app._data.serve("vllm/dual")
+            app.dispatch_action(plan)
+            await _settle(pilot)
+            assert app._pending_serve_slug == "vllm/dual"   # still pending
+            # Drive the watcher past its attempt budget directly (no 30s wait).
+            app._pending_serve_attempts = app._SERVE_REPOLL_MAX_ATTEMPTS
+            app._poll_pending_serve()
+            await _settle(pilot)
+            assert any("still booting" in ln for ln in emitted)
+            assert app._pending_serve_slug == ""            # watcher stopped
+
+    @pytest.mark.asyncio
+    async def test_serve_failed_stamps_cross_and_captures(self):
+        """serve_failed stamps the ✗ terminal line + captures the failure context
+        for [!]."""
+        wr = FakeWriteRunner()
+        app, _, _ = make_app(write_runner=wr)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            live = app.query_one("#serve-live")
+            emitted: list[str] = []
+            orig = live.append_line
+            live.append_line = lambda line, _o=orig, _e=emitted: (_e.append(line), _o(line))[1]
+            plan = app._data.serve("vllm/dual")
+            app._staged_entry = None
+            app.serve_failed(plan, "boot crashed: CUDA OOM")
+            await _settle(pilot)
+            assert any("did not come up" in ln for ln in emitted)
+            assert any("report" in ln for ln in emitted)
+            assert app._problem_slug == "vllm/dual"
+            assert app._pending_serve_slug == ""
+
+
+class TestBatch2N3CatalogServingMarker:
+    """N3 — the Run catalog marks the live-serving slug + clears when none."""
+
+    @pytest.mark.asyncio
+    async def test_catalog_marks_serving_slug(self):
+        # A target on port 8010 → matched_slug vllm/dual.
+        tgt = ServingTarget(
+            url="http://localhost:8010", model="qwen3.6-27b", host_port=8010,
+            gpus=[GpuInfo(index=0, mem_used_mib=1), GpuInfo(index=1, mem_used_mib=1)],
+        )
+        app, _, _ = make_app(target=tgt)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)            # catalog loads
+            await pilot.press("2")          # Operate poll → sets serving slug
+            await _settle(pilot)
+            pane = app.query_one("#catalog-pane", CatalogPane)
+            assert pane._serving_slug == "vllm/dual"
+            tbl = app.query_one("#catalog-table", DataTable)
+            blob = " ".join(str(tbl.get_row_at(r)) for r in range(tbl.row_count))
+            assert "serving" in blob        # the ● serving badge
+
+    @pytest.mark.asyncio
+    async def test_catalog_marker_clears_when_nothing_serving(self):
+        app, _, _ = make_app(target=ServingTarget())   # nothing matches
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            pane = app.query_one("#catalog-pane", CatalogPane)
+            # Force-set a stale marker, then a poll with no match must clear it.
+            pane.set_serving_slug("vllm/dual")
+            assert pane._serving_slug == "vllm/dual"
+            await pilot.press("2")
+            await _settle(pilot)
+            assert pane._serving_slug == ""
+
+
+def _hook_serve_live(app):
+    """Tap the serve LivePane's append_line, returning the emitted-lines list."""
+    live = app.query_one("#serve-live")
+    emitted: list[str] = []
+    orig = live.append_line
+    live.append_line = lambda line, _o=orig, _e=emitted: (_e.append(line), _o(line))[1]
+    return emitted
+
+
+class TestBatch2MustFix1GeneratedServe:
+    """MUST-FIX 1 — a generated/BYO serve (`docker compose -f <path> up -d`) has
+    NO registry slug.  It must NOT get a bogus `-d` pending slug, must NOT false-✓
+    a stale staged catalog slug, and reaches an honest terminal state when its
+    container appears."""
+
+    @pytest.mark.asyncio
+    async def test_generated_serve_does_not_yield_dash_d_slug(self):
+        """A generated serve plan never sets `_pending_serve_slug == '-d'`."""
+        wr = FakeWriteRunner()
+        app, _, _ = make_app(write_runner=wr)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            plan = app._data.serve_generated("/tmp/c3-genc-x.yml")
+            # The argv really ends in `-d` — proving the old bug would have fired.
+            assert plan.cmd[-1] == "-d"
+            assert app._serve_slug_for(plan) == ""        # NOT "-d", NOT a slug
+            app.dispatch_action(plan)
+            await _settle(pilot)
+            assert app._pending_serve_slug == ""          # no bogus slug
+            assert app._pending_serve_slug != "-d"
+            assert app._pending_serve_generated is True   # generated lane armed
+
+    @pytest.mark.asyncio
+    async def test_generated_serve_ignores_stale_staged_catalog_slug(self):
+        """A stale `_staged_entry` from a PRIOR catalog serve must NOT drive the
+        generated serve's slug (which could false-✓ a wrong model)."""
+        wr = FakeWriteRunner()
+
+        class _Stale:
+            slug = "vllm/dual"
+
+        app, _, _ = make_app(write_runner=wr)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            app._staged_entry = _Stale()
+            plan = app._data.serve_generated("/tmp/c3-genc-y.yml")
+            # Even with a stale staged entry, the generated lane yields no slug.
+            assert app._serve_slug_for(plan) == ""
+            # The app's serve-generated entry point clears the stale staged entry.
+            app._serve_generated_compose("/tmp/c3-genc-y.yml")
+            await _settle(pilot)
+            assert app._staged_entry is None
+
+    @pytest.mark.asyncio
+    async def test_generated_serve_no_false_serving_when_slug_estate_matches(self):
+        """Even if the estate registry-matches the stale catalog slug, the
+        generated serve must NOT stamp '✓ serving <that model>' off it — the
+        generated lane resolves ONLY from a new container appearing."""
+        wr = FakeWriteRunner()
+        app, _, _ = make_app(write_runner=wr)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            emitted = _hook_serve_live(app)
+            # Arm the generated lane with a baseline that ALREADY contains the
+            # only container, and a state that registry-matches "vllm/dual".
+            app._pending_serve_generated = True
+            app._pending_serve_slug = ""
+            app._pending_serve_baseline = {"vllm-qwen36-27b-dual"}
+            tgt = ServingTarget(model="qwen3.6-27b", host_port=8010)
+            state = EstateState(
+                target=tgt,
+                matched_slug="vllm/dual",     # estate matches the stale slug…
+                containers=[ContainerInfo(name="vllm-qwen36-27b-dual", kind="engine",
+                                          host_port=8010, slug="vllm/dual")],
+            )
+            app._resolve_pending_serve(state)
+            await _settle(pilot)
+            # NO terminal stamp — the only container was already in the baseline.
+            assert not any("serving" in ln or "launched" in ln for ln in emitted)
+            assert app._pending_serve_generated is True   # still pending
+
+    @pytest.mark.asyncio
+    async def test_generated_serve_reaches_terminal_when_container_appears(self):
+        """When a NEW container (not in the launch baseline) appears, the generated
+        serve stamps '✓ launched …' and stops the watcher."""
+        wr = FakeWriteRunner()
+        app, _, _ = make_app(write_runner=wr)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            emitted = _hook_serve_live(app)
+            app._pending_serve_generated = True
+            app._pending_serve_slug = ""
+            app._pending_serve_baseline = set()           # nothing before launch
+            tgt = ServingTarget(model="", host_port=0)
+            state = EstateState(
+                target=tgt,
+                matched_slug="",                          # BYO — no registry match
+                containers=[ContainerInfo(name="c3-byo-generated", kind="engine",
+                                          host_port=9099)],
+            )
+            app._resolve_pending_serve(state)
+            await _settle(pilot)
+            joined = " ".join(emitted)
+            assert "launched" in joined
+            assert "c3-byo-generated" in joined
+            assert ":9099" in joined
+            assert app._pending_serve_generated is False  # watcher resolved
+            assert app._pending_serve_slug == ""
+
+    @pytest.mark.asyncio
+    async def test_generated_serve_times_out_honestly(self):
+        """If no new container ever appears, the generated watcher times out to an
+        honest 'still booting' line (not a hang)."""
+        wr = FakeWriteRunner()
+        app, _, _ = make_app(write_runner=wr)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            emitted = _hook_serve_live(app)
+            app._pending_serve_generated = True
+            app._pending_serve_slug = ""
+            app._pending_serve_baseline = set()
+            app._pending_serve_attempts = app._SERVE_REPOLL_MAX_ATTEMPTS
+            app._poll_pending_serve()
+            await _settle(pilot)
+            assert any("still booting" in ln for ln in emitted)
+            assert app._pending_serve_generated is False
+
+
+class TestBatch2MustFix2RailAsOf:
+    """MUST-FIX 2 — the rail as-of stamp reflects REAL elapsed time, re-rendered
+    from cached state on a lightweight tick (not stuck on 'just now')."""
+
+    @pytest.mark.asyncio
+    async def test_as_of_shows_seconds_when_clock_advances(self):
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("2")
+            await _settle(pilot)
+            assert app._last_estate_state is not None      # cached for re-render
+            # Pretend the last poll was 40s ago, then run the lightweight re-stamp.
+            import time as _time
+            app._last_estate_poll_mono = _time.monotonic() - 40
+            app._refresh_rail_as_of()
+            rail = str(app.query_one("#rail-status", RailStatus).render())
+            assert "ago" in rail
+            assert "just now" not in rail
+
+    @pytest.mark.asyncio
+    async def test_as_of_shows_minutes_when_clock_advances_far(self):
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("2")
+            await _settle(pilot)
+            import time as _time
+            app._last_estate_poll_mono = _time.monotonic() - 200
+            app._refresh_rail_as_of()
+            rail = str(app.query_one("#rail-status", RailStatus).render())
+            assert "m ago" in rail
+
+    @pytest.mark.asyncio
+    async def test_as_of_refresh_is_gated_to_operate(self):
+        """The as-of re-stamp is a pure cached read but must stay Operate-gated
+        (it's a no-op outside Operate)."""
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            assert app._active_mode == 0                   # Run
+            # No cached state + not Operate → pure no-op, never raises.
+            app._refresh_rail_as_of()
+
+
+class TestBatch2MustFix3ErrorLabel:
+    """MUST-FIX 3 — a detect-failure (docker fine) must NOT be mislabeled
+    'docker unreachable' on the rail / Containers."""
+
+    @pytest.mark.asyncio
+    async def test_detect_failure_not_called_docker_unreachable(self):
+        """Force the services.py detect-failure path → state.error is
+        'detect failed: …' and the rail/Containers render THAT, not 'docker
+        unreachable'."""
+        async def _boom():
+            raise RuntimeError("endpoint probe blew up")
+
+        app, _, _ = make_app()
+        # Swap the detect seam to raise → estate_state sets 'detect failed: …'.
+        app._data._detect_endpoint = _boom
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("2")
+            await _settle(pilot)
+            state = await app._data.estate_state(variants=app._variants or None)
+            assert state.error.startswith("detect failed:")
+            assert "docker unreachable" not in state.error
+            # Render the rail + Containers off THIS state and assert the honest text.
+            app.query_one("#rail-status", RailStatus).update_from_state(state, as_of="")
+            rail = str(app.query_one("#rail-status", RailStatus).render())
+            assert "detect failed" in rail
+            assert "docker unreachable" not in rail
+            app.query_one("#operate-containers-pane", OperateContainersPane).populate(
+                state.containers, state.error
+            )
+            tbl = app.query_one("#containers-table", DataTable)
+            blob = " ".join(str(tbl.get_row_at(r)) for r in range(tbl.row_count))
+            assert "detect failed" in blob
+            assert "docker unreachable" not in blob
+
+    @pytest.mark.asyncio
+    async def test_docker_failure_still_labeled_docker(self):
+        """Regression guard: a REAL docker failure still reads 'docker
+        unreachable' (the headline = the part before ' — ')."""
+        responses = fake_responses(
+            **{"docker ps": RunResult(returncode=1, stdout="", stderr="daemon down")}
+        )
+        app, _, _ = make_app(responses=responses)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("2")
+            await _settle(pilot)
+            rail = str(app.query_one("#rail-status", RailStatus).render())
+            assert "docker unreachable" in rail
+
+
+class TestBatch2NH4NvidiaSmiError:
+    """NH4 — a pure nvidia-smi failure sets state.error (no silent GPU-less rail)."""
+
+    @pytest.mark.asyncio
+    async def test_nvidia_smi_failure_sets_state_error(self):
+        async def _no_gpus():
+            raise RuntimeError("nvidia-smi: command not found")
+
+        # Target with no gpus so estate_state falls through to _get_gpu_info.
+        app, _, _ = make_app(gpus=[], target=ServingTarget(gpus=[]))
+        app._data._get_gpu_info = _no_gpus
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            state = await app._data.estate_state(variants=app._variants or None)
+            assert state.error                              # cue recorded
+            assert "nvidia-smi" in state.error
+            assert state.gpus == []
+
+    @pytest.mark.asyncio
+    async def test_nvidia_smi_error_does_not_clobber_docker_error(self):
+        """A docker error is more specific — nvidia-smi failure must not overwrite
+        it (the `if not state.error` guard)."""
+        async def _no_gpus():
+            raise RuntimeError("nvidia-smi gone")
+
+        responses = fake_responses(
+            **{"docker ps": RunResult(returncode=1, stdout="", stderr="daemon down")}
+        )
+        app, _, _ = make_app(responses=responses, gpus=[], target=ServingTarget(gpus=[]))
+        app._data._get_gpu_info = _no_gpus
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            state = await app._data.estate_state(variants=app._variants or None)
+            assert "docker unreachable" in state.error      # docker wins
+            assert "nvidia-smi" not in state.error
+
+
+class TestBatch2NH5WatcherArmFailure:
+    """NH5 — if set_interval raises, the pending-serve state is cleared and the
+    LivePane gets an honest 'could not arm watcher' line (no hang)."""
+
+    @pytest.mark.asyncio
+    async def test_watcher_arm_failure_clears_pending_and_stamps(self):
+        wr = FakeWriteRunner()
+        app, _, _ = make_app(write_runner=wr)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            emitted = _hook_serve_live(app)
+            # Make set_interval raise just for the watcher-arm call.
+            def _boom(*a, **k):
+                raise RuntimeError("timer subsystem down")
+            app.set_interval = _boom
+            plan = app._data.serve("vllm/dual")
+            app._start_pending_serve_watch(plan)
+            await _settle(pilot)
+            assert app._pending_serve_slug == ""            # cleared, no hang
+            assert app._pending_serve_generated is False
+            assert app._pending_serve_timer is None
+            assert any("could not arm watcher" in ln for ln in emitted)

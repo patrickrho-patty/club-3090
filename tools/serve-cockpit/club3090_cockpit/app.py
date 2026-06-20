@@ -97,6 +97,17 @@ _STATUS_GLYPH: dict[str, str] = {
 }
 
 
+def _error_headline(err: str) -> str:
+    """MUST-FIX 3: condense an estate READ error to a short headline for the rail
+    / Containers strip.  ``state.error`` has multiple producers — a docker failure
+    ("docker unreachable — daemon running? …"), a detect failure ("detect failed:
+    …", docker fine), and an nvidia-smi failure — so a HARDCODED "docker
+    unreachable" mislabels the others.  Render the ACTUAL text, truncated to the
+    part before " — " (the OrchPane error strip renders the full text)."""
+    head = (err or "").strip().split(" — ", 1)[0].strip()
+    return head[:80] if head else "read failed"
+
+
 def _status_glyph(status: str) -> str:
     return _STATUS_GLYPH.get(status.lower(), status)
 
@@ -283,6 +294,9 @@ class CatalogPane(Container):
         # Full enriched catalog, and the current filter substring.
         self._entries: list[CatalogEntry] = []
         self._filter: str = ""
+        # N3: the slug currently live-serving (from the estate's matched_slug),
+        # so its Run-catalog row carries a "● serving" badge.  "" → none serving.
+        self._serving_slug: str = ""
 
     # ── data ────────────────────────────────────────────────────────────────────
 
@@ -307,6 +321,7 @@ class CatalogPane(Container):
         table.clear()
 
         rows = self._filtered_entries()
+        serving = (self._serving_slug or "").strip()
         for e in rows:
             # source provenance — flag a coarse markdown scrape so a measurement
             # from BENCHMARKS.md is never mistaken for a structured record.
@@ -314,8 +329,13 @@ class CatalogPane(Container):
             tps = e.measurement.tps_label
             if meas_src == "benchmarks.md" and tps != "—":
                 tps = f"{tps}*"
+            # N3: mark the live-serving row so the running model is visible at a
+            # glance in Run.  Driven by the estate's matched_slug.
+            slug_cell = e.slug
+            if serving and e.slug == serving:
+                slug_cell = f"[green]●[/green] {e.slug} [green]serving[/green]"
             table.add_row(
-                e.slug,
+                slug_cell,
                 e.engine,
                 e.fit.glyph,
                 e.ctx_label or "—",
@@ -344,6 +364,19 @@ class CatalogPane(Container):
                 table.move_cursor(row=max(0, min(saved, table.row_count - 1)))
             except Exception:
                 pass
+
+    def set_serving_slug(self, slug: str) -> None:
+        """N3: set (or clear, with "") the live-serving slug + re-render so the
+        Run-catalog row badge stays fresh.  Cheap: only re-renders when the slug
+        actually changed (so the periodic Operate poll doesn't churn the Run
+        table on every tick).  Cursor + filter preserved via refresh_enriched."""
+        new = (slug or "").strip()
+        if new == (self._serving_slug or "").strip():
+            return
+        self._serving_slug = new
+        # Re-render only if rows are present (mount-order safe).
+        if self._entries:
+            self.refresh_enriched()
 
     def _has_md_scrape(self) -> bool:
         return any(e.measurement.source == "benchmarks.md" for e in self._entries)
@@ -817,6 +850,16 @@ class OperateOrchPane(Container):
         text-style: bold;
         color: $accent;
     }
+    OperateOrchPane #estate-error-strip {
+        display: none;
+        padding: 0 1;
+        margin: 0 1 0 1;
+        color: $error;
+        text-style: bold;
+    }
+    OperateOrchPane #estate-error-strip.visible {
+        display: block;
+    }
     OperateOrchPane #serving-line {
         padding: 0 1;
         margin: 0 1 0 1;
@@ -864,6 +907,11 @@ class OperateOrchPane(Container):
 
     def compose(self) -> ComposeResult:
         with ScrollableContainer(id="orch-scroll"):
+            # A2/N2: a one-line red strip that only shows when the estate READ
+            # hit a docker / nvidia-smi failure (state.error).  DISTINCT from the
+            # calm "○ no model serving" idle line below — a read failure is not an
+            # idle rig.  Hidden (display:none) until populate() finds an error.
+            yield Static("", id="estate-error-strip")
             with Container(classes="gpu-card", id="gpu0-card"):
                 yield Label("GPU0", classes="gpu-card-title")
                 yield Static("[dim]querying nvidia-smi…[/dim]", id="gpu0-bar")
@@ -905,11 +953,28 @@ class OperateOrchPane(Container):
 
     def populate(self, state: EstateState) -> None:
         self._last_state = state
+        self._populate_error(state)
         self._populate_gpus(state)
         self._populate_serving(state)
         self._populate_doctor(state)
         self._populate_scenes(state.scenes)
         self._populate_services(state)
+
+    def _populate_error(self, state: EstateState) -> None:
+        """A2/N2: render the estate READ error (docker / nvidia-smi failure) as a
+        distinct red strip — NOT the calm idle line.  Hidden when there's no
+        error so a healthy rig shows no scary strip."""
+        try:
+            strip = self.query_one("#estate-error-strip", Static)
+        except Exception:
+            return
+        err = (getattr(state, "error", "") or "").strip()
+        if err:
+            strip.update(f"[red]⚠ {err}[/red]")
+            strip.add_class("visible")
+        else:
+            strip.update("")
+            strip.remove_class("visible")
 
     def _populate_serving(self, state: EstateState) -> None:
         """#1 (Batch 1): surface WHAT'S SERVING — the captured serving target
@@ -970,11 +1035,20 @@ class OperateOrchPane(Container):
                 pass
 
     def _populate_gpus(self, state: EstateState) -> None:
+        # N2: when nvidia-smi returned NOTHING at all (no cards in the snapshot),
+        # say so honestly on the first card rather than a calm "not present" per
+        # slot — a totally-empty GPU read usually means nvidia-smi failed, not a
+        # GPU-less rig.  A per-index gap (one card present, the other not) still
+        # uses the calm "not present".
+        no_gpus_at_all = not state.gpus
         for i, bar_id, title_id in ((0, "#gpu0-bar", "#gpu0-card"), (1, "#gpu1-bar", "#gpu1-card")):
             bar = self.query_one(bar_id, Static)
             gpu = next((g for g in state.gpus if getattr(g, "index", -1) == i), None)
             if gpu is None:
-                bar.update("[dim]not present[/dim]")
+                if no_gpus_at_all and i == 0:
+                    bar.update("[red]no GPUs — nvidia-smi returned nothing[/red]")
+                else:
+                    bar.update("[dim]not present[/dim]")
                 continue
             used = getattr(gpu, "mem_used_mib", 0)
             total = getattr(gpu, "mem_total_mib", 0) or 1
@@ -1118,12 +1192,20 @@ class OperateContainersPane(Container):
         t.add_columns("Name", "Kind", "Engine", "Port", "Slug")
         self._containers: list[ContainerInfo] = []
 
-    def populate(self, containers: list[ContainerInfo]) -> None:
+    def populate(self, containers: list[ContainerInfo], error: str = "") -> None:
         self._containers = list(containers)
         t = self.query_one("#containers-table", DataTable)
         t.clear()
         if not containers:
-            t.add_row("[dim]no stack containers[/dim]", "—", "—", "—", "—")
+            # N2: a READ failure must NOT read as a calm empty estate.
+            err = (error or "").strip()
+            if err:
+                # MUST-FIX 3: surface the ACTUAL error headline, not a hardcoded
+                # "docker unreachable" — a detect failure (docker fine) or an
+                # nvidia-smi failure would otherwise be mislabeled.
+                t.add_row(f"[red]{_error_headline(err)}[/red]", "—", "—", "—", "—")
+            else:
+                t.add_row("[dim]no stack containers[/dim]", "—", "—", "—", "—")
             return
         for c in containers:
             stopped = getattr(c, "status", "running") == "stopped"
@@ -2358,8 +2440,20 @@ class RailStatus(Static):
     def __init__(self, **kwargs):
         super().__init__(self.PLACEHOLDER, **kwargs)
 
-    def update_from_state(self, state: EstateState) -> None:
+    def update_from_state(self, state: EstateState, *, as_of: str = "") -> None:
         lines: list[str] = ["[bold]Estate[/bold]", ""]
+        # A2/N2: a READ error (docker / nvidia-smi failure) shows as a distinct
+        # red line at the top of the rail — the always-visible card must not
+        # quietly read as a healthy idle rig when the read actually failed.
+        err = (getattr(state, "error", "") or "").strip()
+        if err:
+            # MUST-FIX 3: render the ACTUAL error text (truncated to the part
+            # before " — "), NOT a hardcoded "docker unreachable".  state.error
+            # has two producers — a docker failure ("docker unreachable — …") AND
+            # a detect failure ("detect failed: …", docker fine) AND an nvidia-smi
+            # failure — so the literal "docker unreachable" mislabels the others.
+            lines.append(f"[red]⚠ {_error_headline(err)}[/red]")
+            lines.append("")
         for i in (0, 1):
             gpu = next((g for g in state.gpus if getattr(g, "index", -1) == i), None)
             if gpu is None:
@@ -2382,6 +2476,11 @@ class RailStatus(Static):
             lines.append(f"{glyph} {dr.summary}")
         else:
             lines.append("[red]○[/red] not reachable")
+        # A3: stamp the freshness so the always-visible card is honest between
+        # the periodic polls ("as of <Nm/Ns ago>").
+        if as_of:
+            lines.append("")
+            lines.append(f"[dim]as of {as_of}[/dim]")
         self.update("\n".join(lines))
 
 
@@ -2824,6 +2923,38 @@ class CockpitApp(App):
         # a paste-ready issue with the readily-available context.
         self._problem_slug: str = ""
         self._problem_boot_log: str = ""
+        # A3: monotonic timestamp of the last completed estate poll (for the
+        # rail "as of <ago>" freshness stamp).  None until the first poll.
+        self._last_estate_poll_mono: Optional[float] = None
+        # A3: the periodic-refresh interval handle (created once on mount, gated
+        # at fire time to Operate + the main screen so it never churns elsewhere).
+        self._estate_interval = None
+        # A1/A10: the serve-pending watcher.  When a serve is dispatched the boot
+        # is ASYNC, so we DEFER the re-poll: poll the estate every few seconds
+        # until the booted slug matches (✓) or we run out of attempts (still
+        # booting).  These fields drive _resolve_pending_serve.
+        self._pending_serve_slug: str = ""        # slug we're waiting to come up
+        self._pending_serve_model: str = ""       # human label for the ✓ line
+        self._pending_serve_port: int = 0
+        self._pending_serve_timer = None          # the deferred re-poll timer
+        self._pending_serve_attempts: int = 0     # polls done so far
+        # MUST-FIX 1: a GENERATED/BYO serve (`docker compose -f <path> up -d`) has
+        # NO registry slug — `cmd[-1]` is `-d`, not a slug.  So instead of a
+        # slug-match we resolve its terminal state from a NEW container appearing
+        # in the estate.  These two fields drive that container-appearance path
+        # (set only for the generated lane; empty/false for a registry serve).
+        self._pending_serve_generated: bool = False   # generated/BYO serve?
+        # Container names present BEFORE the generated launch.  ``None`` = not yet
+        # seeded → the FIRST post-launch poll establishes the true baseline (so a
+        # stale/empty cached snapshot can't false-✓ a pre-existing container).
+        self._pending_serve_baseline: Optional[set[str]] = None
+        # A3: the last estate snapshot, cached so the periodic as-of re-render can
+        # re-stamp the rail's freshness WITHOUT a fresh subprocess poll.
+        self._last_estate_state: Optional[EstateState] = None
+
+    # A1/A10 deferred-serve re-poll knobs.
+    _SERVE_REPOLL_SECS = 3.0
+    _SERVE_REPOLL_MAX_ATTEMPTS = 10               # ~30s before "still booting"
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -2881,6 +3012,76 @@ class CockpitApp(App):
 
     def on_mount(self) -> None:
         self.load_catalog()
+        # A3: ONE periodic refresh interval, created once.  It is GATED at fire
+        # time (_periodic_estate_refresh) to Operate (_active_mode == 1) AND the
+        # main screen (no modal) — so it never churns subprocesses in Run /
+        # Validate or behind a confirm modal.  set_interval is the only timer.
+        self._estate_interval = self.set_interval(
+            4.0, self._periodic_estate_refresh, pause=False
+        )
+        # A3: a lightweight as-of re-stamp timer.  The full poll (above) resets
+        # the freshness clock every tick → the rail would always read "just now".
+        # This SEPARATE, more-frequent timer re-renders ONLY the rail's as-of line
+        # from the CACHED last EstateState (a pure read — NO subprocess), so the
+        # "Ns/Nm ago" branches actually surface between/behind polls (e.g. when a
+        # poll is skipped behind a modal).  Same Operate-only gating as the poll.
+        self._asof_interval = self.set_interval(
+            1.0, self._refresh_rail_as_of, pause=False
+        )
+
+    def _refresh_rail_as_of(self) -> None:
+        """A3: re-stamp the rail's freshness line from CACHED state — no poll.
+
+        Gated to Operate + the main screen (same as the periodic poll) and a PURE
+        read of self._last_estate_state, so it never spawns a subprocess and never
+        runs outside the live panel.  This is what makes _estate_as_of()'s
+        "Ns/Nm ago" branches reachable (the full poll resets the clock every tick,
+        so on its own the rail would read 'just now' forever)."""
+        if self._active_mode != 1:
+            return
+        try:
+            if len(self.screen_stack) > 1:
+                return
+        except Exception:
+            pass
+        state = self._last_estate_state
+        if state is None:
+            return
+        try:
+            self.query_one("#rail-status", RailStatus).update_from_state(
+                state, as_of=self._estate_as_of()
+            )
+        except Exception:
+            pass
+
+    def _periodic_estate_refresh(self) -> None:
+        """A3: the gated periodic poll.  Fires ONLY while the user is in Operate
+        and looking at the main screen — otherwise it's a no-op (no read churn
+        when the live panel isn't shown)."""
+        if self._active_mode != 1:
+            return
+        # Don't poll behind a modal (confirm gate / help / explain) — the live
+        # panel isn't visible and a re-poll could race the gate's own reads.
+        try:
+            if len(self.screen_stack) > 1:
+                return
+        except Exception:
+            pass
+        self.load_estate()
+
+    def _estate_as_of(self) -> str:
+        """A3: a human "N s/m ago" string for the last estate poll, or "just now".
+        Empty when no poll has completed yet (rail shows its placeholder)."""
+        import time as _time
+        t = getattr(self, "_last_estate_poll_mono", None)
+        if t is None:
+            return "just now"
+        delta = max(0.0, _time.monotonic() - t)
+        if delta < 5:
+            return "just now"
+        if delta < 90:
+            return f"{int(delta)}s ago"
+        return f"{int(delta // 60)}m ago"
 
     # ── Catalog loading ──────────────────────────────────────────────────────────────
 
@@ -2919,6 +3120,13 @@ class CockpitApp(App):
         profile-triage and the validation launches point at the running model,
         and reads the power-cap status (a safe READ) for the orch pane."""
         state = await self._data.estate_state(variants=self._variants or None)
+        # A3: stamp the poll time so the rail can render "as of <ago>".
+        import time as _time
+        self._last_estate_poll_mono = _time.monotonic()
+        # A3: cache the snapshot so the periodic as-of re-render can re-stamp the
+        # rail's freshness from CACHED state (a pure read, no subprocess).  Also
+        # feeds the generated-serve container-appearance baseline (MUST-FIX 1).
+        self._last_estate_state = state
         # Capture the live target for profile-triage / validation launches.
         self._target_slug = state.matched_slug or ""
         tgt = state.target
@@ -2933,7 +3141,7 @@ class CockpitApp(App):
             pass
         try:
             self.query_one("#operate-containers-pane", OperateContainersPane).populate(
-                state.containers
+                state.containers, getattr(state, "error", "") or ""
             )
             # #3/NH1: a (re)populate clears the table and resets the cursor to
             # row 0, firing a PROGRAMMATIC RowHighlighted.  That echo only REACHES
@@ -2964,9 +3172,25 @@ class CockpitApp(App):
         except Exception:
             pass
         try:
-            self.query_one("#rail-status", RailStatus).update_from_state(state)
+            self.query_one("#rail-status", RailStatus).update_from_state(
+                state, as_of=self._estate_as_of()
+            )
         except Exception:
             pass
+        # N3: tell the Run Catalog which slug is live-serving so the running row
+        # is marked.  Driven by the SAME matched_slug the estate poll captured
+        # (cleared to "" when nothing serves) — refreshed every load_estate, so
+        # Operate entry / the periodic refresh / the post-serve re-poll all keep
+        # the Run marker fresh.
+        try:
+            self.query_one("#catalog-pane", CatalogPane).set_serving_slug(
+                self._target_slug
+            )
+        except Exception:
+            pass
+        # A1/A10: if a serve is awaiting confirmation that the booted model came
+        # up, resolve the serve LivePane terminal state from THIS poll's match.
+        self._resolve_pending_serve(state)
         # Power-cap status (READ) for the orch pane.
         st = await self._data.power_cap_get()
         try:
@@ -3142,17 +3366,251 @@ class CockpitApp(App):
             # [!] reports THIS state, not a PRIOR failure (R2b verify fix).
             self._problem_slug = ""
             self._problem_boot_log = ""
-        if plan.kind == "power_cap":
-            # #10(b): a power-cap WRITE changed the rig — RE-POLL the estate so
-            # the GPU cards + the power-cap strip reflect the new cap (else it
-            # looks like the write didn't apply).
+        # A1: re-poll the estate after EVERY successful GPU-mutating write so the
+        # Operate panes / rail / GPU bars / the Run catalog marker reflect the new
+        # rig state — not just power_cap.  These are READS that run AFTER the
+        # reconcile gate passed (execute_action returned executed=True); a REFUSED
+        # write returned above and never reaches here.
+        #
+        #  - SYNCHRONOUS kinds (power_cap, scene-switch, estate-down, container
+        #    restart/stop/rm) take effect by the time execute_action returns →
+        #    re-poll immediately, like power_cap always has.
+        #  - SERVE is ASYNC (the engine boots over ~tens of seconds) → a single
+        #    immediate re-poll would still show the OLD/empty state.  Instead arm
+        #    a DEFERRED watcher that re-polls every few seconds until the booted
+        #    slug matches (or it times out).  See _start_pending_serve_watch.
+        _SYNC_REPOLL_KINDS = {
+            "power_cap",      # power-cap set/sweep
+            "power_cap_sweep",
+            "scene",          # gpu-mode scene switch
+            "estate_down",    # estate_cli down (stop all)
+            "container",      # docker restart/stop <name>
+            "container_rm",   # docker rm <name>
+        }
+        if plan.kind in _SYNC_REPOLL_KINDS:
             self.load_estate()
-        if live is not None and plan.kind == "serve":
-            # Reveal the transient Run boot pane (Fold 2) and stream the boot log.
+        if plan.kind == "serve":
+            if live is not None:
+                # Reveal the transient Run boot pane (Fold 2).  Do NOT print the
+                # old inert "(boot log streams here)" — nothing actually streams
+                # into this pane yet; be honest that we're WATCHING for the model
+                # to come up (the deferred re-poll resolves the terminal state).
+                self._reveal_serve_live()
+                live.clear_log()
+                slug = self._serve_slug_for(plan)
+                live.append_line(
+                    f"[green]▶ launching[/green] {slug or plan.description} — "
+                    f"watching for it to come up…"
+                )
+            # A1/A10: arm the deferred re-poll that resolves the LivePane terminal
+            # state (✓ serving / still booting / ✗ did not come up).
+            self._start_pending_serve_watch(plan)
+
+    @staticmethod
+    def _is_generated_serve(plan: ActionPlan) -> bool:
+        """A generated/BYO serve launches via ``docker compose -f <path> up -d``
+        (serve_generated), NOT a registry ``switch.sh <slug>``.  Such a plan has
+        no registry slug — `cmd[-1]` is `-d`, so we must NOT slug-match it."""
+        cmd = getattr(plan, "cmd", None) or []
+        return bool(cmd) and cmd[0] == "docker"
+
+    def _serve_slug_for(self, plan: ActionPlan) -> str:
+        """Best-effort slug for a REGISTRY serve plan: the staged entry, else the
+        last cmd arg of ``switch.sh <slug>`` (handles ``--force <slug>``).
+
+        Returns "" for a generated/BYO serve (``docker compose … up -d``): it has
+        no registry slug, and deriving one from `cmd[-1]` would yield `-d` (which
+        never matches a registry `matched_slug` → the LivePane would hang forever).
+        The generated lane resolves its terminal state from a NEW container
+        appearing, not a slug match — see _start_pending_serve_watch."""
+        if self._is_generated_serve(plan):
+            return ""
+        if self._staged_entry is not None:
+            s = getattr(self._staged_entry, "slug", "") or ""
+            if s:
+                return s
+        if plan.cmd:
+            return plan.cmd[-1]
+        return ""
+
+    # ── A1/A10: deferred serve re-poll (the boot is ASYNC) ───────────────────────────
+
+    def _start_pending_serve_watch(self, plan: ActionPlan) -> None:
+        """Arm the deferred re-poll for a just-dispatched serve.
+
+        The engine boots asynchronously, so we can't re-poll once and know the
+        result.  Record the slug we're waiting for, then schedule a repeating
+        re-poll (cheap — one load_estate per tick).  Each poll calls
+        _resolve_pending_serve; when the booted slug matches we stamp
+        "✓ serving …" and stop, on timeout "… still booting", and the failure
+        path (_capture_serve_failure) handles "✗ did not come up".
+
+        Don't stack duplicate watchers: cancel any prior pending-serve timer
+        first so a rapid second serve replaces (not duplicates) the watch."""
+        self._cancel_pending_serve_timer()
+        # MUST-FIX 1: a generated/BYO serve has no registry slug — resolve its
+        # terminal state from a NEW container appearing rather than a slug match.
+        self._pending_serve_generated = self._is_generated_serve(plan)
+        if self._pending_serve_generated:
+            self._pending_serve_slug = ""
+            # Baseline is seeded from the FIRST post-launch poll (None until then)
+            # so a stale/empty cached snapshot can't make a pre-existing container
+            # look "new".  The new container coming up is the ✓ launched signal.
+            self._pending_serve_baseline = None
+        else:
+            self._pending_serve_slug = self._serve_slug_for(plan)
+            self._pending_serve_baseline = None
+        self._pending_serve_model = ""
+        self._pending_serve_port = 0
+        self._pending_serve_attempts = 0
+        # NH5: a generated serve has no slug AND (until the first poll) an empty
+        # baseline-relative match — but it IS pending; track that we're watching
+        # so the timer-arm-failure path below can honestly bail it out too.
+        watching = bool(self._pending_serve_slug) or self._pending_serve_generated
+        # Kick an immediate poll (so a fast boot resolves at once), then repeat.
+        self.load_estate()
+        try:
+            self._pending_serve_timer = self.set_interval(
+                self._SERVE_REPOLL_SECS, self._poll_pending_serve
+            )
+        except Exception:
+            # NH5: _pending_serve_slug was committed BEFORE the timer armed; if
+            # set_interval raised, there's no timer to ever resolve the LivePane
+            # → it would hang on "watching…".  Clear the pending state and stamp
+            # an honest line so the user knows to refresh manually.
+            self._pending_serve_timer = None
+            self._pending_serve_slug = ""
+            self._pending_serve_generated = False
+            self._pending_serve_baseline = None
+            if watching:
+                live = self._serve_live_pane()
+                if live is not None:
+                    live.append_line(
+                        "[yellow]…[/yellow] could not arm watcher — "
+                        "press r to refresh"
+                    )
+
+    def _poll_pending_serve(self) -> None:
+        """One deferred re-poll tick for a pending serve: bump the attempt count,
+        re-poll the estate (which calls _resolve_pending_serve with the fresh
+        match), and on timeout stamp the 'still booting' line + stop."""
+        # A registry serve is identified by its pending slug; a generated/BYO
+        # serve has no slug and is identified by the generated flag.
+        if not self._pending_serve_slug and not self._pending_serve_generated:
+            self._cancel_pending_serve_timer()
+            return
+        self._pending_serve_attempts += 1
+        if self._pending_serve_attempts > self._SERVE_REPOLL_MAX_ATTEMPTS:
+            # Timed out without a match — honest "still booting", offer a refresh.
+            live = self._serve_live_pane()
+            if live is not None:
+                live.append_line(
+                    f"[yellow]…[/yellow] still booting — press r to refresh"
+                )
+            self._pending_serve_slug = ""
+            self._pending_serve_generated = False
+            self._pending_serve_baseline = None
+            self._cancel_pending_serve_timer()
+            return
+        self.load_estate()
+
+    def _resolve_pending_serve(self, state: EstateState) -> None:
+        """A1/A10: called from load_estate with each fresh snapshot.  Resolve the
+        serve LivePane terminal state from THIS poll.  A no-op when no serve is
+        pending.
+
+        Two lanes:
+          - REGISTRY serve (`switch.sh <slug>`): wait for the estate's
+            `matched_slug` to equal the served slug → "✓ serving <model> · :<port>".
+          - GENERATED/BYO serve (`docker compose … up -d`): there is NO registry
+            slug (MUST-FIX 1), so wait for a NEW container — one not present at
+            launch — to appear in `state.containers` → "✓ launched <name> · :<port>".
+            If it happens to registry-match we still surface the model/port."""
+        if self._pending_serve_generated:
+            self._resolve_pending_generated_serve(state)
+            return
+        slug = self._pending_serve_slug
+        if not slug:
+            return
+        matched = (state.matched_slug or "").strip()
+        if matched and matched == slug:
+            live = self._serve_live_pane()
+            if live is not None:
+                tgt = state.target
+                model = (getattr(tgt, "model", "") or "").strip() or matched
+                port = getattr(tgt, "host_port", 0) or 0
+                tail = f" · :{port}" if port else ""
+                live.append_line(f"[green]✓ serving[/green] {model}{tail}")
+            self._pending_serve_slug = ""
+            self._cancel_pending_serve_timer()
+
+    def _resolve_pending_generated_serve(self, state: EstateState) -> None:
+        """MUST-FIX 1: terminal-state resolver for a generated/BYO serve.  Stamps
+        "✓ launched <name>" the moment a container NOT in the launch-time baseline
+        appears in the estate.  No registry slug is involved, so a STALE staged
+        catalog slug can NEVER drive a false "✓ serving <that model>"."""
+        containers = list(getattr(state, "containers", None) or [])
+        names = {
+            getattr(c, "name", "") for c in containers if getattr(c, "name", "")
+        }
+        # Seed the baseline from the FIRST post-launch poll: containers already
+        # present now are NOT the freshly-launched one.  (A real boot takes
+        # seconds, so the engine container won't be up on this first immediate
+        # poll — and even if it raced, we'd just need one more tick.)
+        if self._pending_serve_baseline is None:
+            self._pending_serve_baseline = names
+            return
+        new = [
+            c for c in containers
+            if getattr(c, "name", "") and getattr(c, "name", "") not in self._pending_serve_baseline
+        ]
+        if not new:
+            return
+        # Prefer an engine container (it's the served model); else the first new.
+        cont = next((c for c in new if getattr(c, "kind", "") == "engine"), new[0])
+        live = self._serve_live_pane()
+        if live is not None:
+            name = getattr(cont, "name", "") or "container"
+            # If the estate registry-matched the running engine, surface the
+            # model + port; otherwise just the container name (honest — a BYO
+            # compose may not match any registry slug).
+            tgt = state.target
+            model = (getattr(tgt, "model", "") or "").strip()
+            port = getattr(cont, "host_port", 0) or getattr(tgt, "host_port", 0) or 0
+            tail = f" · :{port}" if port else ""
+            label = f"{name}" + (f" ({model})" if model else "")
+            live.append_line(f"[green]✓ launched[/green] {label}{tail}")
+        self._pending_serve_generated = False
+        self._pending_serve_baseline = None
+        self._pending_serve_slug = ""
+        self._cancel_pending_serve_timer()
+
+    def _cancel_pending_serve_timer(self) -> None:
+        timer = getattr(self, "_pending_serve_timer", None)
+        if timer is not None:
+            try:
+                timer.stop()
+            except Exception:
+                pass
+        self._pending_serve_timer = None
+
+    def serve_failed(self, plan: ActionPlan, last_line: str) -> None:
+        """A10: a detected serve failure → stamp the ✗ terminal line + capture the
+        context for the [!] report.  Stops any pending-serve watcher (the boot is
+        resolved — it failed).  Reuses _capture_serve_failure for the report
+        context.  (Hook for the live SubprocessRunner failure callback in R5;
+        tests drive it directly.)"""
+        self._pending_serve_slug = ""
+        self._pending_serve_generated = False
+        self._pending_serve_baseline = None
+        self._cancel_pending_serve_timer()
+        live = self._serve_live_pane()
+        if live is not None:
             self._reveal_serve_live()
-            live.clear_log()
-            live.append_line(f"[green]▶ launching[/green] {plan.description}")
-            live.append_line("[dim](boot log streams here)[/dim]")
+            live.append_line(
+                f"[red]✗ did not come up[/red] — press ! to report"
+            )
+        self._capture_serve_failure(plan, last_line)
 
     def _serve_live_pane(self) -> Optional[LivePane]:
         try:
@@ -4116,6 +4574,10 @@ class CockpitApp(App):
         The serve_generated plan claims the GPU (``requires_reconcile=True``), so
         it routes through the SAME ConfirmActionScreen → run_reconcile_for_modal →
         dispatch_action gate as every serve — the dual-writer lease holds."""
+        # MUST-FIX 1(b): a generated/BYO serve has NO registry slug.  Clear any
+        # entry staged by a PRIOR catalog serve so that stale slug can NEVER drive
+        # a false "✓ serving <that model>" via _serve_slug_for / failure capture.
+        self._staged_entry = None
         plan = self._data.serve_generated(compose_path)
         self.push_screen(ConfirmActionScreen(plan))
 
