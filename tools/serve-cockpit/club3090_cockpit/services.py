@@ -199,6 +199,13 @@ class CockpitData:
     ):
         self.repo_root = Path(repo_root)
         self.card = card
+        # FIX 2 — the registry's top-level ``defaults`` array (curated
+        # per-(model,engine,topology) recommendations) from registry-emit --json.
+        # Surfaced here (not on the per-row CatalogEntry) because it's a catalog
+        # property; ``profile_templates`` reads it to pick a FUNCTIONAL,
+        # registry-recommended representative per (family, topology).  Refreshed
+        # on each ``load_catalog_rows``; empty on the raw-tab fallback path.
+        self.catalog_defaults: list[dict] = []
         self._runner: Runner = runner or RealRunner()
         self._detect_endpoint: DetectEndpointFn = detect_endpoint_fn or core_detect_endpoint
         self._get_gpu_info: GetGpuInfoFn = get_gpu_info_fn or core_get_gpu_info
@@ -281,12 +288,20 @@ class CockpitData:
         )
         if err and not data:
             # Fall back to the raw tab emitter (registry_variant_rows) so the
-            # catalog still loads even if the --json wrapper regresses.
+            # catalog still loads even if the --json wrapper regresses.  The raw
+            # emitter has no `defaults` array, so the profile-template picker
+            # degrades to the status floor (still functional-only).
+            self.catalog_defaults = []
             rows, ferr = await self._load_catalog_rows_fallback()
             if ferr:
                 return [], err
         else:
-            rows = [_variant_row_from_dict(d) for d in (data or {}).get("variants", [])]
+            data = data or {}
+            rows = [_variant_row_from_dict(d) for d in data.get("variants", [])]
+            # FIX 2 — surface the curated defaults so profile_templates can pick
+            # the registry's own recommendation per (family, topology).
+            d = data.get("defaults")
+            self.catalog_defaults = list(d) if isinstance(d, list) else []
 
         return [CatalogEntry(row=r) for r in rows], None
 

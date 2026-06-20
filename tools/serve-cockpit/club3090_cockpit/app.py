@@ -38,6 +38,7 @@ NEVER executed live — tests inject fakes and conftest blocks the real spawn.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from pathlib import Path
 from typing import NamedTuple, Optional
 
@@ -130,6 +131,13 @@ def _status_glyph(status: str) -> str:
 
 _TOPO_ORDER = {"single": 0, "dual": 1, "multi3": 2, "multi4": 3, "multi8": 4}
 
+# FIX 2 (escape hatch) — the curated (family, topology) dropdown is the primary
+# affordance, but it deliberately lists only ~7-12 representatives, not all 53
+# slugs.  A trailing sentinel option reveals a companion free-text Input so ANY
+# registry slug stays expressible (validated by the existing byo_check
+# unknown-profile path).  The sentinel value is a fixed marker, NOT a real slug.
+PROFILE_CUSTOM_SENTINEL = "__custom__"
+
 
 def _variant_topology(row: "VariantRow") -> str:
     """Extract the topology token (single/dual/multiN) from a variant's compose
@@ -144,50 +152,134 @@ def _variant_topology(row: "VariantRow") -> str:
 class ProfileOption(NamedTuple):
     """One profile-template dropdown option.
 
-    A 3-field NamedTuple so it still unpacks as ``(label, value)``-compatible
+    A 4-field NamedTuple so it still unpacks as ``(label, value)``-compatible
     in 2-element contexts is NOT assumed; callers that need the Select's
     ``(label, value)`` pairs use :func:`profile_select_options`.  ``topology``
     is carried THROUGH from the registry variant (NOT re-derived by splitting
-    the label) so the default picker can filter by topology directly."""
+    the label) so the default picker can filter by topology directly.  ``status``
+    is the registry status word of the chosen representative slug (FIX-2
+    status-aware pick) so :func:`default_profile_template` can apply the
+    functional-status floor without re-walking the variant rows."""
 
     label: str
     slug: str
     topology: str
+    status: str = "production"
+
+
+# FIX 2 — functional-status floor (mirrors compose_registry.FUNCTIONAL_STATUSES,
+# kept local so the cockpit data layer has no import dep on the scripts/ tree).
+# A slug is "functional" (launches without --force) iff its status is one of
+# these; experimental / incubating / preview / upstream-gated / deprecated are
+# NON-functional (incubating needs --force).  Used to keep the profile-template
+# representatives + the rig default off non-launchable slugs.
+_FUNCTIONAL_STATUSES = frozenset({"production", "caveats"})
+
+
+def _status_is_functional(status: str) -> bool:
+    return (status or "").strip().lower() in _FUNCTIONAL_STATUSES
 
 
 def profile_select_options(
     options: list["ProfileOption"],
 ) -> list[tuple[str, str]]:
     """Project ``ProfileOption``s down to the ``(label, value)`` pairs a Textual
-    ``Select`` consumes.  Pure."""
-    return [(o.label, o.slug) for o in options]
+    ``Select`` consumes, with the FIX-2 escape-hatch sentinel appended last so any
+    non-curated registry slug stays reachable via a companion free-text Input.
+    Pure."""
+    pairs = [(o.label, o.slug) for o in options]
+    pairs.append(("✎ custom slug…", PROFILE_CUSTOM_SENTINEL))
+    return pairs
 
 
-def profile_templates(variants: list["VariantRow"]) -> list["ProfileOption"]:
+def _curated_default_map(
+    defaults: Optional[list[dict]],
+) -> dict[tuple[str, str], str]:
+    """Project the registry's top-level ``defaults`` array (from
+    ``registry-emit.sh --json``) down to ``{(family, topology): slug}`` — the
+    registry's OWN curated recommendation per (engine-family, topology).  Engine
+    is collapsed to a FAMILY (so ``vllm`` covers vllm-stable / vllm-gemma-stable),
+    matching :func:`profile_templates`' grouping.  Empty when ``defaults`` is
+    absent (the raw-tab fallback load path doesn't carry it) — callers then fall
+    back to the status floor.  Pure."""
+    out: dict[tuple[str, str], str] = {}
+    for d in defaults or []:
+        engine = (d.get("engine") or "").strip()
+        topo = (d.get("topology") or "").strip() or "—"
+        slug = (d.get("slug") or "").strip()
+        if not slug:
+            continue
+        family = _canon_engine_family(engine) or (engine or "—")
+        out.setdefault((family, topo), slug)
+    return out
+
+
+def profile_templates(
+    variants: list["VariantRow"],
+    defaults: Optional[list[dict]] = None,
+) -> list["ProfileOption"]:
     """#6 — derive the profile-template dropdown options from the loaded variants.
 
-    ONE option per registry SLUG — every catalog variant is selectable (the
-    earlier (engine, topology) collapse made 40/53 slugs unreachable).  Returns
-    a list of :class:`ProfileOption` (``label``, ``slug``, ``topology``) sorted
-    by ``(topology, engine, slug)``, where ``slug`` is the profile-like string
-    ``byo_check`` accepts and ``topology`` is carried THROUGH from the variant's
-    compose path (NOT re-derived from the label later).  Pure — no I/O."""
-    seen: set[str] = set()
-    rows: list[tuple[str, str, str]] = []  # (engine, slug, topology)
+    FIX 2 (maintainer directive) — ONE representative option per UNIQUE
+    (engine-FAMILY, topology) pair — a short curated list (~7-12 entries), NOT one
+    per slug.  The maintainer's call: "profile-like was meant to have only the
+    unique and latest engine/topology composes and not all the list."  The escape
+    hatch (a trailing "✎ custom slug…" sentinel + companion Input) keeps every
+    other registry slug reachable, so the short dropdown doesn't strand them.
+
+    Grouping is by canonical engine FAMILY (``_canon_engine_family``) so
+    ``vllm-stable`` and ``vllm-gemma-stable`` collapse to ONE "vllm" per topology
+    (otherwise "vllm / dual" would appear twice).
+
+    **Representative resolution (FIX-2 status-aware — the earlier rule was
+    status-BLIND, so 4 of 7 reps were non-functional, e.g. (vllm, single) →
+    vllm/vibethinker-3b-single [incubating]).** Per (family, topology), in order:
+      a. the slug literally named ``<family>/<topology>`` if present (the
+         canonical/recommended template, e.g. ``vllm/dual``);
+      b. else the registry's curated ``defaults`` slug for that (family,
+         topology) if available (its literal recommendation — exactly the
+         "latest/recommended" the maintainer wants);
+      c. else the LAST variant in registry order whose status is FUNCTIONAL
+         (production / ⚠️ caveats);
+      d. else ``slugs[-1]`` — the group is ENTIRELY non-functional (e.g.
+         (vllm, multi4) and (beellama, dual) on the live registry: every member
+         is experimental), so there is no functional rep to choose; the escape
+         hatch still reaches every member.
+
+    Sorted by (topology order, family).  ``topology`` + the chosen slug's
+    ``status`` are carried THROUGH on the option (status feeds the default
+    picker's floor).  Pure — no I/O."""
+    curated = _curated_default_map(defaults)
+    # Group by (family, topology), preserving registry order within each group.
+    groups: "OrderedDict[tuple[str, str], list[tuple[str, str]]]" = OrderedDict()
     for row in variants:
         engine = (getattr(row, "engine", "") or "").strip()
         slug = (getattr(row, "slug", "") or "").strip()
-        if not slug or slug in seen:
+        if not slug:
             continue
-        seen.add(slug)
+        family = _canon_engine_family(engine) or (engine or "—")
         topo = _variant_topology(row) or "—"
-        rows.append((engine, slug, topo))
-    rows.sort(key=lambda t: (_TOPO_ORDER.get(t[2], 99), t[0], t[1]))
+        status = (getattr(row, "status", "") or "").strip().lower()
+        groups.setdefault((family, topo), []).append((slug, status))
     out: list[ProfileOption] = []
-    for engine, slug, topo in rows:
-        eng_label = engine or "—"
-        label = f"{slug}  ·  {eng_label} / {topo}"
-        out.append(ProfileOption(label=label, slug=slug, topology=topo))
+    for (family, topo), members in groups.items():
+        slugs = [s for (s, _st) in members]
+        status_by_slug = {s: st for (s, st) in members}
+        canonical = f"{family}/{topo}"
+        if canonical in slugs:
+            rep_slug = canonical                                  # (a) literal
+        elif curated.get((family, topo)) in status_by_slug:
+            rep_slug = curated[(family, topo)]                    # (b) curated default
+        else:
+            functional = [s for (s, st) in members if _status_is_functional(st)]
+            rep_slug = functional[-1] if functional else slugs[-1]  # (c) / (d)
+        rep_status = status_by_slug.get(rep_slug, "")
+        # family + topology is the prominent, readable part; the chosen slug shows.
+        label = f"{family} / {topo}  ·  {rep_slug}"
+        out.append(
+            ProfileOption(label=label, slug=rep_slug, topology=topo, status=rep_status)
+        )
+    out.sort(key=lambda o: (_TOPO_ORDER.get(o.topology, 99), o.label))
     return out
 
 
@@ -202,31 +294,52 @@ def default_profile_template(
     slug; then any literal ``<engine>/<topo>`` slug; then any slug whose
     topology matches; finally the first option.  NEVER an arbitrary alphabetical
     (e.g. Gemma/beellama) slug.  Topology comes from the carried-through
-    ``ProfileOption.topology`` — never re-derived from the label."""
+    ``ProfileOption.topology`` — never re-derived from the label.
+
+    **FIX 2 status floor — a Select default MUST be launchable.** The earlier
+    rule returned the FIRST vllm-single option for a 1-card rig, which (since the
+    reps were status-blind) was ``vllm/vibethinker-3b-single`` [incubating] — a 3B
+    that needs ``--force`` to launch.  Now the picker is restricted to FUNCTIONAL
+    options (production / ⚠️ caveats) FIRST; with the status-aware reps that lands
+    the rig default on ``vllm/minimal`` for a single-card rig (the registry's own
+    curated single default) and keeps ``vllm/dual`` for ≥2 cards.  Only if NO
+    functional option exists at all does it fall back to the prior order over the
+    full option set — and the return is ALWAYS one of ``options`` (a Select can't
+    default to an absent value)."""
     if not options:
         return None
     want = "single" if num_gpus <= 1 else "dual"
-    same_topo = [o for o in options if o.topology == want]
-    # 1. the canonical vllm slug literally named "vllm/<topo>".
-    canonical_vllm = f"vllm/{want}"
-    for o in same_topo:
-        if o.slug == canonical_vllm:
-            return o.slug
-    # 2. any slug literally named "<engine>/<topo>", vllm-prefixed first.
-    literal = [o for o in same_topo if o.slug.endswith(f"/{want}")]
-    for o in literal:
-        if o.slug.startswith("vllm/"):
-            return o.slug
-    if literal:
-        return literal[0].slug
-    # 3. any slug of the right topology, vllm-prefixed first.
-    for o in same_topo:
-        if o.slug.startswith("vllm/"):
-            return o.slug
-    if same_topo:
-        return same_topo[0].slug
-    # 4. nothing matches the rig topology — first option (stable, sorted).
-    return options[0].slug
+
+    def _pick(pool: list["ProfileOption"]) -> Optional[str]:
+        """The original topology-preference order, applied to a pre-filtered
+        option pool (functional-only, then the full set)."""
+        same_topo = [o for o in pool if o.topology == want]
+        # 1. the canonical vllm slug literally named "vllm/<topo>".
+        canonical_vllm = f"vllm/{want}"
+        for o in same_topo:
+            if o.slug == canonical_vllm:
+                return o.slug
+        # 2. any slug literally named "<engine>/<topo>", vllm-prefixed first.
+        literal = [o for o in same_topo if o.slug.endswith(f"/{want}")]
+        for o in literal:
+            if o.slug.startswith("vllm/"):
+                return o.slug
+        if literal:
+            return literal[0].slug
+        # 3. any slug of the right topology, vllm-prefixed first.
+        for o in same_topo:
+            if o.slug.startswith("vllm/"):
+                return o.slug
+        if same_topo:
+            return same_topo[0].slug
+        return None
+
+    # Status floor: a functional default first.  Fall back to the full set, then
+    # to the first option, so the return is always a real (selectable) value.
+    functional = [o for o in options if _status_is_functional(o.status)]
+    return _pick(functional) or _pick(options) or (
+        functional[0].slug if functional else options[0].slug
+    )
 
 
 def _set_select_options(
@@ -887,6 +1000,13 @@ class ByoPane(Container):
         width: 40;
         margin-left: 1;
     }
+    ByoPane #byo-profile-custom {
+        width: 40;
+        margin-left: 1;
+    }
+    ByoPane .profile-custom-hidden {
+        display: none;
+    }
     ByoPane #byo-fit-btn {
         width: 14;
         margin-left: 1;
@@ -919,6 +1039,14 @@ class ByoPane(Container):
                 value="vllm/dual",
                 allow_blank=False,
                 id="byo-profile-input",
+            )
+            # FIX 2 (escape hatch) — a companion free-text override, hidden until
+            # the "✎ custom slug…" sentinel is chosen, so any non-curated registry
+            # slug is reachable (validated by byo_check's unknown-profile path).
+            yield Input(
+                placeholder="profile-like slug — e.g. ik-llama/iq4ks-mtp",
+                id="byo-profile-custom",
+                classes="profile-custom-hidden",
             )
             yield Button("Fit-check", id="byo-fit-btn", variant="primary")
         yield Static(
@@ -1279,16 +1407,6 @@ class OperateOrchPane(Container):
         margin: 0 1;
         color: $text-muted;
     }
-    OperateOrchPane #disk-heading {
-        text-style: bold;
-        padding: 0 1;
-        margin: 0 1 0 1;
-    }
-    OperateOrchPane #disk-rail {
-        padding: 0 1;
-        margin: 0 1 1 1;
-        color: $text;
-    }
     """
 
     def compose(self) -> ComposeResult:
@@ -1331,16 +1449,16 @@ class OperateOrchPane(Container):
                 "\\[p] prune images (gated)[/dim]",
                 id="orch-hint",
             )
-            # #12 / N5 — disk-usage bars (repo + /mnt/models) and the system-RAM
-            # line, at the RAIL BOTTOM.  Populated from the Batch-5 telemetry read
-            # piggybacked on the Operate tick (NOT a new timer).
-            yield Label("Host", id="disk-heading")
-            yield Static("[dim]reading disk / RAM…[/dim]", id="disk-rail")
+            # FIX 3 — the host disk-usage bars + system-RAM line MOVED out of this
+            # sub-tab to the global left-rail (HostStatsRail / #host-stats-rail),
+            # per the maintainer's "estate column on the left" directive.
 
     def on_mount(self) -> None:
         t = self.query_one("#scene-table", DataTable)
         t.add_columns("Scene", "Group", "GPUs", "Services")
         self._scenes: list[Scene] = []
+        # FIX 1 — last-rendered scene-row signature (skip-if-unchanged guard).
+        self._scene_rows_sig: Optional[tuple] = None
         # #10: GPU-index → active cap (W) so the GPU cards can show "(cap NNNW)".
         # Populated from the power-cap READ; only set when a card is below its
         # default (genuinely capped) so an uncapped card shows no spurious cap.
@@ -1505,14 +1623,14 @@ class OperateOrchPane(Container):
                 pass
 
     def populate_telemetry(self, tel: EstateTelemetry) -> None:
-        """#12 / N5 + attribution: render the host disk bars + system-RAM line at
-        the rail bottom, and re-render the GPU cards with the VRAM-owner line.
+        """#12 / N5 + attribution: re-render the GPU cards with the VRAM-owner line.
 
-        The telemetry is read by ``load_estate`` piggybacked on the Operate tick
-        (no new timer).  Cached so a later GPU-card re-render (e.g. after the
-        power-cap read) keeps the "held by:" attribution."""
+        FIX 3 — the host disk bars + system-RAM line MOVED to the left-rail
+        ``HostStatsRail`` (the "estate column"); this pane only owns the GPU-card
+        "held by:" attribution now.  The telemetry is read by ``load_estate``
+        piggybacked on the Operate tick (no new timer).  Cached so a later GPU-card
+        re-render (e.g. after the power-cap read) keeps the "held by:" attribution."""
         self._last_telemetry = tel
-        self._populate_disk_rail(tel)
         # Re-render the GPU cards now that the attribution map is known (telemetry
         # is read AFTER the estate poll, so the first card paint had no owner line).
         if getattr(self, "_last_state", None) is not None:
@@ -1520,46 +1638,6 @@ class OperateOrchPane(Container):
                 self._populate_gpus(self._last_state)
             except Exception:
                 pass
-
-    def _populate_disk_rail(self, tel: EstateTelemetry) -> None:
-        """Render the disk bars (repo + /mnt/models) and the RAM line (#12 / N5).
-
-        Bars are compact "label ▕███░░▏ pct%  used/total"; the RAM line reuses the
-        same bar.  A read failure surfaces an honest cue (the B2 "A2" rule) rather
-        than a silent false-zero."""
-        try:
-            rail = self.query_one("#disk-rail", Static)
-        except Exception:
-            return
-        lines: list[str] = []
-
-        def _bar_markup(pct: int) -> str:
-            color = "green" if pct < 80 else "yellow" if pct < 95 else "red"
-            full = max(0, min(10, round(pct / 100 * 10)))
-            return f"▕[{color}]{'█' * full}[/{color}][dim]{'░' * (10 - full)}[/dim]▏"
-
-        for d in tel.disks or []:
-            lines.append(
-                f"  [bold]{d.mount_label:<13}[/bold] {_bar_markup(d.pct)} "
-                f"{d.pct:>3}%  {_human_gb(d.used)}/{_human_gb(d.total)} "
-                f"[dim](free {_human_gb(d.free)})[/dim]"
-            )
-        ram = tel.ram
-        if ram and ram.total > 0 and not ram.error:
-            lines.append(
-                f"  [bold]{'RAM':<13}[/bold] {_bar_markup(ram.pct)} "
-                f"{ram.pct:>3}%  {_human_gb(ram.used)}/{_human_gb(ram.total)}"
-            )
-        elif ram and ram.error:
-            lines.append(f"  [dim]RAM: {ram.error}[/dim]")
-        if not tel.disks and not (ram and ram.total > 0):
-            # Honest failure cue — never a silent blank/false-zero (A2 rule).
-            err = (tel.error or "host telemetry unavailable").strip()
-            rail.update(f"[dim]{err}[/dim]")
-            return
-        if tel.error and (not tel.disks or (ram and ram.error)):
-            lines.append(f"  [dim]⚠ {tel.error}[/dim]")
-        rail.update("\n".join(lines))
 
     def _populate_gpus(self, state: EstateState) -> None:
         # N2: when nvidia-smi returned NOTHING at all (no cards in the snapshot),
@@ -1657,13 +1735,59 @@ class OperateOrchPane(Container):
         glyph = "[green]●[/green]" if dr.serving else "[yellow]○[/yellow]"
         line.update(f"{glyph} {dr.summary}")
 
+    def _scene_rows_signature(self, scenes: list[Scene]) -> tuple:
+        """FIX 1 — a cheap "did the data change?" signature for the scene set.
+        When the next poll's scenes are byte-identical to what's already rendered
+        we skip the whole clear/re-add (removes both flicker AND the cursor churn
+        on the periodic Operate refresh)."""
+        return tuple(
+            (s.name, s.group, s.gpus or "—",
+             ", ".join(s.services[:3]) + ("…" if len(s.services) > 3 else ""))
+            for s in scenes
+        )
+
     def _populate_scenes(self, scenes: list[Scene]) -> None:
-        self._scenes = list(scenes)
         t = self.query_one("#scene-table", DataTable)
+        new_sig = self._scene_rows_signature(scenes)
+        # FIX 1 (skip-if-unchanged guard) — the B2 periodic refresh re-populates
+        # every 4s; when nothing changed, leave the table (and its cursor) alone.
+        if new_sig == getattr(self, "_scene_rows_sig", None):
+            self._scenes = list(scenes)
+            return
+        # FIX 1 (cursor preserve) — capture the selected row's STABLE KEY (scene
+        # name) BEFORE the clear, so a re-populate that changes the row set (a
+        # scene appears/disappears) restores the cursor to the same scene, not a
+        # bare index.  Do NOT call .focus() (must not steal focus from another
+        # widget).  Guarded — a 0-row table must not raise.
+        sel_name = ""
+        old_idx = 0
+        try:
+            old_idx = max(0, t.cursor_row)
+            sel = self.selected_scene()
+            if sel is not None:
+                sel_name = sel.name
+        except Exception:
+            pass
+        self._scenes = list(scenes)
+        self._scene_rows_sig = new_sig
         t.clear()
         for s in scenes:
             svc = ", ".join(s.services[:3]) + ("…" if len(s.services) > 3 else "")
             t.add_row(s.name, s.group, s.gpus or "—", svc or "—")
+        # FIX 1 — restore the cursor by key: if the selected scene still exists,
+        # move to its new index; if it's gone, clamp the OLD index; if the table
+        # was at row 0 / unselected, leave it.  animate=False so no visible jump.
+        try:
+            if t.row_count and (sel_name or old_idx > 0):
+                new_idx = next(
+                    (i for i, s in enumerate(scenes) if s.name == sel_name), None
+                )
+                if new_idx is None:
+                    new_idx = min(old_idx, t.row_count - 1)
+                if new_idx > 0:
+                    t.move_cursor(row=new_idx, animate=False)
+        except Exception:
+            pass
         # #11 — keep the preview in sync with the cursor after a (re-)populate.
         try:
             self.render_scene_preview(self.selected_scene())
@@ -1801,10 +1925,72 @@ class OperateContainersPane(Container):
         t = self.query_one("#containers-table", DataTable)
         t.add_columns("Name", "Kind", "Engine", "Port", "Slug")
         self._containers: list[ContainerInfo] = []
+        # FIX 1 — last-rendered container-row signature (skip-if-unchanged guard).
+        self._container_rows_sig: Optional[tuple] = None
+        # FIX 1 (clamp echo) — set by populate(): True when the prior selection was
+        # CLAMPED to a DIFFERENT container (the selected one vanished), so the
+        # caller can swallow the spurious move_cursor RowHighlighted echo.
+        self.last_populate_clamped: bool = False
 
-    def populate(self, containers: list[ContainerInfo], error: str = "") -> None:
-        self._containers = list(containers)
+    def _container_rows_signature(
+        self, containers: list[ContainerInfo], error: str
+    ) -> tuple:
+        """FIX 1 — a cheap "did the data change?" signature for the container set
+        (incl. the error/empty sentinel rows) so an unchanged periodic poll skips
+        the clear/re-add — removing flicker AND the cursor snap-to-row-0 churn."""
+        if not containers:
+            return ("__sentinel__", (error or "").strip())
+        return tuple(
+            (
+                c.name,
+                getattr(c, "kind", ""),
+                getattr(c, "status", "running"),
+                getattr(c, "engine", "") or "—",
+                getattr(c, "host_port", 0) or 0,
+                getattr(c, "slug", "") or "—",
+            )
+            for c in containers
+        )
+
+    def populate(self, containers: list[ContainerInfo], error: str = "") -> bool:
+        """Re-render the container table.  Returns True when the table was actually
+        cleared + rebuilt (the row set changed), False when an unchanged poll was
+        skipped — the caller uses this to avoid re-arming the row-0 suppression on
+        a no-op poll (which would otherwise drop a pending user drill).
+
+        FIX 1 (clamp echo) — also sets ``self.last_populate_clamped`` to record
+        whether the prior selection was PRESERVED (the same container name still
+        present → the cursor moved to follow it) or CLAMPED to a DIFFERENT
+        container (the selected container vanished → the cursor landed on a row
+        the user never picked).  The caller reads this to suppress the spurious
+        ``move_cursor`` RowHighlighted echo on the CLAMP case (which would
+        otherwise auto-load a docker drill for a container the user didn't
+        select).  Reset to False every call; only True on a CLAMP-to-different."""
         t = self.query_one("#containers-table", DataTable)
+        self.last_populate_clamped = False
+        new_sig = self._container_rows_signature(containers, error)
+        # FIX 1 (skip-if-unchanged guard) — the B2 periodic refresh re-populates
+        # every 4s; when the container set is byte-identical, leave the table (and
+        # its cursor) untouched.  This also means the [r]-re-jump suppression in
+        # load_estate is a no-op on an unchanged poll (the cursor never moved).
+        if new_sig == getattr(self, "_container_rows_sig", None):
+            self._containers = list(containers)
+            return False
+        # FIX 1 (cursor preserve) — capture the selected row's STABLE KEY (container
+        # name) BEFORE the clear so a re-populate whose row set changed (a container
+        # started/stopped) restores the cursor to the same container, not a bare
+        # index.  Do NOT .focus() (must not steal focus).  Guarded — 0-row safe.
+        sel_name = ""
+        old_idx = 0
+        try:
+            old_idx = max(0, t.cursor_row)
+            sel = self.selected_container()
+            if sel is not None:
+                sel_name = sel.name
+        except Exception:
+            pass
+        self._containers = list(containers)
+        self._container_rows_sig = new_sig
         t.clear()
         if not containers:
             # N2: a READ failure must NOT read as a calm empty estate.
@@ -1816,7 +2002,7 @@ class OperateContainersPane(Container):
                 t.add_row(f"[red]{_error_headline(err)}[/red]", "—", "—", "—", "—")
             else:
                 t.add_row("[dim]no stack containers[/dim]", "—", "—", "—", "—")
-            return
+            return True
         for c in containers:
             stopped = getattr(c, "status", "running") == "stopped"
             if stopped:
@@ -1837,6 +2023,32 @@ class OperateContainersPane(Container):
                     str(c.host_port) if c.host_port else "—",
                     c.slug or "—",
                 )
+        # FIX 1 — restore the cursor by key: if the selected container still
+        # exists, move to its new index; if it's gone, clamp the OLD index; if the
+        # table was at row 0 / unselected, leave it.  animate=False so no visible
+        # jump.  Guarded — 0-row safe.  When the selection was CLAMPED to a
+        # DIFFERENT container (the original vanished), record it so the caller can
+        # swallow the move_cursor echo (else a docker drill auto-loads for a
+        # container the user never selected — the re-introduced [r]-re-jump
+        # footgun, now firing on every periodic tick).
+        try:
+            if t.row_count and (sel_name or old_idx > 0):
+                new_idx = next(
+                    (i for i, c in enumerate(containers) if c.name == sel_name), None
+                )
+                preserved = new_idx is not None
+                if new_idx is None:
+                    new_idx = min(old_idx, t.row_count - 1)
+                # CLAMP-to-different = the user HAD a selection (sel_name set) that
+                # is now gone, and the cursor lands on a non-zero row that is NOT
+                # that container.  (Row 0 / unselected keeps the existing behavior.)
+                if (not preserved) and sel_name and new_idx > 0:
+                    self.last_populate_clamped = True
+                if new_idx > 0:
+                    t.move_cursor(row=new_idx, animate=False)
+        except Exception:
+            pass
+        return True
 
     def populate_top(self, top) -> None:
         """Render a ContainerTop into the Top drill tab (READ)."""
@@ -2986,6 +3198,13 @@ class LaneBringPane(Container):
         width: 40;
         margin-left: 1;
     }
+    LaneBringPane #lane-bring-profile-custom {
+        width: 40;
+        margin-left: 1;
+    }
+    LaneBringPane .profile-custom-hidden {
+        display: none;
+    }
     LaneBringPane #lane-bring-fit-btn {
         width: 14;
         margin-left: 1;
@@ -3016,6 +3235,13 @@ class LaneBringPane(Container):
                 value="vllm/dual",
                 allow_blank=False,
                 id="lane-bring-profile-input",
+            )
+            # FIX 2 (escape hatch) — companion free-text override, hidden until the
+            # "✎ custom slug…" sentinel is chosen (same idiom as Run · BYO).
+            yield Input(
+                placeholder="profile-like slug — e.g. ik-llama/iq4ks-mtp",
+                id="lane-bring-profile-custom",
+                classes="profile-custom-hidden",
             )
             yield Button("Fit-check", id="lane-bring-fit-btn", variant="primary")
         yield Static(
@@ -3321,6 +3547,62 @@ class RailStatus(Static):
             lines.append("")
             lines.append(f"[dim]as of {as_of}[/dim]")
         self.update("\n".join(lines))
+
+
+class HostStatsRail(Static):
+    """FIX 3 — host disk + RAM usage in the LEFT RAIL (the "estate column").
+
+    The maintainer's directive: "host repo/models disk and ram usage was meant to
+    show in the estate column on the left but appears in the Orchestration tab."
+    B5 rendered these into ``#disk-rail`` INSIDE the Orchestration sub-tab; this
+    widget moves them to the global left rail (below RailStatus) where they persist
+    across Run/Operate/Validate.  Telemetry is still FETCHED only on the Operate
+    (mode-1) tick (no new subprocess churn elsewhere); the rail simply shows the
+    last-known values — host disk/RAM move slowly, matching RailStatus's
+    persist-last-state pattern.
+
+    The bar-rendering math is the SAME as the former orch-pane ``_populate_disk_rail``
+    (moved verbatim, not rewritten) so the disk/RAM bars are pixel-identical."""
+
+    PLACEHOLDER = "[bold]Host[/bold]\n[dim]reading disk / RAM…[/dim]"
+
+    def __init__(self, **kwargs):
+        super().__init__(self.PLACEHOLDER, **kwargs)
+
+    def populate_telemetry(self, tel: EstateTelemetry) -> None:
+        """Render the disk bars (repo + /mnt/models) and the RAM line into the rail.
+
+        A read failure surfaces an honest cue (the B2 "A2" rule) rather than a
+        silent false-zero."""
+        lines: list[str] = ["[bold]Host[/bold]"]
+
+        def _bar_markup(pct: int) -> str:
+            color = "green" if pct < 80 else "yellow" if pct < 95 else "red"
+            full = max(0, min(10, round(pct / 100 * 10)))
+            return f"▕[{color}]{'█' * full}[/{color}][dim]{'░' * (10 - full)}[/dim]▏"
+
+        bar_lines: list[str] = []
+        for d in tel.disks or []:
+            bar_lines.append(
+                f"[bold]{d.mount_label:<7}[/bold] {_bar_markup(d.pct)} "
+                f"{d.pct:>3}%  {_human_gb(d.used)}/{_human_gb(d.total)}"
+            )
+        ram = tel.ram
+        if ram and ram.total > 0 and not ram.error:
+            bar_lines.append(
+                f"[bold]{'RAM':<7}[/bold] {_bar_markup(ram.pct)} "
+                f"{ram.pct:>3}%  {_human_gb(ram.used)}/{_human_gb(ram.total)}"
+            )
+        elif ram and ram.error:
+            bar_lines.append(f"[dim]RAM: {ram.error}[/dim]")
+        if not tel.disks and not (ram and ram.total > 0):
+            # Honest failure cue — never a silent blank/false-zero (A2 rule).
+            err = (tel.error or "host telemetry unavailable").strip()
+            self.update(f"[bold]Host[/bold]\n[dim]{err}[/dim]")
+            return
+        if tel.error and (not tel.disks or (ram and ram.error)):
+            bar_lines.append(f"[dim]⚠ {tel.error}[/dim]")
+        self.update("\n".join(lines + bar_lines))
 
 
 class ModeSwitcher(Static):
@@ -3749,6 +4031,15 @@ class CockpitApp(App):
         margin-top: 1;
         color: $text;
     }
+    /* FIX 3 — host disk/RAM card at the rail bottom (auto-height, below status). */
+    #host-stats-rail {
+        width: 1fr;
+        height: auto;
+        border: solid $primary;
+        padding: 0 1;
+        margin-top: 1;
+        color: $text;
+    }
     #content-area {
         width: 1fr;
         height: 1fr;
@@ -3990,6 +4281,13 @@ class CockpitApp(App):
         # is active and is guarded out, so no arming is needed there — the tab is
         # calm without a flag flip.  See on_data_table_row_highlighted.
         self._containers_user_navigated: bool = True
+        # FIX 1 (clamp echo) — a one-shot to swallow the SECOND RowHighlighted echo
+        # that a CLAMP-to-different populate emits (the move_cursor that lands on a
+        # container the user never selected).  The row-0 re-arm above swallows the
+        # first echo (the t.clear() reset); this swallows the follow-up move echo so
+        # a periodic poll NEVER auto-loads a docker drill for an unselected
+        # container.  Set True by load_estate on a clamped re-render; consumed once.
+        self._containers_suppress_clamp_echo: bool = False
         # Phase 5: the last BYO fit-check result (Run · BYO) — the arch facts
         # the Promote-to-catalog scaffold computes from.
         self._last_byo: Optional[ByoResult] = None
@@ -4048,6 +4346,9 @@ class CockpitApp(App):
             with Vertical(id="left-rail"):
                 yield ModeSwitcher(id="mode-switcher", surface=self._surface)
                 yield RailStatus(id="rail-status")
+                # FIX 3 — host disk + RAM usage lives in the LEFT RAIL (the "estate
+                # column"), BELOW RailStatus — not inside the Orchestration sub-tab.
+                yield HostStatsRail(id="host-stats-rail")
             with Container(id="content-area"):
                 # Mode 0 — Run (Discover + Serve + Benchmarks folded in)
                 with Container(id="panel-run", classes="mode-panel active"):
@@ -4236,7 +4537,13 @@ class CockpitApp(App):
         ``reapply_default`` forces a re-default after the estate poll first learns
         the GPU count) so a later poll never clobbers a user's manual pick.  Pure —
         no I/O (reads cached variants + cached estate gpu-count)."""
-        options = profile_templates(self._variants or [])
+        # FIX 2 — pass the registry's curated `defaults` array (surfaced by the
+        # catalog load) so each (family, topology) representative is the
+        # registry's own recommendation when available, never a status-blind
+        # last-in-insertion-order slug.  Empty on the raw-tab fallback load path
+        # → profile_templates degrades to the status floor.
+        defaults = list(getattr(self._data, "catalog_defaults", None) or [])
+        options = profile_templates(self._variants or [], defaults)
         if not options:
             return
         self._profile_options = options
@@ -4299,12 +4606,19 @@ class CockpitApp(App):
         return out or None
 
     @work(exclusive=True, group="estate")
-    async def load_estate(self) -> None:
+    async def load_estate(self, *, explicit_refresh: bool = False) -> None:
         """Poll the live estate snapshot + push into the orch/doctor panes + rail.
 
         Also captures the live target (matched slug / model / url) so Doctor's
         profile-triage and the validation launches point at the running model,
-        and reads the power-cap status (a safe READ) for the orch pane."""
+        and reads the power-cap status (a safe READ) for the orch pane.
+
+        ``explicit_refresh`` is True only for the [r]-driven action_refresh (a
+        deliberate user re-read) — NOT the 4s periodic Operate tick.  FIX 1 uses it
+        to decide whether to re-arm the containers row-0 suppression + cancel a
+        pending drill timer even when the container set was unchanged: an explicit
+        [r] should kill a stale drill timer (the [r]-re-jump footgun), but the
+        periodic tick must leave the user's selection + pending drill alone."""
         state = await self._data.estate_state(variants=self._variants or None)
         # A3: stamp the poll time so the rail can render "as of <ago>".
         import time as _time
@@ -4369,9 +4683,18 @@ class CockpitApp(App):
         except Exception:
             pass
         try:
-            self.query_one("#operate-containers-pane", OperateContainersPane).populate(
+            containers_pane = self.query_one(
+                "#operate-containers-pane", OperateContainersPane
+            )
+            rerendered = containers_pane.populate(
                 state.containers, getattr(state, "error", "") or ""
             )
+            # FIX 1 (clamp echo) — did this re-render CLAMP the cursor to a
+            # DIFFERENT container (the user's selection vanished)?  The benign
+            # case (selection PRESERVED, index merely shifted) re-loads the SAME
+            # container and is harmless; the CLAMP case would auto-load a docker
+            # drill for a container the user never picked.
+            clamped_to_other = bool(getattr(containers_pane, "last_populate_clamped", False))
             # #3/NH1: a (re)populate clears the table and resets the cursor to
             # row 0, firing a PROGRAMMATIC RowHighlighted.  That echo only REACHES
             # on_data_table_row_highlighted (past its tab guard) when the populate
@@ -4381,12 +4704,28 @@ class CockpitApp(App):
             # arrow-move re-sets the flag and DOES load.  (On tab-ENTRY the echo
             # fires while Orchestration is active → guarded out → no arming needed,
             # and the tab-focus handler re-arms separately for the calm-entry case.)
-            if self._active_operate_tab() == "tab-containers":
+            # FIX 1: the row-0 suppression + drill-timer cancel are split now.
+            #  • Re-arm the row-0 suppression (flag→False) ONLY when the table was
+            #    actually RE-RENDERED — that re-render resets the cursor to row 0 and
+            #    fires the PROGRAMMATIC echo that consumes the False flag.  Doing it
+            #    on a SKIPPED poll (cursor preserved, no echo) would wrongly swallow
+            #    the user's NEXT genuine move (nothing consumes the flag).
+            #  • Cancel a stale drill timer on a re-render OR an explicit [r]-refresh
+            #    (kills a pending drill from a prior move — the [r]-re-jump footgun),
+            #    but NOT on an unchanged periodic tick (that must leave the user's
+            #    in-flight drill alone — the whole point of preserving the cursor).
+            on_containers = self._active_operate_tab() == "tab-containers"
+            if rerendered and on_containers:
                 self._containers_user_navigated = False
-                # Cancel any in-flight drill debounce from a prior user move: a
-                # repopulate reset the cursor to row 0, and letting a stale timer
-                # fire would load row 0's drill off the user's old selection (the
-                # second half of the [r]-re-jump footgun).
+                # FIX 1 (clamp echo) — when the cursor was CLAMPED onto a DIFFERENT
+                # container, the re-arm above swallows the t.clear() row-0 echo, but
+                # the follow-up move_cursor echo would still arrive with the flag
+                # already True and auto-load a drill the user never asked for.  Arm
+                # the one-shot so that SECOND echo is swallowed too — the net
+                # invariant: a periodic poll never starts a docker logs/top for a
+                # container the user didn't actively select.
+                self._containers_suppress_clamp_echo = clamped_to_other
+            if (rerendered or explicit_refresh) and on_containers:
                 timer = getattr(self, "_drill_timer", None)
                 if timer is not None:
                     try:
@@ -4443,6 +4782,10 @@ class CockpitApp(App):
         if self._active_mode == 1:
             try:
                 tel = await self._data.estate_telemetry()
+                # FIX 3 — disk + RAM bars render into the LEFT RAIL (estate column),
+                # NOT the Orchestration sub-tab.  The GPU-VRAM "held by:" attribution
+                # stays on the orch GPU cards (populate_telemetry re-renders those).
+                self.query_one("#host-stats-rail", HostStatsRail).populate_telemetry(tel)
                 self.query_one("#operate-orch-pane", OperateOrchPane).populate_telemetry(tel)
             except Exception:
                 pass
@@ -5117,12 +5460,12 @@ class CockpitApp(App):
     def action_refresh(self) -> None:
         """Re-read the live data layer for the active mode."""
         if self._active_mode == 1:
-            self.load_estate()
+            self.load_estate(explicit_refresh=True)
         elif self._active_mode == 2:
             self._load_validate()
             # R3b-1: re-prime the live target so [v] Evaluate stays wired to the
             # currently-serving model on a lane refresh (mirrors _switch_mode).
-            self.load_estate()
+            self.load_estate(explicit_refresh=True)
         else:
             try:
                 self.query_one("#catalog-pane", CatalogPane).query_one(
@@ -6235,11 +6578,29 @@ class CockpitApp(App):
             return
         if sel_id not in ("byo-profile-input", "lane-bring-profile-input"):
             return
+        new_val = event.value
+        # FIX 2 (escape hatch) — the "✎ custom slug…" sentinel reveals + focuses the
+        # companion free-text Input so any non-curated registry slug is reachable.
+        # Selecting a curated slug again hides it.  (Done BEFORE the default-applied
+        # guard so the toggle works on the very first user pick.)
+        custom_id = (
+            "#byo-profile-custom"
+            if sel_id == "byo-profile-input"
+            else "#lane-bring-profile-custom"
+        )
+        try:
+            custom = self.query_one(custom_id, Input)
+            if new_val == PROFILE_CUSTOM_SENTINEL:
+                custom.remove_class("profile-custom-hidden")
+                custom.focus()
+            else:
+                custom.add_class("profile-custom-hidden")
+        except Exception:
+            pass
         # Before the registry-derived default has been applied, any Changed is the
         # initial-mount/placeholder seeding — not a user pick.
         if not getattr(self, "_profile_default_applied", False):
             return
-        new_val = event.value
         # Blank / no-selection sentinel isn't a meaningful pick.
         if new_val is None or new_val is Select.BLANK:
             return
@@ -6316,6 +6677,17 @@ class CockpitApp(App):
         # and re-affirms the flag so further moves keep loading.
         if not self._containers_user_navigated:
             self._containers_user_navigated = True
+            return
+        # FIX 1 (clamp echo) — a CLAMP-to-different populate fires TWO programmatic
+        # echoes: the t.clear() row-0 reset (swallowed by the gate above) AND the
+        # follow-up move_cursor onto a container the user never selected.  The
+        # latter arrives here with the navigated flag already True, so it would
+        # auto-load a docker drill for that unselected container — re-introducing
+        # the [r]-re-jump footgun on every periodic tick.  Swallow it via the
+        # one-shot armed by load_estate; a later GENUINE user move clears nothing
+        # (the flag stays True) and loads normally.
+        if self._containers_suppress_clamp_echo:
+            self._containers_suppress_clamp_echo = False
             return
         self._refresh_container_config()
         timer = getattr(self, "_drill_timer", None)
@@ -6415,13 +6787,29 @@ class CockpitApp(App):
     def _selected_profile_like(self, select_id: str) -> str:
         """#6 — the profile-like string from a profile-template Select.  Reads the
         Select's value (a registry-derived slug); falls back to "vllm/dual" if the
-        widget is blank/unresolved."""
+        widget is blank/unresolved.
+
+        FIX 2 (escape hatch) — when the "✎ custom slug…" sentinel is selected, read
+        the companion free-text Input instead so any non-curated registry slug is
+        expressible (byo_check then validates it via the unknown-profile path).  A
+        blank custom Input falls back to the default (never the sentinel marker)."""
         try:
             val = self.query_one(select_id, Select).value
         except Exception:
             return "vllm/dual"
         if val is None or val is Select.BLANK:
             return "vllm/dual"
+        if val == PROFILE_CUSTOM_SENTINEL:
+            custom_id = (
+                "#byo-profile-custom"
+                if select_id == "#byo-profile-input"
+                else "#lane-bring-profile-custom"
+            )
+            try:
+                typed = self.query_one(custom_id, Input).value.strip()
+            except Exception:
+                typed = ""
+            return typed or "vllm/dual"
         return str(val).strip() or "vllm/dual"
 
     def _trigger_byo(self) -> None:

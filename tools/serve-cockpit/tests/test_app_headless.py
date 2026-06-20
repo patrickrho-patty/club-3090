@@ -64,6 +64,7 @@ from club3090_cockpit.data import (
     EstateTelemetry,
     GpuCompApp,
     RamUsage,
+    Scene,
     ServedProbe,
     attribute_gpu_apps,
     parse_cgroup_container_id,
@@ -991,6 +992,38 @@ class TestByoWired:
             pull = next(c for c in runner.calls if "pull.sh" in " ".join(c))
             assert "--dry-run" in pull
 
+    @pytest.mark.asyncio
+    async def test_escape_hatch_custom_slug_reaches_byo_check(self):
+        # FIX 2 (escape hatch) — the curated dropdown lists only ~7 reps, so a
+        # NON-curated registry slug must stay reachable: selecting the "✎ custom
+        # slug…" sentinel reveals the companion Input, and the TYPED slug (not the
+        # sentinel marker, not the rig default) is what byo_check dry-runs.  Pins
+        # the reveal → resolve → byo_check chain end-to-end.
+        from club3090_cockpit.app import PROFILE_CUSTOM_SENTINEL
+
+        app, runner, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            app.query_one("#byo-url-input", Input).value = "org/Model"
+            sel = app.query_one("#byo-profile-input", Select)
+            custom = app.query_one("#byo-profile-custom", Input)
+            # Reveal the companion Input by selecting the sentinel.
+            sel.value = PROFILE_CUSTOM_SENTINEL
+            await pilot.pause()
+            assert "profile-custom-hidden" not in custom.classes  # revealed
+            # The user types a non-curated slug.
+            custom.value = "ik-llama/iq4ks-mtp"
+            await pilot.pause()
+            # _selected_profile_like resolves to the TYPED slug, not the sentinel.
+            assert app._selected_profile_like("#byo-profile-input") == "ik-llama/iq4ks-mtp"
+            runner.calls.clear()
+            app.query_one("#byo-fit-btn", Button).press()
+            await _settle(pilot)
+            pull = next(c for c in runner.calls if "pull.sh" in " ".join(c))
+            joined = " ".join(pull)
+            assert "--profile-like ik-llama/iq4ks-mtp" in joined
+            assert PROFILE_CUSTOM_SENTINEL not in joined   # sentinel never leaks
+
 
 # ===========================================================================
 # Serve folded into Run (⏎ on a catalog row → reconcile-gated confirm modal)
@@ -1162,6 +1195,155 @@ class TestEstateWired:
             await pilot.press("enter")
             await pilot.pause()
             assert isinstance(app.screen, ConfirmActionScreen)
+
+
+@pytest.mark.asyncio
+class TestFix1CursorPreserveAcrossPoll:
+    """FIX 1 — the B2 periodic refresh re-populates the scene + container tables
+    every 4s.  The cursor must NOT snap back to row 0 on each tick: preserve it by
+    STABLE ROW KEY (scene / container name) across a re-populate, fall back to a
+    clamped index when the selected row disappears, and skip the re-populate
+    entirely when the row set is unchanged."""
+
+    SCENES = [
+        Scene(name="27b", group="serving", description="Qwen",
+              services=["vllm-qwen36-27b-dual"], ports=["8010"], gpus="both"),
+        Scene(name="gemma", group="serving", description="Gemma",
+              services=["vllm-gemma"], ports=["8011"], gpus="both"),
+        Scene(name="diffusion", group="serving", description="Diff",
+              services=["comfyui"], ports=["8188"], gpus="0"),
+        Scene(name="off", group="ops", description="Stop all",
+              services=[], ports=[], gpus="none"),
+    ]
+
+    CONTAINERS = [
+        ContainerInfo(name="vllm-a", kind="engine", host_port=8010, engine="vllm", slug="vllm/dual"),
+        ContainerInfo(name="vllm-b", kind="engine", host_port=8011, engine="vllm", slug="vllm/single"),
+        ContainerInfo(name="comfyui", kind="service", host_port=8188, engine="", slug=""),
+        ContainerInfo(name="open-webui", kind="service", host_port=3000, engine="", slug=""),
+    ]
+
+    async def test_scene_cursor_held_across_identical_poll(self):
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("2")
+            await _settle(pilot)
+            orch = app.query_one("#operate-orch-pane", OperateOrchPane)
+            orch._populate_scenes(self.SCENES)
+            t = app.query_one("#scene-table", DataTable)
+            t.move_cursor(row=2)  # "diffusion"
+            await pilot.pause()
+            assert orch.selected_scene().name == "diffusion"
+            # Two more poll cycles with the SAME scenes — cursor must NOT snap to 0.
+            orch._populate_scenes(self.SCENES)
+            orch._populate_scenes(self.SCENES)
+            await pilot.pause()
+            assert t.cursor_row == 2
+            assert orch.selected_scene().name == "diffusion"
+
+    async def test_scene_cursor_follows_key_when_row_set_changes(self):
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("2")
+            await _settle(pilot)
+            orch = app.query_one("#operate-orch-pane", OperateOrchPane)
+            orch._populate_scenes(self.SCENES)
+            t = app.query_one("#scene-table", DataTable)
+            t.move_cursor(row=2)  # "diffusion"
+            await pilot.pause()
+            # A scene appears at the TOP → "diffusion" is now at index 3; the cursor
+            # must FOLLOW the key, not stay pinned to the stale index 2.
+            shifted = [Scene(name="new", group="serving", description="N",
+                             services=["x"], ports=["9"], gpus="0")] + self.SCENES
+            orch._populate_scenes(shifted)
+            await pilot.pause()
+            assert orch.selected_scene().name == "diffusion"
+            assert t.cursor_row == 3
+
+    async def test_scene_cursor_clamps_when_selected_disappears(self):
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("2")
+            await _settle(pilot)
+            orch = app.query_one("#operate-orch-pane", OperateOrchPane)
+            orch._populate_scenes(self.SCENES)
+            t = app.query_one("#scene-table", DataTable)
+            t.move_cursor(row=3)  # "off" (last row)
+            await pilot.pause()
+            assert orch.selected_scene().name == "off"
+            # The selected scene DISAPPEARS on the next poll → graceful clamp, no crash.
+            fewer = self.SCENES[:2]  # only "27b", "gemma"
+            orch._populate_scenes(fewer)
+            await pilot.pause()
+            assert t.cursor_row == min(3, t.row_count - 1) == 1
+            assert orch.selected_scene() is not None  # no crash, valid selection
+
+    async def test_container_cursor_held_across_identical_poll(self):
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("2")
+            await _settle(pilot)
+            pane = app.query_one("#operate-containers-pane", OperateContainersPane)
+            pane.populate(self.CONTAINERS)
+            t = app.query_one("#containers-table", DataTable)
+            t.move_cursor(row=2)  # "comfyui"
+            await pilot.pause()
+            assert pane.selected_container().name == "comfyui"
+            # Two identical polls — cursor stays on comfyui, never resets to row 0.
+            pane.populate(self.CONTAINERS)
+            pane.populate(self.CONTAINERS)
+            await pilot.pause()
+            assert t.cursor_row == 2
+            assert pane.selected_container().name == "comfyui"
+
+    async def test_container_cursor_clamps_when_selected_disappears(self):
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("2")
+            await _settle(pilot)
+            pane = app.query_one("#operate-containers-pane", OperateContainersPane)
+            pane.populate(self.CONTAINERS)
+            t = app.query_one("#containers-table", DataTable)
+            t.move_cursor(row=3)  # "open-webui" (last)
+            await pilot.pause()
+            assert pane.selected_container().name == "open-webui"
+            # That container stops → row set shrinks; cursor clamps, no crash.
+            fewer = self.CONTAINERS[:2]
+            pane.populate(fewer)
+            await pilot.pause()
+            assert t.cursor_row == 1
+            assert pane.selected_container() is not None
+
+    async def test_container_cursor_follows_key_when_one_starts(self):
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("2")
+            await _settle(pilot)
+            pane = app.query_one("#operate-containers-pane", OperateContainersPane)
+            pane.populate(self.CONTAINERS)
+            t = app.query_one("#containers-table", DataTable)
+            t.move_cursor(row=2)  # "comfyui"
+            await pilot.pause()
+            # A new container appears at the top → comfyui shifts to index 3; the
+            # cursor must follow the KEY (comfyui), not the stale index 2.
+            grown = [ContainerInfo(name="new-svc", kind="engine", host_port=9000,
+                                   engine="vllm", slug="vllm/x")] + self.CONTAINERS
+            pane.populate(grown)
+            await pilot.pause()
+            assert pane.selected_container().name == "comfyui"
+            assert t.cursor_row == 3
+
+    async def test_populate_returns_false_on_unchanged_poll(self):
+        # FIX 1 — the skip-if-unchanged guard reports a no-op so load_estate doesn't
+        # spuriously re-arm the row-0 suppression / cancel a pending drill.
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("2")
+            await _settle(pilot)
+            pane = app.query_one("#operate-containers-pane", OperateContainersPane)
+            assert pane.populate(self.CONTAINERS) is True       # first render
+            assert pane.populate(self.CONTAINERS) is False      # unchanged → skipped
+            assert pane.populate(self.CONTAINERS[:2]) is True   # changed → re-rendered
 
 
 # ===========================================================================
@@ -3989,6 +4171,122 @@ class TestContainerAutoLoad:
             )
 
 
+class TestContainerClampDoesNotAutoloadDrill:
+    """FIX 1 (clamp echo) — when a periodic poll (load_estate) drops the
+    container the user had selected, populate() CLAMPS the cursor to a DIFFERENT
+    container.  The move_cursor clamp fires a SECOND RowHighlighted echo that
+    BYPASSED the row-0 drill suppression → a spurious `docker logs/top` auto-fired
+    for a container the user never picked (the [r]-re-jump footgun, now on every
+    tick).  These guards drive the WHOLE pipeline through load_estate (not just
+    populate()) and assert the invariant: a poll NEVER starts a docker logs/top
+    for an unselected container, while the benign index-shift case is preserved."""
+
+    # vllm-a (engine, row 0) · comfyui (row 1) · open-webui (row 2).  The user
+    # sits on open-webui (a non-row-0 container) with the Logs drill open.
+    CONTAINERS_FULL = [
+        ContainerInfo(name="vllm-a", kind="engine", host_port=8010, engine="vllm", slug="vllm/dual"),
+        ContainerInfo(name="comfyui", kind="service", host_port=8188),
+        ContainerInfo(name="open-webui", kind="service", host_port=3000),
+    ]
+    # open-webui DROPS — cursor must clamp from row 2 → comfyui (row 1).
+    CONTAINERS_DROPPED = [
+        ContainerInfo(name="vllm-a", kind="engine", host_port=8010, engine="vllm", slug="vllm/dual"),
+        ContainerInfo(name="comfyui", kind="service", host_port=8188),
+    ]
+    # A container appears at the TOP — open-webui survives but shifts row 2 → 3.
+    CONTAINERS_SHIFTED = [
+        ContainerInfo(name="new-svc", kind="engine", host_port=9000, engine="vllm", slug="vllm/x"),
+        ContainerInfo(name="vllm-a", kind="engine", host_port=8010, engine="vllm", slug="vllm/dual"),
+        ContainerInfo(name="comfyui", kind="service", host_port=8188),
+        ContainerInfo(name="open-webui", kind="service", host_port=3000),
+    ]
+
+    def _patch_estate(self, app, holder):
+        """Make load_estate observe whatever container list ``holder`` points at,
+        so a test flips the live estate between polls without any subprocess."""
+        async def _estate_state(*_a, **_k):
+            return EstateState(containers=list(holder["containers"]))
+        app._data.estate_state = _estate_state
+
+    async def _enter_containers_on_logs(self, app, pilot, holder):
+        await pilot.press("2")                                  # Operate
+        await _settle(pilot)
+        app.query_one("#operate-tabs", TabbedContent).active = "tab-containers"
+        await _settle(pilot)
+        # First poll paints the full table.
+        app.load_estate()
+        await _settle(pilot)
+        # User selects open-webui (row 2 — a non-row-0 container) and opens Logs.
+        tbl = app.query_one("#containers-table", DataTable)
+        tbl.focus()
+        await pilot.pause()
+        app.query_one("#drill-tabs", TabbedContent).active = "drill-tab-logs"
+        await _settle(pilot)
+        tbl.move_cursor(row=2)                                  # → open-webui
+        await pilot.pause()
+        assert app._selected_container().name == "open-webui"
+        # Explicitly load the Logs drill for open-webui (the user's pick).
+        app._load_active_drill_tab()
+        await _settle(pilot)
+
+    @pytest.mark.asyncio
+    async def test_clamp_to_other_container_does_not_autoload_drill(self):
+        holder = {"containers": list(self.CONTAINERS_FULL)}
+        app, runner, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            self._patch_estate(app, holder)
+            await self._enter_containers_on_logs(app, pilot, holder)
+            # The user's Logs read DID fire for open-webui.
+            assert any("docker logs" in " ".join(c) and "open-webui" in " ".join(c)
+                       for c in runner.calls), "user's open-webui logs never loaded"
+            runner.calls.clear()
+            # PERIODIC POLL where open-webui DISAPPEARS → cursor clamps to comfyui.
+            holder["containers"] = list(self.CONTAINERS_DROPPED)
+            app.load_estate()
+            await _settle(pilot)
+            await pilot.pause(0.35)                             # let any drill timer fire
+            await _settle(pilot)
+            # INVARIANT: NO docker logs/top fired for the clamped-to container
+            # (comfyui) — nor for anything the user didn't pick.
+            assert not any("docker logs" in " ".join(c) for c in runner.calls), (
+                f"clamp spuriously auto-loaded docker logs: {runner.calls}"
+            )
+            assert not any("docker top" in " ".join(c) for c in runner.calls), (
+                f"clamp spuriously auto-loaded docker top: {runner.calls}"
+            )
+            # The cursor DID clamp to a different container (comfyui), proving the
+            # scenario actually exercised the clamp path.
+            assert app._selected_container().name == "comfyui"
+
+    @pytest.mark.asyncio
+    async def test_preserved_selection_index_shift_retains_same_drill(self):
+        # Benign companion: the selection is PRESERVED (open-webui survives, index
+        # merely shifts).  Reloading the SAME container's drill is harmless — and
+        # crucially NO OTHER container's drill is loaded.
+        holder = {"containers": list(self.CONTAINERS_FULL)}
+        app, runner, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            self._patch_estate(app, holder)
+            await self._enter_containers_on_logs(app, pilot, holder)
+            runner.calls.clear()
+            # A container appears at the top → open-webui shifts row 2 → 3 but is
+            # PRESERVED (same container under the cursor).
+            holder["containers"] = list(self.CONTAINERS_SHIFTED)
+            app.load_estate()
+            await _settle(pilot)
+            await pilot.pause(0.35)
+            await _settle(pilot)
+            # The cursor followed the KEY — still open-webui (now row 3).
+            assert app._selected_container().name == "open-webui"
+            # No drill for a DIFFERENT container leaked (comfyui / vllm-a / new-svc).
+            for other in ("comfyui", "vllm-a", "new-svc"):
+                assert not any(
+                    ("docker logs" in " ".join(c) or "docker top" in " ".join(c))
+                    and other in " ".join(c)
+                    for c in runner.calls
+                ), f"a drill spuriously loaded for {other}: {runner.calls}"
+
+
 class TestEscClosesFilter:
     """Esc closes an open filter Input + refocuses the table (it was a dead key
     inside the filter before) — and never quits the app."""
@@ -6174,10 +6472,11 @@ class TestProfileTemplateDerivation:
             compose_path=path, status="production", ctx_label="262K", status_note="",
         )
 
-    def test_every_slug_is_selectable_none_collapsed(self):
-        # BLOCKER: the dropdown must emit ONE option per registry SLUG — the old
-        # (engine, topology) collapse made siblings unreachable.  THREE vllm dual
-        # slugs sharing (vllm-stable, dual) must ALL survive (real-registry shape).
+    def test_one_option_per_unique_family_topology_not_per_slug(self):
+        # FIX 2 (maintainer directive — REVERSES the B4b all-slugs deviation): the
+        # dropdown emits ONE representative per UNIQUE (engine-FAMILY, topology) pair,
+        # NOT one per slug.  THREE vllm dual slugs sharing (vllm, dual) collapse to a
+        # SINGLE "vllm / dual" option (the escape hatch keeps the rest reachable).
         rows = [
             self._mk("vllm/dual", "vllm-stable", "models/q/vllm/compose/dual/aq/fp8-mtp.yml"),
             self._mk("vllm/qwen-27b-dual-max", "vllm-stable", "models/q/vllm/compose/dual/aq/int8.yml"),
@@ -6187,20 +6486,45 @@ class TestProfileTemplateDerivation:
             self._mk("llamacpp/default", "llama-cpp-local", "models/q/llama-cpp/compose/single/u/default.yml"),
         ]
         opts = profile_templates(rows)
-        values = [o.slug for o in opts]
-        # NONE collapsed away — every distinct slug is a selectable option.
-        for slug in (
-            "vllm/dual", "vllm/qwen-27b-dual-max", "vllm/qwen-27b-dual-fast",
-            "vllm/minimal", "ik-llama/iq4ks-mtp", "llamacpp/default",
-        ):
-            assert slug in values, slug
-        assert len(values) == len(set(values)) == 6  # one option per slug, deduped
-        # labels carry the engine/topology so a user can read what they pick.
-        assert any("vllm-stable / dual" in o.label for o in opts)
+        # Distinct (family, topology) pairs in this fixture:
+        #   (vllm, dual), (vllm, single), (llama-cpp, single)   ← ik-llama + llamacpp
+        #   slugs BOTH map to engine family "llama-cpp" so they share one option.
+        pairs = {(o.label.split("  ·  ")[0]) for o in opts}
+        assert len(opts) == len(pairs)        # one option per distinct pair
+        assert len(opts) == 3                 # NOT 6 (per-slug); curated short-list
+        # The (vllm, dual) representative is the canonical literal "vllm/dual".
+        by_topo_fam = {(o.topology, o.label.split(" / ")[0]): o for o in opts}
+        assert by_topo_fam[("dual", "vllm")].slug == "vllm/dual"
+        # labels lead with the readable family / topology, then the chosen slug.
+        assert any(o.label.startswith("vllm / dual  ·  vllm/dual") for o in opts)
         # topology is carried THROUGH on the option (not re-derived from the label).
-        by_slug = {o.slug: o for o in opts}
-        assert by_slug["vllm/dual"].topology == "dual"
-        assert by_slug["vllm/minimal"].topology == "single"
+        assert by_topo_fam[("dual", "vllm")].topology == "dual"
+        assert by_topo_fam[("single", "vllm")].topology == "single"
+
+    def test_vllm_stable_and_gemma_stable_collapse_to_one_vllm_dual(self):
+        # FIX 2 — vllm-stable + vllm-gemma-stable are DIFFERENT raw engines but the
+        # SAME canonical family "vllm"; their dual variants must collapse to a SINGLE
+        # "vllm / dual" option (otherwise "vllm / dual" would appear twice).
+        rows = [
+            self._mk("vllm/dual", "vllm-stable", "models/q/vllm/compose/dual/aq/fp8-mtp.yml"),
+            self._mk("vllm/gemma-bf16-mtp", "vllm-gemma-stable", "models/q/vllm/compose/dual/aq/bf16-mtp.yml"),
+        ]
+        opts = profile_templates(rows)
+        assert len(opts) == 1                 # ONE vllm/dual, not two
+        assert opts[0].slug == "vllm/dual"    # canonical-literal representative wins
+        assert opts[0].label.startswith("vllm / dual")
+
+    def test_representative_is_last_in_order_when_no_canonical_literal(self):
+        # FIX 2 — when no literal "<family>/<topo>" slug exists in a group, the
+        # representative is the LAST variant in registry order (a stable latest proxy).
+        rows = [
+            self._mk("vllm/minimal", "vllm-stable", "models/q/vllm/compose/single/aq/base.yml"),
+            self._mk("vllm/qwen-a3b-preview-single", "vllm-stable", "models/q/vllm/compose/single/aq/preview.yml"),
+        ]
+        opts = profile_templates(rows)
+        assert len(opts) == 1
+        # No literal "vllm/single" → last-in-order representative.
+        assert opts[0].slug == "vllm/qwen-a3b-preview-single"
 
     def test_rig_default_is_canonical_not_alphabetical_gemma(self):
         # BLOCKER: the rig-topology default must be the CANONICAL vllm slug for the
@@ -6240,6 +6564,186 @@ class TestProfileTemplateDerivation:
         opts = profile_templates(rows)
         assert default_profile_template(opts, 1) == "vllm/single"
         assert default_profile_template(opts, 2) == "vllm/dual"
+
+    def test_default_value_is_present_in_curated_options(self):
+        # FIX 2 — a Select can't default to a value not in its options.  The
+        # rig-default (vllm/dual on ≥2 cards) MUST be one of the curated entries.
+        rows = [
+            self._mk("vllm/dual", "vllm-stable", "models/q/vllm/compose/dual/aq/fp8-mtp.yml"),
+            self._mk("vllm/qwen-27b-dual-max", "vllm-stable", "models/q/vllm/compose/dual/aq/int8.yml"),
+            self._mk("vllm/minimal", "vllm-stable", "models/q/vllm/compose/single/aq/base.yml"),
+            self._mk("beellama/dflash", "beellama-local", "models/q/beellama/compose/single/u/dflash.yml"),
+        ]
+        opts = profile_templates(rows)
+        curated_slugs = {o.slug for o in opts}
+        assert default_profile_template(opts, 2) in curated_slugs
+        assert default_profile_template(opts, 1) in curated_slugs
+
+    def test_select_options_include_custom_escape_hatch_sentinel(self):
+        # FIX 2 (escape hatch) — the (label, value) pairs a Select consumes carry a
+        # trailing "✎ custom slug…" sentinel so any non-curated registry slug stays
+        # reachable.  The sentinel is the LAST option and is NOT a real slug.
+        from club3090_cockpit.app import (
+            profile_select_options,
+            PROFILE_CUSTOM_SENTINEL,
+        )
+        rows = [
+            self._mk("vllm/dual", "vllm-stable", "models/q/vllm/compose/dual/aq/fp8-mtp.yml"),
+        ]
+        pairs = profile_select_options(profile_templates(rows))
+        assert pairs[-1][1] == PROFILE_CUSTOM_SENTINEL
+        assert "custom" in pairs[-1][0].lower()
+        # the curated representative is still present as a real option.
+        assert ("vllm / dual  ·  vllm/dual", "vllm/dual") in pairs
+
+    # ── FIX 2 (status-aware representative pick) regression guards ──────────────
+    #
+    # The B4b/FIX-2 rewrite picked ``rep_slug = slugs[-1]`` (registry insertion
+    # order — STATUS-BLIND) whenever no literal ``<family>/<topo>`` existed.  On
+    # the LIVE 53-variant registry that left 4 of 7 reps non-functional — e.g.
+    # (vllm, single) → vllm/vibethinker-3b-single [incubating] — and the
+    # single-card rig DEFAULT resolved to that incubating 3B (needs --force to
+    # launch) instead of the curated vllm/minimal.  The 2-card path stayed green
+    # (vllm/dual is the one literal slug) which is why synthetic fixtures + the
+    # maintainer's 2-card rig never caught it.  These two guards pin the
+    # status-aware behavior: one drives the REAL registry, one a faithful fixture
+    # that mirrors its status distribution (so the suite catches it even off-rig).
+
+    _INCUBATING = "incubating"
+    _EXPERIMENTAL = "experimental"
+
+    def _mk_status(self, slug, engine, path, status):
+        row = self._mk(slug, engine, path)
+        return row._replace(status=status) if hasattr(row, "_replace") else VariantRow(
+            slug=slug, switch_engine=engine, launch_engine=engine,
+            compose_dir=path.rsplit("/", 1)[0], file=path.rsplit("/", 1)[1],
+            port=8000, model="q", engine=engine, kvcalc_key="k", container="c",
+            compose_path=path, status=status, ctx_label="262K", status_note="",
+        )
+
+    def test_status_aware_rep_skips_incubating_when_functional_sibling_exists(self):
+        # Fixture mirroring the live (vllm, single) group: the LAST slug in
+        # registry order is an incubating 3B; a functional vllm/minimal sits
+        # EARLIER.  The status-BLIND rule chose slugs[-1] (the incubating one) —
+        # the status-aware rule must choose the functional vllm/minimal, and the
+        # 1-card default must be functional / non-incubating.
+        rows = [
+            self._mk_status("vllm/minimal", "vllm-stable",
+                            "models/q/vllm/compose/single/aq/minimal.yml", "production"),
+            self._mk_status("vllm/qwen-a3b-preview-single", "vllm-stable",
+                            "models/q/vllm/compose/single/aq/preview.yml", "preview"),
+            # last-in-order single vllm slug is the incubating 3B (the trap).
+            self._mk_status("vllm/vibethinker-3b-single", "vllm-stable",
+                            "models/q/vllm/compose/single/aq/vibe.yml", self._INCUBATING),
+            self._mk_status("vllm/dual", "vllm-stable",
+                            "models/q/vllm/compose/dual/aq/fp8-mtp.yml", "production"),
+        ]
+        # No curated `defaults` passed → exercises the STATUS FLOOR (rule c).
+        opts = profile_templates(rows)
+        single = next(o for o in opts if o.topology == "single")
+        # status-blind would have given vibethinker; status-aware gives minimal.
+        assert single.slug == "vllm/minimal"
+        assert single.status not in (self._INCUBATING, self._EXPERIMENTAL, "preview")
+        # The 1-card rig default must be a launchable (functional) slug.
+        dflt = default_profile_template(opts, 1)
+        assert dflt == "vllm/minimal"
+        dflt_status = next(o.status for o in opts if o.slug == dflt)
+        assert dflt_status in {"production", "caveats"}
+
+    def test_curated_defaults_drive_rep_when_no_literal_slug(self):
+        # FIX 2 rule (b): when a (family, topology) has no literal "<fam>/<topo>"
+        # slug but the registry's curated `defaults` array names one, USE it —
+        # it's the registry's own recommendation.  Here llamacpp/dual has no
+        # literal; the curated default names llamacpp/deckard40B-dual-mtp.
+        rows = [
+            self._mk_status("llamacpp/hauhaucs-35ba3b-dual", "llama-cpp-local",
+                            "models/q/llama-cpp/compose/dual/u/hauhau.yml", self._EXPERIMENTAL),
+            self._mk_status("llamacpp/deckard40B-dual-mtp", "llama-cpp-local",
+                            "models/q/llama-cpp/compose/dual/u/deckard.yml", "production"),
+        ]
+        defaults = [
+            {"model": "deckard40b", "engine": "llamacpp", "topology": "dual",
+             "slug": "llamacpp/deckard40B-dual-mtp", "source": "curated"},
+        ]
+        opts = profile_templates(rows, defaults)
+        dual = next(o for o in opts if o.topology == "dual")
+        assert dual.slug == "llamacpp/deckard40B-dual-mtp"
+        assert dual.status == "production"
+
+    def test_entirely_nonfunctional_group_keeps_last_resort_rep(self):
+        # FIX 2 rule (d): a group whose EVERY member is non-functional (the live
+        # registry's (beellama, dual) + (vllm, multi4)) has no functional rep to
+        # pick — fall back to slugs[-1].  The escape hatch still reaches the rest.
+        rows = [
+            self._mk_status("beellama/qwen-mtp-dual", "beellama-local",
+                            "models/q/beellama/compose/dual/q8/mtp.yml", self._EXPERIMENTAL),
+            self._mk_status("beellama/gemma-q8-dflash-dual", "beellama-local",
+                            "models/q/beellama/compose/dual/q8/dflash.yml", self._EXPERIMENTAL),
+        ]
+        opts = profile_templates(rows)
+        dual = next(o for o in opts if o.topology == "dual")
+        assert dual.slug == "beellama/gemma-q8-dflash-dual"   # last-in-order
+
+    def test_real_registry_reps_are_status_aware(self):
+        # REAL-REGISTRY guard — drive profile_templates + default_profile_template
+        # against the live `registry-emit.sh --json` (the SAME contract the
+        # production load path consumes), so a status-blind regression reds here.
+        # Skips cleanly if the registry/emitter is absent; present in this repo.
+        import subprocess
+        from club3090_cockpit.services import _variant_row_from_dict
+
+        repo_root = Path(__file__).resolve().parents[3]
+        emitter = repo_root / "scripts" / "lib" / "registry-emit.sh"
+        if not emitter.exists():
+            pytest.skip("registry-emit.sh not present — real-registry guard skipped")
+        try:
+            proc = subprocess.run(
+                ["bash", str(emitter), "--json"],
+                capture_output=True, text=True, timeout=60, cwd=str(repo_root),
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pytest.skip("registry-emit.sh --json unavailable — real-registry guard skipped")
+        if proc.returncode != 0 or not proc.stdout.strip():
+            pytest.skip(f"registry-emit.sh --json returned nothing (rc={proc.returncode})")
+        payload = json.loads(proc.stdout)
+        variants = [_variant_row_from_dict(d) for d in payload.get("variants", [])]
+        defaults = payload.get("defaults", [])
+        assert variants, "real registry returned no variants"
+
+        opts = profile_templates(variants, defaults)
+        # Exactly one option per (family, topology); 7 distinct groups today.
+        pairs = {(o.topology, o.label.split(" / ")[0]) for o in opts}
+        assert len(opts) == len(pairs), "duplicate (family, topology) representative"
+        assert len(opts) == 7, f"expected 7 reps, got {len(opts)}: {[o.slug for o in opts]}"
+
+        # The 1-card rig default must be FUNCTIONAL + non-incubating — ideally the
+        # registry's curated single default (vllm/minimal).
+        dflt = default_profile_template(opts, 1)
+        dflt_status = next((o.status for o in opts if o.slug == dflt), "")
+        assert dflt_status in {"production", "caveats"}, (
+            f"1-card default {dflt!r} is non-functional ({dflt_status})"
+        )
+        assert dflt == "vllm/minimal", f"1-card default is {dflt!r}, not vllm/minimal"
+
+        # NO representative is non-functional while a FUNCTIONAL sibling exists in
+        # its group — the exact defect (incubating/experimental rep over a
+        # functional one).  Rebuild the per-group membership to check siblings.
+        from club3090_cockpit.app import _canon_engine_family, _variant_topology
+        groups: dict[tuple, list[str]] = {}
+        for v in variants:
+            fam = _canon_engine_family(v.engine) or v.engine
+            topo = _variant_topology(v) or "—"
+            groups.setdefault((fam, topo), []).append((v.status or "").lower())
+        FUNCTIONAL = {"production", "caveats"}
+        for o in opts:
+            fam = o.label.split(" / ")[0]
+            members = groups.get((fam, o.topology), [])
+            group_has_functional = any(s in FUNCTIONAL for s in members)
+            if group_has_functional:
+                assert o.status in FUNCTIONAL, (
+                    f"rep {o.slug!r} is {o.status!r} but its ({fam},{o.topology}) "
+                    f"group has a functional sibling"
+                )
 
 
 class TestCatalogPreview:
@@ -6469,6 +6973,41 @@ class TestProfileSelectInputErgonomics:
             pull = next(c for c in runner.calls if "pull.sh" in " ".join(c))
             assert "--dry-run" in pull
             assert "vllm/dual" in pull
+
+    @pytest.mark.asyncio
+    async def test_custom_sentinel_reveals_input_and_routes_typed_slug(self):
+        # FIX 2 (escape hatch) — selecting "✎ custom slug…" reveals the companion
+        # free-text Input; a typed arbitrary (non-curated) slug reaches byo_check.
+        from club3090_cockpit.app import PROFILE_CUSTOM_SENTINEL
+        responses = fake_responses(**{"registry-emit.sh --json": ok(REGISTRY_JSON_CAVEAT)})
+        app, _, _ = make_app(responses=responses)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            custom = app.query_one("#byo-profile-custom", Input)
+            # Hidden until the sentinel is chosen.
+            assert custom.has_class("profile-custom-hidden")
+            sel = app.query_one("#byo-profile-input", Select)
+            sel.value = PROFILE_CUSTOM_SENTINEL
+            await pilot.pause()
+            # Revealed by the sentinel pick.
+            assert not custom.has_class("profile-custom-hidden")
+            # A custom slug NOT in the curated list is what _selected_profile_like
+            # returns (so it reaches byo_check's unknown-profile validation path).
+            custom.value = "ik-llama/iq4ks-mtp"
+            assert app._selected_profile_like("#byo-profile-input") == "ik-llama/iq4ks-mtp"
+
+    @pytest.mark.asyncio
+    async def test_custom_slug_not_in_curated_list_still_validates(self):
+        # FIX 2 (escape hatch) — a typed slug that's NOT one of the curated dropdown
+        # representatives still flows to byo_check (validated, then served if known).
+        app, runner, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            app.run_byo_check("org/Model", "ik-llama/iq4ks-mtp")
+            await _settle(pilot)
+            pull = next(c for c in runner.calls if "pull.sh" in " ".join(c))
+            assert "--dry-run" in pull
+            assert "ik-llama/iq4ks-mtp" in pull
 
 
 class TestProducerLaneHandoff:
@@ -6819,8 +7358,9 @@ class TestBatch5TelemetryDataLayer:
 
 @pytest.mark.asyncio
 class TestBatch5OperateRendering:
-    """The Operate pane renders the disk rail / RAM line and the GPU "held by:"
-    attribution from the telemetry read on the existing tick."""
+    """The LEFT RAIL renders the disk / RAM line (FIX 3 — moved out of the
+    Orchestration sub-tab) and the GPU "held by:" attribution renders on the orch
+    GPU cards, both from the telemetry read on the existing tick."""
 
     async def test_disk_rail_renders_bars_and_ram(self):
         gpus = [
@@ -6833,7 +7373,7 @@ class TestBatch5OperateRendering:
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.press("2")
             await _settle(pilot)
-            rail = str(app.query_one("#disk-rail", Static).render())
+            rail = str(app.query_one("#host-stats-rail", Static).render())
             assert "repo" in rail
             assert "models" in rail
             assert "26%" in rail      # repo Use%
@@ -6885,7 +7425,7 @@ class TestBatch5OperateRendering:
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.press("2")
             await _settle(pilot)
-            rail = str(app.query_one("#disk-rail", Static).render())
+            rail = str(app.query_one("#host-stats-rail", Static).render())
             assert "disk read failed" in rail     # honest cue
             assert "0%" not in rail               # NO fabricated zero bar
             assert "0G/0G" not in rail
@@ -6903,7 +7443,7 @@ class TestBatch5OperateRendering:
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.press("2")
             await _settle(pilot)
-            rail = str(app.query_one("#disk-rail", Static).render())
+            rail = str(app.query_one("#host-stats-rail", Static).render())
             assert "MemAvailable missing" in rail  # honest cue
             assert "100%" not in rail              # NOT a misleading full bar
 
@@ -6926,6 +7466,53 @@ class TestBatch5OperateRendering:
             assert "card unknown" in bar0          # neutral heading
             assert "llama-cpp-pi-reasoning" in bar0  # holder still surfaced
             assert "held by:" not in bar0          # NOT mis-pinned to a card
+
+
+@pytest.mark.asyncio
+class TestFix3HostStatsPlacement:
+    """FIX 3 — host disk + RAM render into the LEFT RAIL (the "estate column"),
+    NOT the Orchestration sub-tab; GPU "held by:" attribution stays on the cards."""
+
+    async def test_disk_ram_render_into_left_rail_not_orch_pane(self):
+        from club3090_cockpit.app import HostStatsRail, OperateOrchPane
+        gpus = [
+            GpuInfo(index=0, mem_used_mib=22 * 1024, mem_total_mib=24 * 1024),
+            GpuInfo(index=1, mem_used_mib=1, mem_total_mib=24 * 1024),
+        ]
+        app, _, _ = make_app(
+            responses=batch5_responses(), gpus=gpus, target=ServingTarget(gpus=gpus)
+        )
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("2")
+            await _settle(pilot)
+            # The disk/RAM card lives in the GLOBAL left rail, below RailStatus.
+            rail_widget = app.query_one("#host-stats-rail", HostStatsRail)
+            assert rail_widget in app.query_one("#left-rail").children
+            rail = str(rail_widget.render())
+            assert "repo" in rail and "RAM" in rail   # disk + RAM after a poll
+            # The orch pane NO LONGER owns a #disk-rail child (it was moved out).
+            orch = app.query_one("#operate-orch-pane", OperateOrchPane)
+            assert len(orch.query("#disk-rail")) == 0
+
+    async def test_gpu_held_by_attribution_stays_on_orch_cards(self):
+        # FIX 3 — the GPU-VRAM → container attribution was NOT flagged; it stays on
+        # the orch GPU cards (only disk/RAM moved to the rail).
+        gpus = [
+            GpuInfo(index=0, mem_used_mib=22 * 1024, mem_total_mib=24 * 1024),
+            GpuInfo(index=1, mem_used_mib=1, mem_total_mib=24 * 1024),
+        ]
+        app, _, _ = make_app(
+            responses=batch5_responses(), gpus=gpus, target=ServingTarget(gpus=gpus)
+        )
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("2")
+            await _settle(pilot)
+            bar0 = str(app.query_one("#gpu0-bar", Static).render())
+            assert "held by:" in bar0                  # attribution unchanged
+            assert "llama-cpp-pi-reasoning" in bar0
+            # And the rail did NOT absorb the GPU attribution.
+            rail = str(app.query_one("#host-stats-rail", Static).render())
+            assert "held by:" not in rail
 
 
 @pytest.mark.asyncio
