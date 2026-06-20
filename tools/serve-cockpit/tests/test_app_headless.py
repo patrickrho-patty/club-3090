@@ -31,14 +31,17 @@ from typing import Any, Optional
 import pytest
 
 from textual.widgets import Button, DataTable, Input, Static, TabbedContent, TabPane, Label
+from textual.widgets._footer import FooterKey
 
 from club3090_tui_core.detect import GpuInfo, ServingTarget
 
 from club3090_cockpit.app import (
     CockpitApp,
     CatalogPane,
+    CockpitCommands,
     ConfirmActionScreen,
     ExplainScreen,
+    FocusableFooter,
     HelpScreen,
     ModeSwitcher,
     ByoPane,
@@ -51,6 +54,8 @@ from club3090_cockpit.app import (
     MeasureVsBarScreen,
     ShareBackReportScreen,
     RailStatus,
+    _PALETTE_COMMANDS,
+    _PALETTE_PRODUCER_ONLY,
 )
 from club3090_cockpit.data import ContainerInfo, EstateState, ServedProbe
 from club3090_cockpit.services import CockpitData, RunResult
@@ -5506,3 +5511,483 @@ class TestA9GateLadderOutcome:
         # 'running' (never a fabricated pass).
         assert CockpitApp._run_verdict({"mock_state": True}) == "running"
         assert CockpitApp._run_verdict(None) == "running"
+
+
+# ===========================================================================
+# UX Batch 4a — navigation & discoverability (A5 · #5 · #8 · N6 · A11)
+# ===========================================================================
+
+
+class TestA5HelpTeachesHiddenKeys:
+    """A5 — the help overlay teaches the otherwise-undiscoverable keys: the
+    sub-tab cycle ([ ]) and the Contribute door (C).  Both must appear on the
+    CONSUMER help (C is always-on — a consumer needs it to opt in)."""
+
+    @pytest.mark.asyncio
+    async def test_consumer_help_lists_subtab_cycle_keys(self):
+        app, _, _ = make_app(surface="consumer")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            await pilot.press("question_mark")
+            await pilot.pause()
+            assert isinstance(app.screen, HelpScreen)
+            text = app.screen.help_text
+            # The bracket keys (the only no-mouse sub-tab move) are taught.
+            assert "previous / next sub-tab" in text
+            assert "[" in text and "]" in text
+            # A Navigation section heading anchors them.
+            assert "Navigation" in text
+
+    @pytest.mark.asyncio
+    async def test_consumer_help_lists_contribute_key(self):
+        app, _, _ = make_app(surface="consumer")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            await pilot.press("question_mark")
+            await pilot.pause()
+            text = app.screen.help_text
+            # The [C] Contribute door is taught on CONSUMER (it is the opt-in).
+            assert "toggle Contribute" in text
+            assert "[cyan]C[/cyan]" in text
+
+    @pytest.mark.asyncio
+    async def test_consumer_help_lists_rail_toggle_key(self):
+        app, _, _ = make_app(surface="consumer")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            await pilot.press("question_mark")
+            await pilot.pause()
+            text = app.screen.help_text
+            assert "toggle the left rail" in text
+
+    @pytest.mark.asyncio
+    async def test_help_keys_are_real_bindings(self):
+        """Every cyan key the help advertises must be a real app Binding /
+        action so the help can't drift into teaching a dead key."""
+        # The bindings the help references by action.
+        bound_actions = {b.action for b in CockpitApp.BINDINGS}
+        for action in ("toggle_contribute", "toggle_rail",
+                       "prev_subtab", "next_subtab", "help", "refresh"):
+            assert action in bound_actions, action
+
+
+class TestHashFiveFooterTabFocus:
+    """#5 — the footer's action keys are reachable via the Tab focus chain."""
+
+    @pytest.mark.asyncio
+    async def test_footer_keys_are_focusable_and_in_chain(self):
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            ff = app.query_one(FocusableFooter)
+            keys = list(ff.query(FooterKey))
+            assert keys, "footer has key items"
+            assert all(k.can_focus for k in keys)
+            chain = app.screen.focus_chain
+            assert any(isinstance(w, FooterKey) for w in chain), \
+                "at least one FooterKey participates in the Tab focus chain"
+
+    @pytest.mark.asyncio
+    async def test_focus_next_lands_on_a_footer_key(self):
+        """Walking the focus chain (what Tab does) reaches a footer key."""
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            # focus_next is exactly the action Screen binds to Tab.
+            landed = app.screen.focus_next()
+            # If the first focusable wasn't a footer key, keep walking until we
+            # either hit one or exhaust the chain (no intervening pause → no
+            # recompose churn).
+            seen = []
+            for _ in range(len(app.screen.focus_chain) + 1):
+                cur = app.screen.focused
+                seen.append(cur)
+                if isinstance(cur, FooterKey):
+                    break
+                landed = app.screen.focus_next()
+            assert any(isinstance(w, FooterKey) for w in seen), \
+                "Tab traversal reaches a focusable footer key"
+
+    @pytest.mark.asyncio
+    async def test_enter_on_focused_footer_key_activates_it(self):
+        """A focused footer key activates on Enter (keyboard analogue of the
+        stock mouse-down activation) — the footer's on_key routes through
+        simulate_key, firing the SAME action the binding would.  Asserts the
+        EFFECT: 'r' = refresh, which re-reads the catalog, so the data layer's
+        load_catalog_rows is called exactly once more (mirrors TestA11's
+        one-start fidelity — a broken on_key would no longer pass).
+
+        Drives the production FocusableFooter.on_key handler directly with a
+        synthesized Enter event: a nested ``simulate_key`` posted from *inside*
+        Textual's own key-event processing (what ``pilot.press('enter')`` would
+        trigger) is swallowed by the focused FooterKey in the headless harness,
+        so we invoke the handler from the test coroutine to exercise the same
+        code path without the harness's re-entrancy quirk."""
+        from textual import events
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            ff = app.query_one(FocusableFooter)
+            # Spy the data layer's catalog read so we can count refresh re-reads.
+            calls = {"n": 0}
+            orig = app._data.load_catalog_rows
+
+            async def counting_load_catalog_rows():
+                calls["n"] += 1
+                return await orig()
+
+            app._data.load_catalog_rows = counting_load_catalog_rows
+            # Focus the 'r' (refresh) footer key — the Tab-reachable affordance.
+            chain = app.screen.focus_chain
+            rkey = next(k for k in chain
+                        if isinstance(k, FooterKey) and k.key == "r")
+            rkey.focus()
+            await pilot.pause()
+            assert app.focused is rkey
+            before = calls["n"]
+            # Enter on the focused key → footer on_key → simulate_key('r') →
+            # action_refresh → exactly one catalog read.
+            ff.on_key(events.Key("enter", None))
+            await _settle(pilot)
+            assert calls["n"] == before + 1, (
+                "Enter on the focused 'r' footer key fires refresh, re-reading "
+                "the catalog exactly once"
+            )
+
+    @pytest.mark.asyncio
+    async def test_tab_does_not_break_table_focus(self):
+        """The catalog DataTable stays focusable + in the chain — #5 only ADDS
+        footer keys to the chain, it doesn't strip the existing widgets."""
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            chain = app.screen.focus_chain
+            assert any(isinstance(w, DataTable) for w in chain)
+
+    @pytest.mark.asyncio
+    async def test_focused_footer_key_survives_a_real_binding_change(self):
+        """The bindings_changed focus-held early-return: while a FooterKey holds
+        focus, a GENUINE displayed-binding change (a surface flip, which adds the
+        [3] Bring & Validate mode key to the footer) must NOT recompose the
+        footer — the focused key keeps its identity + focus, and the footer
+        recomposes only once focus leaves it."""
+        app, _, _ = make_app(surface="consumer")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            ff = app.query_one(FocusableFooter)
+            # Focus the '1' mode key (present on BOTH surfaces, so its identity is
+            # a clean witness for "did the footer get rebuilt?").
+            onekey = next(k for k in ff.query(FooterKey) if k.key == "1")
+            onekey.focus()
+            await pilot.pause()
+            assert app.focused is onekey
+            sig_before = ff._last_binding_sig
+            id_before = id(onekey)
+            # Sanity: '3' (Bring & Validate) is NOT shown on the consumer surface.
+            assert "3" not in {k.key for k in ff.query(FooterKey)}
+            # Trigger a REAL displayed-binding change without re-homing focus:
+            # flipping to the producer surface UN-gates [3] (mode_validate), which
+            # IS show=True, so the footer signature genuinely changes.  Fires
+            # bindings_changed while the '1' FooterKey still holds focus.
+            app._surface = "producer"
+            app.refresh_bindings()
+            await pilot.pause()
+            # Focus-held branch took the early return: footer NOT rebuilt — same
+            # FooterKey object, focus retained, snapshot signature untouched, and
+            # the new [3] key has NOT been composed in yet (recompose suppressed).
+            assert app.focused is onekey
+            assert id(app.focused) == id_before
+            assert ff._last_binding_sig == sig_before
+            assert app.query_one(FocusableFooter) is ff   # no crash / re-creation
+            assert "3" not in {k.key for k in ff.query(FooterKey)}
+            # Move focus off the footer onto the table, then a binding change DOES
+            # recompose (the suppression only holds while a FooterKey is focused).
+            table = next(w for w in app.screen.focus_chain
+                         if isinstance(w, DataTable))
+            table.focus()
+            await pilot.pause()
+            assert not isinstance(app.focused, FooterKey)
+            app.refresh_bindings()
+            await _settle(pilot)
+            # Footer recomposed for the new (producer) signature — the stale
+            # snapshot was replaced + [3] is now composed in, now that no footer
+            # key pinned it.
+            assert ff._last_binding_sig != sig_before
+            assert "3" in {k.key for k in ff.query(FooterKey)}
+
+
+class TestHashEightRailToggle:
+    """#8 — collapse / restore the left rail; mode keys still work hidden."""
+
+    @pytest.mark.asyncio
+    async def test_dot_toggles_left_rail_hidden_and_back(self):
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            rail = app.query_one("#left-rail")
+            assert "rail-hidden" not in rail.classes
+            await pilot.press("full_stop")
+            await pilot.pause()
+            assert "rail-hidden" in rail.classes
+            await pilot.press("full_stop")
+            await pilot.pause()
+            assert "rail-hidden" not in rail.classes
+
+    @pytest.mark.asyncio
+    async def test_mode_keys_work_while_rail_hidden(self):
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            await pilot.press("full_stop")   # hide rail
+            await pilot.pause()
+            await pilot.press("2")           # Operate
+            await _settle(pilot)
+            assert app._active_mode == 1
+            await pilot.press("1")           # back to Run
+            await _settle(pilot)
+            assert app._active_mode == 0
+            # Rail is still hidden — the toggle is independent of mode switching.
+            assert "rail-hidden" in app.query_one("#left-rail").classes
+
+    @pytest.mark.asyncio
+    async def test_hiding_rail_does_not_strand_focus(self):
+        """Hiding the rail re-homes focus to the active mode's primary widget so
+        no hidden widget is left holding focus."""
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            await pilot.press("full_stop")
+            await pilot.pause()
+            focused = app.focused
+            # Focus must NOT be inside the now-hidden rail subtree.
+            if focused is not None:
+                node = focused
+                in_rail = False
+                while node is not None:
+                    if getattr(node, "id", "") == "left-rail":
+                        in_rail = True
+                        break
+                    node = node.parent
+                assert not in_rail
+
+
+class TestN6CommandPalette:
+    """N6 — Textual command palette wired to the app's actions, surface-gated."""
+
+    def test_palette_provider_registered(self):
+        assert CockpitCommands in CockpitApp.COMMANDS
+
+    def test_palette_commands_resolve_to_real_actions(self):
+        """Drift guard: every _PALETTE_COMMANDS verb must map to a real
+        action_<name> method — a future rename would otherwise ship a
+        fuzzy-findable no-op."""
+        for action, title, _help in _PALETTE_COMMANDS:
+            assert hasattr(CockpitApp, f"action_{action}"), (
+                f"palette command '{title}' → action_{action} has no method"
+            )
+
+    @pytest.mark.asyncio
+    async def test_palette_lists_core_actions_on_consumer(self):
+        app, _, _ = make_app(surface="consumer")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            prov = CockpitCommands(app.screen)
+            names = [a for a, _, _ in prov._available()]
+            # A solid consumer core set.
+            for action in ("mode_run", "mode_operate", "primary_action",
+                           "rig_report", "toggle_rail"):
+                assert action in names, action
+
+    @pytest.mark.asyncio
+    async def test_palette_gates_producer_actions_on_consumer(self):
+        """A producer-only action is NOT offered on the consumer surface (the
+        palette respects the same surface gate as check_action)."""
+        app, _, _ = make_app(surface="consumer")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            prov = CockpitCommands(app.screen)
+            names = [a for a, _, _ in prov._available()]
+            for action in _PALETTE_PRODUCER_ONLY:
+                assert action not in names, action
+            # …but every producer-only palette action IS a real _PRODUCER_ONLY
+            # action (the two sets agree — no drift).
+            assert _PALETTE_PRODUCER_ONLY <= set(CockpitApp._PRODUCER_ONLY)
+
+    @pytest.mark.asyncio
+    async def test_palette_exposes_producer_actions_on_producer(self):
+        app, _, _ = make_app(surface="producer")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            prov = CockpitCommands(app.screen)
+            names = [a for a, _, _ in prov._available()]
+            assert "promote_catalog" in names
+            assert "serve_untested" in names
+
+    @pytest.mark.asyncio
+    async def test_palette_search_runs_a_core_action(self):
+        """Selecting a palette hit invokes the SAME action method the binding
+        would — fuzzy-search 'Operate mode' then run it → mode 1."""
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            prov = CockpitCommands(app.screen)
+            cb = None
+            async for hit in prov.search("Operate mode"):
+                cb = hit.command
+                break
+            assert cb is not None
+            assert app._active_mode == 0
+            cb()
+            await _settle(pilot)
+            assert app._active_mode == 1
+
+    @pytest.mark.asyncio
+    async def test_palette_discover_yields_consumer_set(self):
+        app, _, _ = make_app(surface="consumer")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            prov = CockpitCommands(app.screen)
+            titles = []
+            async for hit in prov.discover():
+                titles.append(hit.text if hasattr(hit, "text") else str(hit))
+            assert titles, "discover surfaces a default set"
+            # No producer-only title leaks onto consumer discover.
+            joined = " ".join(titles)
+            assert "Promote to catalog" not in joined
+
+
+class TestA11ConfirmModalDiscoverableBindings:
+    """A11 — Enter/Force are discoverable BINDINGS (show=True) in the modal
+    footer; Force visibility follows plan safety; behaviour is UNCHANGED."""
+
+    @pytest.mark.asyncio
+    async def test_modal_has_enter_force_escape_bindings(self):
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            plan = app._data.serve("vllm/dual")
+            app.push_screen(ConfirmActionScreen(plan))
+            await _settle(pilot)
+            actions = {b.action: b for b in app.screen.BINDINGS}
+            assert "confirm" in actions and actions["confirm"].show is True
+            assert "force" in actions and actions["force"].show is True
+            assert "cancel" in actions  # Esc still cancels
+
+    @pytest.mark.asyncio
+    async def test_safe_gate_shows_confirm_hides_force(self):
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            plan = app._data.serve("vllm/dual")
+            app.push_screen(ConfirmActionScreen(plan))
+            await _settle(pilot)
+            sc = app.screen
+            assert sc._reconcile.safe is True
+            # Confirm visible (gate safe), Force hidden (forcing meaningless).
+            assert sc.check_action("confirm", ()) is True
+            assert sc.check_action("force", ()) is False
+            footer_keys = {k.key for k in sc.query(FooterKey)}
+            assert "enter" in footer_keys      # Enter Confirm advertised
+            assert "f" not in footer_keys      # Force hidden on a safe gate
+
+    @pytest.mark.asyncio
+    async def test_unsafe_gate_hides_confirm_shows_force(self):
+        responses = fake_responses(**{"docker ps": ok(DOCKER_PS_ENGINE)})
+        gpus = [GpuInfo(index=0, mem_used_mib=22000), GpuInfo(index=1, mem_used_mib=1)]
+        app, _, _ = make_app(responses=responses, gpus=gpus,
+                             target=ServingTarget(gpus=gpus))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            plan = app._data.serve("vllm/dual")
+            app.push_screen(ConfirmActionScreen(plan))
+            await _settle(pilot)
+            sc = app.screen
+            assert sc._reconcile.safe is False
+            assert sc.check_action("confirm", ()) is False
+            assert sc.check_action("force", ()) is True
+            footer_keys = {k.key for k in sc.query(FooterKey)}
+            assert "f" in footer_keys          # Force advertised on unsafe gate
+            assert "enter" not in footer_keys  # Confirm hidden when unsafe
+
+    @pytest.mark.asyncio
+    async def test_enter_still_commits_through_the_same_gate(self):
+        """Enter (now a Binding) commits through the SAME reconcile gate — the
+        mocked write runner sees exactly one start, no live process."""
+        wr = FakeWriteRunner()
+        app, _, _ = make_app(write_runner=wr)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            plan = app._data.serve("vllm/dual")
+            app.push_screen(ConfirmActionScreen(plan))
+            await _settle(pilot)
+            await pilot.press("enter")
+            await _settle(pilot)
+            assert len(wr.started) == 1
+            assert wr.started[0]["cmd"] == ["bash", "scripts/switch.sh", "vllm/dual"]
+
+    @pytest.mark.asyncio
+    async def test_f_still_forces_through_the_same_gate(self):
+        """f (now a Binding) forces through the SAME gate — --force inserted,
+        still via the mocked runner."""
+        wr = FakeWriteRunner()
+        responses = fake_responses(**{"docker ps": ok(DOCKER_PS_ENGINE)})
+        gpus = [GpuInfo(index=0, mem_used_mib=22000), GpuInfo(index=1, mem_used_mib=1)]
+        app, _, _ = make_app(responses=responses, gpus=gpus,
+                             target=ServingTarget(gpus=gpus), write_runner=wr)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            plan = app._data.serve("vllm/dual")
+            app.push_screen(ConfirmActionScreen(plan))
+            await _settle(pilot)
+            await pilot.press("f")
+            await _settle(pilot)
+            assert len(wr.started) == 1
+            assert "--force" in wr.started[0]["cmd"]
+
+    @pytest.mark.asyncio
+    async def test_f_is_inert_on_a_safe_gate(self):
+        """On a SAFE gate the Force binding is gated off (check_action False) —
+        pressing f must NOT force-launch (behaviour unchanged from the old
+        on_key guard that checked the disabled button)."""
+        wr = FakeWriteRunner()
+        app, _, _ = make_app(write_runner=wr)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            plan = app._data.serve("vllm/dual")
+            app.push_screen(ConfirmActionScreen(plan))
+            await _settle(pilot)
+            assert app.screen.check_action("force", ()) is False
+            await pilot.press("f")
+            await _settle(pilot)
+            # f did nothing (no forced launch); the safe path is Enter/Confirm.
+            assert all("--force" not in c["cmd"] for c in wr.started)
+
+    @pytest.mark.asyncio
+    async def test_enter_is_inert_on_an_unsafe_gate(self):
+        """SAFETY: on an UNSAFE gate the Confirm binding is gated off, and Enter
+        must NOT fall through to Force and force-launch the teardown.  Pressing
+        Enter starts no write at all; the explicit `f` key is the only force
+        path and it STILL forces (the Force path is unchanged)."""
+        wr = FakeWriteRunner()
+        responses = fake_responses(**{"docker ps": ok(DOCKER_PS_ENGINE)})
+        gpus = [GpuInfo(index=0, mem_used_mib=22000), GpuInfo(index=1, mem_used_mib=1)]
+        app, _, _ = make_app(responses=responses, gpus=gpus,
+                             target=ServingTarget(gpus=gpus), write_runner=wr)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            plan = app._data.serve("vllm/dual")
+            app.push_screen(ConfirmActionScreen(plan))
+            await _settle(pilot)
+            sc = app.screen
+            assert sc._reconcile.safe is False
+            assert sc.check_action("confirm", ()) is False
+            # Enter on an unsafe gate is INERT — no write started at all (and in
+            # particular no --force teardown the gate guards).
+            await pilot.press("enter")
+            await _settle(pilot)
+            assert wr.started == []
+            # The explicit `f` key STILL forces — the Force path is unchanged.
+            await pilot.press("f")
+            await _settle(pilot)
+            assert len(wr.started) == 1
+            assert "--force" in wr.started[0]["cmd"]

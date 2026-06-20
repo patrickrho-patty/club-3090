@@ -43,6 +43,7 @@ from typing import Optional
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
+from textual.command import DiscoveryHit, Hit, Hits, Provider
 from textual.containers import Container, Horizontal, Vertical, ScrollableContainer
 from textual.screen import ModalScreen
 from textual.widgets import (
@@ -57,6 +58,7 @@ from textual.widgets import (
     TabPane,
 )
 from textual import work
+from textual.widgets._footer import FooterKey
 
 from club3090_tui_core.registry import VariantRow
 from club3090_tui_core.widgets.live_pane import LivePane
@@ -191,6 +193,19 @@ class HelpScreen(ModalScreen):
             "  [cyan]e[/cyan]  Explain selected slug (Run · Catalog — incl. cross-rig benchmarks)",
             "  [cyan]⏎[/cyan]  Primary action (serve / switch scene / run step / open report)",
             "  [cyan]?[/cyan]  This help        [cyan]q[/cyan]  Quit",
+            "",
+            # A5: the navigation keys that are otherwise undiscoverable — the
+            # sub-tab cycle has show=False bindings (so it never reaches the
+            # footer) and [C] (the Contribute door) is show=False too.  This help
+            # is their ONLY teaching surface; surface BOTH on consumer AND producer
+            # ([C] is always-on — a consumer needs it to opt IN to the producer
+            # Bring & Validate lane).
+            "[bold]Navigation[/bold]",
+            "  [cyan]\\[[/cyan] / [cyan]][/cyan]  previous / next sub-tab (the only no-mouse tab move)",
+            "  [cyan]Tab[/cyan]      cycle focus (tables · inputs · the footer keys)",
+            "  [cyan].[/cyan]        toggle the left rail (Modes + Estate) — full-width content",
+            "  [cyan]C[/cyan]        toggle Contribute (reveals the producer contributor surface)",
+            "  [cyan]Ctrl+p[/cyan]   command palette — fuzzy-search + run any action",
             "",
             "[bold]Run · Catalog[/bold]",
             "  [cyan]⏎[/cyan] serve selected slug (reconcile-gated confirm; F to Force the teardown)",
@@ -753,8 +768,23 @@ class ConfirmActionScreen(ModalScreen):
     }
     """
 
+    # A11 — surface the commit affordances in the modal footer.  Enter→confirm
+    # and f→force were previously RAW on_key handlers, so the footer read only
+    # "Esc Cancel" and hid the two keys a user actually needs.  Promoting them to
+    # show=True BINDINGS makes the footer read "Enter Confirm · f Force · Esc
+    # Cancel".  Visibility is gated per-state in check_action: Confirm shows only
+    # when the gate is safe; Force shows only when forcing is MEANINGFUL (the gate
+    # is unsafe) — mirroring the disabled-button logic in set_reconcile.  This is
+    # discoverability ONLY: the actions call the SAME _commit path (same reconcile
+    # gate, same confirm semantics) the on_key handlers used.
+    # priority=True so these win over the focused commit Button's own ``enter``→
+    # press binding (otherwise the Button shadows our ``enter`` and the footer
+    # would not advertise "Enter Confirm").  Both still route through the SAME
+    # _commit path, so behaviour is identical to a Button press.
     BINDINGS = [
-        Binding("escape", "cancel", "Cancel"),
+        Binding("enter", "confirm", "Confirm", show=True, priority=True),
+        Binding("f", "force", "Force", show=True, priority=True),
+        Binding("escape", "cancel", "Cancel", show=True),
     ]
 
     def __init__(self, plan: ActionPlan, *, on_confirm=None, **kwargs):
@@ -776,6 +806,9 @@ class ConfirmActionScreen(ModalScreen):
                 yield Button("⏎ Confirm", id="confirm-ok-btn", variant="success", disabled=True)
                 yield Button("F Force", id="confirm-force-btn", variant="warning", disabled=True)
                 yield Button("Esc Cancel", id="confirm-cancel-btn")
+            # A11 — the modal footer renders the Enter / f / Esc bindings (show=True),
+            # gated per-state by check_action.  Without it the keys stayed invisible.
+            yield Footer()
 
     def on_mount(self) -> None:
         # Re-run the gate (fresh detect) before enabling any commit button.
@@ -820,9 +853,21 @@ class ConfirmActionScreen(ModalScreen):
             lines.append("  [dim]Confirm is disabled — F to FORCE this teardown (override).[/dim]")
             ok_btn.disabled = True
             force_btn.disabled = False
-            force_btn.focus()
+            # SAFETY: do NOT focus the Force button on an unsafe gate.  Textual's
+            # run_action returns False for the gated enter→confirm binding without
+            # STOPPING the key event, so a stray Enter falls through to whatever is
+            # focused — and the Force button's default enter→press would then fire
+            # _commit(force=True), i.e. Enter would FORCE the very teardown the gate
+            # guards.  Focus the Cancel button instead so a fall-through Enter is
+            # inert; forcing must go through the explicit `f` key (the on_key guard
+            # below also stops a stray enter belt-and-suspenders).
+            cancel_btn = self.query_one("#confirm-cancel-btn", Button)
+            cancel_btn.focus()
 
         body.update("\n".join(lines))
+        # A11 — now that the safe/unsafe verdict is known, refresh the modal footer
+        # so the Confirm / Force bindings show/hide per check_action's gate.
+        self.refresh_bindings()
 
     # ── button / key handlers ────────────────────────────────────────────────────
 
@@ -835,16 +880,52 @@ class ConfirmActionScreen(ModalScreen):
             self.action_cancel()
 
     def on_key(self, event) -> None:
-        if event.key == "f":
-            force_btn = self.query_one("#confirm-force-btn", Button)
-            if not force_btn.disabled:
-                event.stop()
-                self._commit(force=True)
-        elif event.key == "enter":
-            ok_btn = self.query_one("#confirm-ok-btn", Button)
-            if not ok_btn.disabled:
-                event.stop()
-                self._commit(force=False)
+        """SAFETY belt-and-suspenders: stop a stray ``enter`` whenever the
+        ``confirm`` binding is gated off (gate unsafe / not yet resolved).
+
+        check_action returning False for ``confirm`` makes its run_action a no-op
+        but does NOT stop the key event, so Enter would otherwise propagate to the
+        focused button's enter→press.  If the focused button were Force, Enter
+        would force the teardown the gate guards.  We stop it here so an unsafe-gate
+        Enter is genuinely inert.  The explicit `f` key is untouched — Force still
+        routes through action_force → _commit(force=True)."""
+        if event.key == "enter" and self.check_action("confirm", ()) is not True:
+            event.stop()
+            event.prevent_default()
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        """A11 — gate the footer visibility of Confirm / Force on plan safety.
+
+        Mirrors the disabled-button logic in set_reconcile so the modal footer is
+        honest:
+          - before reconcile resolves (rec is None): neither commit key is shown
+            (the buttons are disabled too).
+          - gate SAFE  → Confirm shown, Force hidden (forcing is meaningless).
+          - gate UNSAFE→ Confirm hidden, Force shown (forcing is the only path).
+        Esc/Cancel is always shown.  Returning False hides the ``confirm`` binding
+        from the footer and makes run_action a no-op for it — BUT Textual returns
+        False *without stopping the key event*, so a stray Enter on an unsafe gate
+        still propagates.  Inertness is therefore NOT free here: it relies on (1)
+        set_reconcile focusing Cancel (not Force) on the unsafe branch, and (2) the
+        on_key guard below stopping an ``enter`` whenever ``confirm`` is gated off,
+        so the event can never fall through to the focused button's enter→press."""
+        rec = self._reconcile
+        if action == "confirm":
+            return bool(rec is not None and rec.safe)
+        if action == "force":
+            return bool(rec is not None and not rec.safe)
+        return True
+
+    def action_confirm(self) -> None:
+        """Enter → commit (only reachable when the gate is safe; check_action
+        disables this binding otherwise)."""
+        self._commit(force=False)
+
+    def action_force(self) -> None:
+        """f → FORCE the teardown (only reachable when the gate is unsafe;
+        check_action disables this binding otherwise).  Routes through the SAME
+        _commit(force=True) path the old raw on_key handler used."""
+        self._commit(force=True)
 
     def _commit(self, *, force: bool) -> None:
         plan = self._plan
@@ -2793,6 +2874,208 @@ class ModeSwitcher(Static):
                 pass
 
 
+# ── Keyboard-traversable footer (#5) ───────────────────────────────────────────────
+
+
+class FocusableFooter(Footer, can_focus_children=True):
+    """#5 — a Footer whose key items participate in the Tab focus chain.
+
+    Textual's stock ``Footer`` is ``can_focus_children=False`` and its
+    ``FooterKey`` items are mouse-only (``on_mouse_down`` → ``simulate_key``), so
+    a keyboard user can never Tab onto a footer affordance.  This subclass:
+
+      1. opts into ``can_focus_children=True`` so the focus chain can include the
+         footer's children, and
+      2. marks each ``FooterKey`` ``can_focus=True`` as it is composed, and
+      3. activates the focused key on Enter (``simulate_key``) — the keyboard
+         analogue of the existing mouse-down activation.
+
+    This does NOT change the existing Tab behaviour for tables / inputs / the
+    sub-tab cycle — it only ADDS the footer keys to the END of the focus chain
+    (Textual orders the chain by DOM position, and the Footer is docked last).
+    Pressing the highlighted footer key's binding still routes through the app's
+    normal action dispatch (so gating is unchanged).
+
+    Recompose guard: the stock Footer recomposes on EVERY ``bindings_changed``
+    signal — and moving focus ONTO a footer key re-fires that signal (the focused
+    widget changed), which rebuilds the FooterKey objects and strands the focus
+    we just placed (focus → DataTable → signal → recompose → … a churn loop).  We
+    suppress the recompose when the DISPLAYED binding signature (the ordered
+    (key, action, enabled) tuples) is UNCHANGED, so a pure focus move no longer
+    rebuilds the footer and Tab focus is stable."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._last_binding_sig: Optional[tuple] = None
+
+    def _binding_signature(self) -> tuple:
+        try:
+            active = self.screen.active_bindings
+        except Exception:
+            return ()
+        return tuple(
+            (binding.key, binding.action, enabled)
+            for (_node, binding, enabled, _tooltip) in active.values()
+            if binding.show
+        )
+
+    def compose(self) -> ComposeResult:
+        # Snapshot the signature we are composing for, so bindings_changed can
+        # skip a redundant recompose that would only strand footer focus.
+        self._last_binding_sig = self._binding_signature()
+        for widget in super().compose():
+            # super().compose() yields FooterKey items and KeyGroup containers
+            # (which hold nested FooterKeys).  Mark the directly-yielded keys
+            # focusable here; nested ones are handled in _make_keys_focusable on
+            # mount/recompose (a KeyGroup's children aren't built yet at yield).
+            if isinstance(widget, FooterKey):
+                widget.can_focus = True
+            yield widget
+
+    def _make_keys_focusable(self) -> None:
+        for key in self.query(FooterKey):
+            key.can_focus = True
+
+    def on_mount(self) -> None:
+        super().on_mount()
+        self._make_keys_focusable()
+
+    def bindings_changed(self, screen) -> None:
+        # Break the focus-churn loop: moving focus ONTO a footer key re-fires this
+        # signal, and the stock recompose would rebuild the FooterKey objects and
+        # strand the focus.  While one of our own footer keys holds focus, skip
+        # the recompose entirely (the key set is what the user is navigating — it
+        # must not be rebuilt under them).  Otherwise, only recompose when the
+        # DISPLAYED key signature actually changed.
+        self._bindings_ready = True
+        try:
+            if isinstance(self.app.focused, FooterKey):
+                return
+        except Exception:
+            pass
+        if self._binding_signature() == self._last_binding_sig:
+            return
+        super().bindings_changed(screen)
+
+    def on_key(self, event) -> None:
+        # Enter activates the focused FooterKey (keyboard analogue of the stock
+        # mouse-down activation).  Only acts when a FooterKey actually has focus,
+        # so it never swallows Enter elsewhere.
+        if event.key != "enter":
+            return
+        focused = self.app.focused
+        if isinstance(focused, FooterKey) and not getattr(focused, "_disabled", False):
+            event.stop()
+            event.prevent_default()
+            self.app.simulate_key(focused.key)
+
+
+# ── Command palette (N6) ──────────────────────────────────────────────────────────
+
+
+# N6: the user-facing actions exposed in the Textual command palette (Ctrl+P).
+# Each entry is (action_method, title, help) — title is what the user fuzzy-types,
+# help is the secondary line.  These invoke the SAME ``action_*`` methods the key
+# bindings call, so the palette is a discoverability layer, never a parallel code
+# path.  Producer-only actions (``_palette_is_producer_only``) are FILTERED OUT on
+# the consumer surface — the palette respects the same surface gate as
+# ``check_action`` (no producer action runnable on the consumer surface).  Mode-
+# gated actions stay listed: invoking one out of its mode no-ops EXACTLY as the
+# binding does (the ``action_*`` methods guard internally on ``_active_mode``), so
+# the palette behaviour is consistent with the keyboard.
+_PALETTE_COMMANDS: tuple[tuple[str, str, str], ...] = (
+    # Always-on navigation / global verbs.
+    ("mode_run", "Run mode", "Discover + serve models (Catalog · BYO)"),
+    ("mode_operate", "Operate mode", "Live estate · containers · Doctor"),
+    ("mode_validate", "Bring & Validate mode", "Producer lane ① Bring → ⑤ Promote"),
+    ("toggle_contribute", "Toggle Contribute mode", "Consumer ↔ producer surface"),
+    ("toggle_rail", "Toggle left rail", "Collapse / restore Modes + Estate rail"),
+    ("refresh", "Refresh", "Re-read the live data layer for the active mode"),
+    ("help", "Help", "Show the keybindings + phase help overlay"),
+    # Run · Catalog.
+    ("primary_action", "Serve selected / primary action", "⏎ — serve the selected slug (reconcile-gated)"),
+    ("explain", "Explain selected slug", "Run · Catalog — detail + cross-rig benchmarks"),
+    ("filter_catalog", "Filter catalog", "Run · Catalog — filter by slug / engine / status"),
+    ("set_default", "Set default", "Run · Catalog — pin the selected slug as model default"),
+    ("clear_default", "Clear default", "Run · Catalog — clear the model default pin"),
+    ("optimize_card", "Optimize for my card", "Run — v0.10.0 seam (not available yet)"),
+    # Operate · Orchestration / Containers / Doctor.
+    ("serving_stop", "Stop this model", "Operate — stop JUST the serving container (gated)"),
+    ("serving_restart", "Restart serving", "Operate — restart the serving container (gated)"),
+    ("serving_switch", "Switch model", "Operate — jump to Run · Catalog to pick another"),
+    ("estate_off", "Stop ALL (estate down)", "Operate — tear down the whole estate (gated)"),
+    ("power_cap_toggle", "Power cap on/off", "Operate — toggle the power cap (gated)"),
+    ("power_cap_sweep", "Power cap sweep", "Operate — sweep power caps (gated)"),
+    ("prune_images", "Prune images", "Operate — docker image prune (gated)"),
+    ("container_logs", "Container logs", "Operate · Containers — stream the selected container's logs"),
+    ("doctor_rerun", "Re-run Doctor", "Operate · Doctor — re-run the diagnose reads (read-only)"),
+    # Share-back (consumer-resident — NOT producer-gated).
+    ("rig_report", "Rig report", "Paste-ready rig/bench snapshot (read · no network)"),
+    ("submit_bench", "Submit bench", "Operate — submit the latest benched result (gated · never auto)"),
+    ("report_problem", "Report a problem", "Paste-ready issue from the failure context (read)"),
+    # Producer lane (Bring & Validate) — filtered out on the consumer surface.
+    ("serve_untested", "Serve untested (② Serve)", "Producer lane — generate a compose + serve it untested"),
+    ("full_report", "Full validation battery (③ Gate)", "Producer lane — report.sh --full (~43-min · gated)"),
+    ("measure_vs_bar", "Compare vs catalog bar (④ Measure)", "Producer lane — read · flags protocol"),
+    ("evaluate_target", "Evaluate running target", "Producer lane — c3t evaluate (confirm-gated)"),
+    ("promote_catalog", "Promote to catalog (⑤ Promote)", "Producer lane — scaffold + gated write"),
+)
+
+# The producer-only subset — kept in sync with ``CockpitApp._PRODUCER_ONLY`` (a
+# guard test asserts the two agree).  Used to FILTER the palette on consumer.
+_PALETTE_PRODUCER_ONLY: frozenset[str] = frozenset({
+    "mode_validate", "promote_catalog", "evaluate_target", "serve_untested",
+    "measure_vs_bar", "full_report",
+})
+
+
+class CockpitCommands(Provider):
+    """N6 — fuzzy command-palette provider for the cockpit's user-facing actions.
+
+    Surface-gated: producer-only actions are NOT offered on the consumer surface
+    (mirrors ``CockpitApp._PRODUCER_ONLY`` / ``check_action``'s surface gate).
+    Selecting a command dispatches the SAME ``action_*`` method the key binding
+    would — so the palette is a pure discoverability layer.
+    """
+
+    def _available(self) -> list[tuple[str, str, str]]:
+        app = self.app
+        producer = getattr(app, "_surface", "consumer") == "producer"
+        out: list[tuple[str, str, str]] = []
+        for action, title, help_text in _PALETTE_COMMANDS:
+            if not producer and action in _PALETTE_PRODUCER_ONLY:
+                continue
+            out.append((action, title, help_text))
+        return out
+
+    def _run(self, action: str):
+        app = self.app
+
+        def _do() -> None:
+            method = getattr(app, f"action_{action}", None)
+            if method is not None:
+                method()
+
+        return _do
+
+    async def discover(self) -> Hits:
+        """Surface a sensible default set when the palette opens (no query yet)."""
+        for action, title, help_text in self._available():
+            yield DiscoveryHit(title, self._run(action), help=help_text)
+
+    async def search(self, query: str) -> Hits:
+        matcher = self.matcher(query)
+        for action, title, help_text in self._available():
+            score = matcher.match(title)
+            if score > 0:
+                yield Hit(
+                    score,
+                    matcher.highlight(title),
+                    self._run(action),
+                    help=help_text,
+                )
+
+
 # ── Main application ──────────────────────────────────────────────────────────────
 
 
@@ -2802,6 +3085,10 @@ class CockpitApp(App):
     TITLE = "club3090 cockpit"
     SUB_TITLE = "wired"
 
+    # N6 — register the cockpit's action provider alongside Textual's built-in
+    # system commands so Ctrl+P fuzzy-searches our verbs too.
+    COMMANDS = App.COMMANDS | {CockpitCommands}
+
     BINDINGS = [
         Binding("q", "quit", "Quit", show=True),
         Binding("question_mark", "help", "Help", show=True),
@@ -2809,6 +3096,9 @@ class CockpitApp(App):
         # Sub-tab cycle — shown only in modes that have sub-tabs (check_action gates).
         Binding("left_square_bracket", "prev_subtab", "Prev tab", show=False),
         Binding("right_square_bracket", "next_subtab", "Next tab", show=False),
+        # #8 — collapse / restore the left rail (Modes + Estate) so the content
+        # area uses the full terminal width.  Always-on (no mode/surface gate).
+        Binding("full_stop", "toggle_rail", "Rail", show=False),
         # Context-sensitive — check_action enables/shows them only in the right mode.
         Binding("slash", "filter_catalog", "Filter", show=False),
         Binding("e", "explain", "Explain", show=False),
@@ -2888,6 +3178,10 @@ class CockpitApp(App):
         height: 1fr;
         padding: 0 0;
     }
+    /* #8 — collapsed rail: the content area then claims the full width. */
+    #left-rail.rail-hidden {
+        display: none;
+    }
     #rail-status {
         width: 1fr;
         height: 1fr;
@@ -2927,6 +3221,9 @@ class CockpitApp(App):
         "quit", "help", "refresh",
         "mode_run", "mode_operate", "mode_validate",
         "primary_action",
+        # #8 — the left-rail toggle is a pure view control (no write, no mode
+        # dependency), reachable everywhere.
+        "toggle_rail",
         # The Contribute door (R4) is the consumer's opt-in INTO producer mode,
         # so it must stay reachable on the consumer surface — always-on, NOT in
         # _PRODUCER_ONLY (a consumer that can't toggle could never contribute).
@@ -3226,7 +3523,9 @@ class CockpitApp(App):
                             yield ValidateEvidencePane(id="validate-evidence-pane")
                         with TabPane("⑤ Promote", id="tab-promote"):
                             yield LanePromotePane(id="lane-promote-pane")
-        yield Footer()
+        # #5 — a Tab-traversable footer so keyboard users can reach the footer
+        # affordances (in addition to the hotkeys).
+        yield FocusableFooter()
 
     # ── Mount / startup ────────────────────────────────────────────────────────────
 
@@ -4085,6 +4384,40 @@ class CockpitApp(App):
             )
         else:
             self.notify("Consumer mode", title="Contribute", timeout=3)
+
+    def action_toggle_rail(self) -> None:
+        """[.] — collapse / restore the left rail (Modes + Estate).
+
+        When hidden, the content area expands to the full terminal width; when
+        shown, the rail returns.  This is a pure view toggle — it never touches
+        the active mode, the surface, or any write.  We must NOT strand focus:
+        the rail's only focusable child is the ModeSwitcher (a Static — not
+        focusable), and the mode keys 1/2/3 are app-level BINDINGS (not widget
+        focus dependent), so hiding the rail can't break mode switching.  But if
+        focus happened to land inside the rail subtree we move it back to the
+        active mode's primary widget so a hidden-but-focused widget can't swallow
+        keys."""
+        try:
+            rail = self.query_one("#left-rail", Vertical)
+        except Exception:
+            return
+        hide = "rail-hidden" not in rail.classes
+        if hide:
+            # If focus is somewhere in the rail subtree, re-home it before hiding.
+            focused = self.focused
+            if focused is not None:
+                node = focused
+                in_rail = False
+                while node is not None:
+                    if node is rail:
+                        in_rail = True
+                        break
+                    node = node.parent
+                if in_rail:
+                    self._focus_mode_primary(self._active_mode)
+            rail.add_class("rail-hidden")
+        else:
+            rail.remove_class("rail-hidden")
 
     def action_refresh(self) -> None:
         """Re-read the live data layer for the active mode."""
