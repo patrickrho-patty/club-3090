@@ -24,6 +24,106 @@ from club3090_tui_core.registry import VariantRow
 # ── Fit verdict ───────────────────────────────────────────────────────────────
 
 
+def parse_ctx_label(label: Any) -> Optional[int]:
+    """A7: turn a compact ctx label ("262K" / "131072") into an int.
+
+    Inverse of ``_ctx_label`` — used ONLY as a last-resort fallback (when no exact
+    numeric configured-ctx int is available) to render/compare a catalog slug's
+    colloquial ctx label.  Returns None when nothing numeric parses (so the UI
+    labels the field "(per catalog slug)" rather than fabricating a comparison).
+
+    K-convention is ×1000 — the inverse of ``_ctx_label`` / ``registry-emit.sh``'s
+    ÷1000 (``262K`` → 262000), NOT ×1024.  This is deliberately the SAME convention
+    across the stack so a round-trip label never drifts from the source int by more
+    than the rounding registry-emit already applied.  The divergence badge prefers
+    the EXACT configured int and never round-trips through this label (MUST-FIX 2)."""
+    if label is None:
+        return None
+    s = str(label).strip().upper().replace(",", "")
+    if not s:
+        return None
+    m = re.match(r"^([0-9]+(?:\.[0-9]+)?)\s*([KM]?)", s)
+    if not m:
+        return None
+    try:
+        val = float(m.group(1))
+    except ValueError:
+        return None
+    mult = {"": 1, "K": 1000, "M": 1000 * 1000}.get(m.group(2), 1)
+    return int(round(val * mult))
+
+
+def topology_cards(row: Any) -> int:
+    """A6: how many cards the row's compose places on (1 / 2 / N).
+
+    Derived from the compose path (``…/single/…`` / ``…/dual/…`` / ``…/multiN/…``)
+    so we know whether the per-card vram_est must fit on ONE free card or on
+    EVERY card the topology spans.  Defaults to 1 when the path gives no signal
+    (the conservative single-card assumption)."""
+    path = f"{getattr(row, 'compose_dir', '') or ''} {getattr(row, 'compose_path', '') or ''}".lower()
+    m = re.search(r"/multi(\d+)/", path)
+    if m:
+        try:
+            return max(1, int(m.group(1)))
+        except ValueError:
+            return 2
+    if "/dual/" in path:
+        return 2
+    return 1
+
+
+def downgrade_fit_glyph(
+    fit: "FitVerdict",
+    row: Any,
+    free_gb_by_index: Optional[dict[int, float]],
+) -> tuple[str, str]:
+    """A6: post-process the DISPLAYED fit glyph against LIVE free-VRAM.
+
+    The catalog fit-gate (kv-calc ``--fit-all``) is computed against the TOTAL
+    card (an empty card).  On a rig where GPU0 already holds ~18.5 GB (ComfyUI),
+    a "● fits-clean" row will OOM at serve.  This DOWNGRADES the displayed glyph
+    using the last estate poll's per-GPU free-VRAM — WITHOUT re-running kv-calc
+    (a pure post-process of the already-computed verdict).
+
+    Returns ``(glyph, note)``:
+      - When live free-VRAM is UNKNOWN (``None``/empty): the original glyph + a
+        "(vs empty card)" note so "● fits-clean" is never read as a live verdict.
+      - When KNOWN and the row's per-card vram_est exceeds the free-VRAM on the
+        card(s) the topology needs: a downgraded glyph ("⚠"/"✗") + a reason.
+      - When KNOWN and it still fits live: the original glyph, no note.
+
+    NEVER fabricates a number — it only downgrades on a REAL free-VRAM figure;
+    the actual serve-time collision is still owned by the reconcile gate."""
+    glyph = fit.glyph
+    # Only the affirmative "fits" verdicts can be downgraded; skip/unknown/wont-fit
+    # carry no live claim to walk back.
+    if fit.verdict not in ("fits-clean", "fits-constrained"):
+        return glyph, ""
+    if not free_gb_by_index:
+        # No live data — label the column so the glyph isn't read as live.
+        return glyph, "vs empty card"
+    est = fit.vram_est_gb
+    if est is None:
+        return glyph, "vs empty card"
+    need = topology_cards(row)
+    frees = sorted(free_gb_by_index.values(), reverse=True)
+    # A dual/multi row needs the TOP-N cards each to hold the per-card estimate;
+    # a single-card row needs ANY one card to hold it.
+    if need <= 1:
+        fits_live = bool(frees) and frees[0] >= est
+    else:
+        fits_live = len(frees) >= need and all(f >= est for f in frees[:need])
+    if fits_live:
+        return glyph, ""
+    # Downgrade.  A card that's close (within ~1 GB) is "tight"; clearly short is
+    # "won't fit now".
+    best = frees[need - 1] if len(frees) >= need else (frees[-1] if frees else 0.0)
+    headroom = best - est
+    if headroom >= -1.0:
+        return "⚠", f"tight — {est:.0f}G est vs {best:.0f}G free now"
+    return "✗", f"won't fit now — {est:.0f}G est vs {best:.0f}G free"
+
+
 @dataclass
 class FitVerdict:
     """Result of kv-calc --fit / switch.sh --explain's fit block for one slug."""
@@ -132,6 +232,16 @@ class CatalogEntry:
         return self.row.ctx_label
 
     @property
+    def configured_ctx(self) -> Optional[int]:
+        """A7/MUST-FIX 2: the EXACT numeric CONFIGURED ctx for this slug (the
+        registry max_ctx int behind ``ctx_label`` — e.g. 262144 for "262K").  This
+        is the slug's CONFIGURED serving ctx, NOT the kv-calc CAPACITY ceiling
+        (``fit.max_ctx``, e.g. ~295K) — the divergence badge must compare the probe
+        against THIS, so an honest 262144 serve does not badge against a 295K
+        ceiling.  ``None`` when the registry row didn't carry it."""
+        return getattr(self.row, "configured_ctx", None)
+
+    @property
     def port(self) -> int:
         return self.row.port
 
@@ -213,6 +323,29 @@ class DoctorRead:
 
 
 @dataclass
+class ServedProbe:
+    """A7: the ACTUAL running config probed from the live engine — NOT the
+    catalog slug's claim.
+
+    ``max_model_len`` is read from ``GET <url>/v1/models`` (vLLM exposes it per
+    model id); ``image`` is the engine container image from
+    ``docker inspect <c> --format '{{.Image}}'`` (CLAUDE.md: ``vllm.__version__``
+    lags the docker tag, so the image is ground truth).  Empty/None fields mean
+    "the probe didn't return that field" — the UI must NOT fabricate a value, it
+    falls back to the catalog claim (clearly labelled) when a probe field is
+    missing.  ``ok`` is True when at least one probe leg returned something."""
+
+    max_model_len: Optional[int] = None     # probed running ctx (vLLM /v1/models)
+    image: str = ""                         # engine container image (docker inspect)
+    served_model: str = ""                  # /v1/models data[0].id
+    error: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.max_model_len is not None or bool(self.image)
+
+
+@dataclass
 class EstateState:
     """Live estate snapshot: detect + doctor + scene catalog + estate-planner."""
 
@@ -223,6 +356,7 @@ class EstateState:
     doctor: DoctorRead = field(default_factory=DoctorRead)
     estate_report: dict[str, Any] = field(default_factory=dict)   # estate_cli report-state
     matched_slug: str = ""              # slug the running engine matched, if any
+    served: ServedProbe = field(default_factory=ServedProbe)  # A7: probed running config
     error: str = ""
 
 
@@ -1100,13 +1234,22 @@ def bench_row_from_corpus_record(rec: dict[str, Any]) -> Optional[BenchRow]:
 
 
 def _ctx_label(max_model_len: Any) -> str:
-    """Render a max_model_len int as a compact ctx label (262144 → '256K')."""
+    """Render a max_model_len int as a compact ctx label (262144 → '262K').
+
+    K-convention is ÷1000, ROUNDED — the SAME convention ``registry-emit.sh``'s
+    ``ctx_label`` uses (``round(max_ctx / 1000)`` → ``262K``).  Aligning the two
+    means the serving-panel running-ctx label and the catalog row read identically
+    for the same int (MUST-FIX 3); the old ÷1024 form rendered 262144 as ``256K``,
+    visibly mismatching the catalog's ``262K`` for the SAME value.  ``parse_ctx_label``
+    is the inverse (×1000)."""
     n = _as_int(max_model_len)
     if n is None:
         return ""
-    if n >= 1024:
-        k = n / 1024.0
-        return f"{k:.0f}K" if k == int(k) else f"{k:.1f}K"
+    if n >= 1000:
+        # ÷1000 ROUNDED to an integer K — byte-for-byte what registry-emit.sh's
+        # ctx_label emits (round(max_ctx / 1000)), so the same int renders the same
+        # label in the serving panel and the catalog row.
+        return f"{round(n / 1000)}K"
     return str(n)
 
 

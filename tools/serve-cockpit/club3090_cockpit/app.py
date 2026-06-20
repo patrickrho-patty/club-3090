@@ -80,7 +80,10 @@ from .data import (
     Scene,
     _bench_row_matches,
     _canon_engine_family,
+    _ctx_label,
+    downgrade_fit_glyph,
     measurement_from_explain_columns,
+    parse_ctx_label,
 )
 from .services import CockpitData
 
@@ -194,7 +197,8 @@ class HelpScreen(ModalScreen):
             "  [cyan]d[/cyan] set-default   [cyan]D[/cyan] clear-default",
             "  [cyan]O[/cyan] ▸ Optimize for my card (v0.10.0 seam — not available yet)",
             "[bold]Operate · Orchestration[/bold]",
-            "  [cyan]o[/cyan] stop all   [cyan]c[/cyan] power-cap on/off   [cyan]w[/cyan] cap sweep   [cyan]p[/cyan] prune images   (all gated)",
+            "  [cyan]k[/cyan] stop THIS model   [cyan]b[/cyan] restart serving   [cyan]n[/cyan] switch model (→ Run · Catalog)   (writes gated)",
+            "  [cyan]o[/cyan] stop ALL (tears down the whole estate)   [cyan]c[/cyan] power-cap on/off   [cyan]w[/cyan] cap sweep   [cyan]p[/cyan] prune images   (all gated)",
             "[bold]Operate · Containers[/bold]",
             "  [cyan]l[/cyan] logs   [cyan]t[/cyan] top (read)   [cyan]s[/cyan] restart   [cyan]x[/cyan] stop   [cyan]X[/cyan] rm   (writes gated)",
             "[bold]Operate · Doctor[/bold]",
@@ -297,6 +301,11 @@ class CatalogPane(Container):
         # N3: the slug currently live-serving (from the estate's matched_slug),
         # so its Run-catalog row carries a "● serving" badge.  "" → none serving.
         self._serving_slug: str = ""
+        # A6: live per-GPU free-VRAM (GB) from the last estate poll, used to
+        # DOWNGRADE a "● fits-clean" glyph that would actually OOM right now (e.g.
+        # GPU0 holding ComfyUI).  None → unknown (the fit column is then labelled
+        # "vs empty card" so the glyph is never read as a live verdict).
+        self._free_gb_by_index: Optional[dict[int, float]] = None
 
     # ── data ────────────────────────────────────────────────────────────────────
 
@@ -332,12 +341,34 @@ class CatalogPane(Container):
             # N3: mark the live-serving row so the running model is visible at a
             # glance in Run.  Driven by the estate's matched_slug.
             slug_cell = e.slug
-            if serving and e.slug == serving:
+            is_serving_row = bool(serving and e.slug == serving)
+            if is_serving_row:
                 slug_cell = f"[green]●[/green] {e.slug} [green]serving[/green]"
+            # A6: downgrade the displayed fit glyph against LIVE free-VRAM (no
+            # kv-calc re-run — a pure post-process of the verdict).  A "fits-clean"
+            # row that would OOM right now (live free < per-card est) is shown
+            # "⚠"/"✗"; with no live data the glyph carries a "vs empty card" note.
+            #
+            # MUST-FIX 1: the live-serving model's OWN row is EXEMPT from the
+            # live-VRAM downgrade.  nvidia-smi's mem_used INCLUDES the running
+            # model's own allocation, so free = total − used already nets out this
+            # row's ~20 G — comparing the row's est against that residual free
+            # falsely stamps "✗ won't fit now" while the model is PROVABLY serving.
+            # Render its base fit glyph unchanged (it is, by definition, fitting).
+            if is_serving_row:
+                fit_glyph, fit_note = e.fit.glyph, ""
+            else:
+                fit_glyph, fit_note = downgrade_fit_glyph(
+                    e.fit, e.row, self._free_gb_by_index
+                )
+            fit_cell = fit_glyph
+            if fit_note:
+                color = "yellow" if fit_glyph == "⚠" else "red" if fit_glyph == "✗" else "dim"
+                fit_cell = f"{fit_glyph} [{color}]{fit_note}[/{color}]"
             table.add_row(
                 slug_cell,
                 e.engine,
-                e.fit.glyph,
+                fit_cell,
                 e.ctx_label or "—",
                 tps,
                 e.measurement.quality_label,
@@ -345,13 +376,21 @@ class CatalogPane(Container):
                 e.source,
             )
 
+        # A6: state the fit basis so "● fits-clean" is never silently read as a
+        # live verdict.  With live free-VRAM known the column is live-adjusted;
+        # otherwise it is "(vs empty card)".
+        fit_basis = (
+            "  ·  fit [dim](vs live free-VRAM)[/dim]"
+            if self._free_gb_by_index
+            else "  ·  fit [dim](vs empty card)[/dim]"
+        )
         if self._filter:
             status_label.update(
-                f"{len(rows)} / {len(self._entries)} variants  ·  filter: {self._filter!r}"
+                f"{len(rows)} / {len(self._entries)} variants  ·  filter: {self._filter!r}{fit_basis}"
             )
         else:
             star = "  ([dim]*[/dim] = BENCHMARKS.md scrape)" if self._has_md_scrape() else ""
-            status_label.update(f"{len(self._entries)} variants loaded from registry{star}")
+            status_label.update(f"{len(self._entries)} variants loaded from registry{star}{fit_basis}")
 
     def refresh_enriched(self) -> None:
         """Re-render after background enrichment mutated the shared entries in
@@ -375,6 +414,25 @@ class CatalogPane(Container):
             return
         self._serving_slug = new
         # Re-render only if rows are present (mount-order safe).
+        if self._entries:
+            self.refresh_enriched()
+
+    def set_live_free_vram(self, free_gb_by_index: Optional[dict[int, float]]) -> None:
+        """A6: feed the live per-GPU free-VRAM (GB) from the estate poll so the
+        fit column reflects what actually fits RIGHT NOW.  Re-renders only when
+        the value meaningfully changed (so the periodic Operate poll doesn't churn
+        the Run table every tick).  Cursor + filter preserved via refresh_enriched."""
+        new = free_gb_by_index or None
+
+        def _key(d: Optional[dict[int, float]]) -> Optional[tuple]:
+            if not d:
+                return None
+            # Round to whole GB so sub-GB jitter doesn't trigger a re-render.
+            return tuple(sorted((i, round(v)) for i, v in d.items()))
+
+        if _key(new) == _key(self._free_gb_by_index):
+            return
+        self._free_gb_by_index = new
         if self._entries:
             self.refresh_enriched()
 
@@ -931,7 +989,8 @@ class OperateOrchPane(Container):
             yield Label("Power cap", id="powercap-heading")
             yield Static("[dim]reading power-cap status…[/dim]", id="powercap-strip")
             yield Label(
-                "[dim]\\[⏎] switch scene (gated)   \\[o] stop all (gated)   "
+                "[dim]\\[k] stop this model (gated)   \\[b] restart serving (gated)   "
+                "\\[n] switch model   \\[⏎] switch scene (gated)   \\[o] stop all (gated)   "
                 "\\[c] cap on/off (gated)   \\[w] cap sweep (gated)   "
                 "\\[p] prune images (gated)[/dim]",
                 id="orch-hint",
@@ -948,11 +1007,26 @@ class OperateOrchPane(Container):
         # Cache the last estate state so a later power-cap read can re-render the
         # GPU cards with the cap note (power-cap is read AFTER the estate poll).
         self._last_state: Optional[EstateState] = None
+        # A7: matched catalog slug's claimed ctx (set by populate()).
+        self._catalog_ctx_label: str = ""
+        self._catalog_ctx: Optional[int] = None
 
     # ── data ────────────────────────────────────────────────────────────────────
 
-    def populate(self, state: EstateState) -> None:
+    def populate(
+        self,
+        state: EstateState,
+        *,
+        catalog_ctx_label: str = "",
+        catalog_ctx: Optional[int] = None,
+    ) -> None:
         self._last_state = state
+        # A7: the matched catalog slug's CLAIMED ctx — both a display label (e.g.
+        # "262K") and the NUMERIC claim (e.g. 262144).  The numeric one drives the
+        # divergence comparison so a colloquial label doesn't trip a false badge;
+        # the label is for display only.
+        self._catalog_ctx_label = catalog_ctx_label or ""
+        self._catalog_ctx = catalog_ctx
         self._populate_error(state)
         self._populate_gpus(state)
         self._populate_serving(state)
@@ -1002,7 +1076,58 @@ class OperateOrchPane(Container):
             parts.append(f"[dim]:{port}[/dim]")
         elif url:
             parts.append(f"[dim]{url}[/dim]")
-        line.update("[green]▶[/green] Serving: " + "  ·  ".join(parts))
+        head = "[green]▶[/green] Serving: " + "  ·  ".join(parts)
+        # A7: render the ACTUAL probed running config (ctx + engine image), NOT
+        # the catalog slug's claim — and BADGE a divergence when the probed ctx
+        # differs from the matched slug's claimed ctx.  A field the probe did not
+        # return falls back to the catalog claim, clearly labelled "(per catalog
+        # slug)"; we NEVER present a claim as a measured value.
+        line.update(head + self._serving_config_suffix(state))
+
+    def _serving_config_suffix(self, state: EstateState) -> str:
+        """A7: the second line of the serving panel — the PROBED running config
+        (ctx + image) with a divergence badge vs the catalog slug's claim.
+
+        Honesty rules:
+          - PROBED ctx is shown as a measured value; the catalog ctx is shown
+            only as a fallback labelled "(per catalog slug)" when the probe gave
+            nothing.
+          - a divergence badge fires only when BOTH a probed ctx AND a catalog
+            claim exist and they differ — never on a missing probe."""
+        served = getattr(state, "served", None)
+        probed_ctx = getattr(served, "max_model_len", None) if served else None
+        image = (getattr(served, "image", "") or "").strip() if served else ""
+        claim_label = (self._catalog_ctx_label or "").strip()
+        # Prefer the NUMERIC catalog claim (fit.max_ctx) for the comparison; fall
+        # back to parsing the display label only when no numeric claim was passed.
+        claim_ctx = self._catalog_ctx
+        if claim_ctx is None:
+            claim_ctx = parse_ctx_label(claim_label)
+
+        bits: list[str] = []
+        # ── context ──────────────────────────────────────────────────────────
+        if probed_ctx is not None:
+            bits.append(f"ctx [cyan]{_ctx_label(probed_ctx)}[/cyan] [dim](running)[/dim]")
+            # Divergence badge — only when there's a real NUMERIC claim to compare
+            # to AND the probed running ctx genuinely differs from it (within a
+            # small tolerance so a 1-token rounding artefact doesn't fire a false
+            # badge).  Comparing the exact ints (not the colloquial labels) means
+            # a slug labelled "262K" for a 262144 ctx does NOT trip divergence.
+            if claim_ctx is not None and abs(int(claim_ctx) - int(probed_ctx)) > 1024:
+                bits.append(
+                    f"[yellow]⚠ config differs from catalog slug "
+                    f"{state.matched_slug or '?'}[/yellow] "
+                    f"[dim](slug claims {claim_label or _ctx_label(claim_ctx)})[/dim]"
+                )
+        elif claim_label:
+            # No probe value — show the claim, clearly labelled as the claim.
+            bits.append(f"ctx [dim]{claim_label} (per catalog slug)[/dim]")
+        # ── engine image (ground truth — vllm.__version__ lags the tag) ────────
+        if image:
+            bits.append(f"image [dim]{image}[/dim]")
+        if not bits:
+            return ""
+        return "\n   " + "  ·  ".join(bits)
 
     def populate_power_cap(self, st: PowerCapState) -> None:
         strip = self.query_one("#powercap-strip", Static)
@@ -1361,17 +1486,65 @@ class ValidateRunPane(Container):
             id="run-hint",
         )
 
+    # A9: outcome glyph vocabulary — reuses DoctorPane's step_glyph language so a
+    # cleared gate reads the same everywhere.  ·(unrun) / ⟳(running) / ✓ / ✗ / ⚠.
+    _OUTCOME_GLYPH: dict[str, str] = {
+        "unrun": "[dim]·[/dim]",
+        "running": "[cyan]⟳[/cyan]",
+        "passed": "[green]✓[/green]",
+        "failed": "[red]✗[/red]",
+        "warn": "[yellow]⚠[/yellow]",
+    }
+
     def on_mount(self) -> None:
         t = self.query_one("#run-ladder-table", DataTable)
-        t.add_columns("step", "kind", "what it checks")
+        # A9: leading "last" column shows each step's last-run outcome glyph so the
+        # producer can answer "have I cleared the gate?" without scrolling the log.
+        t.add_columns("last", "step", "kind", "what it checks")
         # (kind) in cursor order — the selected row maps back to a run kind.
         self._kinds: list[str] = []
+        # A9: per-kind last-run outcome, cached in the pane (decision input for
+        # ⑤ Promote).  Defaults to "unrun" until a run reports an outcome.
+        self._outcomes: dict[str, str] = {}
+        self._rows: list[tuple[str, str, str]] = list(_RUN_LADDER) + [
+            (k, l, b) for (k, l, b) in _RUN_EXTRAS
+        ]
+        self._render_ladder()
+
+    def _render_ladder(self) -> None:
+        t = self.query_one("#run-ladder-table", DataTable)
+        # Preserve the cursor across the re-render (outcome updates don't move it).
+        saved = t.cursor_row
+        t.clear()
+        self._kinds = []
         for kind, label, blurb in _RUN_LADDER:
-            t.add_row(f"[cyan]▷[/cyan] {label}", "ladder", blurb)
+            t.add_row(self._outcome_glyph(kind), f"[cyan]▷[/cyan] {label}", "ladder", blurb)
             self._kinds.append(kind)
         for kind, label, blurb in _RUN_EXTRAS:
-            t.add_row(f"[cyan]▷[/cyan] {label}", "extra", blurb)
+            t.add_row(self._outcome_glyph(kind), f"[cyan]▷[/cyan] {label}", "extra", blurb)
             self._kinds.append(kind)
+        if t.row_count:
+            try:
+                t.move_cursor(row=max(0, min(saved, t.row_count - 1)))
+            except Exception:
+                pass
+
+    def _outcome_glyph(self, kind: str) -> str:
+        return self._OUTCOME_GLYPH.get(self._outcomes.get(kind, "unrun"), self._OUTCOME_GLYPH["unrun"])
+
+    def set_run_outcome(self, kind: str, status: str) -> None:
+        """A9: record (and render) the last-run outcome for a ladder kind.
+
+        ``status`` ∈ {unrun, running, passed, failed, warn}.  Cached per kind so
+        the leading glyph survives across re-renders; the decision input for ⑤
+        Promote ("have I cleared the gate?")."""
+        if status not in self._OUTCOME_GLYPH:
+            return
+        self._outcomes[kind] = status
+        try:
+            self._render_ladder()
+        except Exception:
+            pass
 
     def selected_kind(self) -> Optional[str]:
         t = self.query_one("#run-ladder-table", DataTable)
@@ -1423,7 +1596,7 @@ class DoctorPane(Container):
 
     def compose(self) -> ComposeResult:
         with ScrollableContainer(id="doctor-scroll"):
-            yield Label("Doctor  [dim](r refreshes — runs the three diagnose reads)[/dim]", id="doctor-heading")
+            yield Label("Doctor  [dim](y / r re-runs the three diagnose reads)[/dim]", id="doctor-heading")
             with Container(classes="doctor-card", id="doctor-card-health"):
                 yield Label("health.sh", classes="doctor-card-title")
                 yield Static("[dim]reading health.sh…[/dim]", id="doctor-health-body")
@@ -1434,7 +1607,9 @@ class DoctorPane(Container):
                 yield Label("diagnose-profile", classes="doctor-card-title")
                 yield Static("[dim]reading diagnose-profile…[/dim]", id="doctor-profile-body")
             yield Label(
-                "[dim]all three legs are READ-only (safe to run live)[/dim]",
+                "[dim]all three legs are READ-only (safe to run live)   ·   "
+                "[cyan]y[/cyan] re-run   ·   for a full validation battery use "
+                "[cyan]F[/cyan] (report.sh --full) in the producer Bring & Validate lane[/dim]",
                 id="doctor-hint",
             )
 
@@ -1445,10 +1620,22 @@ class DoctorPane(Container):
     def _render_health(self, dr) -> None:
         body = self.query_one("#doctor-health-body", Static)
         if not dr.reachable:
-            body.update("[red]✗[/red]  API not reachable")
+            # N7: OFFER the obvious remediation, not just the symptom.  No write
+            # here — a navigation pointer to the gated serve path.
+            body.update(
+                "[red]✗[/red]  API not reachable\n"
+                "   [dim]→ fix: serve a model — Run · Catalog ([cyan]1[/cyan]), pick a "
+                "variant, [cyan]⏎[/cyan] (reconcile-gated)[/dim]"
+            )
             return
         glyph = "[green]✓[/green]" if dr.serving else "[yellow]○[/yellow]"
         line = f"{glyph}  {dr.summary}"
+        if not dr.serving:
+            # Reachable endpoint but nothing served — point at the serve path.
+            line += (
+                "\n   [dim]→ fix: serve a model — Run · Catalog ([cyan]1[/cyan]) "
+                "[cyan]⏎[/cyan][/dim]"
+            )
         body.update(line)
 
     def populate_report(self, report: DoctorReport) -> None:
@@ -1492,9 +1679,21 @@ class DoctorPane(Container):
             f"   ({tri.passed}/{len(tri.steps)} steps)",
         ]
         step_glyph = {"passed": "[green]✓[/green]", "failed": "[red]✗[/red]", "warn": "[yellow]⚠[/yellow]"}
+        failed_any = False
         for s in tri.steps:
             g = step_glyph.get(s.status, "·")
             lines.append(f"    {g} [{s.num}/{s.total}] {s.name}")
+            if s.status == "failed":
+                failed_any = True
+        # N7: a failed triage step has an obvious next action — re-run the read
+        # after the fix, and (for deeper triage) the full battery in the lane.
+        # FLAG: a per-step issue→fix automation is deferred (the step names are
+        # free-text from diagnose-profile.sh); we offer the generic next action.
+        if failed_any:
+            lines.append(
+                "   [dim]→ fix: address the ✗ step above, then [cyan]y[/cyan] re-run; "
+                "for a full battery use [cyan]F[/cyan] in the Bring & Validate lane[/dim]"
+            )
         body.update("\n".join(lines))
 
 
@@ -2663,6 +2862,21 @@ class CockpitApp(App):
         # at runtime + persist the choice for next launch.  Always available (it
         # is the consumer's opt-in into producer mode) — NOT in _PRODUCER_ONLY.
         Binding("C", "toggle_contribute", "Contribute mode", show=False),
+        # A4 — TARGETED serving verbs on Operate · Orchestration's #serving-line
+        # (the most-looked-at panel).  Unlike [o] stop-ALL (which tears the whole
+        # estate down, killing co-resident ComfyUI / studio), these act on JUST
+        # the serving model's container.  All three writes are CONFIRM-gated
+        # through ConfirmActionScreen → the reconcile gate (never auto-fired):
+        #   [k] stop just this model        (resolve container by matched slug)
+        #   [b] restart the serving container
+        #   [n] switch — jump to Run · Catalog to pick another
+        Binding("k", "serving_stop", "Stop this model", show=False),
+        Binding("b", "serving_restart", "Restart serving", show=False),
+        Binding("n", "serving_switch", "Switch model", show=False),
+        # #4 — Operate · Doctor: RE-RUN the three diagnose reads on demand (all
+        # READ-only).  [r] also refreshes Doctor (via load_estate→load_doctor),
+        # but [y] is the discoverable, Doctor-resident re-run verb.
+        Binding("y", "doctor_rerun", "Re-run Doctor", show=False),
     ]
 
     CSS = """
@@ -2744,6 +2958,12 @@ class CockpitApp(App):
         "power_cap_toggle": ({1}, {"tab-orchestration"}),
         "power_cap_sweep":  ({1}, {"tab-orchestration"}),
         "prune_images":     ({1}, {"tab-orchestration"}),
+        # A4 — targeted serving verbs on the #serving-line (Operate · Orch).
+        "serving_stop":     ({1}, {"tab-orchestration"}),
+        "serving_restart":  ({1}, {"tab-orchestration"}),
+        "serving_switch":   ({1}, {"tab-orchestration"}),
+        # Operate · Doctor (#4 — re-run the READ-only diagnose reads on demand)
+        "doctor_rerun":     ({1}, {"tab-doctor"}),
         # Operate · Containers
         "container_logs":   ({1}, {"tab-containers"}),
         # [s] restart only on Operate (any tab, action guards internally) +
@@ -3112,6 +3332,37 @@ class CockpitApp(App):
 
     # ── Estate polling ───────────────────────────────────────────────────────────────
 
+    def _catalog_entry_for(self, slug: str) -> Optional[CatalogEntry]:
+        """A7: the enriched CatalogEntry for a slug (for its numeric fit.max_ctx
+        claim), or None.  Reads the already-loaded catalog pane entries."""
+        try:
+            entries = self.query_one("#catalog-pane", CatalogPane)._entries
+        except Exception:
+            return None
+        for e in entries:
+            if getattr(e, "slug", "") == slug:
+                return e
+        return None
+
+    @staticmethod
+    def _live_free_gb_by_index(state: EstateState) -> Optional[dict[int, float]]:
+        """A6: derive live per-GPU FREE VRAM (GB) from the estate poll's GpuInfo.
+
+        free = (mem_total_mib − mem_used_mib) / 1024.  Returns None when no GPU
+        was read (nvidia-smi gave nothing) — the honest "unknown" signal so the
+        catalog labels the fit column "vs empty card" rather than fabricating a
+        free figure."""
+        gpus = getattr(state, "gpus", None) or []
+        out: dict[int, float] = {}
+        for g in gpus:
+            idx = getattr(g, "index", None)
+            total = getattr(g, "mem_total_mib", 0) or 0
+            used = getattr(g, "mem_used_mib", 0) or 0
+            if idx is None or total <= 0:
+                continue
+            out[int(idx)] = max(0.0, (total - used) / 1024.0)
+        return out or None
+
     @work(exclusive=True, group="estate")
     async def load_estate(self) -> None:
         """Poll the live estate snapshot + push into the orch/doctor panes + rail.
@@ -3135,8 +3386,41 @@ class CockpitApp(App):
         # Hold the SHARED ServingTarget object (by identity) for the c3t Evaluate
         # hand-off — design §4/§6.6 requires passing the SAME dataclass instance.
         self._target_obj = tgt
+        # A7: look up the matched slug's CONFIGURED ctx so the serving panel can
+        # badge a divergence between the probed running ctx and the catalog slug's
+        # CONFIGURED ctx.  Both a display label (ctx_label, e.g. "262K") and the
+        # NUMERIC configured ctx (the registry max_ctx int, e.g. 262144) are passed
+        # — the numeric one drives the divergence comparison so a colloquial label
+        # ("262K" for 262144) doesn't trip a false divergence.
+        #
+        # MUST-FIX 2: this is the slug's CONFIGURED ctx (registry max_ctx), NOT the
+        # kv-calc CAPACITY ceiling (fit.max_ctx, e.g. ~295K for a 262K-configured
+        # qwen).  Comparing the probe against the capacity ceiling false-fired the
+        # badge on an honest 262144 serve (|295000−262144|>1024).  "" / None when
+        # unmatched or the registry row didn't carry the int.
+        catalog_ctx_label = ""
+        catalog_ctx = None
+        if self._target_slug:
+            mrow = next(
+                (v for v in (self._variants or []) if getattr(v, "slug", "") == self._target_slug),
+                None,
+            )
+            if mrow is not None:
+                catalog_ctx_label = getattr(mrow, "ctx_label", "") or ""
+                catalog_ctx = getattr(mrow, "configured_ctx", None)
+            # The enriched catalog entry is the authoritative source for the
+            # configured int (it carries the registry row); prefer it when present.
+            mentry = self._catalog_entry_for(self._target_slug)
+            if mentry is not None:
+                ent_cfg = mentry.configured_ctx
+                if ent_cfg is not None:
+                    catalog_ctx = ent_cfg
+                if not catalog_ctx_label:
+                    catalog_ctx_label = mentry.ctx_label or ""
         try:
-            self.query_one("#operate-orch-pane", OperateOrchPane).populate(state)
+            self.query_one("#operate-orch-pane", OperateOrchPane).populate(
+                state, catalog_ctx_label=catalog_ctx_label, catalog_ctx=catalog_ctx
+            )
         except Exception:
             pass
         try:
@@ -3183,9 +3467,14 @@ class CockpitApp(App):
         # Operate entry / the periodic refresh / the post-serve re-poll all keep
         # the Run marker fresh.
         try:
-            self.query_one("#catalog-pane", CatalogPane).set_serving_slug(
-                self._target_slug
-            )
+            cat = self.query_one("#catalog-pane", CatalogPane)
+            cat.set_serving_slug(self._target_slug)
+            # A6: feed the Run catalog the LIVE per-GPU free-VRAM so a
+            # "fits-clean" row that would OOM right now (e.g. GPU0 holding
+            # ComfyUI) is downgraded.  Derived from THIS poll's GpuInfo
+            # (free = total - used); empty/none when nvidia-smi gave nothing
+            # (→ the column honestly reads "vs empty card").
+            cat.set_live_free_vram(self._live_free_gb_by_index(state))
         except Exception:
             pass
         # A1/A10: if a serve is awaiting confirmation that the booted model came
@@ -4149,19 +4438,58 @@ class CockpitApp(App):
             live.clear_log()
             live.append_line(f"[green]▶ launching[/green] {kind} (streams below)")
         slug = self._target_slug or (self._staged_entry.slug if self._staged_entry else None)
+        # A9: mark the ladder row "running" while the step is in flight.
+        self._set_run_outcome(kind, "running")
 
         def _on_line(text: str) -> None:
             if live is not None:
                 live.append_line(text)
 
-        await self._data.run_validation(
+        run_state = await self._data.run_validation(
             kind,
             model=self._target_model or None,
             url=self._target_url or None,
             slug=slug,
             on_line=_on_line,
         )
+        # A9/MUST-FIX 4: run_validation returns the core run state RIGHT AFTER
+        # spawning (verdict=='', exit_code=None) — the real verdict is written only
+        # when the detached _read_output task finishes and sets state.done.  Without
+        # awaiting that, a COMPLETED real run stays stuck at ⟳ (the spawn-time
+        # unknown verdict).  AWAIT the per-run completion (the established pattern,
+        # services.py _release_claim_when_done) before reading the verdict.  The
+        # worker is async — a long soak just keeps the row at ⟳ while it streams,
+        # then resolves; the script owns its own timeout so we use none here.  A
+        # mock/stub state with no ``done`` event (the FakeWriteRunner dict) skips
+        # the await and resolves immediately via _run_verdict's unknown→running.
+        done = getattr(run_state, "done", None)
+        if done is not None:
+            await done.wait()
+        # A9: record the last-run OUTCOME so the ③ Gate ladder shows ✓/✗ per kind
+        # (decision input for ⑤ Promote) — read from the core run state's verdict
+        # / exit_code.  An unknown outcome (no verdict, no exit_code) leaves the row
+        # at "running" rather than claiming a pass it didn't measure.
+        self._set_run_outcome(kind, self._run_verdict(run_state))
         self.notify(f"{kind} launched.", title="Validate", severity="information", timeout=4)
+
+    @staticmethod
+    def _run_verdict(run_state: Any) -> str:
+        """A9: map a core run state to a ladder outcome glyph key.  Honest about
+        the unknown case — a mock/None state with no verdict stays 'running' (we
+        never fabricate a pass)."""
+        verdict = (getattr(run_state, "verdict", "") or "").strip().lower()
+        if verdict in ("passed", "failed", "warn"):
+            return verdict
+        exit_code = getattr(run_state, "exit_code", None)
+        if exit_code is not None:
+            return "passed" if exit_code == 0 else "failed"
+        return "running"
+
+    def _set_run_outcome(self, kind: str, status: str) -> None:
+        try:
+            self.query_one("#validate-run-pane", ValidateRunPane).set_run_outcome(kind, status)
+        except Exception:
+            pass
 
     def _run_output_pane(self) -> Optional[LivePane]:
         try:
@@ -4404,6 +4732,98 @@ class CockpitApp(App):
             return
         plan = self._data.estate_down()
         self.push_screen(ConfirmActionScreen(plan))
+
+    # ── A4 · targeted serving verbs (Operate · Orchestration #serving-line) ────────
+
+    def _serving_container(self) -> Optional[ContainerInfo]:
+        """A4: resolve the container running the matched serving model.
+
+        Matches the last estate poll's ``matched_slug`` against the running
+        engine containers (``ContainerInfo.slug``) so the targeted stop/restart
+        acts on JUST this model — not the whole estate ([o]).  Falls back to the
+        detected target's container name when the slug join is empty.  Returns
+        None when nothing is serving."""
+        state = self._last_estate_state
+        if state is None:
+            return None
+        slug = (getattr(state, "matched_slug", "") or "").strip()
+        cons = [c for c in (getattr(state, "containers", []) or []) if getattr(c, "kind", "") == "engine"]
+        if slug:
+            for c in cons:
+                if (getattr(c, "slug", "") or "").strip() == slug and getattr(c, "is_running", True):
+                    return c
+        # Fallback: the detected target's container name.
+        tgt = getattr(state, "target", None)
+        tgt_name = (getattr(tgt, "container", "") or "").strip()
+        if tgt_name:
+            for c in cons:
+                if getattr(c, "name", "") == tgt_name and getattr(c, "is_running", True):
+                    return c
+        return None
+
+    def _serving_write(self, op: str) -> None:
+        """A4: confirm-gated `docker <op> <serving-container>` (op ∈ stop|restart).
+
+        Resolves the serving model's container and routes the write through the
+        SAME ConfirmActionScreen → reconcile gate as every other GPU-mutating
+        write (NEVER auto-fired).  No-ops with a notify when nothing is serving."""
+        if self._active_mode != 1 or self._active_operate_tab() != "tab-orchestration":
+            return
+        con = self._serving_container()
+        if con is None:
+            self.notify(
+                "No model serving — nothing to "
+                f"{op}.",
+                title="Serving",
+                severity="warning",
+                timeout=3,
+            )
+            return
+        plan = self._data.container_action(con.name, op)
+        self.push_screen(ConfirmActionScreen(plan))
+
+    def action_serving_stop(self) -> None:
+        """[k] in Operate · Orchestration: stop JUST the serving model's container
+        (confirm-gated) — unlike [o] which tears down the whole estate."""
+        self._serving_write("stop")
+
+    def action_serving_restart(self) -> None:
+        """[b] in Operate · Orchestration: restart the serving model's container
+        (confirm-gated)."""
+        self._serving_write("restart")
+
+    def action_doctor_rerun(self) -> None:
+        """[y] in Operate · Doctor (#4): re-run the three diagnose reads on demand
+        (health + diagnose-estate + diagnose-profile).  ALL READ-only — no gate
+        (nothing is mutated).  Distinct from the global [r] refresh in that it is
+        the Doctor-resident, discoverable re-run verb."""
+        if self._active_mode != 1 or self._active_operate_tab() != "tab-doctor":
+            return
+        self.load_doctor()
+        self.notify(
+            "Re-running Doctor (health + diagnose-estate + diagnose-profile)…",
+            title="Doctor",
+            severity="information",
+            timeout=3,
+        )
+
+    def action_serving_switch(self) -> None:
+        """[n] in Operate · Orchestration: switch model — jump to Run · Catalog to
+        pick another (the serve itself is the existing reconcile-gated ⏎ path).
+        A pure navigation verb; no write here."""
+        if self._active_mode != 1 or self._active_operate_tab() != "tab-orchestration":
+            return
+        self._switch_mode(0)
+        try:
+            self.query_one("#run-tabs", TabbedContent).active = "tab-catalog"
+        except Exception:
+            pass
+        self.notify(
+            "Pick a variant and press ⏎ to switch — the serve is reconcile-gated.",
+            title="Switch model",
+            severity="information",
+            timeout=4,
+        )
 
     # ── Phase 5 · Hook 1: Evaluate the running target via c3t (design §4) ──────────────
 

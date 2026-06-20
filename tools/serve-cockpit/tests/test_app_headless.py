@@ -23,6 +23,7 @@ RealRunner / SubprocessRunner.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Any, Optional
@@ -51,7 +52,7 @@ from club3090_cockpit.app import (
     ShareBackReportScreen,
     RailStatus,
 )
-from club3090_cockpit.data import ContainerInfo, EstateState
+from club3090_cockpit.data import ContainerInfo, EstateState, ServedProbe
 from club3090_cockpit.services import CockpitData, RunResult
 from club3090_cockpit.__main__ import (
     resolve_surface,
@@ -144,6 +145,17 @@ def make_detect(target: ServingTarget):
     return _detect
 
 
+def make_probe(probe):
+    """A7: a fake live-config probe (returns a canned ServedProbe) so no real
+    httpx / docker inspect is touched.  Defaults to an empty probe (the
+    'nothing probed' case) when ``probe`` is None."""
+    from club3090_cockpit.data import ServedProbe
+
+    async def _probe(_target) -> ServedProbe:
+        return probe if probe is not None else ServedProbe()
+    return _probe
+
+
 def make_gpu_info(gpus: list[GpuInfo]):
     async def _gpus() -> list[GpuInfo]:
         return gpus
@@ -173,6 +185,7 @@ REGISTRY_JSON = json.dumps(
                 "compose_path": "models/qwen3.6-27b/vllm/compose/dual/autoround-int4/fp8-mtp.yml",
                 "status": "production",
                 "ctx_label": "262K",
+                "configured_ctx": 262144,
                 "status_note": "",
                 "source": "curated",
             },
@@ -190,6 +203,7 @@ REGISTRY_JSON = json.dumps(
                 "compose_path": "models/qwen3.6-27b/ik-llama/compose/single/ubergarm-iq4ks/mtp.yml",
                 "status": "production",
                 "ctx_label": "200K",
+                "configured_ctx": 200000,
                 "status_note": "",
                 "source": "curated",
             },
@@ -492,6 +506,7 @@ def make_app(
     repo_root: Optional[Path] = None,
     surface: str = "consumer",
     runner: Optional[FakeRunner] = None,
+    probe_served: Optional[Any] = None,
 ) -> tuple[CockpitApp, FakeRunner, FakeWriteRunner]:
     """Build a CockpitApp wired to a fully-faked CockpitData.
 
@@ -506,11 +521,19 @@ def make_app(
     gpus = gpus if gpus is not None else [GpuInfo(index=0, mem_used_mib=1), GpuInfo(index=1, mem_used_mib=1)]
     target = target if target is not None else ServingTarget(gpus=gpus)
     write_runner = write_runner or FakeWriteRunner()
+    # A7: always inject a fake probe so the real httpx + docker-inspect probe is
+    # never reached in tests.  ``probe_served`` may be a ServedProbe (wrapped) or
+    # an async callable (used as-is); default = an empty probe.
+    if callable(probe_served):
+        probe_fn = probe_served
+    else:
+        probe_fn = make_probe(probe_served)
     data = CockpitData(
         root,
         runner=runner,
         detect_endpoint_fn=make_detect(target),
         get_gpu_info_fn=make_gpu_info(gpus),
+        probe_served_fn=probe_fn,
         write_runner=write_runner,
     )
     app = CockpitApp(repo_root=root, data=data, surface=surface)
@@ -4944,3 +4967,542 @@ class TestBatch2NH5WatcherArmFailure:
             assert app._pending_serve_generated is False
             assert app._pending_serve_timer is None
             assert any("could not arm watcher" in ln for ln in emitted)
+
+
+# ===========================================================================
+# UX Batch 3 — honesty + serving actions (live-rig audit)
+# ===========================================================================
+
+
+class TestA6CatalogLiveFreeVram:
+    """A6: the catalog fit-gate is computed against the TOTAL card; downgrade the
+    DISPLAYED glyph against the LIVE per-GPU free-VRAM so a "fits-clean" row that
+    would OOM right now is not shown as a clean live verdict.  Pure post-process
+    of the verdict — kv-calc is NOT re-run."""
+
+    @pytest.mark.asyncio
+    async def test_row_downgraded_when_est_exceeds_live_free(self):
+        # vllm/dual's per-card vram_est is 19.881 G (from FIT_ALL_JSON); make GPU0
+        # hold a big tenant so only ~5 G is free → the dual row can't fit BOTH
+        # cards now → it must NOT render the clean "●" glyph.
+        gpus = [
+            GpuInfo(index=0, mem_used_mib=19000, mem_total_mib=24576),  # ~5.4 G free
+            GpuInfo(index=1, mem_used_mib=1000, mem_total_mib=24576),
+        ]
+        target = ServingTarget(gpus=gpus)
+        app, _, _ = make_app(gpus=gpus, target=target)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            await pilot.press("2")  # Operate poll feeds the live free-VRAM to Run
+            await _settle(pilot)
+            pane = app.query_one("#catalog-pane", CatalogPane)
+            # The fit verdict itself is still fits-clean (kv-calc unchanged)…
+            entry = next(e for e in pane._entries if e.slug == "vllm/dual")
+            assert entry.fit.verdict == "fits-clean"
+            # …but the DISPLAYED glyph is downgraded (not the clean ● live).
+            from club3090_cockpit.data import downgrade_fit_glyph
+            glyph, note = downgrade_fit_glyph(entry.fit, entry.row, app._live_free_gb_by_index(app._last_estate_state))
+            assert glyph in ("⚠", "✗")
+            assert note  # carries a reason
+            # And the live data path is actually populated.
+            assert pane._free_gb_by_index is not None
+
+    @pytest.mark.asyncio
+    async def test_column_labelled_vs_empty_card_when_no_live_data(self):
+        # No GPUs read → free-VRAM unknown → the fit column must read "vs empty
+        # card" so "fits-clean" is never mistaken for a live verdict.
+        app, _, _ = make_app(gpus=[], target=ServingTarget(gpus=[]))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            pane = app.query_one("#catalog-pane", CatalogPane)
+            assert pane._free_gb_by_index is None
+            status = str(app.query_one("#catalog-status", Label).render())
+            assert "vs empty card" in status
+
+    @pytest.mark.asyncio
+    async def test_clean_when_live_free_is_ample(self):
+        # Both cards nearly empty → 19.881 G fits → glyph stays the clean ●.
+        gpus = [
+            GpuInfo(index=0, mem_used_mib=500, mem_total_mib=24576),
+            GpuInfo(index=1, mem_used_mib=500, mem_total_mib=24576),
+        ]
+        app, _, _ = make_app(gpus=gpus, target=ServingTarget(gpus=gpus))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            await pilot.press("2")
+            await _settle(pilot)
+            pane = app.query_one("#catalog-pane", CatalogPane)
+            entry = next(e for e in pane._entries if e.slug == "vllm/dual")
+            from club3090_cockpit.data import downgrade_fit_glyph
+            glyph, note = downgrade_fit_glyph(entry.fit, entry.row, pane._free_gb_by_index)
+            assert glyph == "●"
+            assert note == ""
+
+    @pytest.mark.asyncio
+    async def test_serving_model_own_row_not_false_wont_fit(self):
+        """MUST-FIX 1: nvidia-smi mem_used INCLUDES the running model's own
+        allocation, so free = total − used already nets out the serving row's
+        ~20 G.  Comparing the row's est against that residual free falsely stamps
+        "✗ won't fit now" while it is PROVABLY serving.  The serving slug's OWN
+        catalog row is EXEMPT from the live-VRAM downgrade → its base glyph (●)."""
+        # vllm/dual is the matched serving slug; both cards hold ~20 G (the running
+        # model) so only ~4 G is free — the exact "free < est" trap the bug hit.
+        gpus = [
+            GpuInfo(index=0, mem_used_mib=20000, mem_total_mib=24576),  # ~4.5 G free
+            GpuInfo(index=1, mem_used_mib=20000, mem_total_mib=24576),
+        ]
+        target = ServingTarget(container="vllm_qwen36_27b", host_port=8010, gpus=gpus)
+        responses = fake_responses(**{"docker ps": ok(DOCKER_PS_ENGINE)})
+        app, _, _ = make_app(responses=responses, gpus=gpus, target=target)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            await pilot.press("2")            # Operate poll → sets serving slug + free-VRAM
+            await _settle(pilot)
+            pane = app.query_one("#catalog-pane", CatalogPane)
+            assert pane._serving_slug == "vllm/dual"   # it IS the serving row
+            assert pane._free_gb_by_index is not None   # live free-VRAM is low
+            tbl = app.query_one("#catalog-table", DataTable)
+            # Find the serving row + read its fit cell (column index 2).
+            serving_fit = None
+            for r in range(tbl.row_count):
+                row = [str(c) for c in tbl.get_row_at(r)]
+                if "serving" in row[0]:
+                    serving_fit = row[2]
+                    break
+            assert serving_fit is not None
+            # NOT downgraded — no ✗/⚠ and no "won't fit"/"tight" reason on its own row.
+            assert "✗" not in serving_fit and "⚠" not in serving_fit
+            assert "won't fit" not in serving_fit and "tight" not in serving_fit
+            assert "●" in serving_fit                   # stays the base fits-clean glyph
+
+    @pytest.mark.asyncio
+    async def test_non_serving_row_still_downgraded_when_serving_exempt(self):
+        """Sibling non-serving rows are still honestly downgraded when live free is
+        low — the exemption is scoped to the serving row ONLY, not a blanket skip."""
+        gpus = [
+            GpuInfo(index=0, mem_used_mib=20000, mem_total_mib=24576),  # ~4.5 G free
+            GpuInfo(index=1, mem_used_mib=20000, mem_total_mib=24576),
+        ]
+        target = ServingTarget(container="vllm_qwen36_27b", host_port=8010, gpus=gpus)
+        responses = fake_responses(**{"docker ps": ok(DOCKER_PS_ENGINE)})
+        app, _, _ = make_app(responses=responses, gpus=gpus, target=target)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            await pilot.press("2")
+            await _settle(pilot)
+            pane = app.query_one("#catalog-pane", CatalogPane)
+            # The serving exemption holds, but a non-serving fits-clean sibling that
+            # genuinely can't fit the residual free IS downgraded.  (vllm/dual is the
+            # only fits-clean slug here; assert the exemption + downgrade machinery
+            # agree by checking the helper directly on a non-serving copy.)
+            from club3090_cockpit.data import downgrade_fit_glyph
+            entry = next(e for e in pane._entries if e.slug == "vllm/dual")
+            glyph, note = downgrade_fit_glyph(entry.fit, entry.row, pane._free_gb_by_index)
+            assert glyph in ("⚠", "✗") and note   # the raw helper still downgrades
+
+
+class TestA7ServingPanelProbedConfig:
+    """A7: the serving panel shows the ACTUAL probed running config (ctx + image),
+    not the catalog slug's claim, and BADGES a divergence when the probed ctx
+    differs from the matched slug's claimed ctx.  The probe is a READ (mocked)."""
+
+    @pytest.mark.asyncio
+    async def test_serving_panel_shows_probed_ctx_and_image(self):
+        gpus = [GpuInfo(index=0, mem_used_mib=1), GpuInfo(index=1, mem_used_mib=1)]
+        target = ServingTarget(container="vllm_qwen36_27b", host_port=8010, gpus=gpus)
+        responses = fake_responses(**{"docker ps": ok(DOCKER_PS_ENGINE)})
+        # Probe reports the catalog-claimed 262144 → NO divergence; image shown.
+        probe = ServedProbe(max_model_len=262144, image="vllm/vllm-openai:v0.22.0")
+        app, _, _ = make_app(responses=responses, gpus=gpus, target=target, probe_served=probe)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("2")
+            await _settle(pilot)
+            line = str(app.query_one("#serving-line", Static).render())
+            assert "running" in line               # probed ctx is labelled running
+            assert "262K" in line                   # 262144 → "262K" (÷1000, matches catalog)
+            assert "vllm/vllm-openai:v0.22.0" in line
+            assert "config differs from catalog slug" not in line  # no divergence
+
+    @pytest.mark.asyncio
+    async def test_serving_panel_badges_divergence(self):
+        gpus = [GpuInfo(index=0, mem_used_mib=1), GpuInfo(index=1, mem_used_mib=1)]
+        target = ServingTarget(container="vllm_qwen36_27b", host_port=8010, gpus=gpus)
+        responses = fake_responses(**{"docker ps": ok(DOCKER_PS_ENGINE)})
+        # Probe reports 131072, but the slug (vllm/dual) claims 262K → divergence.
+        probe = ServedProbe(max_model_len=131072, image="vllm/vllm-openai:v0.22.0")
+        app, _, _ = make_app(responses=responses, gpus=gpus, target=target, probe_served=probe)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("2")
+            await _settle(pilot)
+            assert app._target_slug == "vllm/dual"
+            line = str(app.query_one("#serving-line", Static).render())
+            assert "131K" in line                          # 131072 → "131K" (÷1000)
+            assert "config differs from catalog slug" in line
+            assert "vllm/dual" in line
+
+    @pytest.mark.asyncio
+    async def test_serving_panel_falls_back_to_claim_when_no_probe_ctx(self):
+        gpus = [GpuInfo(index=0, mem_used_mib=1), GpuInfo(index=1, mem_used_mib=1)]
+        target = ServingTarget(container="vllm_qwen36_27b", host_port=8010, gpus=gpus)
+        responses = fake_responses(**{"docker ps": ok(DOCKER_PS_ENGINE)})
+        # Probe returned NO ctx (e.g. llama.cpp) → fall back to the catalog claim,
+        # clearly labelled "(per catalog slug)" — never presented as measured.
+        probe = ServedProbe(max_model_len=None, image="ghcr.io/ggml-org/llama.cpp:server-cuda")
+        app, _, _ = make_app(responses=responses, gpus=gpus, target=target, probe_served=probe)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("2")
+            await _settle(pilot)
+            line = str(app.query_one("#serving-line", Static).render())
+            assert "per catalog slug" in line
+            assert "ghcr.io/ggml-org/llama.cpp:server-cuda" in line
+
+    @pytest.mark.asyncio
+    async def test_no_false_badge_when_fit_ceiling_exceeds_configured_ctx(self):
+        """MUST-FIX 2: the badge must compare the probe against the slug's
+        CONFIGURED ctx (registry max_ctx = 262144), NOT the kv-calc CAPACITY
+        ceiling (fit.max_ctx).  Here fit.max_ctx is 295000 (the 295K ceiling) but
+        the slug is configured 262144 — an honest 262144 serve must NOT badge."""
+        gpus = [GpuInfo(index=0, mem_used_mib=1), GpuInfo(index=1, mem_used_mib=1)]
+        target = ServingTarget(container="vllm_qwen36_27b", host_port=8010, gpus=gpus)
+        # fit.max_ctx (capacity ceiling) DIFFERS from configured_ctx (262144).
+        fit_all_295k = json.dumps(
+            {
+                "card": "rtx-3090",
+                "card_vram_gb": 24.0,
+                "variants": {
+                    "vllm/dual": {"verdict": "fits-clean", "vram_est_gb": 19.881, "band_gb": 1.5, "max_ctx": 295000},
+                    "ik-llama/iq4ks-mtp": {"verdict": "skip"},
+                },
+            }
+        )
+        responses = fake_responses(
+            **{"docker ps": ok(DOCKER_PS_ENGINE), "kv-calc.py --fit-all": ok(fit_all_295k)}
+        )
+        # Probe reports exactly the CONFIGURED 262144 — within tolerance of config.
+        probe = ServedProbe(max_model_len=262144, image="vllm/vllm-openai:v0.22.0")
+        app, _, _ = make_app(responses=responses, gpus=gpus, target=target, probe_served=probe)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("2")
+            await _settle(pilot)
+            # Confirm the fit ceiling really is the 295K (the value the OLD code
+            # wrongly compared against — proving the fix is load-bearing).
+            entry = app._catalog_entry_for("vllm/dual")
+            assert entry is not None and entry.fit.max_ctx == 295000
+            assert entry.configured_ctx == 262144
+            line = str(app.query_one("#serving-line", Static).render())
+            assert "262K" in line
+            assert "config differs from catalog slug" not in line  # NO false badge
+
+    @pytest.mark.asyncio
+    async def test_fallback_path_no_false_badge_before_enrich(self):
+        """MUST-FIX 2 (b): the fallback path (no enriched catalog entry yet, so no
+        numeric configured_ctx from fit) must NOT false-badge when probed ==
+        configured.  The configured int comes from the registry VariantRow
+        (configured_ctx=262144); probe 262144 → exact match → no badge."""
+        from club3090_cockpit.data import EstateState as _ES
+
+        gpus = [GpuInfo(index=0, mem_used_mib=1), GpuInfo(index=1, mem_used_mib=1)]
+        target = ServingTarget(container="vllm_qwen36_27b", host_port=8010, gpus=gpus)
+        responses = fake_responses(**{"docker ps": ok(DOCKER_PS_ENGINE)})
+        probe = ServedProbe(max_model_len=262144, image="vllm/vllm-openai:v0.22.0")
+        app, _, _ = make_app(responses=responses, gpus=gpus, target=target, probe_served=probe)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            # Drive the OperateOrchPane.populate directly with the EXACT-INT
+            # configured ctx (262144) but NO display label and NO fit-derived
+            # numeric — the pre-enrich fallback shape.
+            from club3090_cockpit.data import ServedProbe as _SP
+            state = _ES(
+                target=target,
+                matched_slug="vllm/dual",
+                served=_SP(max_model_len=262144, image="vllm/vllm-openai:v0.22.0"),
+            )
+            pane = app.query_one("#operate-orch-pane", OperateOrchPane)
+            pane.populate(state, catalog_ctx_label="262K", catalog_ctx=262144)
+            await pilot.pause()
+            line = str(app.query_one("#serving-line", Static).render())
+            assert "262K" in line
+            assert "config differs from catalog slug" not in line  # no false-fire
+
+    @pytest.mark.asyncio
+    async def test_running_ctx_label_matches_catalog_ctx_label(self):
+        """MUST-FIX 3: the serving-panel running-ctx label and the catalog ctx
+        label must read IDENTICALLY for the same int (one ÷1000 K-convention)."""
+        gpus = [GpuInfo(index=0, mem_used_mib=1), GpuInfo(index=1, mem_used_mib=1)]
+        target = ServingTarget(container="vllm_qwen36_27b", host_port=8010, gpus=gpus)
+        responses = fake_responses(**{"docker ps": ok(DOCKER_PS_ENGINE)})
+        probe = ServedProbe(max_model_len=262144, image="vllm/vllm-openai:v0.22.0")
+        app, _, _ = make_app(responses=responses, gpus=gpus, target=target, probe_served=probe)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            await pilot.press("2")
+            await _settle(pilot)
+            # Serving panel running-ctx label.
+            serving_line = str(app.query_one("#serving-line", Static).render())
+            assert "262K (running)" in serving_line.replace("[dim]", "").replace("[/dim]", "")
+            # Catalog row ctx label for the SAME int.
+            tbl = app.query_one("#catalog-table", DataTable)
+            cat_blob = " ".join(str(tbl.get_row_at(r)) for r in range(tbl.row_count))
+            assert "262K" in cat_blob
+            # And the OLD ÷1024 form ("256K") appears NOWHERE — the convention is unified.
+            assert "256K" not in serving_line and "256K" not in cat_blob
+
+
+class TestA4TargetedServingVerbs:
+    """A4: targeted stop / restart / switch on the #serving-line — NOT just [o]
+    stop-ALL.  Stop/restart resolve the serving container by matched slug and open
+    the SAME confirm gate (never auto-fired); they no-op with no model serving."""
+
+    @pytest.mark.asyncio
+    async def test_serving_stop_resolves_container_and_opens_gate(self):
+        gpus = [GpuInfo(index=0, mem_used_mib=1), GpuInfo(index=1, mem_used_mib=1)]
+        target = ServingTarget(container="vllm_qwen36_27b", host_port=8010, gpus=gpus)
+        responses = fake_responses(**{"docker ps": ok(DOCKER_PS_ENGINE)})
+        wr = FakeWriteRunner()
+        app, _, _ = make_app(responses=responses, gpus=gpus, target=target, write_runner=wr)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("2")
+            await _settle(pilot)
+            app.query_one("#operate-tabs", TabbedContent).active = "tab-orchestration"
+            await pilot.pause()
+            await pilot.press("k")     # stop THIS model
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmActionScreen)
+            plan = app.screen._plan
+            # Resolves the matched-slug container, NOT a stop-all.
+            assert plan.cmd[:2] == ["docker", "stop"]
+            assert "vllm-qwen36-27b-dual" in plan.cmd
+            assert wr.started == []     # nothing auto-fired
+
+    @pytest.mark.asyncio
+    async def test_serving_restart_opens_gate(self):
+        gpus = [GpuInfo(index=0, mem_used_mib=1), GpuInfo(index=1, mem_used_mib=1)]
+        target = ServingTarget(container="vllm_qwen36_27b", host_port=8010, gpus=gpus)
+        responses = fake_responses(**{"docker ps": ok(DOCKER_PS_ENGINE)})
+        app, _, _ = make_app(responses=responses, gpus=gpus, target=target)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("2")
+            await _settle(pilot)
+            app.query_one("#operate-tabs", TabbedContent).active = "tab-orchestration"
+            await pilot.pause()
+            await pilot.press("b")     # restart serving
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmActionScreen)
+            assert app.screen._plan.cmd[:2] == ["docker", "restart"]
+
+    @pytest.mark.asyncio
+    async def test_serving_stop_noops_with_no_model(self):
+        # Nothing serving (empty docker ps, no target) → [k] must NOT open the gate.
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("2")
+            await _settle(pilot)
+            app.query_one("#operate-tabs", TabbedContent).active = "tab-orchestration"
+            await pilot.pause()
+            await pilot.press("k")
+            await pilot.pause()
+            assert not isinstance(app.screen, ConfirmActionScreen)
+
+    @pytest.mark.asyncio
+    async def test_serving_switch_jumps_to_run_catalog(self):
+        gpus = [GpuInfo(index=0, mem_used_mib=1), GpuInfo(index=1, mem_used_mib=1)]
+        target = ServingTarget(container="vllm_qwen36_27b", host_port=8010, gpus=gpus)
+        responses = fake_responses(**{"docker ps": ok(DOCKER_PS_ENGINE)})
+        app, _, _ = make_app(responses=responses, gpus=gpus, target=target)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("2")
+            await _settle(pilot)
+            app.query_one("#operate-tabs", TabbedContent).active = "tab-orchestration"
+            await pilot.pause()
+            await pilot.press("n")     # switch → Run · Catalog (navigation, no write)
+            await pilot.pause()
+            assert "active" in app.query_one("#panel-run").classes
+            assert app.query_one("#run-tabs", TabbedContent).active == "tab-catalog"
+            assert not isinstance(app.screen, ConfirmActionScreen)  # no write here
+
+
+class TestDoctorRerunAndRemediation:
+    """#4: a Doctor-resident key re-runs the three READ-only diagnose reads on
+    demand.  N7: a surfaced issue OFFERS the obvious remediation pointer."""
+
+    @pytest.mark.asyncio
+    async def test_doctor_rerun_triggers_doctor_read(self):
+        responses = fake_responses(**{"docker ps": ok(DOCKER_PS_ENGINE)})
+        app, runner, _ = make_app(responses=responses)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("2")
+            await _settle(pilot)
+            app.query_one("#operate-tabs", TabbedContent).active = "tab-doctor"
+            await pilot.pause()
+            # Clear the call log, then press [y] — it must re-run the diagnose reads.
+            runner.calls.clear()
+            await pilot.press("y")
+            await _settle(pilot)
+            assert any("diagnose-estate.sh --json" in " ".join(c) for c in runner.calls)
+
+    @pytest.mark.asyncio
+    async def test_doctor_health_offers_remediation_when_unreachable(self):
+        # An unreachable endpoint surfaces the obvious next action (serve a model),
+        # not just the symptom.
+        from club3090_cockpit.data import DoctorRead
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            pane = app.query_one("#doctor-pane", DoctorPane)
+            pane._render_health(DoctorRead(reachable=False))
+            body = str(app.query_one("#doctor-health-body", Static).render())
+            assert "not reachable" in body
+            assert "fix:" in body and "Run · Catalog" in body
+
+
+class TestA9GateLadderOutcome:
+    """A9: each ③ Gate ladder row shows its last-run outcome glyph (·/⟳/✓/✗/⚠),
+    cached per kind, so the producer can answer 'have I cleared the gate?'."""
+
+    @pytest.mark.asyncio
+    async def test_ladder_row_shows_passed_glyph_from_last_run(self):
+        app, _, _ = make_app(surface="producer")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("3")           # Bring & Validate lane
+            await _settle(pilot)
+            app.query_one("#validate-tabs", TabbedContent).active = "tab-run"
+            await pilot.pause()
+            pane = app.query_one("#validate-run-pane", ValidateRunPane)
+            pane.set_run_outcome("verify-full", "passed")
+            pane.set_run_outcome("bench", "failed")
+            await pilot.pause()
+            assert pane._outcomes["verify-full"] == "passed"
+            table = app.query_one("#run-ladder-table", DataTable)
+            # Row 0 is verify-full (first _RUN_LADDER entry) → ✓ in the "last" col.
+            cell0 = str(table.get_cell_at((0, 0)))
+            assert "✓" in cell0
+            # bench is the 3rd ladder row → ✗.
+            cell2 = str(table.get_cell_at((2, 0)))
+            assert "✗" in cell2
+
+    @pytest.mark.asyncio
+    async def test_ladder_default_outcome_is_unrun(self):
+        app, _, _ = make_app(surface="producer")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("3")
+            await _settle(pilot)
+            app.query_one("#validate-tabs", TabbedContent).active = "tab-run"
+            await pilot.pause()
+            table = app.query_one("#run-ladder-table", DataTable)
+            cell0 = str(table.get_cell_at((0, 0)))
+            assert "·" in cell0              # unrun
+
+    @pytest.mark.asyncio
+    async def test_ladder_resolves_only_after_done_event(self):
+        """MUST-FIX 4: run_validation returns the state RIGHT AFTER spawning
+        (verdict=='', exit_code=None) — the real verdict is written only when the
+        detached reader finishes and sets state.done.  The launch must AWAIT that
+        before reading the verdict, so the ladder row flips ⟳→✓ ONLY after done is
+        set, never staying stuck at ⟳ on a completed run."""
+
+        class _AsyncState:
+            def __init__(self):
+                self.verdict = ""
+                self.exit_code = None
+                self.done = asyncio.Event()
+
+        class _AsyncWriteRunner:
+            """start_raw returns a still-running state (done NOT set); the test
+            sets verdict + signals done out-of-band to mimic _read_output."""
+
+            def __init__(self):
+                self.state = _AsyncState()
+                self.started: list[dict[str, Any]] = []
+
+            def set_callbacks(self, on_event=None, on_line=None, on_complete=None):
+                pass
+
+            async def start_raw(self, cmd, env, run_type, parser):
+                self.started.append({"cmd": cmd, "run_type": run_type})
+                return self.state
+
+        wr = _AsyncWriteRunner()
+        app, _, _ = make_app(write_runner=wr, surface="producer")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("3")
+            await _settle(pilot)
+            app.query_one("#validate-tabs", TabbedContent).active = "tab-run"
+            await pilot.pause()
+            pane = app.query_one("#validate-run-pane", ValidateRunPane)
+
+            # Launch — the worker spawns then AWAITS done.wait(); it must NOT resolve.
+            app.run_validation_launch("verify-full")
+            # Let the worker reach the await (it's parked on done.wait()).
+            for _ in range(5):
+                await pilot.pause()
+            assert wr.started, "start_raw should have been called"
+            # Still in flight → the row stays at ⟳ (running), NOT a fabricated pass.
+            assert pane._outcomes["verify-full"] == "running"
+
+            # The detached reader finishes: writes the verdict, then sets done.
+            wr.state.verdict = "passed"
+            wr.state.done.set()
+            await pilot.app.workers.wait_for_complete()
+            await pilot.pause()
+            # NOW the row resolves to ✓ (passed) — only after done fired.
+            assert pane._outcomes["verify-full"] == "passed"
+
+    @pytest.mark.asyncio
+    async def test_ladder_resolves_failed_after_done_event(self):
+        """MUST-FIX 4 (failed leg): a real run that fails flips ⟳→✗ after done."""
+
+        class _AsyncState:
+            def __init__(self):
+                self.verdict = ""
+                self.exit_code = None
+                self.done = asyncio.Event()
+
+        class _AsyncWriteRunner:
+            def __init__(self):
+                self.state = _AsyncState()
+                self.started: list[dict[str, Any]] = []
+
+            def set_callbacks(self, on_event=None, on_line=None, on_complete=None):
+                pass
+
+            async def start_raw(self, cmd, env, run_type, parser):
+                self.started.append({"cmd": cmd})
+                return self.state
+
+        wr = _AsyncWriteRunner()
+        app, _, _ = make_app(write_runner=wr, surface="producer")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("3")
+            await _settle(pilot)
+            app.query_one("#validate-tabs", TabbedContent).active = "tab-run"
+            await pilot.pause()
+            pane = app.query_one("#validate-run-pane", ValidateRunPane)
+            app.run_validation_launch("verify-full")
+            for _ in range(5):
+                await pilot.pause()
+            assert pane._outcomes["verify-full"] == "running"
+            wr.state.verdict = "failed"
+            wr.state.done.set()
+            await pilot.app.workers.wait_for_complete()
+            await pilot.pause()
+            assert pane._outcomes["verify-full"] == "failed"
+
+    def test_run_verdict_never_fabricates_a_pass(self):
+        """MUST-FIX 4 unit: _run_verdict maps verdict=='failed'→failed,
+        exit_code==0→passed, and a bare dict / None state (no verdict, no
+        exit_code) → 'running' — NEVER a fabricated pass."""
+        from club3090_cockpit.app import CockpitApp
+
+        class _S:
+            def __init__(self, verdict="", exit_code=None):
+                self.verdict = verdict
+                self.exit_code = exit_code
+
+        assert CockpitApp._run_verdict(_S(verdict="failed")) == "failed"
+        assert CockpitApp._run_verdict(_S(verdict="passed")) == "passed"
+        assert CockpitApp._run_verdict(_S(exit_code=0)) == "passed"
+        assert CockpitApp._run_verdict(_S(exit_code=1)) == "failed"
+        # The mock-phase shapes: a bare dict and a None state carry no verdict →
+        # 'running' (never a fabricated pass).
+        assert CockpitApp._run_verdict({"mock_state": True}) == "running"
+        assert CockpitApp._run_verdict(None) == "running"

@@ -396,7 +396,7 @@ sys.modules["_c3_tui_registry"] = _tui_registry
 _spec.loader.exec_module(_tui_registry)
 
 from scripts.lib.profiles.compat import load_profiles  # noqa: E402
-from scripts.lib.profiles.compose_registry import DEFAULTS  # noqa: E402
+from scripts.lib.profiles.compose_registry import COMPOSE_REGISTRY, DEFAULTS  # noqa: E402
 
 tab = os.environ.get("REGISTRY_TAB", "")
 
@@ -420,6 +420,12 @@ for vr in _tui_registry.parse_variant_rows(tab):
             "compose_path": d["compose_path"],
             "status": d["status"],
             "ctx_label": d["ctx_label"],
+            # The EXACT numeric configured ctx (the registry max_ctx int behind
+            # ctx_label — e.g. 262144 for "262K").  Sourced straight from
+            # COMPOSE_REGISTRY so the cockpit's divergence badge compares the
+            # probed running ctx against the slug's CONFIGURED ctx as an exact int,
+            # never round-tripping through the colloquial ÷1000 label.
+            "configured_ctx": (COMPOSE_REGISTRY.get(d["slug"], {}) or {}).get("max_ctx"),
             "status_note": d["status_note"],
             "source": "curated",
         }

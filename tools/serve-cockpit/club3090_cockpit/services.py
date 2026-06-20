@@ -69,6 +69,7 @@ from .data import (
     PromoteScaffold,
     ReconcileResult,
     Scene,
+    ServedProbe,
     _bench_row_matches,
     _canon_engine_family,
     _canon_model_key,
@@ -150,6 +151,9 @@ class RealRunner:
 # Detect seam: async callables matching the core signatures.
 DetectEndpointFn = Callable[[], Awaitable[ServingTarget]]
 GetGpuInfoFn = Callable[[], Awaitable[list[GpuInfo]]]
+# A7: probe the live engine for its ACTUAL running config (ctx + image).  Takes
+# the detected ServingTarget (for url / container) and returns a ServedProbe.
+ProbeServedFn = Callable[[Any], Awaitable["ServedProbe"]]
 
 
 # ── The service class ───────────────────────────────────────────────────────────
@@ -174,6 +178,7 @@ class CockpitData:
         runner: Optional[Runner] = None,
         detect_endpoint_fn: Optional[DetectEndpointFn] = None,
         get_gpu_info_fn: Optional[GetGpuInfoFn] = None,
+        probe_served_fn: Optional[ProbeServedFn] = None,
         write_runner: Optional[SubprocessRunner] = None,
     ):
         self.repo_root = Path(repo_root)
@@ -181,6 +186,9 @@ class CockpitData:
         self._runner: Runner = runner or RealRunner()
         self._detect_endpoint: DetectEndpointFn = detect_endpoint_fn or core_detect_endpoint
         self._get_gpu_info: GetGpuInfoFn = get_gpu_info_fn or core_get_gpu_info
+        # A7: the live-config probe seam.  Defaults to the real httpx + docker
+        # inspect probe; tests inject a fake so no network / docker is touched.
+        self._probe_served: ProbeServedFn = probe_served_fn or self._real_probe_served
         # Write runner is constructed lazily and NEVER invoked in this phase.
         self._write_runner = write_runner or SubprocessRunner(self.repo_root)
         # Dual-writer serialization (design §3.2): the reconcile→execute window
@@ -645,6 +653,18 @@ class CockpitData:
             target = match_target_to_registry(target, variants)
             state.matched_slug = target.slug
         state.target = target
+
+        # A7: PROBE the live engine for its ACTUAL running config (ctx + image),
+        # so the serving panel shows what's REALLY running, not the catalog slug's
+        # claim.  READ-only (httpx GET /v1/models + docker inspect); best-effort —
+        # a failed probe leaves an empty ServedProbe and the panel falls back to
+        # the catalog claim (clearly labelled).  Only probe when something is
+        # actually serving (a url or container was detected).
+        if getattr(target, "url", "") or getattr(target, "container", ""):
+            try:
+                state.served = await self._probe_served(target)
+            except Exception as exc:  # pragma: no cover - defensive
+                state.served = ServedProbe(error=str(exc)[:120])
         state.gpus = list(getattr(target, "gpus", []) or [])
         if not state.gpus:
             # detect may not populate GPUs if no engine running; query directly.
@@ -698,6 +718,55 @@ class CockpitData:
         state.estate_report = report or {}
 
         return state
+
+    async def _real_probe_served(self, target: Any) -> ServedProbe:
+        """A7: probe the live engine for its ACTUAL running config (READ-only).
+
+        Two legs, both best-effort (a failed leg leaves its field empty so the
+        UI falls back to the catalog claim, clearly labelled):
+          - ``GET <url>/v1/models`` → ``max_model_len`` + served model id (vLLM
+            exposes the running context per model id; llama.cpp omits it, so the
+            field stays None and the panel labels ctx "(per catalog slug)").
+          - ``docker inspect <container> --format '{{.Image}}'`` → the engine
+            image (CLAUDE.md: ``vllm.__version__`` lags the docker tag, so the
+            image digest is ground truth).
+
+        NEVER run in tests — the probe seam is injected with a fake (conftest also
+        hard-blocks the real subprocess/httpx path)."""
+        probe = ServedProbe()
+        url = (getattr(target, "url", "") or "").strip()
+        container = (getattr(target, "container", "") or "").strip()
+        # Leg 1: /v1/models (httpx).
+        if url:
+            try:
+                import httpx  # local import — only the real probe needs it
+
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    resp = await client.get(f"{url}/v1/models")
+                    if resp.status_code == 200:
+                        data = (resp.json() or {}).get("data", []) or []
+                        if data:
+                            first = data[0] or {}
+                            probe.served_model = str(first.get("id", "") or "")
+                            mml = first.get("max_model_len")
+                            if mml is not None:
+                                try:
+                                    probe.max_model_len = int(mml)
+                                except (TypeError, ValueError):
+                                    pass
+            except Exception as exc:
+                probe.error = f"models probe: {str(exc)[:80]}"
+        # Leg 2: docker inspect image (READ).
+        if container:
+            res = await self._runner.run(
+                ["docker", "inspect", container, "--format", "{{.Config.Image}}"],
+                cwd=str(self.repo_root),
+                timeout=10.0,
+            )
+            img = (res.stdout or "").strip()
+            if img and res.returncode == 0:
+                probe.image = img
+        return probe
 
     async def scenes(self) -> list[Scene]:
         """gpu-mode --list-modes --json → Scene list."""
@@ -2357,6 +2426,15 @@ def _variant_row_from_dict(d: dict[str, Any]) -> VariantRow:
         compose_path=str(d.get("compose_path", "")),
         status=str(d.get("status", "")),
         ctx_label=str(d.get("ctx_label", "")),
+        # A7/MUST-FIX 2: the EXACT numeric configured ctx (registry max_ctx int).
+        # None when the contract didn't carry it (older --json / tab fallback) so
+        # the badge degrades to the colloquial-label fallback rather than fabricating.
+        configured_ctx=(
+            int(d["configured_ctx"])
+            if isinstance(d.get("configured_ctx"), (int, float))
+            or (isinstance(d.get("configured_ctx"), str) and str(d.get("configured_ctx")).isdigit())
+            else None
+        ),
         status_note=str(d.get("status_note", "")),
     )
     # 'source' provenance (curated/community/local) — attach without schema change.

@@ -1725,7 +1725,7 @@ class TestPhase4Parsers:
         assert row.topology == "dual"
         assert row.code_tps == 44.02       # decode_tps_by_ctx['canonical-short']
         assert row.narr_tps == 43.81       # wall_tps
-        assert row.max_ctx == "256K"       # 262144 → 256K
+        assert row.max_ctx == "262K"       # 262144 → 262K (÷1000, registry-emit convention)
         assert row.quality_8pk == ""       # bench-only record carries no 8pk
         assert row.source == "corpus"
         assert row.tag == "vllm/dual"
