@@ -41,6 +41,7 @@ from club3090_cockpit.app import (
     CatalogPane,
     CockpitCommands,
     ConfirmActionScreen,
+    ServeContext,
     ExplainScreen,
     FocusableFooter,
     HelpScreen,
@@ -893,13 +894,16 @@ class TestNavNodesExist:
             col_labels = [str(c.label) for c in table.columns.values()]
             # Fold 3: TPS / 8pk columns are explicitly labelled as our-rig.
             # Round-4: "source" column dropped; "topology" added BEFORE "engine".
+            # Serve-confirm rework: the "fit" column moved into the serve pop-up.
             for expected in (
-                "slug", "topology", "engine", "fit", "ctx",
+                "slug", "topology", "engine", "ctx",
                 "TPS (our rig)", "8pk (our rig)", "status",
             ):
                 assert expected in col_labels, f"missing {expected!r}: {col_labels}"
             # "source" is gone.
             assert "source" not in col_labels, col_labels
+            # "fit" is gone — it lives in the serve confirm pop-up now.
+            assert "fit" not in col_labels, col_labels
             # topology sits immediately before engine.
             assert col_labels.index("topology") < col_labels.index("engine"), col_labels
 
@@ -2084,8 +2088,9 @@ class TestNoLiveWriteEverExecuted:
             await _settle(pilot)
             screen = app.screen
             assert isinstance(screen, ConfirmActionScreen)
-            # commit through the (mocked) gated executor.
-            screen.query_one("#confirm-ok-btn", Button).press()
+            # Serve-of-catalog-slug → the state-aware Start (footer key, no button
+            # row).  Commit through the (mocked) gated executor via Enter→Start.
+            await pilot.press("enter")
             await _settle(pilot)
             # The only write went to the fake; no switch.sh appears in READ calls.
             assert all("scripts/switch.sh vllm/dual" not in " ".join(c) for c in runner.calls)
@@ -5915,15 +5920,19 @@ class TestA6CatalogLiveFreeVram:
 
     @pytest.mark.asyncio
     async def test_column_labelled_vs_empty_card_when_no_live_data(self):
-        # No GPUs read → free-VRAM unknown → the fit column must read "vs empty
-        # card" so "fits-clean" is never mistaken for a live verdict.
+        # No GPUs read → free-VRAM unknown → the fit verdict must read "vs empty
+        # card" so "fits-clean" is never mistaken for a live verdict.  The fit moved
+        # OUT of the Catalog column into the serve pop-up + the preview strip, so the
+        # basis label now lives on the PREVIEW STRIP (not the catalog status line).
         app, _, _ = make_app(gpus=[], target=ServingTarget(gpus=[]))
         async with app.run_test(size=(120, 40)) as pilot:
             await _settle(pilot)
             pane = app.query_one("#catalog-pane", CatalogPane)
             assert pane._free_gb_by_index is None
-            status = str(app.query_one("#catalog-status", Label).render())
-            assert "vs empty card" in status
+            entry = next(e for e in pane._entries if e.slug == "vllm/dual")
+            pane.render_preview(entry)
+            preview = str(app.query_one("#catalog-preview", Static).render())
+            assert "vs empty card" in preview
 
     @pytest.mark.asyncio
     async def test_clean_when_live_free_is_ample(self):
@@ -5948,8 +5957,12 @@ class TestA6CatalogLiveFreeVram:
         """MUST-FIX 1: nvidia-smi mem_used INCLUDES the running model's own
         allocation, so free = total − used already nets out the serving row's
         ~20 G.  Comparing the row's est against that residual free falsely stamps
-        "✗ won't fit now" while it is PROVABLY serving.  The serving slug's OWN
-        catalog row is EXEMPT from the live-VRAM downgrade → its base glyph (●)."""
+        "✗ won't fit now" while it is PROVABLY serving.  The serving slug is EXEMPT
+        from the live-VRAM downgrade → its base glyph (●).
+
+        The fit moved OUT of the Catalog column into the serve pop-up + the preview
+        strip; the exemption is asserted via the PREVIEW STRIP now (it applies the
+        SAME B3 downgrade the column used to, with the same serving-row exemption)."""
         # vllm/dual is the matched serving slug; both cards hold ~20 G (the running
         # model) so only ~4 G is free — the exact "free < est" trap the bug hit.
         gpus = [
@@ -5965,21 +5978,15 @@ class TestA6CatalogLiveFreeVram:
             pane = app.query_one("#catalog-pane", CatalogPane)
             assert pane._serving_slug == "vllm/dual"   # it IS the serving row
             assert pane._free_gb_by_index is not None   # live free-VRAM is low
-            tbl = app.query_one("#catalog-table", DataTable)
-            # Find the serving row + read its fit cell.  Columns are now
-            # [slug, topology, engine, fit, …] (round-4: topology added before
-            # engine), so the fit cell is index 3.
-            serving_fit = None
-            for r in range(tbl.row_count):
-                row = [str(c) for c in tbl.get_row_at(r)]
-                if "serving" in row[0]:
-                    serving_fit = row[3]
-                    break
-            assert serving_fit is not None
-            # NOT downgraded — no ✗/⚠ and no "won't fit"/"tight" reason on its own row.
-            assert "✗" not in serving_fit and "⚠" not in serving_fit
-            assert "won't fit" not in serving_fit and "tight" not in serving_fit
-            assert "●" in serving_fit                   # stays the base fits-clean glyph
+            # Render the preview strip for the SERVING entry → exemption applies.
+            serving_entry = next(e for e in pane._entries if e.slug == "vllm/dual")
+            pane.render_preview(serving_entry)
+            preview = str(app.query_one("#catalog-preview", Static).render())
+            # NOT downgraded — no ✗/⚠ and no "won't fit"/"tight" reason for the
+            # serving slug, even though live free is below its per-card est.
+            assert "✗" not in preview and "⚠" not in preview
+            assert "won't fit" not in preview and "tight" not in preview
+            assert "●" in preview                   # stays the base fits-clean glyph
 
     @pytest.mark.asyncio
     async def test_non_serving_row_still_downgraded_when_serving_exempt(self):
@@ -7304,6 +7311,299 @@ class TestA11ConfirmModalDiscoverableBindings:
             await _settle(pilot)
             assert len(wr.started) == 1
             assert "--force" in wr.started[0]["cmd"]
+
+
+# ===========================================================================
+# SERVE confirm rework — the state-aware Stop/Start/warned-Start pop-up.
+#   ⏎ on a catalog row opens a state-aware SERVE confirm:
+#     - target IS serving      → Stop + Cancel (no Start/Force/phantom)
+#     - target free            → Start + Cancel
+#     - target w/ a conflict   → Start + Cancel, card warns "will STOP <model>"
+#   Controls live ONLY in the footer (no button row, no phantom placeholder).
+#   The card shows the explain summary + fit verdict + reconcile/teardown status.
+#   The detect runs in the BACKGROUND (paint un-blocked) but the WRITE still waits
+#   for it; Enter on an unresolved/unsafe gate never fires a destructive write.
+#   The dual-writer reconcile/lease invariants are PRESERVED exactly.
+# ===========================================================================
+
+
+def _serve_footer_keys(sc):
+    return {k.key for k in sc.query(FooterKey)}
+
+
+def _serve_card_text(sc):
+    return str(sc.query_one("#confirm-body", Static).render())
+
+
+def _serve_footer_desc(sc, key):
+    """The rendered footer description for a given key (e.g. 'enter' → 'Start')."""
+    for fk in sc.query(FooterKey):
+        if fk.key == key:
+            return fk.description
+    return None
+
+
+# A free rig (both cards near-empty, nothing serving) for the Start traces.
+_FREE_GPUS = [
+    GpuInfo(index=0, mem_used_mib=1, mem_total_mib=24576),
+    GpuInfo(index=1, mem_used_mib=1, mem_total_mib=24576),
+]
+
+
+class TestServeConfirmStateAware:
+    """The SERVE confirm pop-up is state-aware: Stop / Start / warned-Start, with
+    controls as footer key-hints only and a useful 'what am I about to do' card."""
+
+    async def _open_serve(self, pilot, app, *, on_serving_tab=False):
+        """⏎ a catalog row → the state-aware serve confirm.  When the target is the
+        serving model we must reach the Catalog tab from Operate first."""
+        if on_serving_tab:
+            await _enter_operate(pilot)
+            app.query_one("#operate-tabs", TabbedContent).active = "tab-catalog"
+            await pilot.pause()
+        else:
+            await _settle(pilot)
+        app.query_one("#catalog-table", DataTable).move_cursor(row=0)
+        await pilot.press("enter")
+        await _settle(pilot)
+        return app.screen
+
+    # (a) ⏎ on a SERVING slug → Stop + Cancel (no Start / Force / phantom).
+    @pytest.mark.asyncio
+    async def test_serving_slug_shows_stop_and_cancel(self):
+        target = ServingTarget(container="vllm_qwen36_27b", host_port=8010, gpus=_FREE_GPUS)
+        responses = fake_responses(**{"docker ps": ok(DOCKER_PS_ENGINE)})
+        app, _, _ = make_app(responses=responses, gpus=_FREE_GPUS, target=target)
+        async with app.run_test(size=(120, 40)) as pilot:
+            sc = await self._open_serve(pilot, app, on_serving_tab=True)
+            assert isinstance(sc, ConfirmActionScreen)
+            assert app._target_slug == "vllm/dual"            # IS the serving row
+            assert sc._serve_ctx is not None and sc._serve_ctx.mode == "stop"
+            fk = _serve_footer_keys(sc)
+            assert "k" in fk and "escape" in fk               # Stop + Cancel
+            assert "enter" not in fk and "f" not in fk        # no Start, no Force
+            assert sc.check_action("stop", ()) is True
+            assert sc.check_action("start", ()) is False
+            assert sc.check_action("confirm", ()) is False
+            assert sc.check_action("force", ()) is False
+            # NO phantom/empty button placeholder, NO button row at all.
+            assert not sc.query(Button)
+
+    # (a') Stop dispatches the targeted docker-stop of the serving container.
+    @pytest.mark.asyncio
+    async def test_serving_slug_stop_dispatches_targeted_stop(self):
+        wr = FakeWriteRunner()
+        target = ServingTarget(container="vllm_qwen36_27b", host_port=8010, gpus=_FREE_GPUS)
+        responses = fake_responses(**{"docker ps": ok(DOCKER_PS_ENGINE)})
+        app, _, _ = make_app(responses=responses, gpus=_FREE_GPUS, target=target, write_runner=wr)
+        async with app.run_test(size=(120, 40)) as pilot:
+            sc = await self._open_serve(pilot, app, on_serving_tab=True)
+            assert sc._serve_ctx.mode == "stop"
+            await pilot.press("k")                            # Stop
+            await _settle(pilot)
+            assert len(wr.started) == 1
+            assert wr.started[0]["cmd"] == ["docker", "stop", "vllm-qwen36-27b-dual"]
+
+    # (b) ⏎ on a NOT-serving FREE slug → Start + Cancel.
+    @pytest.mark.asyncio
+    async def test_free_slug_shows_start_and_cancel(self):
+        app, _, _ = make_app(gpus=_FREE_GPUS, target=ServingTarget(gpus=_FREE_GPUS))
+        async with app.run_test(size=(120, 40)) as pilot:
+            sc = await self._open_serve(pilot, app)
+            assert app._target_slug == ""                     # nothing serving
+            assert sc._serve_ctx.mode == "start"
+            fk = _serve_footer_keys(sc)
+            assert "enter" in fk and "escape" in fk           # Start + Cancel
+            assert "k" not in fk and "f" not in fk            # no Stop, no Force
+            assert sc.check_action("start", ()) is True
+            assert sc.check_action("stop", ()) is False
+            assert sc._has_conflict is False
+            assert "gate clear" in _serve_card_text(sc)
+            assert not sc.query(Button)                       # footer-only, no phantom
+
+    # (b') Start (free) dispatches the gated, NON-forced serve.
+    @pytest.mark.asyncio
+    async def test_free_slug_start_dispatches_gated_serve(self):
+        wr = FakeWriteRunner()
+        app, _, _ = make_app(gpus=_FREE_GPUS, target=ServingTarget(gpus=_FREE_GPUS), write_runner=wr)
+        async with app.run_test(size=(120, 40)) as pilot:
+            sc = await self._open_serve(pilot, app)
+            await pilot.press("enter")                        # Start
+            await _settle(pilot)
+            assert len(wr.started) == 1
+            assert wr.started[0]["cmd"] == ["bash", "scripts/switch.sh", "vllm/dual"]
+            assert "--force" not in wr.started[0]["cmd"]
+
+    # (c) ⏎ on a NOT-serving slug with a GPU conflict → Start + Cancel, warned.
+    @pytest.mark.asyncio
+    async def test_conflict_slug_shows_warned_start(self):
+        # A live engine holds GPU0 but the TARGET slug isn't the matched one
+        # (target has no container match → matched_slug "" → a Start with conflict).
+        gpus = [GpuInfo(index=0, mem_used_mib=22000, mem_total_mib=24576),
+                GpuInfo(index=1, mem_used_mib=1, mem_total_mib=24576)]
+        responses = fake_responses(**{"docker ps": ok(DOCKER_PS_ENGINE)})
+        app, _, _ = make_app(responses=responses, gpus=gpus, target=ServingTarget(gpus=gpus))
+        async with app.run_test(size=(120, 40)) as pilot:
+            sc = await self._open_serve(pilot, app)
+            assert app._target_slug == ""                     # not the serving row
+            assert sc._serve_ctx.mode == "start"
+            assert sc._reconcile is not None and sc._reconcile.safe is False
+            assert sc._has_conflict is True
+            fk = _serve_footer_keys(sc)
+            assert "enter" in fk and "escape" in fk           # Start + Cancel
+            assert "f" not in fk                              # NO separate Force
+            assert sc.check_action("start", ()) is True       # warned-Start is Start
+            # The card warns the teardown explicitly.
+            assert "will STOP" in _serve_card_text(sc)
+
+    # (c'') the footer Start key is RELABELLED "Start (stops <model>)" on conflict
+    #       (the destructive affordance is visible in the footer, not only the card).
+    @pytest.mark.asyncio
+    async def test_conflict_relabels_footer_start_key(self):
+        gpus = [GpuInfo(index=0, mem_used_mib=22000, mem_total_mib=24576),
+                GpuInfo(index=1, mem_used_mib=1, mem_total_mib=24576)]
+        responses = fake_responses(**{"docker ps": ok(DOCKER_PS_ENGINE)})
+        app, _, _ = make_app(responses=responses, gpus=gpus, target=ServingTarget(gpus=gpus))
+        async with app.run_test(size=(120, 40)) as pilot:
+            sc = await self._open_serve(pilot, app)
+            assert sc._has_conflict is True
+            desc = _serve_footer_desc(sc, "enter")
+            assert desc is not None and desc.startswith("Start (stops ")
+            # the relabel does NOT leak to the class BINDINGS (per-instance copy).
+            class_start = [b for b in ConfirmActionScreen.BINDINGS if b.action == "start"]
+            assert class_start and class_start[0].description == "Start"
+
+    # (c''') a FREE Start keeps the plain "Start" footer label (no teardown).
+    @pytest.mark.asyncio
+    async def test_free_start_keeps_plain_footer_label(self):
+        app, _, _ = make_app(gpus=_FREE_GPUS, target=ServingTarget(gpus=_FREE_GPUS))
+        async with app.run_test(size=(120, 40)) as pilot:
+            sc = await self._open_serve(pilot, app)
+            assert sc._has_conflict is False
+            assert _serve_footer_desc(sc, "enter") == "Start"
+
+    # (c') warned-Start performs teardown-then-serve (the old Force, folded in).
+    @pytest.mark.asyncio
+    async def test_conflict_slug_warned_start_forces(self):
+        wr = FakeWriteRunner()
+        gpus = [GpuInfo(index=0, mem_used_mib=22000, mem_total_mib=24576),
+                GpuInfo(index=1, mem_used_mib=1, mem_total_mib=24576)]
+        responses = fake_responses(**{"docker ps": ok(DOCKER_PS_ENGINE)})
+        app, _, _ = make_app(responses=responses, gpus=gpus,
+                             target=ServingTarget(gpus=gpus), write_runner=wr)
+        async with app.run_test(size=(120, 40)) as pilot:
+            sc = await self._open_serve(pilot, app)
+            assert sc._has_conflict is True
+            await pilot.press("enter")                        # warned Start
+            await _settle(pilot)
+            assert len(wr.started) == 1
+            # teardown-then-serve == switch.sh --force <slug> (force folded in).
+            assert "--force" in wr.started[0]["cmd"]
+            assert wr.started[0]["cmd"][-1] == "vllm/dual"
+
+    # (d) the card shows an explain summary + fit verdict (not unrelated content).
+    @pytest.mark.asyncio
+    async def test_card_shows_explain_summary_and_fit(self):
+        app, _, _ = make_app(gpus=_FREE_GPUS, target=ServingTarget(gpus=_FREE_GPUS))
+        async with app.run_test(size=(120, 40)) as pilot:
+            sc = await self._open_serve(pilot, app)
+            card = _serve_card_text(sc)
+            # Explain summary: model · engine · ctx · measured TPS/8-pack · status.
+            assert "qwen3.6-27b" in card                      # model
+            assert "vllm-stable" in card                      # engine
+            assert "262K" in card                             # max ctx
+            assert "174/42" in card                           # measured TPS
+            assert "109/150" in card                          # 8-pack
+            assert "production" in card                       # status badge
+            # Fit verdict (the fit that moved OUT of the Catalog column).
+            assert "fits-clean" in card
+            assert "GiB" in card                              # ~VRAM / band
+
+    # (d') the card paints IMMEDIATELY from cached fields, before the detect lands.
+    @pytest.mark.asyncio
+    async def test_card_paints_before_detect_resolves(self):
+        app, _, _ = make_app(gpus=_FREE_GPUS, target=ServingTarget(gpus=_FREE_GPUS))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            entry = app.query_one("#catalog-pane", CatalogPane).selected_entry()
+            plan = app._data.serve("vllm/dual")
+            sc = ConfirmActionScreen(plan, serve_ctx=ServeContext(mode="start", entry=entry))
+            app.push_screen(sc)
+            await pilot.pause()                               # mount, NOT settle
+            # The slug summary + fit are already on the card from cached fields…
+            sc._reconcile = None                              # simulate pre-detect
+            sc._render_serve_card()
+            card = _serve_card_text(sc)
+            assert "qwen3.6-27b" in card and "fits-clean" in card
+            # …and the reconcile line is the non-blocking "checking rig state…".
+            assert "checking rig state" in card
+            # The destructive Start is DISABLED until the detect lands.
+            assert sc.check_action("start", ()) is False
+
+    # (e) Enter on an UNRESOLVED gate does NOT start a write (footgun safety).
+    @pytest.mark.asyncio
+    async def test_enter_on_unresolved_gate_starts_no_write(self):
+        wr = FakeWriteRunner()
+        app, _, _ = make_app(gpus=_FREE_GPUS, target=ServingTarget(gpus=_FREE_GPUS), write_runner=wr)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            entry = app.query_one("#catalog-pane", CatalogPane).selected_entry()
+            plan = app._data.serve("vllm/dual")
+            sc = ConfirmActionScreen(plan, serve_ctx=ServeContext(mode="start", entry=entry))
+            # rec is None (unresolved): Start gated off, and the on_key guard stops
+            # a stray Enter before it can reach action_start.
+            assert sc._reconcile is None
+            assert sc.check_action("start", ()) is False
+
+            class _Ev:
+                key = "enter"
+                stopped = False
+                prevented = False
+                def stop(self):
+                    self.stopped = True
+                def prevent_default(self):
+                    self.prevented = True
+            ev = _Ev()
+            sc.on_key(ev)
+            assert ev.stopped and ev.prevented                # Enter stopped — inert
+            assert wr.started == []                           # no write fired
+
+    # (f) the legacy (non-serve) confirm keeps Confirm/Force/Cancel + its buttons.
+    @pytest.mark.asyncio
+    async def test_non_serve_confirm_keeps_legacy_semantics(self):
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            # Scene-switch is NOT a serve-of-catalog-slug → the legacy modal.
+            plan = app._data.scene_switch("27b")
+            sc = ConfirmActionScreen(plan)                    # no serve_ctx
+            app.push_screen(sc)
+            await _settle(pilot)
+            assert sc._serve_ctx is None
+            # Legacy buttons present (EXACTLY the three — no phantom placeholder).
+            assert {b.id for b in sc.query(Button)} == {
+                "confirm-ok-btn", "confirm-force-btn", "confirm-cancel-btn",
+            }
+            # Confirm/Force gating unchanged; serve verbs never apply here.
+            assert sc.check_action("confirm", ()) is True     # safe gate
+            assert sc.check_action("start", ()) is False
+            assert sc.check_action("stop", ()) is False
+
+    # (f') scene-switch still dispatches through the gate from the modal.
+    @pytest.mark.asyncio
+    async def test_non_serve_confirm_still_dispatches(self):
+        wr = FakeWriteRunner()
+        app, _, _ = make_app(write_runner=wr)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            plan = app._data.scene_switch("27b")
+            sc = ConfirmActionScreen(plan)
+            app.push_screen(sc)
+            await _settle(pilot)
+            sc.query_one("#confirm-ok-btn", Button).press()
+            await _settle(pilot)
+            assert len(wr.started) == 1
+            assert wr.started[0]["cmd"] == ["bash", "scripts/gpu-mode.sh", "27b"]
 
 
 # ===========================================================================

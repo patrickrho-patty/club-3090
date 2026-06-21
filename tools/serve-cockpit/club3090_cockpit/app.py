@@ -38,6 +38,7 @@ NEVER executed live — tests inject fakes and conftest blocks the real spawn.
 
 from __future__ import annotations
 
+import dataclasses
 from collections import OrderedDict
 from pathlib import Path
 from typing import NamedTuple, Optional
@@ -582,7 +583,11 @@ class CatalogPane(Container):
         # Fold 3: the TPS / 8-pack columns are OUR-RIG measurements (cross-rig
         # rows live in the explain drill-down) — label them so cross-rig ambiguity
         # is gone now that the standalone Benchmarks tab is retired.
-        table.add_columns("slug", "topology", "engine", "fit", "ctx", "TPS (our rig)", "8pk (our rig)", "status")
+        # The Fit column moved OUT of the table into the serve confirm pop-up (the
+        # fit verdict is a pick-the-serve decision input, shown when you ⏎ a row).
+        # Fit is STILL computed (it feeds the pop-up + the serving-row exemption);
+        # it just no longer occupies a Catalog column.
+        table.add_columns("slug", "topology", "engine", "ctx", "TPS (our rig)", "8pk (our rig)", "status")
         # Full enriched catalog, and the current filter substring.
         self._entries: list[CatalogEntry] = []
         self._filter: str = ""
@@ -606,7 +611,7 @@ class CatalogPane(Container):
             self._entries = []
             table.clear()
             status_label.update(f"[red]Catalog error:[/red] {error}")
-            table.add_row("—", "—", "—", "—", "—", "—", "—", "—")
+            table.add_row("—", "—", "—", "—", "—", "—", "—")
             return
 
         self._entries = list(entries)
@@ -632,53 +637,27 @@ class CatalogPane(Container):
             is_serving_row = bool(serving and e.slug == serving)
             if is_serving_row:
                 slug_cell = f"[green]●[/green] {e.slug} [green]serving[/green]"
-            # A6: downgrade the displayed fit glyph against LIVE free-VRAM (no
-            # kv-calc re-run — a pure post-process of the verdict).  A "fits-clean"
-            # row that would OOM right now (live free < per-card est) is shown
-            # "⚠"/"✗"; with no live data the glyph carries a "vs empty card" note.
-            #
-            # MUST-FIX 1: the live-serving model's OWN row is EXEMPT from the
-            # live-VRAM downgrade.  nvidia-smi's mem_used INCLUDES the running
-            # model's own allocation, so free = total − used already nets out this
-            # row's ~20 G — comparing the row's est against that residual free
-            # falsely stamps "✗ won't fit now" while the model is PROVABLY serving.
-            # Render its base fit glyph unchanged (it is, by definition, fitting).
-            if is_serving_row:
-                fit_glyph, fit_note = e.fit.glyph, ""
-            else:
-                fit_glyph, fit_note = downgrade_fit_glyph(
-                    e.fit, e.row, self._free_gb_by_index
-                )
-            fit_cell = fit_glyph
-            if fit_note:
-                color = "yellow" if fit_glyph == "⚠" else "red" if fit_glyph == "✗" else "dim"
-                fit_cell = f"{fit_glyph} [{color}]{fit_note}[/{color}]"
+            # The fit glyph is NO LONGER a Catalog column (it moved into the serve
+            # confirm pop-up — see ConfirmActionScreen._render_serve_card).  Fit is
+            # STILL computed here for the serving-row exemption + the pop-up; we
+            # just don't emit a fit cell.
             table.add_row(
                 slug_cell,
                 e.topology,
                 e.engine,
-                fit_cell,
                 e.ctx_label or "—",
                 tps,
                 e.measurement.quality_label,
                 _status_glyph(e.status),
             )
 
-        # A6: state the fit basis so "● fits-clean" is never silently read as a
-        # live verdict.  With live free-VRAM known the column is live-adjusted;
-        # otherwise it is "(vs empty card)".
-        fit_basis = (
-            "  ·  fit [dim](vs live free-VRAM)[/dim]"
-            if self._free_gb_by_index
-            else "  ·  fit [dim](vs empty card)[/dim]"
-        )
         if self._filter:
             status_label.update(
-                f"{len(rows)} / {len(self._entries)} variants  ·  filter: {self._filter!r}{fit_basis}"
+                f"{len(rows)} / {len(self._entries)} variants  ·  filter: {self._filter!r}"
             )
         else:
             star = "  ([dim]*[/dim] = BENCHMARKS.md scrape)" if self._has_md_scrape() else ""
-            status_label.update(f"{len(self._entries)} variants loaded from registry{star}{fit_basis}")
+            status_label.update(f"{len(self._entries)} variants loaded from registry{star}")
 
         # #9/A8 — keep the preview strip in sync with the cursor after a (re-)render
         # (enrichment mutates fit/measurement in place; the preview must reflect it).
@@ -781,7 +760,8 @@ class CatalogPane(Container):
         if entry is None:
             body.update("[dim]highlight a variant (move cursor) to preview it[/dim]")
             return
-        # Fit line — reuse the same B3 live-downgrade the table column applies, so
+        # Fit line — the B3 live-downgrade (now that the Catalog table has no fit
+        # column, this preview strip + the serve pop-up are its only surfaces), so
         # the preview never reads "fits-clean" for a row that would OOM right now.
         serving = (self._serving_slug or "").strip()
         is_serving_row = bool(serving and entry.slug == serving)
@@ -994,6 +974,38 @@ class ExplainScreen(ModalScreen):
 # stay — ① Bring reuses them.
 
 
+# ── Serve context (state-aware SERVE confirm) ────────────────────────────────────
+
+
+class ServeContext(NamedTuple):
+    """The state-aware context for a SERVE-of-a-catalog-slug confirm.
+
+    Built by the app (``_serve_context_for``) when ⏎ stages a registry slug, this
+    tells the confirm modal which controls to present:
+
+      - ``mode == "stop"``   — the TARGET slug is the one ALREADY serving → the
+        modal offers **Stop** (tear down THIS model, via ``stop_plan``) + Cancel.
+        NO Start, NO Force.
+      - ``mode == "start"``  — the target is NOT serving → the modal offers
+        **Start** (the gated serve ``plan``) + Cancel.  Whether a CONFLICTING
+        model holds the GPU is learned from the reconcile result once it lands:
+        a conflict turns Start into a **warned Start** ("Starting this will STOP
+        <model> on GPU N"), which performs teardown-then-serve — this is the old
+        Force semantics FOLDED INTO Start (the maintainer's call), so there is no
+        separate Force control.
+
+    ``entry`` is the staged CatalogEntry (drives the card summary + fit verdict —
+    rendered immediately from cached fields, BEFORE the background detect lands).
+    ``stop_plan`` is the targeted-stop ActionPlan (``docker stop <container>``),
+    present only for ``mode == "stop"``.
+    """
+
+    mode: str                                   # "stop" | "start"
+    entry: Optional[CatalogEntry] = None
+    stop_plan: Optional[ActionPlan] = None
+    serving_container: str = ""                 # the container Stop tears down
+
+
 # ── Confirm modal (used for serve + scene + container writes) ────────────────────
 
 
@@ -1002,9 +1014,21 @@ class ConfirmActionScreen(ModalScreen):
 
     Shows the plan + the FRESH reconcile result (what this write would collide
     with / tear down), and only on confirm dispatches the write through the
-    app's gated executor.  When the gate is unsafe, the primary action is
-    disabled and the user must surface the explicit Force override (which is
-    routed back to the app with a reason).
+    app's gated executor.
+
+    Two presentations share ONE reconcile gate:
+
+      - **SERVE of a catalog slug** (``serve_ctx`` set): a state-aware card
+        (slug summary · fit verdict · reconcile/teardown status) with
+        Start/Stop + Cancel as FOOTER key-hints — no on-screen button row, no
+        phantom placeholder, no separate Force.  The card paints IMMEDIATELY
+        from the staged entry's cached fields; the destructive Start/Stop key is
+        disabled until the background detect (the dual-writer gate) resolves.
+      - **Every other write** (scene-switch / estate-off / container / default /
+        validation / generated serve — ``serve_ctx`` None): the original
+        Confirm/Force/Cancel semantics, UNCHANGED.  When the gate is unsafe the
+        primary action is disabled and the explicit Force override (routed back
+        with a reason) is the only path.
     """
 
     DEFAULT_CSS = """
@@ -1037,26 +1061,33 @@ class ConfirmActionScreen(ModalScreen):
     }
     """
 
-    # A11 — surface the commit affordances in the modal footer.  Enter→confirm
-    # and f→force were previously RAW on_key handlers, so the footer read only
-    # "Esc Cancel" and hid the two keys a user actually needs.  Promoting them to
-    # show=True BINDINGS makes the footer read "Enter Confirm · f Force · Esc
-    # Cancel".  Visibility is gated per-state in check_action: Confirm shows only
-    # when the gate is safe; Force shows only when forcing is MEANINGFUL (the gate
-    # is unsafe) — mirroring the disabled-button logic in set_reconcile.  This is
-    # discoverability ONLY: the actions call the SAME _commit path (same reconcile
-    # gate, same confirm semantics) the on_key handlers used.
-    # priority=True so these win over the focused commit Button's own ``enter``→
-    # press binding (otherwise the Button shadows our ``enter`` and the footer
-    # would not advertise "Enter Confirm").  Both still route through the SAME
-    # _commit path, so behaviour is identical to a Button press.
+    # The commit affordances live ONLY in the modal footer (show=True BINDINGS),
+    # gated per-state by check_action — there is no duplicate on-screen button row
+    # and no phantom/empty placeholder.  priority=True so these win over any
+    # focused widget's own ``enter``→press.
+    #
+    # SERVE (serve_ctx set):
+    #   - mode "stop"  → ``Stop`` (k) + Cancel.  No start/confirm, no force.
+    #   - mode "start" → ``Start`` (enter) + Cancel.  When the reconcile result
+    #     shows a CONFLICT the Start is a WARNED start (teardown-then-serve, the
+    #     old force semantics folded in) — still the SAME ``start`` action, just
+    #     relabelled "Start (stops <model>)" in the footer (set_reconcile swaps
+    #     this instance's per-instance ``start`` Binding description, so the
+    #     destructive affordance is visible in the footer, not only the card).
+    # NON-SERVE (serve_ctx None): the original ``confirm`` / ``force`` / Cancel.
+    #
+    # SAFETY: the destructive keys (confirm/start/stop/force) are gated off until
+    # reconcile RESOLVES (rec is not None) — Enter/Stop on an unresolved or unsafe
+    # gate never fires a write (check_action False + the on_key guard).
     BINDINGS = [
         Binding("enter", "confirm", "Confirm", show=True, priority=True),
+        Binding("enter", "start", "Start", show=True, priority=True),
+        Binding("k", "stop", "Stop", show=True, priority=True),
         Binding("f", "force", "Force", show=True, priority=True),
         Binding("escape", "cancel", "Cancel", show=True),
     ]
 
-    def __init__(self, plan: ActionPlan, *, on_confirm=None, **kwargs):
+    def __init__(self, plan: ActionPlan, *, on_confirm=None, serve_ctx=None, **kwargs):
         super().__init__(**kwargs)
         self._plan = plan
         self._reconcile: Optional[ReconcileResult] = None
@@ -1066,8 +1097,38 @@ class ConfirmActionScreen(ModalScreen):
         # ``run_validation`` into the Run LivePane and never claim a GPU.  The
         # callback receives the (possibly force-reissued) plan.
         self._on_confirm = on_confirm
+        # The state-aware SERVE context (None → the legacy Confirm/Force modal).
+        self._serve_ctx: Optional[ServeContext] = serve_ctx
+
+    # ── presentation predicates ───────────────────────────────────────────────────
+
+    @property
+    def _is_serve(self) -> bool:
+        """True iff this is a state-aware SERVE-of-a-catalog-slug confirm."""
+        return self._serve_ctx is not None
+
+    @property
+    def _is_stop_mode(self) -> bool:
+        return bool(self._serve_ctx is not None and self._serve_ctx.mode == "stop")
+
+    @property
+    def _has_conflict(self) -> bool:
+        """Reconcile landed AND it is unsafe (a live model holds the GPU)."""
+        rec = self._reconcile
+        return bool(rec is not None and not rec.safe)
 
     def compose(self) -> ComposeResult:
+        if self._is_serve:
+            ctx = self._serve_ctx
+            verb = "Stop" if ctx.mode == "stop" else "Start"
+            slug = getattr(ctx.entry, "slug", "") or self._serve_slug()
+            with Vertical():
+                yield Label(f"{verb} · {slug}", classes="confirm-title")
+                yield Static("", id="confirm-body")
+                # Controls live ONLY in the footer (no on-screen button row, no
+                # phantom placeholder) — matches the rest of the app.
+                yield Footer()
+            return
         with Vertical():
             yield Label(f"Confirm · {self._plan.description}", classes="confirm-title")
             yield Static("Re-running reconcile gate (fresh detect)…", id="confirm-body")
@@ -1080,12 +1141,165 @@ class ConfirmActionScreen(ModalScreen):
             yield Footer()
 
     def on_mount(self) -> None:
-        # Re-run the gate (fresh detect) before enabling any commit button.
+        # FASTER PAINT: render the card IMMEDIATELY from cached fields, THEN run
+        # the fresh reconcile detect in the BACKGROUND (run_reconcile_for_modal is
+        # a @work worker).  The card never blocks on the detect; only the
+        # destructive Start/Stop is disabled until the detect lands (set_reconcile
+        # enables it).  The WRITE still waits for the detect — paint un-blocks, the
+        # write never does.
+        if self._is_serve:
+            self._render_serve_card()
+        # Re-run the gate (fresh detect) before enabling any commit affordance.
         self.app.run_reconcile_for_modal(self, self._plan)  # type: ignore[attr-defined]
+        self.refresh_bindings()
+
+    def _serve_slug(self) -> str:
+        ctx = self._serve_ctx
+        if ctx is not None and ctx.entry is not None:
+            return getattr(ctx.entry, "slug", "") or ""
+        return ""
+
+    # ── SERVE card (immediate, then reconcile-enriched) ───────────────────────────
+
+    def _render_serve_card(self) -> None:
+        """Render the 'what am I about to do' card from the staged CatalogEntry's
+        CACHED fields (model · quant/engine · KV/ctx · measured TPS/8-pack · status
+        · fit verdict).  Painted on mount — does NOT wait for the detect.  The
+        reconcile/teardown line is filled in by set_reconcile once it lands."""
+        try:
+            body = self.query_one("#confirm-body", Static)
+        except Exception:
+            return
+        ctx = self._serve_ctx
+        entry = ctx.entry if ctx is not None else None
+        lines: list[str] = []
+        if entry is not None:
+            lines.append(
+                f"  [bold]{entry.slug}[/bold]   "
+                f"{_status_glyph(entry.status)} {entry.status or '—'}"
+            )
+            lines.append(
+                f"  [bold]model[/bold]  {entry.model or '—'}"
+                f"   [bold]engine[/bold] {entry.engine or '—'}"
+                f"   [bold]topo[/bold] {entry.topology or '—'}"
+            )
+            lines.append(
+                f"  [bold]ctx[/bold]    {entry.ctx_label or '—'}"
+                f"   [bold]measured[/bold] {entry.measurement.tps_label} TPS"
+                f"  ·  8pk {entry.measurement.quality_label}"
+            )
+            # Fit verdict — the fit that moved OUT of the Catalog column now lives
+            # here.  Glyph + verdict + ~VRAM/band for THIS rig.
+            fv = entry.fit
+            fit_line = f"{fv.glyph} {fv.verdict}"
+            if fv.vram_est_gb is not None:
+                fit_line += f"  ~{float(fv.vram_est_gb):.1f} GiB"
+                if fv.band_gb is not None:
+                    fit_line += f" / {float(fv.band_gb):.1f} GiB band"
+            lines.append(f"  [bold]fit[/bold]    {fit_line}")
+            note = (entry.status_note or "").strip()
+            if note:
+                lines.append(f"  [bold]caveat[/bold] [yellow]{note}[/yellow]")
+        else:
+            lines.append(f"  [bold]{self._serve_slug() or self._plan.description}[/bold]")
+        # The reconcile / teardown line — a placeholder until the detect lands.
+        lines.append("")
+        lines.append(self._reconcile_line())
+        body.update("\n".join(lines))
+
+    def _reconcile_line(self) -> str:
+        """The reconcile/teardown status line for the SERVE card.
+
+        - before reconcile resolves: "checking rig state…" (Start/Stop disabled).
+        - STOP mode: the running container being torn down.
+        - START · gate clear: nothing to tear down.
+        - START · conflict: the conflicting model(s) Start would stop, with GPU.
+        """
+        rec = self._reconcile
+        ctx = self._serve_ctx
+        if rec is None:
+            return "  [dim]checking rig state…[/dim]"
+        if ctx is not None and ctx.mode == "stop":
+            con = ctx.serving_container or self._serve_slug() or "the running model"
+            return f"  [yellow]⏹ stops[/yellow] container [red]{con}[/red] (frees its GPUs)"
+        if rec.safe:
+            return "  [green]● gate clear[/green] — GPU free, nothing to tear down."
+        # START with a conflict → warn that Start performs teardown-then-serve.
+        parts: list[str] = []
+        for c in rec.conflicts:
+            g = f" on GPU {c.gpus}" if c.gpus else ""
+            parts.append(f"[red]{c.slug or c.name}[/red]{g}")
+        for gc in rec.gpu_conflicts:
+            parts.append(f"[red]GPU{gc.gpu_index}[/red] ({gc.mem_used_mib} MiB)")
+        for inst in rec.estate_claims:
+            parts.append(f"estate [red]{inst.get('name', '?')}[/red] (GPU {inst.get('gpus', [])})")
+        who = ", ".join(parts) if parts else "the running model"
+        return f"  [yellow]⚠ Starting this will STOP[/yellow] {who} — then serve."
+
+    def _primary_conflict_name(self) -> str:
+        """A SHORT, markup-free name for the model a warned-Start would stop —
+        for the footer relabel (the card's _reconcile_line carries the full,
+        marked-up list).  Same source order: container slug/name → estate name →
+        bare GPU → generic."""
+        rec = self._reconcile
+        if rec is None:
+            return "running model"
+        for c in rec.conflicts:
+            if c.slug or c.name:
+                return c.slug or c.name
+        for inst in rec.estate_claims:
+            name = inst.get("name")
+            if name:
+                return name
+        for gc in rec.gpu_conflicts:
+            return f"GPU{gc.gpu_index}"
+        return "running model"
+
+    def _set_start_binding_label(self, label: str) -> None:
+        """Relabel THIS modal's footer Start key in place.
+
+        ``self._bindings`` is a per-instance copy of the class BINDINGS (DOMNode
+        copies it at init), so swapping the frozen ``start`` Binding for one with
+        a new ``description`` affects ONLY this short-lived modal — never the
+        class or a sibling modal.  The Footer renders ``binding.description``, so
+        this is how the warned conflict-Start surfaces "Start (stops <model>)" in
+        the footer.  Caller must refresh_bindings() afterwards (set_reconcile
+        does)."""
+        for bindings in self._bindings.key_to_bindings.values():
+            for i, b in enumerate(bindings):
+                if b.action == "start" and b.description != label:
+                    bindings[i] = dataclasses.replace(b, description=label)
+                    return
 
     def set_reconcile(self, rec: ReconcileResult) -> None:
-        """Render the reconcile verdict + enable the appropriate commit path."""
+        """Render the reconcile verdict + enable the appropriate commit path.
+
+        Two presentations:
+          - SERVE card → refresh the teardown line + enable Start/Stop now that
+            the dual-writer detect has resolved.
+          - legacy Confirm/Force modal → the original safe/unsafe rendering.
+        """
         self._reconcile = rec
+        if self._is_serve:
+            self._render_serve_card()
+            # Surface the teardown in the FOOTER too (not only the card body): on a
+            # conflicting Start, relabel the footer key "Start (stops <model>)" so
+            # the destructive affordance is visible where the user reads controls.
+            ctx = self._serve_ctx
+            if ctx is not None and ctx.mode == "start":
+                self._set_start_binding_label(
+                    f"Start (stops {self._primary_conflict_name()})"
+                    if self._has_conflict
+                    else "Start"
+                )
+            # The destructive Start/Stop is now safe to ENABLE (the fresh detect
+            # landed).  Footer reflects it via check_action.
+            self.refresh_bindings()
+            # Focus nothing destructive: there is no button row.  The footer keys
+            # (Start/Stop/Cancel) carry the affordance; a stray Enter on an
+            # unresolved gate is already guarded (check_action False before rec).
+            return
+
         body = self.query_one("#confirm-body", Static)
         ok_btn = self.query_one("#confirm-ok-btn", Button)
         force_btn = self.query_one("#confirm-force-btn", Button)
@@ -1141,6 +1355,7 @@ class ConfirmActionScreen(ModalScreen):
     # ── button / key handlers ────────────────────────────────────────────────────
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
+        # Only the legacy (non-serve) modal yields buttons.
         if event.button.id == "confirm-ok-btn":
             self._commit(force=False)
         elif event.button.id == "confirm-force-btn":
@@ -1150,57 +1365,106 @@ class ConfirmActionScreen(ModalScreen):
 
     def on_key(self, event) -> None:
         """SAFETY belt-and-suspenders: stop a stray ``enter`` whenever the
-        ``confirm`` binding is gated off (gate unsafe / not yet resolved).
+        destructive primary (``confirm`` / ``start``) is gated off (gate unsafe in
+        the legacy modal, or not yet resolved).
 
-        check_action returning False for ``confirm`` makes its run_action a no-op
-        but does NOT stop the key event, so Enter would otherwise propagate to the
-        focused button's enter→press.  If the focused button were Force, Enter
-        would force the teardown the gate guards.  We stop it here so an unsafe-gate
-        Enter is genuinely inert.  The explicit `f` key is untouched — Force still
-        routes through action_force → _commit(force=True)."""
-        if event.key == "enter" and self.check_action("confirm", ()) is not True:
+        check_action returning False for the destructive action makes its
+        run_action a no-op but does NOT stop the key event, so Enter would
+        otherwise propagate to whatever is focused (in the legacy modal that could
+        be the Force button → forcing the very teardown the gate guards).  We stop
+        it here so an unresolved/unsafe-gate Enter is genuinely inert.  The
+        explicit `f` (legacy force) / `k` (serve stop) keys are untouched."""
+        if event.key != "enter":
+            return
+        primary = "start" if self._is_serve else "confirm"
+        if self.check_action(primary, ()) is not True:
             event.stop()
             event.prevent_default()
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
-        """A11 — gate the footer visibility of Confirm / Force on plan safety.
+        """Gate the footer visibility + run_action of every commit key on state.
 
-        Mirrors the disabled-button logic in set_reconcile so the modal footer is
-        honest:
-          - before reconcile resolves (rec is None): neither commit key is shown
-            (the buttons are disabled too).
-          - gate SAFE  → Confirm shown, Force hidden (forcing is meaningless).
-          - gate UNSAFE→ Confirm hidden, Force shown (forcing is the only path).
-        Esc/Cancel is always shown.  Returning False hides the ``confirm`` binding
-        from the footer and makes run_action a no-op for it — BUT Textual returns
-        False *without stopping the key event*, so a stray Enter on an unsafe gate
-        still propagates.  Inertness is therefore NOT free here: it relies on (1)
-        set_reconcile focusing Cancel (not Force) on the unsafe branch, and (2) the
-        on_key guard below stopping an ``enter`` whenever ``confirm`` is gated off,
-        so the event can never fall through to the focused button's enter→press."""
+        SERVE (serve_ctx set) — only the right one verb shows, and ONLY after the
+        dual-writer detect resolves (rec is not None):
+          - mode "stop"  → ``stop`` shown; confirm/start/force hidden.
+          - mode "start" → ``start`` shown; stop/confirm/force hidden.  (The
+            conflict warned-Start is the SAME ``start`` action — the teardown is
+            folded into _commit, so there is no separate Force.)
+        LEGACY (serve_ctx None) — the original Confirm/Force gating:
+          - rec None: neither commit key shown (buttons disabled too).
+          - gate SAFE   → ``confirm`` shown, ``force`` hidden.
+          - gate UNSAFE → ``confirm`` hidden, ``force`` shown.
+        Esc/Cancel is always shown.  Inertness on an unresolved/unsafe gate is NOT
+        free: it relies on (1) the legacy unsafe branch focusing Cancel (not
+        Force), and (2) the on_key guard stopping a stray ``enter`` whenever the
+        destructive primary is gated off."""
         rec = self._reconcile
+        resolved = rec is not None
+        if self._is_serve:
+            ctx = self._serve_ctx
+            if action == "stop":
+                return bool(resolved and ctx is not None and ctx.mode == "stop")
+            if action == "start":
+                return bool(resolved and ctx is not None and ctx.mode == "start")
+            # confirm/force never apply in serve mode.
+            if action in ("confirm", "force"):
+                return False
+            return True
         if action == "confirm":
-            return bool(rec is not None and rec.safe)
+            return bool(resolved and rec.safe)
         if action == "force":
-            return bool(rec is not None and not rec.safe)
+            return bool(resolved and not rec.safe)
+        # stop/start never apply in the legacy modal.
+        if action in ("stop", "start"):
+            return False
         return True
 
     def action_confirm(self) -> None:
-        """Enter → commit (only reachable when the gate is safe; check_action
-        disables this binding otherwise)."""
+        """Enter → commit (legacy modal; only reachable when the gate is safe —
+        check_action disables this binding otherwise)."""
         self._commit(force=False)
 
     def action_force(self) -> None:
-        """f → FORCE the teardown (only reachable when the gate is unsafe;
-        check_action disables this binding otherwise).  Routes through the SAME
-        _commit(force=True) path the old raw on_key handler used."""
+        """f → FORCE the teardown (legacy modal; only reachable when the gate is
+        unsafe — check_action disables this binding otherwise).  Routes through
+        the SAME _commit(force=True) path the old raw on_key handler used."""
         self._commit(force=True)
+
+    def action_start(self) -> None:
+        """Enter → START the serve (serve mode).  Only reachable once the
+        dual-writer detect RESOLVES (check_action gates it off until then).  When
+        a conflicting model holds the GPU the gate is unsafe → Start performs
+        teardown-then-serve (the old Force semantics folded into Start, the
+        maintainer's choice): the SAME --force re-issue, presented as the warned
+        Start the card body AND the footer key ("Start (stops <model>)", set in
+        set_reconcile) already announced."""
+        # force when (and only when) a live model holds the GPU — the warned-Start
+        # the card surfaced.  On a clear gate this is a plain serve.
+        self._commit(force=self._has_conflict)
+
+    def action_stop(self) -> None:
+        """k → STOP the targeted serving model (serve mode, stop-context only).
+        Dispatches the targeted-stop ActionPlan (``docker stop <container>``) — the
+        SAME reconcile-gated B3 serving-panel stop path.  Only reachable once the
+        detect resolves (check_action gates it off until then)."""
+        ctx = self._serve_ctx
+        if ctx is None or ctx.stop_plan is None:
+            return
+        self.app.pop_screen()
+        self.app.dispatch_action(ctx.stop_plan)  # type: ignore[attr-defined]
 
     def _commit(self, *, force: bool) -> None:
         plan = self._plan
         if force and not plan.force:
             # Re-issue the plan as a forced one (with a surfaced reason) so the
-            # executor's force path is taken explicitly — never silently.
+            # executor's force path is taken explicitly — never silently.  In serve
+            # mode this is the warned-Start teardown-then-serve; in the legacy
+            # modal it is the Force override.
+            reason = (
+                "user accepted teardown via warned Start (stop conflicting model, then serve)"
+                if self._is_serve
+                else "user accepted teardown via Force override"
+            )
             plan = ActionPlan(
                 kind=plan.kind,
                 cmd=_with_force(plan),
@@ -1208,7 +1472,7 @@ class ConfirmActionScreen(ModalScreen):
                 is_write=plan.is_write,
                 requires_reconcile=plan.requires_reconcile,
                 force=True,
-                force_reason="user accepted teardown via Force override",
+                force_reason=reason,
             )
         self.app.pop_screen()
         if self._on_confirm is not None:
@@ -5917,7 +6181,53 @@ class CockpitApp(App):
             return
         self._staged_entry = entry
         plan = self._data.serve(entry.slug)  # gated, NOT --force
-        self.push_screen(ConfirmActionScreen(plan))
+        self.push_screen(
+            ConfirmActionScreen(plan, serve_ctx=self._serve_context_for(entry))
+        )
+
+    def _serve_context_for(self, entry: CatalogEntry) -> ServeContext:
+        """Build the state-aware SERVE context for a staged catalog ``entry``.
+
+        Resolves the mode from the LAST estate poll's matched serving slug:
+          - the entry IS the live-serving slug → ``"stop"`` (offer a targeted Stop
+            of THIS model, via the SAME ``container_action(stop)`` B3 path); the
+            stop_plan tears down the matched serving container.
+          - else → ``"start"`` (the conflict warned-Start is decided later from the
+            reconcile result the modal runs — we don't pre-judge it here).
+
+        The card itself is rendered from ``entry``'s cached fields; this only picks
+        the controls + the stop target.  ALL writes still flow through the modal's
+        background detect + the lease (Stop dispatches its own gated plan)."""
+        serving = (self._target_slug or "").strip()
+        if serving and entry.slug == serving:
+            con = self._serving_container()
+            if con is not None:
+                # A targeted stop of THE SERVING container would otherwise
+                # reconcile-UNSAFE against ITSELF (it holds the GPU → the gate
+                # reads it as a conflict).  A stop FREES a card, it doesn't claim
+                # one, and the user explicitly chose Stop — so build the stop as an
+                # explicit, reasoned force: the dual-writer gate still runs its
+                # FRESH detect + holds the lease/claim (serialization preserved),
+                # it just doesn't refuse the user's named teardown of the very
+                # container they targeted.  (A concurrent claim_token is still a
+                # HARD block — force can't override an in-flight write.)
+                stop_plan = ActionPlan(
+                    kind="container",
+                    cmd=["docker", "stop", con.name],
+                    description=f"docker stop {con.name}",
+                    requires_reconcile=True,
+                    force=True,
+                    force_reason=f"user chose Stop for the serving model {entry.slug}",
+                )
+                return ServeContext(
+                    mode="stop",
+                    entry=entry,
+                    stop_plan=stop_plan,
+                    serving_container=con.name,
+                )
+            # Serving slug matched but we couldn't resolve the container — fall
+            # back to a Start presentation (no stop target to offer).
+        return ServeContext(mode="start", entry=entry)
 
     def _operate_primary(self) -> None:
         """⏎ on the merged mode's Orchestration tab: confirm-gated scene switch."""
