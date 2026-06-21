@@ -2731,6 +2731,7 @@ class PromoteScaffoldScreen(ModalScreen):
     }
     PromoteScaffoldScreen > Vertical {
         width: 100;
+        max-width: 100%;
         height: 84%;
         border: thick $accent;
         background: $surface;
@@ -2753,7 +2754,16 @@ class PromoteScaffoldScreen(ModalScreen):
     }
     """
 
+    # FIX 3 — the Enter verb is a DECLARED binding (was a raw on_key("enter")), so
+    # Help / binding-introspection advertise it.  NOTE this modal renders no Footer
+    # of its own — the visible affordance is the "Stage write" button label + body
+    # text; show=True just keeps the binding in active_bindings (Help parity).
+    # ``stage_write`` is gated in check_action on ``self._scaffold.computed``
+    # (mirroring the disabled stage button), so the key is inert when staging isn't
+    # possible.  priority=True so it wins over the focused button's own enter→press
+    # (both route through the SAME _stage_write path).
     BINDINGS = [
+        Binding("enter", "stage_write", "Stage write", show=True, priority=True),
         Binding("escape", "dismiss", "Close"),
     ]
 
@@ -2818,12 +2828,20 @@ class PromoteScaffoldScreen(ModalScreen):
         elif event.button.id == "promote-close-btn":
             self.action_dismiss()
 
-    def on_key(self, event) -> None:
-        if event.key == "enter":
-            btn = self.query_one("#promote-stage-btn", Button)
-            if not btn.disabled:
-                event.stop()
-                self._stage_write()
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        """Gate the ⏎ Stage-write binding on whether the scaffold computed — so the
+        footer only advertises it when staging is actually possible (mirrors the
+        disabled state of #promote-stage-btn)."""
+        if action == "stage_write":
+            return bool(self._scaffold.computed)
+        return True
+
+    def action_stage_write(self) -> None:
+        """⏎ — stage the gated write+guard plan (only reachable when the scaffold
+        computed; check_action gates the binding otherwise).  Same path the
+        #promote-stage-btn press takes."""
+        if self._scaffold.computed:
+            self._stage_write()
 
     def _stage_write(self) -> None:
         """Hand the GATED write+guard plan back to the app's confirm gate.  The
@@ -2954,6 +2972,7 @@ class UntestedComposePreviewScreen(ModalScreen):
     }
     UntestedComposePreviewScreen > Vertical {
         width: 100;
+        max-width: 100%;
         height: 84%;
         border: thick $accent;
         background: $surface;
@@ -2976,7 +2995,14 @@ class UntestedComposePreviewScreen(ModalScreen):
     }
     """
 
+    # FIX 3 — the Enter verb is a DECLARED binding (was a raw on_key("enter")), so
+    # Help / binding-introspection advertise it.  NOTE this modal renders no Footer
+    # of its own — the visible affordance is the "Serve" button label + body; show=True
+    # just keeps the binding in active_bindings (Help parity).  priority=True so it
+    # wins over the focused button's own enter→press (both route through the SAME
+    # _serve path).
     BINDINGS = [
+        Binding("enter", "serve_untested", "Serve untested", show=True, priority=True),
         Binding("escape", "dismiss", "Close"),
     ]
 
@@ -3024,10 +3050,10 @@ class UntestedComposePreviewScreen(ModalScreen):
         elif event.button.id == "untested-close-btn":
             self.action_dismiss()
 
-    def on_key(self, event) -> None:
-        if event.key == "enter":
-            event.stop()
-            self._serve()
+    def action_serve_untested(self) -> None:
+        """⏎ — hand the serve_generated plan to the app's reconcile gate.  Same
+        path the #untested-serve-btn press takes (NEVER auto-fired / live)."""
+        self._serve()
 
     def _serve(self) -> None:
         """Hand the serve_generated plan to the app's reconcile gate.  Routes
@@ -3912,7 +3938,11 @@ class CockpitApp(App):
         # #4 — Operate · Doctor: RE-RUN the three diagnose reads on demand (all
         # READ-only).  [r] also refreshes Doctor (via load_estate→load_doctor),
         # but [y] is the discoverable, Doctor-resident re-run verb.
-        Binding("y", "doctor_rerun", "Re-run Doctor", show=False),
+        # FIX 2 — show=True so the real Doctor verb surfaces in the footer (the
+        # OLD ⏎ "Select" no-op on Doctor is now hidden by check_action).  It is
+        # context-gated to mode 0 · Doctor in _CONTEXT_KEYS, so it only renders
+        # there.
+        Binding("y", "doctor_rerun", "Re-run Doctor", show=True),
     ]
 
     CSS = """
@@ -3967,6 +3997,15 @@ class CockpitApp(App):
         height: 12;
         margin: 0 1 1 1;
     }
+    /* FIX 1 — while a ModalScreen is topmost, suppress the BASE FocusableFooter
+       (the main screen's footer renders UNDER/around the modal otherwise, showing
+       global keys + "Enter Select" that are NOT active).  A modal either renders its
+       own Footer (only ConfirmActionScreen does) or advertises its keys in-body —
+       either way the BASE footer's hints are stale.  Toggled by the screen-stack
+       watcher (_sync_base_footer_visibility), restored when the modal pops. */
+    FocusableFooter.base-footer-hidden {
+        display: none;
+    }
     """
 
     # ── Dynamic binding visibility ─────────────────────────────────────────────────
@@ -3975,7 +4014,10 @@ class CockpitApp(App):
     _ALWAYS_ON: frozenset[str] = frozenset({
         "quit", "help", "refresh",
         "mode_run", "mode_operate", "mode_validate",
-        "primary_action",
+        # FIX 2 — ``primary_action`` (⏎) was always-on, so the footer ALWAYS
+        # advertised "Enter Select" even on tabs where ⏎ is a no-op (Doctor /
+        # Containers).  It is now context-gated in check_action (only the surfaces
+        # whose action_primary_action does real work show it).  NOT in _ALWAYS_ON.
         # #8 — the left-rail toggle is a pure view control (no write, no mode
         # dependency), reachable everywhere.
         "toggle_rail",
@@ -4023,9 +4065,10 @@ class CockpitApp(App):
         "doctor_rerun":     ({0}, {"tab-doctor"}),
         # Merged mode 0 · Containers tab
         "container_logs":   ({0}, {"tab-containers"}),
-        # [s] restart on Containers (mode 0, action guards internally on the tab) +
-        # [s] submit on the lane's ④ Measure (mode 1); no sub-tab constraint here.
-        "s_key":            ({0, 1}, None),  # Containers (restart) + Evidence (submit)
+        # [s] is handled by a DEDICATED branch in check_action (FIX 2) — Containers
+        # (restart) on mode 0 + the lane's ④ Measure (submit) on mode 1 — so it is
+        # NOT listed here (the old `({0, 1}, None)` entry was over-broad: it showed
+        # [s] on every mode-0 tab and every lane stage).
         "container_stop":   ({0}, {"tab-containers"}),
         "container_rm":     ({0}, {"tab-containers"}),
         # [t] = docker top on the Containers tab.
@@ -4116,6 +4159,25 @@ class CockpitApp(App):
             if action in ("prev_subtab", "next_subtab"):
                 return False
 
+        # FIX 2 — ⏎ (primary_action) is shown ONLY on surfaces whose
+        # action_primary_action does real work: merged mode 0 · Catalog (serve) +
+        # Orchestration (scene switch), and EVERY Bring & Validate stage (mode 1).
+        # On Doctor / Containers (mode 0) ⏎ is a no-op → hide it so the footer never
+        # advertises a key that does nothing.
+        if action == "primary_action":
+            return self._primary_action_enabled()
+
+        # FIX 2 — [s] is context-sensitive (action_s_key routes restart vs submit)
+        # but the binding was over-broad ({0,1}, no sub-tab).  Constrain it to the
+        # ONLY two surfaces it acts on: merged mode 0 · Containers (docker restart)
+        # and the Bring & Validate lane's ④ Measure stage (submit-to-localmaxxing).
+        if action == "s_key":
+            if self._active_mode == 0:
+                return self._current_subtab() == "tab-containers"
+            if self._active_mode == 1:
+                return self._active_validate_tab() == "tab-evidence"
+            return False
+
         # Sub-tab cycle keys: both modes have sub-tabs (merged 0 = 4 tabs; lane 1
         # = the ①→⑤ stages).
         if action in ("prev_subtab", "next_subtab"):
@@ -4147,6 +4209,19 @@ class CockpitApp(App):
             return self.query_one(tc_id, TabbedContent).active
         except Exception:
             return ""
+
+    # FIX 2 — the (mode, tab) surfaces where ⏎ (action_primary_action) does real
+    # work.  Kept in lock-step with action_primary_action / _validate_primary:
+    #   mode 0 · tab-catalog        → serve the selected slug (reconcile-gated)
+    #   mode 0 · tab-orchestration  → scene switch (confirm-gated)
+    #   mode 1 · ANY stage          → per-stage lane verb (fit-check … promote)
+    # Doctor / Containers (mode 0) have NO ⏎ primary, so ⏎ is hidden there.
+    def _primary_action_enabled(self) -> bool:
+        if self._active_mode == 0:
+            return self._current_subtab() in ("tab-catalog", "tab-orchestration")
+        if self._active_mode == 1:
+            return True
+        return False
 
     def __init__(self, repo_root: Path, *, data: Optional[CockpitData] = None,
                  surface: str = "producer", **kwargs):
@@ -4339,6 +4414,48 @@ class CockpitApp(App):
         self._asof_interval = self.set_interval(
             1.0, self._refresh_rail_as_of, pause=False
         )
+        # FIX 1 — sync the base-footer suppression to the initial (modal-free)
+        # stack so it starts visible.
+        self._sync_base_footer_visibility()
+
+    # ── FIX 1 · base-footer suppression under a modal ────────────────────────────
+    #
+    # The main screen docks ONE FocusableFooter (compose()).  When a ModalScreen is
+    # topmost, that base footer still renders under/around the modal advertising
+    # global keys + "Enter Select" — misleading, because ONLY the modal's own
+    # bindings are live.  (A modal either yields its own Footer — only
+    # ConfirmActionScreen does — or advertises its keys in-body via button labels;
+    # either way the BASE footer's hints are stale.)  We suppress the base
+    # footer whenever the screen stack is deeper than the main screen, and restore
+    # it when the last modal pops.  ``screen_stack`` mutates SYNCHRONOUSLY in
+    # push_screen / pop_screen (verified), so toggling right after super() is
+    # correct; ``dismiss`` also routes through App.pop_screen, so it's covered too.
+
+    def _sync_base_footer_visibility(self) -> None:
+        """Show the base FocusableFooter ONLY when no modal is topmost.
+
+        Toggles the ``base-footer-hidden`` class (CSS ``display:none``) so that a
+        modal's own footer is the single source of footer truth while it is up,
+        and the base footer comes back the instant the stack returns to the main
+        screen.  Never strands focus: the suppressed footer is a docked,
+        non-focused widget — modals manage their own focus, and on restore the
+        main screen's existing focus is untouched."""
+        try:
+            footer = self.query_one(FocusableFooter)
+        except Exception:
+            return
+        modal_topmost = len(self.screen_stack) > 1
+        footer.set_class(modal_topmost, "base-footer-hidden")
+
+    def push_screen(self, *args, **kwargs):
+        result = super().push_screen(*args, **kwargs)
+        self._sync_base_footer_visibility()
+        return result
+
+    def pop_screen(self, *args, **kwargs):
+        result = super().pop_screen(*args, **kwargs)
+        self._sync_base_footer_visibility()
+        return result
 
     def _refresh_rail_as_of(self) -> None:
         """A3: re-stamp the rail's freshness line from CACHED state — no poll.

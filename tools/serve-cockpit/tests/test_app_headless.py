@@ -6487,6 +6487,325 @@ class TestA11ConfirmModalDiscoverableBindings:
 
 
 # ===========================================================================
+# UX Tier-1 hygiene (external Codex review) — footer/binding honesty:
+#   FIX 1  base FocusableFooter suppressed under a modal, restored on pop
+#   FIX 2  ⏎ hidden where it no-ops (Doctor/Containers) · real Doctor verb
+#          surfaced · [s] gated to its valid tabs only
+#   FIX 3  Promote / Untested Enter is a real Binding (footer-discoverable)
+# The reconcile-gate Enter-on-unsafe safety is regression-locked here too.
+# ===========================================================================
+
+
+class TestTier1BaseFooterUnderModal:
+    """FIX 1 — the base footer must NOT render under a modal (only the modal's own
+    footer is honest while it is up); it must come back when the modal pops."""
+
+    @pytest.mark.asyncio
+    async def test_base_footer_visible_with_no_modal(self):
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            footer = app.query_one(FocusableFooter)
+            assert not footer.has_class("base-footer-hidden")
+            assert len(app.screen_stack) == 1
+
+    @pytest.mark.asyncio
+    async def test_base_footer_hidden_under_confirm_modal_and_restored(self):
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            footer = app.query_one(FocusableFooter)
+            plan = app._data.serve("vllm/dual")
+            app.push_screen(ConfirmActionScreen(plan))
+            await _settle(pilot)
+            assert len(app.screen_stack) > 1
+            assert footer.has_class("base-footer-hidden")  # suppressed under modal
+            assert footer.display is False  # RENDERED effect (display:none), not just the class
+            # Pop the modal → base footer restored.
+            app.pop_screen()
+            await _settle(pilot)
+            assert len(app.screen_stack) == 1
+            assert not footer.has_class("base-footer-hidden")
+            assert footer.display is True  # rendered visible again
+
+    @pytest.mark.asyncio
+    async def test_base_footer_restored_after_help_modal(self):
+        """Restored after a NON-confirm modal too (Help) — the suppression keys off
+        the screen stack depth, not the modal class."""
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            footer = app.query_one(FocusableFooter)
+            await pilot.press("?")  # Help
+            await _settle(pilot)
+            assert isinstance(app.screen, HelpScreen)
+            assert footer.has_class("base-footer-hidden")
+            await pilot.press("escape")
+            await _settle(pilot)
+            assert not footer.has_class("base-footer-hidden")
+
+    @pytest.mark.asyncio
+    async def test_base_footer_hidden_under_preview_modal_and_restored(self, tmp_path):
+        """The untested-compose preview modal (a producer-lane preview) also
+        suppresses the base footer and restores it on close."""
+        runner = FakeGenComposeRunner(GENERATED_COMPOSE_YAML)
+        app, _, _ = make_app(repo_root=tmp_path, surface="producer", runner=runner)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            footer = app.query_one(FocusableFooter)
+            app.run_byo_check("unsloth/Qwen3-27B-abliterated", "vllm/dual")
+            await _settle(pilot)
+            await pilot.press("2")
+            await _settle(pilot)
+            app.query_one("#validate-tabs", TabbedContent).active = "tab-serve"
+            await pilot.pause()
+            app.action_serve_untested()
+            await _settle(pilot)
+            assert isinstance(app.screen, UntestedComposePreviewScreen)
+            assert footer.has_class("base-footer-hidden")
+            await pilot.press("enter")  # the modal's ⏎ verb → reconcile confirm
+            await _settle(pilot)
+            # Still a modal on top (the confirm gate) → still suppressed.
+            assert isinstance(app.screen, ConfirmActionScreen)
+            assert footer.has_class("base-footer-hidden")
+            app.pop_screen()
+            await _settle(pilot)
+            assert not footer.has_class("base-footer-hidden")
+
+
+class TestTier1PrimaryActionAndSKeyHonesty:
+    """FIX 2 — ⏎ is advertised ONLY where action_primary_action does real work;
+    the real Doctor re-run verb is surfaced; [s] is gated to its valid tabs."""
+
+    @pytest.mark.asyncio
+    async def test_enter_advertised_on_catalog(self):
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            app.query_one("#operate-tabs", TabbedContent).active = "tab-catalog"
+            await pilot.pause()
+            assert app.check_action("primary_action", ()) is True
+
+    @pytest.mark.asyncio
+    async def test_enter_advertised_on_lane_bring(self):
+        app, _, _ = make_app(surface="producer")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            await pilot.press("2")
+            await _settle(pilot)
+            app.query_one("#validate-tabs", TabbedContent).active = "tab-bring"
+            await pilot.pause()
+            assert app.check_action("primary_action", ()) is True
+
+    @pytest.mark.asyncio
+    async def test_enter_not_advertised_on_doctor(self):
+        """⏎ no-ops on Doctor → check_action falsey so the footer never shows
+        the misleading 'Enter Select' there."""
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _enter_operate(pilot, tab="tab-doctor")
+            assert app.check_action("primary_action", ()) is False
+            # And the footer genuinely omits the enter key on Doctor.
+            footer_keys = {k.key for k in app.query(FooterKey)}
+            assert "enter" not in footer_keys
+
+    @pytest.mark.asyncio
+    async def test_enter_not_advertised_on_containers(self):
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _enter_operate(pilot, tab="tab-containers")
+            assert app.check_action("primary_action", ()) is False
+
+    @pytest.mark.asyncio
+    async def test_doctor_rerun_verb_advertised_on_doctor(self):
+        """The REAL Doctor verb ([y] doctor_rerun) is surfaced in the footer on
+        Doctor (show=True + context-gated there), replacing the no-op ⏎."""
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _enter_operate(pilot, tab="tab-doctor")
+            assert app.check_action("doctor_rerun", ()) is True
+            # The binding is declared show=True so it can reach the footer.
+            doctor_binding = next(
+                b for b in CockpitApp.BINDINGS if b.action == "doctor_rerun"
+            )
+            assert doctor_binding.show is True
+            assert doctor_binding.key == "y"
+            footer_keys = {k.key for k in app.query(FooterKey)}
+            assert "y" in footer_keys  # the real re-run verb is on Doctor's footer
+
+    @pytest.mark.asyncio
+    async def test_doctor_rerun_not_advertised_off_doctor(self):
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            app.query_one("#operate-tabs", TabbedContent).active = "tab-catalog"
+            await pilot.pause()
+            assert app.check_action("doctor_rerun", ()) is False
+
+    @pytest.mark.asyncio
+    async def test_s_key_gated_to_containers_only_in_mode0(self):
+        """[s] is valid on Containers (restart) but NOT on Catalog / Orchestration /
+        Doctor — the over-broad ({0,1}, None) gate is gone."""
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            tc = app.query_one("#operate-tabs", TabbedContent)
+            tc.active = "tab-containers"
+            await pilot.pause()
+            assert app.check_action("s_key", ()) is True
+            for tab in ("tab-catalog", "tab-orchestration", "tab-doctor"):
+                tc.active = tab
+                await pilot.pause()
+                assert app.check_action("s_key", ()) is False, tab
+
+    @pytest.mark.asyncio
+    async def test_s_key_gated_to_evidence_only_in_lane(self):
+        """In the Bring & Validate lane [s] is valid ONLY on ④ Measure (submit),
+        not on ① Bring / ② Serve / ③ Gate / ⑤ Promote."""
+        app, _, _ = make_app(surface="producer")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            await pilot.press("2")
+            await _settle(pilot)
+            tc = app.query_one("#validate-tabs", TabbedContent)
+            tc.active = "tab-evidence"
+            await pilot.pause()
+            assert app.check_action("s_key", ()) is True
+            for tab in ("tab-bring", "tab-serve", "tab-run", "tab-promote"):
+                tc.active = tab
+                await pilot.pause()
+                assert app.check_action("s_key", ()) is False, tab
+
+
+class TestTier1PreviewModalEnterBindings:
+    """FIX 3 — Promote / Untested Enter is a declared Binding (show=True), so it is
+    footer-discoverable, AND it still performs the same action it did via on_key."""
+
+    @pytest.mark.asyncio
+    async def test_promote_enter_is_a_real_binding(self):
+        app, _, _ = make_app(surface="producer")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            app.run_byo_check("unsloth/Qwen3-27B-abliterated", "vllm/dual")
+            await _settle(pilot)
+            await pilot.press("2")
+            await _settle(pilot)
+            await pilot.press("P")
+            await pilot.pause()
+            scr = app.screen
+            assert isinstance(scr, PromoteScaffoldScreen)
+            actions = {b.action: b for b in scr.BINDINGS}
+            assert "stage_write" in actions
+            assert actions["stage_write"].key == "enter"
+            assert actions["stage_write"].show is True
+            # Footer-discoverable: stage_write reaches the modal footer.
+            assert any(
+                v.binding.action == "stage_write" and v.binding.show
+                for v in scr.active_bindings.values()
+            )
+
+    @pytest.mark.asyncio
+    async def test_promote_enter_still_stages_the_gated_write(self):
+        """⏎ on the promote preview still opens the SAME mock-only confirm gate the
+        #promote-stage-btn press does (behaviour preserved)."""
+        wr = FakeWriteRunner()
+        app, _, _ = make_app(write_runner=wr, surface="producer")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            app.run_byo_check("unsloth/Qwen3-27B-abliterated", "vllm/dual")
+            await _settle(pilot)
+            await pilot.press("2")
+            await _settle(pilot)
+            await pilot.press("P")
+            await pilot.pause()
+            assert isinstance(app.screen, PromoteScaffoldScreen)
+            await pilot.press("enter")
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmActionScreen)
+            assert app.screen._plan.kind == "promote_catalog"
+            assert wr.started == []  # mock-only, never auto-fired
+
+    @pytest.mark.asyncio
+    async def test_untested_enter_is_a_real_binding(self, tmp_path):
+        runner = FakeGenComposeRunner(GENERATED_COMPOSE_YAML)
+        app, _, _ = make_app(repo_root=tmp_path, surface="producer", runner=runner)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            app.run_byo_check("unsloth/Qwen3-27B-abliterated", "vllm/dual")
+            await _settle(pilot)
+            await pilot.press("2")
+            await _settle(pilot)
+            app.query_one("#validate-tabs", TabbedContent).active = "tab-serve"
+            await pilot.pause()
+            app.action_serve_untested()
+            await _settle(pilot)
+            scr = app.screen
+            assert isinstance(scr, UntestedComposePreviewScreen)
+            actions = {b.action: b for b in scr.BINDINGS}
+            assert "serve_untested" in actions
+            assert actions["serve_untested"].key == "enter"
+            assert actions["serve_untested"].show is True
+            assert any(
+                v.binding.action == "serve_untested" and v.binding.show
+                for v in scr.active_bindings.values()
+            )
+
+    @pytest.mark.asyncio
+    async def test_untested_enter_still_serves_through_reconcile_gate(self, tmp_path):
+        wr = FakeWriteRunner()
+        runner = FakeGenComposeRunner(GENERATED_COMPOSE_YAML)
+        app, _, _ = make_app(repo_root=tmp_path, surface="producer",
+                             runner=runner, write_runner=wr)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            app.run_byo_check("unsloth/Qwen3-27B-abliterated", "vllm/dual")
+            await _settle(pilot)
+            await pilot.press("2")
+            await _settle(pilot)
+            app.query_one("#validate-tabs", TabbedContent).active = "tab-serve"
+            await pilot.pause()
+            app.action_serve_untested()
+            await _settle(pilot)
+            assert isinstance(app.screen, UntestedComposePreviewScreen)
+            await pilot.press("enter")
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmActionScreen)
+            plan = app.screen._plan
+            assert plan.kind == "serve"
+            assert plan.requires_reconcile is True
+            assert wr.started == []  # not auto-fired
+
+
+class TestTier1ReconcileGateSafetyUntouched:
+    """Regression-lock: FIX 1-3 are footer/binding hygiene ONLY — the load-bearing
+    ConfirmActionScreen Enter-on-UNSAFE safety stays INERT (no force footgun)."""
+
+    @pytest.mark.asyncio
+    async def test_enter_on_unsafe_gate_stays_inert(self):
+        wr = FakeWriteRunner()
+        responses = fake_responses(**{"docker ps": ok(DOCKER_PS_ENGINE)})
+        gpus = [GpuInfo(index=0, mem_used_mib=22000), GpuInfo(index=1, mem_used_mib=1)]
+        app, _, _ = make_app(responses=responses, gpus=gpus,
+                             target=ServingTarget(gpus=gpus), write_runner=wr)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            plan = app._data.serve("vllm/dual")
+            app.push_screen(ConfirmActionScreen(plan))
+            await _settle(pilot)
+            sc = app.screen
+            assert sc._reconcile.safe is False
+            assert sc.check_action("confirm", ()) is False
+            await pilot.press("enter")
+            await _settle(pilot)
+            assert wr.started == []  # INERT — no write, no forced teardown
+            # The explicit `f` STILL forces (unchanged force path).
+            await pilot.press("f")
+            await _settle(pilot)
+            assert len(wr.started) == 1
+            assert "--force" in wr.started[0]["cmd"]
+
+
+# ===========================================================================
 # UX Batch 4b — preview & input ergonomics
 #   #9/A8 Catalog preview · #11 Scene preview · N8 evidence/gate preview ·
 #   #6/A12 profile-template Select + rig default + unknown-profile ·
