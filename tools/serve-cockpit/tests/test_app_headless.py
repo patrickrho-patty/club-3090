@@ -6248,6 +6248,236 @@ class TestBareBootFocusOnCatalog:
                 f"bare boot must focus #catalog-table, got {app.focused!r}"
 
 
+class TestArrowKeyFocusDescent:
+    """Arrow-key focus descent between the tab bar (ContentTabs) and the active
+    tab's primary list (DataTable):
+
+      1. tab bar + [down]        → focus descends INTO the active tab's list.
+      2. list @ row 0 + [up]     → focus ascends back UP to the tab bar.
+      3. mid-list [up]/[down]    → the DataTable moves its row cursor (NOT hijacked).
+
+    Gated to NEVER fire under a modal, and to leave focus alone when an Input /
+    Select in the lane is focused (those widgets use arrow keys themselves)."""
+
+    @staticmethod
+    async def _focus_tab_bar(pilot, tc_id: str, tab: str):
+        """Activate ``tab`` on the TabbedContent ``tc_id`` and focus its tab bar."""
+        app = pilot.app
+        tc = app.query_one(tc_id, TabbedContent)
+        tc.active = tab
+        await _settle(pilot)
+        tc.query_one(ContentTabs).focus()
+        await pilot.pause()
+        assert isinstance(app.focused, Tabs), f"precondition: focus on the tab bar ({app.focused!r})"
+        return tc
+
+    # ── Behavior 1 — tab bar + down → descend into the list ──────────────────────
+
+    @pytest.mark.asyncio
+    async def test_tab_bar_down_descends_into_catalog_list(self):
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            await self._focus_tab_bar(pilot, "#operate-tabs", "tab-catalog")
+            await pilot.press("down")
+            await pilot.pause()
+            assert isinstance(app.focused, DataTable)
+            assert app.focused.id == "catalog-table", \
+                f"down on the tab bar must descend into #catalog-table, got {app.focused!r}"
+
+    @pytest.mark.asyncio
+    async def test_tab_bar_down_descends_into_orchestration_and_containers(self):
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            for tab, table_id in (
+                ("tab-orchestration", "scene-table"),
+                ("tab-containers", "containers-table"),
+            ):
+                await self._focus_tab_bar(pilot, "#operate-tabs", tab)
+                await pilot.press("down")
+                await pilot.pause()
+                assert isinstance(app.focused, DataTable) and app.focused.id == table_id, \
+                    f"down on {tab} tab bar must descend into #{table_id}, got {app.focused!r}"
+
+    @pytest.mark.asyncio
+    async def test_tab_bar_down_descends_in_lane_gate_and_measure(self):
+        """The producer lane's ③ Gate (#run-ladder-table) and ④ Measure
+        (#evidence-table) descend the same way."""
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            await pilot.press("2")  # into Bring & Validate
+            await _settle(pilot)
+            for tab, table_id in (
+                ("tab-run", "run-ladder-table"),
+                ("tab-evidence", "evidence-table"),
+            ):
+                await self._focus_tab_bar(pilot, "#validate-tabs", tab)
+                await pilot.press("down")
+                await pilot.pause()
+                assert isinstance(app.focused, DataTable) and app.focused.id == table_id, \
+                    f"down on lane {tab} tab bar must descend into #{table_id}, got {app.focused!r}"
+
+    # ── Behavior 2 — list @ row 0 + up → ascend to the tab bar ───────────────────
+
+    @pytest.mark.asyncio
+    async def test_list_row0_up_ascends_to_tab_bar(self):
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            tc = app.query_one("#operate-tabs", TabbedContent)
+            tc.active = "tab-catalog"
+            await _settle(pilot)
+            t = app.query_one("#catalog-table", DataTable)
+            t.focus()
+            t.move_cursor(row=0)
+            await pilot.pause()
+            assert app.focused is t and t.cursor_row == 0
+            await pilot.press("up")
+            await pilot.pause()
+            assert isinstance(app.focused, Tabs), \
+                f"up at row 0 must ascend to the tab bar, got {app.focused!r}"
+
+    # ── Behavior 3 — mid-list up/down move the cursor, never hijacked ────────────
+
+    @pytest.mark.asyncio
+    async def test_mid_list_up_moves_cursor_not_hijacked(self):
+        """[up] with cursor ABOVE row 0 moves the DataTable cursor (does not ascend).
+
+        The fake catalog has 2 rows, so the deepest cursor is row 1; pressing up
+        there must land on row 0 with focus STILL on the table (the priority `up`
+        binding is inert when cursor_row != 0)."""
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            tc = app.query_one("#operate-tabs", TabbedContent)
+            tc.active = "tab-catalog"
+            await _settle(pilot)
+            t = app.query_one("#catalog-table", DataTable)
+            t.focus()
+            t.move_cursor(row=1)
+            await pilot.pause()
+            assert app.focused is t and t.cursor_row == 1, (app.focused, t.cursor_row)
+            await pilot.press("up")
+            await pilot.pause()
+            assert app.focused is t, f"up above row 0 must NOT ascend, got {app.focused!r}"
+            assert t.cursor_row == 0, f"up must move the cursor to row 0, got {t.cursor_row}"
+
+    @pytest.mark.asyncio
+    async def test_list_down_moves_cursor_not_hijacked(self):
+        """[down] anywhere in the list moves the DataTable cursor (does not jump to
+        the tab bar / re-descend)."""
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            tc = app.query_one("#operate-tabs", TabbedContent)
+            tc.active = "tab-catalog"
+            await _settle(pilot)
+            t = app.query_one("#catalog-table", DataTable)
+            t.focus()
+            t.move_cursor(row=0)
+            await pilot.pause()
+            assert app.focused is t and t.cursor_row == 0
+            await pilot.press("down")
+            await pilot.pause()
+            assert app.focused is t, f"down in a list must keep focus on the table, got {app.focused!r}"
+            assert t.cursor_row == 1, f"down must move the cursor, got {t.cursor_row}"
+
+    # ── No-op surfaces — Doctor (no primary list) ────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_doctor_tab_bar_down_is_a_noop(self):
+        """Doctor has no primary list → descend is a no-op (focus stays on the bar)."""
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            await self._focus_tab_bar(pilot, "#operate-tabs", "tab-doctor")
+            await pilot.press("down")
+            await pilot.pause()
+            assert isinstance(app.focused, Tabs), \
+                f"down on Doctor's tab bar (no list) must stay on the bar, got {app.focused!r}"
+
+    # ── Modal invariant — arrows never steal focus to/from the tab bar ───────────
+
+    @pytest.mark.asyncio
+    async def test_modal_blocks_descend_and_ascend(self):
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            tc = app.query_one("#operate-tabs", TabbedContent)
+            tc.active = "tab-catalog"
+            await _settle(pilot)
+            tc.query_one(ContentTabs).focus()
+            await pilot.pause()
+            assert isinstance(app.focused, Tabs)
+            plan = app._data.serve("vllm/dual")
+            app.push_screen(ConfirmActionScreen(plan))
+            await _settle(pilot)
+            assert isinstance(app.screen, ConfirmActionScreen)
+            # The gates refuse to fire while a modal is topmost (modals own their
+            # own keys, including arrow keys in their widgets).
+            assert app.check_action("descend_to_content", ()) is False
+            assert app.check_action("ascend_to_tabbar", ()) is False
+            # Pressing arrows leaves the modal up — the app focus is not yanked to a
+            # tab/list underneath.
+            await pilot.press("down")
+            await pilot.pause()
+            await pilot.press("up")
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmActionScreen), "modal must stay up"
+
+    # ── Lane Input gate — arrow keys belong to the Input, not descend/ascend ─────
+
+    @pytest.mark.asyncio
+    async def test_input_focused_does_not_descend_or_ascend(self):
+        """① Bring's Input uses arrow keys itself — the gates must be False when an
+        Input is focused so up/down reach the Input, not the descend/ascend actions."""
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            await pilot.press("2")  # into Bring & Validate
+            await _settle(pilot)
+            vtc = app.query_one("#validate-tabs", TabbedContent)
+            vtc.active = "tab-bring"
+            await _settle(pilot)
+            inp = app.query_one("#lane-bring-url-input", Input)
+            inp.focus()
+            await pilot.pause()
+            assert app.focused is inp
+            # With an Input focused, neither gate fires (focus is not the tab bar /
+            # a primary DataTable).
+            assert app.check_action("descend_to_content", ()) is False
+            assert app.check_action("ascend_to_tabbar", ()) is False
+            await pilot.press("down")
+            await pilot.pause()
+            await pilot.press("up")
+            await pilot.pause()
+            assert app.focused is inp, \
+                f"arrow keys must stay with the focused Input, got {app.focused!r}"
+
+    # ── DRY check — the shared map backs both the descend action and the resolver ─
+
+    @pytest.mark.asyncio
+    async def test_primary_list_resolver_uses_shared_map(self):
+        """``_primary_list_for_active_tab`` resolves via the shared _TAB_PRIMARY_LIST
+        constant — the same map the tab-activation focus logic reads."""
+        from club3090_cockpit.app import _TAB_PRIMARY_LIST
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            tc = app.query_one("#operate-tabs", TabbedContent)
+            tc.active = "tab-catalog"
+            await _settle(pilot)
+            tbl = app._primary_list_for_active_tab()
+            assert isinstance(tbl, DataTable) and tbl.id == "catalog-table"
+            # Doctor is absent from the map → no primary list → None.
+            tc.active = "tab-doctor"
+            await _settle(pilot)
+            assert app._primary_list_for_active_tab() is None
+            assert "tab-doctor" not in _TAB_PRIMARY_LIST
+
+
 class TestSubtabCycleScopedToDirectPanes:
     """MUST-FIX 2 — the [/] sub-tab cycle (and _current_subtab) must read only the
     TabbedContent's DIRECT panes, never the NESTED Containers drill (Logs/Top/

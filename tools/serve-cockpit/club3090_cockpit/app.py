@@ -3774,6 +3774,22 @@ _PALETTE_PRODUCER_ONLY: frozenset[str] = frozenset({
     "measure_vs_bar", "full_report",
 })
 
+# Single source of truth: each mode-level tab → the CSS id of its PRIMARY content
+# list (the DataTable focus descends into / ascends out of).  The single map read
+# by ALL THREE focus consumers — tab-activation focus (on_tabbed_content_tab_activated),
+# mode-switch focus (_focus_mode_primary via _primary_list_for_active_tab), and the
+# arrow-key focus-descent actions (action_descend_to_content / action_ascend_to_tabbar)
+# — so the tab→list association never drifts.  Tabs absent from this map have NO primary
+# list (mode 0 · Doctor; lane ① Bring / ② Serve / ⑤ Promote) — descend is a no-op
+# there and there is nothing to ascend from.
+_TAB_PRIMARY_LIST: dict[str, str] = {
+    "tab-catalog":       "#catalog-table",
+    "tab-run":           "#run-ladder-table",
+    "tab-evidence":      "#evidence-table",
+    "tab-orchestration": "#scene-table",
+    "tab-containers":    "#containers-table",
+}
+
 
 class CockpitCommands(Provider):
     """N6 — fuzzy command-palette provider for the cockpit's user-facing actions.
@@ -3842,6 +3858,20 @@ class CockpitApp(App):
         # Sub-tab cycle — shown only in modes that have sub-tabs (check_action gates).
         Binding("left_square_bracket", "prev_subtab", "Prev tab", show=False),
         Binding("right_square_bracket", "next_subtab", "Next tab", show=False),
+        # Arrow-key focus descent (keyboard-nav enhancement):
+        #   [down] on the tab bar → descend INTO the active tab's primary list.
+        #     A NON-priority binding: the tab bar (ContentTabs) does NOT consume
+        #     `down`, so the key bubbles to this app binding; the DataTable DOES
+        #     consume `down` for its row cursor, so when focus is already on the
+        #     list this binding's check_action returns falsey and the list keeps it.
+        #   [up] at row 0 of a primary list → ascend back UP to the tab bar.
+        #     PRIORITY so it's checked BEFORE the focused DataTable (which consumes
+        #     `up` even at row 0).  check_action returns True ONLY at cursor_row==0
+        #     on a primary list; above row 0 it's inert → the DataTable moves the
+        #     cursor up as normal.  (Same priority+check_action shape the confirm
+        #     modal uses for enter/f.)
+        Binding("down", "descend_to_content", show=False),
+        Binding("up", "ascend_to_tabbar", show=False, priority=True),
         # #8 — collapse / restore the left rail (Modes + Estate) so the content
         # area uses the full terminal width.  Always-on (no mode/surface gate).
         Binding("full_stop", "toggle_rail", "Rail", show=False),
@@ -4109,6 +4139,37 @@ class CockpitApp(App):
         # consumer via this gate, so it MUST beat _ALWAYS_ON.
         if self._surface != "producer" and action in self._PRODUCER_ONLY:
             return False
+
+        # Arrow-key focus descent (tab bar ↔ primary list).  These are gated here —
+        # BEFORE _ALWAYS_ON — so the result is fully controlled (neither is in
+        # _ALWAYS_ON / _PRODUCER_ONLY).  show=False, so the bool only governs whether
+        # the binding FIRES, never footer visibility.
+        if action in ("descend_to_content", "ascend_to_tabbar"):
+            # Under a modal (screen_stack deeper than the main screen): NEVER fire —
+            # modals own their own keys, including arrow keys inside their widgets.
+            if len(self.screen_stack) > 1:
+                return False
+            focused = self.focused
+            if action == "descend_to_content":
+                # [down] descends ONLY when focus is the active mode's tab bar AND
+                # the active tab maps to a primary list.  When focus is the list
+                # itself (or an Input/Select in the lane), return False so [down]
+                # reaches the DataTable cursor / the widget's own handler.
+                bar = self._active_tab_bar()
+                if bar is None or focused is not bar:
+                    return False
+                return self._primary_list_for_active_tab() is not None
+            # ascend_to_tabbar: [up] ascends ONLY when focus is the active tab's
+            # PRIMARY DataTable AND its cursor is on row 0.  Above row 0 (or off a
+            # primary list) → False → the priority binding is inert and the focused
+            # DataTable handles [up] (cursor up) normally.
+            table = self._primary_list_for_active_tab()
+            if table is None or focused is not table:
+                return False
+            try:
+                return table.cursor_row == 0
+            except Exception:
+                return False
 
         if action in self._ALWAYS_ON:
             return True
@@ -5364,40 +5425,25 @@ class CockpitApp(App):
         call_after_refresh callbacks from on_tabbed_content_tab_activated (which
         are enqueued during mount) — ensuring mode-switch focus wins."""
         def _do() -> None:
+            # DRY: resolve the active tab's primary list via the SHARED
+            # _TAB_PRIMARY_LIST (the same helper the arrow-descent actions use)
+            # rather than a hand-coded tab→table chain.  ``index`` is the mode being
+            # entered; _switch_mode / on_mount set self._active_mode = index BEFORE
+            # this deferred body runs, so the helpers resolve the right mode.
             try:
-                if index == 0:  # merged Run & Operate — focus the ACTIVE tab's
-                    # primary table (Catalog / Orchestration / Containers).  Doctor
-                    # is read-only with no focusable table, so leave focus unset
-                    # there rather than grabbing a hidden table.
-                    try:
-                        tc = self.query_one("#operate-tabs", TabbedContent)
-                        if tc.active == "tab-catalog":
-                            self.query_one("#catalog-table", DataTable).focus()
-                        elif tc.active == "tab-containers":
-                            self.query_one("#containers-table", DataTable).focus()
-                        elif tc.active == "tab-orchestration":
-                            self.query_one("#scene-table", DataTable).focus()
-                    except Exception:
-                        pass
-                elif index == 1:  # Bring & Validate lane — focus the active stage's
-                    # primary DATA TABLE (③ Gate ladder / ④ Measure list).  ① Bring /
-                    # ② Serve / ⑤ Promote have no focusable table (① Bring's only
-                    # focusable is an Input, which would swallow the global digit /
-                    # bracket keys), so FOCUS THE LANE TAB BAR (validate-tabs
-                    # ContentTabs) there instead of leaving focus None — a focus
-                    # black hole now that the footer is out of the Tab chain.  The
-                    # ContentTabs is a Tabs (not an Input), so 1/2 + [ ] still route
-                    # to the app, and there is always a VISIBLE focus.
-                    try:
-                        tc = self.query_one("#validate-tabs", TabbedContent)
-                        if tc.active == "tab-run":
-                            self.query_one("#run-ladder-table", DataTable).focus()
-                        elif tc.active == "tab-evidence":
-                            self.query_one("#evidence-table", DataTable).focus()
-                        else:  # ① Bring / ② Serve / ⑤ Promote — no table; focus bar.
-                            tc.get_child_by_type(ContentTabs).focus()
-                    except Exception:
-                        pass
+                tbl = self._primary_list_for_active_tab()
+                if tbl is not None:
+                    tbl.focus()
+                elif index == 1:
+                    # Lane table-less stage (① Bring / ② Serve / ⑤ Promote): focus
+                    # the lane tab bar (a ContentTabs — not an Input — so 1/2 + [ ]
+                    # still route, and there's always a VISIBLE focus, not None)
+                    # rather than leaving a focus black hole now the footer is out of
+                    # the Tab chain.
+                    bar = self._active_tab_bar()
+                    if bar is not None:
+                        bar.focus()
+                # mode-0 Doctor (also no table) is read-only → leave focus unset.
             except Exception:
                 pass
         self.call_after_refresh(_do)
@@ -5571,6 +5617,70 @@ class CockpitApp(App):
             return self.query_one("#operate-tabs", TabbedContent).active
         except Exception:
             return ""
+
+    # ── Arrow-key focus descent (tab bar ↔ primary list) ───────────────────────────
+    #
+    # The focus chain is `tab bar (ContentTabs) ↔ active content list (DataTable)`.
+    # These helpers resolve the active mode's TabbedContent / its tab bar / the
+    # active tab's primary list, and back the [down]/[up] descend/ascend actions +
+    # their check_action gates.  They reuse the SHARED _TAB_PRIMARY_LIST map so the
+    # tab→list association never drifts from the tab-activation focus logic.
+
+    def _active_tabbed_content(self) -> Optional["TabbedContent"]:
+        """The TabbedContent for the ACTIVE mode (mode 0 = #operate-tabs, mode 1 =
+        #validate-tabs), or None if it can't be resolved."""
+        tc_id = {0: "#operate-tabs", 1: "#validate-tabs"}.get(self._active_mode, "")
+        if not tc_id:
+            return None
+        try:
+            return self.query_one(tc_id, TabbedContent)
+        except Exception:
+            return None
+
+    def _active_tab_bar(self) -> Optional[ContentTabs]:
+        """The active mode's tab bar (the ContentTabs that holds focus while
+        arrow/[ ] cycle tabs), or None."""
+        tc = self._active_tabbed_content()
+        if tc is None:
+            return None
+        try:
+            return tc.get_child_by_type(ContentTabs)
+        except Exception:
+            return None
+
+    def _primary_list_for_active_tab(self) -> Optional[DataTable]:
+        """The DataTable that is the active mode's active-tab PRIMARY list, or None
+        when the active tab has no primary list (mode 0 · Doctor; lane ① Bring /
+        ② Serve / ⑤ Promote — none are in _TAB_PRIMARY_LIST)."""
+        active_tab = self._current_subtab()
+        widget_id = _TAB_PRIMARY_LIST.get(active_tab, "")
+        if not widget_id:
+            return None
+        try:
+            return self.query_one(widget_id, DataTable)
+        except Exception:
+            return None
+
+    def action_descend_to_content(self) -> None:
+        """[down] on the tab bar → move focus INTO the active tab's primary list.
+
+        Does NOT reset the list's cursor — the preserved row stays selected.  A
+        no-op when there is no primary list (check_action also gates this away)."""
+        table = self._primary_list_for_active_tab()
+        if table is not None:
+            try:
+                table.focus()
+            except Exception:
+                pass
+
+    def action_ascend_to_tabbar(self) -> None:
+        """[up] at row 0 of a primary list → move focus back UP to the tab bar."""
+        bar = self._active_tab_bar()
+        if bar is not None:
+            try:
+                bar.focus()
+            except Exception:
+                pass
 
     def action_explain(self) -> None:
         """Open the explain detail modal for the selected catalog slug (merged
@@ -6615,17 +6725,13 @@ class CockpitApp(App):
         if tab_id not in allowed_tabs:
             return
         # NOTE: the lane's ① Bring / ② Serve / ⑤ Promote stages + the merged mode's
-        # Doctor tab are NOT in _focus_map on purpose — ① Bring's only focusable
-        # widget is an Input (which would swallow the global digit (1/2) + bracket
-        # ([ ]) keys), and Doctor is read-only.  Leaving focus on the tab bar there
-        # keeps those keys routed to the app; the user Tab/clicks into the input.
-        _focus_map: dict[str, str] = {
-            "tab-catalog":        "#catalog-table",
-            "tab-run":            "#run-ladder-table",
-            "tab-evidence":       "#evidence-table",
-            "tab-orchestration":  "#scene-table",
-            "tab-containers":     "#containers-table",
-        }
+        # Doctor tab are NOT in _TAB_PRIMARY_LIST on purpose — ① Bring's only
+        # focusable widget is an Input (which would swallow the global digit (1/2) +
+        # bracket ([ ]) keys), and Doctor is read-only.  Leaving focus on the tab bar
+        # there keeps those keys routed to the app; the user Tab/clicks into the
+        # input.  The map is the shared module constant so the tab-activation focus
+        # logic + the arrow-key descend/ascend actions can never drift.
+        _focus_map = _TAB_PRIMARY_LIST
         # FIX B — don't yank focus DOWN into the list when the user is browsing
         # the TAB BAR.  When focus is on the tab bar (a Tabs/ContentTabs widget —
         # that is what holds focus while arrow/[ ] cycle tabs; the individual Tab
