@@ -69,6 +69,8 @@ from textual.widgets import (
 from textual.widgets._tabbed_content import ContentSwitcher, ContentTabs
 from textual import work
 
+from rich.text import Text
+
 from club3090_tui_core.registry import VariantRow
 from club3090_tui_core.widgets.live_pane import LivePane
 
@@ -463,6 +465,8 @@ class HelpScreen(ModalScreen):
             "  [cyan].[/cyan]        toggle the left rail (Modes + Estate) — full-width content",
             "  [cyan]C[/cyan]        toggle lean view (hide / restore the Bring & Validate mode)",
             "  [cyan]Ctrl+p[/cyan]   command palette — fuzzy-search + run any action",
+            "  [cyan]Y[/cyan]        copy the highlighted slug / open report / selection to the clipboard",
+            "  [cyan]Shift+←/→[/cyan] page-scroll a wide table sideways (faster than the ←/→ column cursor)",
             "",
             "[bold]Run & Operate · Catalog[/bold]",
             "  [cyan]⏎[/cyan] serve selected slug (reconcile-gated confirm; F to Force the teardown)",
@@ -822,10 +826,32 @@ class CatalogPane(Container):
         return False
 
 
+# ── Copy-to-clipboard support (Batch 4) ──────────────────────────────────────────
+
+
+class _CopyableModal:
+    """Mixin — a modal that holds paste-ready text exposes it to the global
+    ``[Y]`` copy action via ``copyable_text()``.  The subclass stashes the RAW
+    (markup-free) text in ``_copy_payload`` when its body is rendered.  This is
+    how the report / explain / evidence overlays become one-keystroke copyable
+    (their bodies are ``Static`` which CAN be drag-selected, but a context copy
+    that doesn't depend on a mouse selection is more reliable).
+
+    NOTE: a ``ModalScreen`` caps the binding chain at the modal (the whole point
+    of a modal), so the app-level ``[Y]`` never reaches an open modal — each
+    copyable modal binds ``Y`` → ``app.copy_context`` EXPLICITLY in its own
+    BINDINGS (Textual does not merge BINDINGS from a non-DOMNode mixin)."""
+
+    _copy_payload: str = ""
+
+    def copyable_text(self) -> str:
+        return self._copy_payload or ""
+
+
 # ── Explain detail modal ────────────────────────────────────────────────────────
 
 
-class ExplainScreen(ModalScreen):
+class ExplainScreen(_CopyableModal, ModalScreen):
     """Tier-3 detail overlay for one slug (switch.sh --explain --json)."""
 
     DEFAULT_CSS = """
@@ -853,6 +879,7 @@ class ExplainScreen(ModalScreen):
     BINDINGS = [
         Binding("escape", "dismiss", "Close"),
         Binding("e", "dismiss", "Close"),
+        Binding("Y", "app.copy_context", "Copy", show=True),
     ]
 
     def __init__(self, slug: str, *, model: str = "", engine: str = "", **kwargs):
@@ -962,6 +989,8 @@ class ExplainScreen(ModalScreen):
         lines.append("")
         lines.append("  [dim]Esc / e to close[/dim]")
         body.update("\n".join(lines))
+        # Stash a markup-free copy of the detail for the global [Y] copy action.
+        self._copy_payload = "\n".join(Text.from_markup(ln).plain for ln in lines[:-2])
 
     def action_dismiss(self) -> None:
         self.app.pop_screen()
@@ -2776,7 +2805,7 @@ class ValidateEvidencePane(Container):
 # ── Evidence report modal (reuses the history_view read pattern) ─────────────────
 
 
-class EvidenceReportScreen(ModalScreen):
+class EvidenceReportScreen(_CopyableModal, ModalScreen):
     """Paste-ready report overlay for one rebench tag (READ — reads results)."""
 
     DEFAULT_CSS = """
@@ -2802,6 +2831,7 @@ class EvidenceReportScreen(ModalScreen):
 
     BINDINGS = [
         Binding("escape", "dismiss", "Close"),
+        Binding("Y", "app.copy_context", "Copy", show=True),
     ]
 
     def __init__(self, tag: str, **kwargs):
@@ -2813,7 +2843,7 @@ class EvidenceReportScreen(ModalScreen):
             yield Label(f"Report · {self._tag}", classes="evidence-report-title")
             with ScrollableContainer(id="evidence-report-scroll"):
                 yield Static("Generating report (rebench-report.py — reads results)…", id="evidence-report-body")
-            yield Label("[dim]Esc to close[/dim]")
+            yield Label("[dim]Esc to close · Y to copy[/dim]")
 
     def on_mount(self) -> None:
         # Load the report once the modal is mounted (so set_report's query
@@ -2830,6 +2860,7 @@ class EvidenceReportScreen(ModalScreen):
         from rich.markup import escape
 
         body.update(escape(report.body))
+        self._copy_payload = report.body   # raw markdown (the [Y] copy target)
 
     def action_dismiss(self) -> None:
         self.app.pop_screen()
@@ -2962,7 +2993,7 @@ class MeasureVsBarScreen(ModalScreen):
 # ── Phase R / R2b · Share-back paste-ready report modal (design §3.2 / §9.4 R2) ───
 
 
-class ShareBackReportScreen(ModalScreen):
+class ShareBackReportScreen(_CopyableModal, ModalScreen):
     """Generic paste-ready report overlay for the consumer share-back affordances
     (rig report [R] / problem report [!]).  READ-only — it loads its body on
     mount via a worker (mirrors EvidenceReportScreen) and renders it verbatim for
@@ -2996,6 +3027,7 @@ class ShareBackReportScreen(ModalScreen):
 
     BINDINGS = [
         Binding("escape", "dismiss", "Close"),
+        Binding("Y", "app.copy_context", "Copy", show=True),
     ]
 
     def __init__(self, title: str, kind: str, **kwargs):
@@ -3008,7 +3040,7 @@ class ShareBackReportScreen(ModalScreen):
             yield Label(self._title, classes="share-report-title")
             with ScrollableContainer(id="share-report-scroll"):
                 yield Static("Generating report (local read — no network)…", id="share-report-body")
-            yield Label("[dim]Esc to close · copy the text above to share[/dim]")
+            yield Label("[dim]Esc to close · [cyan]Y[/cyan] to copy the report for sharing[/dim]")
 
     def on_mount(self) -> None:
         # Load once the modal is mounted (so set_report's query resolves) —
@@ -3023,6 +3055,7 @@ class ShareBackReportScreen(ModalScreen):
         from rich.markup import escape
 
         body.update(escape(report))
+        self._copy_payload = report   # raw, paste-ready (the [Y] copy target)
 
     def action_dismiss(self) -> None:
         self.app.pop_screen()
@@ -4117,6 +4150,7 @@ _PALETTE_COMMANDS: tuple[tuple[str, str, str], ...] = (
     ("mode_validate", "Bring & Validate mode", "Producer lane ① Bring → ⑤ Promote"),
     ("toggle_contribute", "Toggle lean view", "Hide / restore the Bring & Validate mode"),
     ("toggle_rail", "Toggle left rail", "Collapse / restore Modes + Estate rail"),
+    ("copy_context", "Copy current view", "Copy the highlighted slug / open report / selection to the clipboard ([Y])"),
     ("refresh", "Refresh", "Re-read the live data layer for the active mode"),
     ("help", "Help", "Show the keybindings + phase help overlay"),
     # Run & Operate · Catalog tab.
@@ -4258,6 +4292,13 @@ class CockpitApp(App):
         # #8 — collapse / restore the left rail (Modes + Estate) so the content
         # area uses the full terminal width.  Always-on (no mode/surface gate).
         Binding("full_stop", "toggle_rail", "Rail", show=False),
+        # Batch 4 — [Y] yank the contextually-relevant text to the system clipboard
+        # (DataTable cells can't be drag-selected — ALLOW_SELECT is False — so a
+        # context-aware copy is the reliable path).  shift+←/→ page-scroll a wide
+        # table horizontally (faster than the per-column ←/→ cursor).
+        Binding("Y", "copy_context", "Copy", show=False),
+        Binding("shift+left", "hscroll_left", "Scroll ◀", show=False),
+        Binding("shift+right", "hscroll_right", "Scroll ▶", show=False),
         # Context-sensitive — check_action enables/shows them only in the right mode.
         Binding("slash", "filter_catalog", "Filter", show=False),
         Binding("e", "explain", "Explain", show=False),
@@ -4421,6 +4462,11 @@ class CockpitApp(App):
         # NOT in _PRODUCER_ONLY (a lean-view user that can't toggle could never
         # restore the full view).
         "toggle_contribute",
+        # Batch 4 — [Y] copy the contextually-relevant text (highlighted row's
+        # slug / the open report's body / any active selection) to the system
+        # clipboard (OSC52).  Reachable everywhere; no-ops with a notify when
+        # there's nothing copyable.  shift+←/→ page-scroll the active wide table.
+        "copy_context", "hscroll_left", "hscroll_right",
     })
 
     # Context key → (modes, subtabs) where it should be enabled.
@@ -6060,6 +6106,107 @@ class CockpitApp(App):
             rail.add_class("rail-hidden")
         else:
             rail.remove_class("rail-hidden")
+
+    # ── Batch 4 · copy-to-clipboard + horizontal scroll ──────────────────────────
+
+    def action_copy_context(self) -> None:
+        """[Y] — yank the contextually-relevant text to the system clipboard.
+
+        DataTable cells can't be drag-selected (Textual ``ALLOW_SELECT`` is False
+        on tables), so a context-aware copy is the reliable path.  Priority:
+        (1) an active text selection (a Static body the user dragged), (2) the
+        open modal's paste-ready body (report / explain / evidence), (3) the
+        highlighted row's primary id (catalog slug / scene / container / run tag).
+        Uses ``copy_to_clipboard`` (OSC52) — works over SSH on an OSC52-capable
+        terminal; no-ops with a notify when there's nothing to copy."""
+        text, what = self._resolve_copy_text()
+        if not text:
+            self.notify(
+                "Nothing to copy here — highlight a row or open a report first.",
+                title="Copy", severity="warning", timeout=3,
+            )
+            return
+        self.copy_to_clipboard(text)
+        preview = " ".join(text.split())
+        if len(preview) > 56:
+            preview = preview[:55] + "…"
+        self.notify(
+            f"Copied {what} to clipboard: {preview}",
+            title="Copy", severity="information", timeout=3,
+        )
+
+    def _resolve_copy_text(self) -> tuple[str, str]:
+        """Return ``(text, label)`` for [Y] — '' text means nothing copyable."""
+        # 1. an explicit text selection (any selectable Static the user dragged).
+        try:
+            sel = self.screen.get_selected_text()
+        except Exception:
+            sel = None
+        if sel:
+            return sel, "selection"
+        # 2. a modal holding paste-ready text (ShareBack / Explain / Evidence).
+        getter = getattr(self.screen, "copyable_text", None)
+        if callable(getter):
+            try:
+                payload = getter() or ""
+            except Exception:
+                payload = ""
+            if payload:
+                return payload, "details"
+        # 3. the highlighted row's primary id on the active table.
+        return self._active_row_primary()
+
+    def _active_row_primary(self) -> tuple[str, str]:
+        """The most-pasteable id of the highlighted row on the active primary
+        table (clean — via each pane's typed accessor, not a markup-laden cell)."""
+        tab = self._current_subtab()
+        try:
+            if tab == "tab-catalog":
+                e = self.query_one("#catalog-pane", CatalogPane).selected_entry()
+                if e:
+                    return e.slug, "slug"
+            elif tab == "tab-orchestration":
+                sc = self.query_one("#operate-orch-pane", OperateOrchPane).selected_scene()
+                if sc:
+                    return sc.name, "scene"
+            elif tab == "tab-containers":
+                c = self.query_one(
+                    "#operate-containers-pane", OperateContainersPane
+                ).selected_container()
+                if c:
+                    return c.name, "container"
+            elif tab == "tab-evidence":
+                t = self.query_one(
+                    "#validate-evidence-pane", ValidateEvidencePane
+                ).selected_tag()
+                if t:
+                    return t.tag, "run tag"
+        except Exception:
+            pass
+        return "", ""
+
+    def action_hscroll_left(self) -> None:
+        self._hscroll(-1)
+
+    def action_hscroll_right(self) -> None:
+        self._hscroll(1)
+
+    def _hscroll(self, direction: int) -> None:
+        """shift+←/→ — page-scroll the active wide table horizontally (faster than
+        the per-column ←/→ cursor).  A no-op (silently) when nothing scrollable is
+        focused or under a modal."""
+        if len(self.screen_stack) > 1:
+            return
+        table = self._primary_list_for_active_tab()
+        if table is None:
+            return
+        try:
+            if direction < 0:
+                table.scroll_page_left(animate=False)
+            else:
+                table.scroll_page_right(animate=False)
+        except Exception:
+            pass
 
     def action_refresh(self) -> None:
         """Re-read the live data layer for the active mode.

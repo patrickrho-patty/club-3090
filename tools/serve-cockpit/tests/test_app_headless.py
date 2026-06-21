@@ -7232,6 +7232,99 @@ class TestN6CommandPalette:
             assert "Promote to catalog" not in joined
 
 
+class TestCopyAndHScroll:
+    """Batch 4 — [Y] copies the contextually-relevant text (slug / report / a
+    selection) to the system clipboard via OSC52; shift+←/→ page-scroll a wide
+    table.  copy_to_clipboard is spied (no real OSC52 emitted in tests)."""
+
+    @pytest.mark.asyncio
+    async def test_copy_yanks_highlighted_catalog_slug(self):
+        app, _, _ = make_app()
+        copied: dict = {}
+        async with app.run_test(size=(140, 40)) as pilot:
+            await _settle(pilot)
+            app.copy_to_clipboard = lambda t: copied.__setitem__("text", t)
+            app.query_one("#catalog-table", DataTable).move_cursor(row=0)
+            await pilot.pause()
+            await pilot.press("Y")
+            await _settle(pilot)
+            # the CLEAN slug (via the pane accessor) — no markup, no "● " marker.
+            assert copied.get("text") == "vllm/dual", copied
+            assert "[" not in copied["text"]
+
+    @pytest.mark.asyncio
+    async def test_copy_yanks_open_report_body(self):
+        """[Y] works INSIDE a modal (the modal binds it explicitly — the app-level
+        Y can't reach a modal) and copies the raw, markup-free report."""
+        app, _, _ = make_app()
+        copied: dict = {}
+        async with app.run_test(size=(140, 40)) as pilot:
+            await _settle(pilot)
+            app.copy_to_clipboard = lambda t: copied.__setitem__("text", t)
+            sc = ShareBackReportScreen("Rig report", "rig")
+            await app.push_screen(sc)
+            await pilot.pause()
+            sc.set_report("RIG SNAPSHOT\nGPU0: 24G\n[brackets] kept literal", None)
+            await pilot.pause()
+            await pilot.press("Y")
+            await _settle(pilot)
+            assert copied.get("text", "").startswith("RIG SNAPSHOT")
+            assert "[brackets] kept literal" in copied["text"]   # raw, not markup-stripped
+
+    @pytest.mark.asyncio
+    async def test_copy_nothing_copyable_notifies_no_clipboard(self):
+        app, _, _ = make_app()
+        copied: dict = {}
+        notes: list = []
+        async with app.run_test(size=(140, 40)) as pilot:
+            await _enter_operate(pilot)
+            # Doctor tab has no primary table + no modal → nothing to copy.
+            app.query_one("#operate-tabs", TabbedContent).active = "tab-doctor"
+            await pilot.pause()
+            app.copy_to_clipboard = lambda t: copied.__setitem__("text", t)
+            orig = app.notify
+            app.notify = lambda *a, **k: (notes.append(a[0] if a else k.get("message", "")), orig(*a, **k))[1]
+            await pilot.press("Y")
+            await _settle(pilot)
+            assert "text" not in copied                      # nothing copied
+            assert any("nothing to copy" in n.lower() for n in notes)
+
+    @pytest.mark.asyncio
+    async def test_copy_context_reachable_everywhere(self):
+        app, _, _ = make_app()
+        async with app.run_test(size=(140, 40)) as pilot:
+            await _settle(pilot)
+            assert app.check_action("copy_context", ()) is True
+
+    @pytest.mark.asyncio
+    async def test_shift_arrows_page_scroll_wide_table(self):
+        app, _, _ = make_app()
+        async with app.run_test(size=(60, 30)) as pilot:   # narrow → catalog overflows
+            await _settle(pilot)
+            t = app.query_one("#catalog-table", DataTable)
+            assert t.max_scroll_x > 0, "expected the catalog to overflow at width 60"
+            x0 = t.scroll_x
+            await pilot.press("shift+right")
+            await _settle(pilot)
+            assert t.scroll_x > x0                            # advanced right
+            mid = t.scroll_x
+            await pilot.press("shift+left")
+            await _settle(pilot)
+            assert t.scroll_x < mid                            # came back left
+
+    @pytest.mark.asyncio
+    async def test_hscroll_is_noop_under_modal(self):
+        app, _, _ = make_app()
+        async with app.run_test(size=(60, 30)) as pilot:
+            await _settle(pilot)
+            await app.push_screen(ShareBackReportScreen("Rig report", "rig"))
+            await pilot.pause()
+            # _hscroll bails under a modal — must not raise / scroll a hidden table.
+            app.action_hscroll_right()
+            await pilot.pause()
+            assert isinstance(app.screen, ShareBackReportScreen)
+
+
 class TestA11ConfirmModalDiscoverableBindings:
     """A11 — Enter/Force are discoverable BINDINGS (show=True) in the modal
     footer; Force visibility follows plan safety; behaviour is UNCHANGED."""
