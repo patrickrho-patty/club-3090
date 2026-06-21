@@ -53,6 +53,27 @@ def parse_ctx_label(label: Any) -> Optional[int]:
     return int(round(val * mult))
 
 
+def variant_topology(row: Any) -> str:
+    """The topology TOKEN (``single`` / ``dual`` / ``multiN``) from a variant's
+    compose path — the path encodes it as ``…/compose/<topology>/<quant>/<file>``.
+
+    Pure path parse (no I/O) so :class:`CatalogEntry` can surface the topology
+    column without dragging the app-layer ``_variant_topology`` helper into the
+    data module.  Returns ``""`` when the path carries no recognizable token."""
+    path = (
+        f"{getattr(row, 'compose_path', '') or ''} "
+        f"{getattr(row, 'compose_dir', '') or ''}"
+    ).replace("\\", "/")
+    m = re.search(r"/(multi\d+)/", path)
+    if m:
+        return m.group(1)
+    if "/dual/" in path:
+        return "dual"
+    if "/single/" in path:
+        return "single"
+    return ""
+
+
 def topology_cards(row: Any) -> int:
     """A6: how many cards the row's compose places on (1 / 2 / N).
 
@@ -244,6 +265,14 @@ class CatalogEntry:
     @property
     def port(self) -> int:
         return self.row.port
+
+    @property
+    def topology(self) -> str:
+        """The hardware-topology token (``single`` / ``dual`` / ``multiN``) for the
+        Catalog 'Topology' column, derived from the variant's compose path (the
+        path encodes it as ``…/compose/<topology>/<quant>/<file>``).  Falls back to
+        ``·`` when the path carries no recognizable token (the tab-form fallback)."""
+        return variant_topology(self.row) or "·"
 
     @property
     def source(self) -> str:

@@ -8,7 +8,7 @@ Verifies:
      bindings 1/2/3; nav nodes exist.  (R1 folded Discover + Serve + Benchmarks
      into a single Run mode; R2a renamed Estate → Operate and moved Doctor into it.)
   3. Run · Catalog populates from real enriched entries (fit glyph, TPS,
-     8pk, source) and filters live.
+     8pk, topology) and filters live (multi-word AND).
   4. BYO renders the swap_path route from byo_check.
   5. ⏎ on a Run · Catalog row opens the reconcile-gated confirm modal directly.
   6. Operate · Orchestration + Containers + Doctor populate from estate_state /
@@ -892,11 +892,16 @@ class TestNavNodesExist:
             table = app.query_one("#catalog-table", DataTable)
             col_labels = [str(c.label) for c in table.columns.values()]
             # Fold 3: TPS / 8pk columns are explicitly labelled as our-rig.
+            # Round-4: "source" column dropped; "topology" added BEFORE "engine".
             for expected in (
-                "slug", "engine", "fit", "ctx",
-                "TPS (our rig)", "8pk (our rig)", "status", "source",
+                "slug", "topology", "engine", "fit", "ctx",
+                "TPS (our rig)", "8pk (our rig)", "status",
             ):
                 assert expected in col_labels, f"missing {expected!r}: {col_labels}"
+            # "source" is gone.
+            assert "source" not in col_labels, col_labels
+            # topology sits immediately before engine.
+            assert col_labels.index("topology") < col_labels.index("engine"), col_labels
 
     @pytest.mark.asyncio
     async def test_mode_switcher_exists(self):
@@ -966,6 +971,79 @@ class TestCatalogWired:
             assert pane.selected_entry() is None or pane.selected_entry().slug == "ik-llama/iq4ks-mtp"
             pane.set_filter("")
             assert app.query_one("#catalog-table", DataTable).row_count == 2
+
+    @pytest.mark.asyncio
+    async def test_catalog_topology_column_cell(self):
+        """Round-4 CHANGE 1: the catalog rows carry a topology cell derived from
+        the compose path — vllm/dual → "dual", ik-llama single → "single"."""
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            pane = app.query_one("#catalog-pane", CatalogPane)
+            dual = next(e for e in pane._entries if e.slug == "vllm/dual")
+            single = next(e for e in pane._entries if e.slug == "ik-llama/iq4ks-mtp")
+            assert dual.topology == "dual"
+            assert single.topology == "single"
+
+    @pytest.mark.asyncio
+    async def test_catalog_multiword_filter_is_and(self):
+        """Round-4 CHANGE 2: a multi-word filter ("gemma dual") is AND-of-substrings
+        across the searchable text (slug + topology + engine + model + status +
+        source).  It matches a gemma dual row but NOT a gemma single row — the old
+        contiguous-substring test matched neither."""
+        from club3090_cockpit.data import CatalogEntry as _CE
+        from club3090_tui_core import VariantRow as _VR
+
+        def _entry(slug: str, model: str, compose_path: str) -> _CE:
+            return _CE(
+                row=_VR(
+                    slug=slug,
+                    switch_engine="vllm",
+                    launch_engine="vllm",
+                    compose_dir=compose_path.rsplit("/", 1)[0],
+                    file=compose_path.rsplit("/", 1)[-1],
+                    port=8000,
+                    model=model,
+                    engine="vllm-stable",
+                    kvcalc_key=f"{model}:dual",
+                    container="c",
+                    compose_path=compose_path,
+                    status="production",
+                    ctx_label="262K",
+                    status_note="",
+                )
+            )
+
+        gemma_dual = _entry(
+            "vllm/gemma-dual", "gemma-4-31b",
+            "models/gemma-4-31b/vllm/compose/dual/autoround-int4/bf16-mtp.yml",
+        )
+        gemma_single = _entry(
+            "vllm/gemma-single", "gemma-4-31b",
+            "models/gemma-4-31b/vllm/compose/single/autoround-int4/base.yml",
+        )
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            pane = app.query_one("#catalog-pane", CatalogPane)
+            pane.populate([gemma_dual, gemma_single], None)
+            # multi-word AND: "gemma dual" → only the gemma DUAL row.
+            pane.set_filter("gemma dual")
+            assert [e.slug for e in pane._filtered_entries()] == ["vllm/gemma-dual"]
+            # single word still works (both gemma rows).
+            pane.set_filter("gemma")
+            assert {e.slug for e in pane._filtered_entries()} == {
+                "vllm/gemma-dual", "vllm/gemma-single",
+            }
+            # term order is irrelevant for AND.
+            pane.set_filter("dual gemma")
+            assert [e.slug for e in pane._filtered_entries()] == ["vllm/gemma-dual"]
+            # a term that matches nothing → no rows.
+            pane.set_filter("gemma qwen")
+            assert pane._filtered_entries() == []
+            # empty query → all rows.
+            pane.set_filter("")
+            assert len(pane._filtered_entries()) == 2
 
     @pytest.mark.asyncio
     async def test_catalog_error_surfaces(self):
@@ -4269,8 +4347,10 @@ class TestModeSwitcherKeyboardNav:
 
     @pytest.mark.asyncio
     async def test_arrows_switch_mode_and_keep_focus(self):
-        """↓/↑ (and →/←) on the focused ModeSwitcher switch the ACTIVE mode (and
-        the visible panel + _active_mode), and focus STAYS on the ModeSwitcher."""
+        """Round-4 CHANGE 4: ↑/↓ on the focused ModeSwitcher SELECT the active mode
+        (prev / next visible mode + the visible panel + _active_mode); focus STAYS
+        on the ModeSwitcher.  ←/→ are NO LONGER mode-switchers (→ descends, ←
+        inert — see the dedicated tests below)."""
         app, _, _ = make_app(surface="producer")
         async with app.run_test(size=(120, 40)) as pilot:
             await _settle(pilot)
@@ -4292,15 +4372,47 @@ class TestModeSwitcherKeyboardNav:
             assert app._active_mode == 0
             assert "active" in app.query_one("#panel-run").classes
             assert app.focused is ms
-            # → also advances; ← also retreats (forgiving).
-            await pilot.press("right")
+
+    @pytest.mark.asyncio
+    async def test_left_arrow_is_inert(self):
+        """Round-4 CHANGE 4: ← on the focused ModeSwitcher does NOTHING — it no
+        longer retreats the mode.  Mode + focus are unchanged."""
+        app, _, _ = make_app(surface="producer")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            ms = app.query_one("#mode-switcher", ModeSwitcher)
+            ms.focus()
+            await pilot.pause()
+            # Move to mode 1 with ↓ so a (former) ←-retreat would be observable.
+            await pilot.press("down")
             await pilot.pause()
             await pilot.pause()
             assert app._active_mode == 1
+            # ← is inert — mode stays 1, focus stays on the ModeSwitcher.
             await pilot.press("left")
             await pilot.pause()
             await pilot.pause()
+            assert app._active_mode == 1
+            assert app.focused is ms
+
+    @pytest.mark.asyncio
+    async def test_right_arrow_descends_to_content(self):
+        """Round-4 CHANGE 4: → on the focused ModeSwitcher DESCENDS into the
+        selected mode's content (Enter alias) — Catalog → #catalog-table."""
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            ms = app.query_one("#mode-switcher", ModeSwitcher)
+            ms.focus()
+            await pilot.pause()
             assert app._active_mode == 0
+            await pilot.press("right")
+            await pilot.pause()
+            await pilot.pause()
+            # Descended into mode 0's primary list (mode did NOT advance).
+            assert app._active_mode == 0
+            assert isinstance(app.focused, DataTable)
+            assert app.focused.id == "catalog-table"
 
     @pytest.mark.asyncio
     async def test_arrows_clamp_at_ends(self):
@@ -4325,9 +4437,10 @@ class TestModeSwitcherKeyboardNav:
             assert app._active_mode == 1
 
     @pytest.mark.asyncio
-    async def test_up_from_tabbar_focuses_modeswitcher(self):
-        """BUG 2 — ↑ from the content tab bar ascends to the ModeSwitcher (the
-        'arrow up to the Modes')."""
+    async def test_up_from_tabbar_is_inert(self):
+        """Round-4 CHANGE 3: ↑ on the TAB BAR does NOTHING — it must NOT jump to the
+        ModeSwitcher (the round-3 tab-bar→Modes ascent is removed).  Focus stays on
+        the tab bar; the ModeSwitcher stays reachable via Shift+Tab."""
         app, _, _ = make_app()
         async with app.run_test(size=(120, 40)) as pilot:
             await _settle(pilot)
@@ -4337,6 +4450,12 @@ class TestModeSwitcherKeyboardNav:
             await pilot.pause()
             assert isinstance(app.focused, Tabs)
             await pilot.press("up")
+            await pilot.pause()
+            # Inert: focus is STILL the tab bar, NOT the ModeSwitcher.
+            assert app.focused is bar
+            assert app.focused is not ms
+            # Shift+Tab still reaches the ModeSwitcher (focus chain unchanged).
+            await pilot.press("shift+tab")
             await pilot.pause()
             assert app.focused is ms
 
@@ -5847,12 +5966,14 @@ class TestA6CatalogLiveFreeVram:
             assert pane._serving_slug == "vllm/dual"   # it IS the serving row
             assert pane._free_gb_by_index is not None   # live free-VRAM is low
             tbl = app.query_one("#catalog-table", DataTable)
-            # Find the serving row + read its fit cell (column index 2).
+            # Find the serving row + read its fit cell.  Columns are now
+            # [slug, topology, engine, fit, …] (round-4: topology added before
+            # engine), so the fit cell is index 3.
             serving_fit = None
             for r in range(tbl.row_count):
                 row = [str(c) for c in tbl.get_row_at(r)]
                 if "serving" in row[0]:
-                    serving_fit = row[2]
+                    serving_fit = row[3]
                     break
             assert serving_fit is not None
             # NOT downgraded — no ✗/⚠ and no "won't fit"/"tight" reason on its own row.

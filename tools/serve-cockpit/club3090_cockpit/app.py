@@ -558,7 +558,7 @@ class CatalogPane(Container):
 
     def compose(self) -> ComposeResult:
         yield Label("Loading catalog…", id="catalog-status")
-        yield Input(placeholder="filter slug / engine / model / status…", id="catalog-filter")
+        yield Input(placeholder="filter slug / topology / engine / model / status… (space = AND)", id="catalog-filter")
         table: DataTable = DataTable(id="catalog-table", zebra_stripes=True)
         table.cursor_type = "row"
         yield table
@@ -582,7 +582,7 @@ class CatalogPane(Container):
         # Fold 3: the TPS / 8-pack columns are OUR-RIG measurements (cross-rig
         # rows live in the explain drill-down) — label them so cross-rig ambiguity
         # is gone now that the standalone Benchmarks tab is retired.
-        table.add_columns("slug", "engine", "fit", "ctx", "TPS (our rig)", "8pk (our rig)", "status", "source")
+        table.add_columns("slug", "topology", "engine", "fit", "ctx", "TPS (our rig)", "8pk (our rig)", "status")
         # Full enriched catalog, and the current filter substring.
         self._entries: list[CatalogEntry] = []
         self._filter: str = ""
@@ -655,13 +655,13 @@ class CatalogPane(Container):
                 fit_cell = f"{fit_glyph} [{color}]{fit_note}[/{color}]"
             table.add_row(
                 slug_cell,
+                e.topology,
                 e.engine,
                 fit_cell,
                 e.ctx_label or "—",
                 tps,
                 e.measurement.quality_label,
                 _status_glyph(e.status),
-                e.source,
             )
 
         # A6: state the fit basis so "● fits-clean" is never silently read as a
@@ -737,11 +737,20 @@ class CatalogPane(Container):
     def _filtered_entries(self) -> list[CatalogEntry]:
         if not self._filter:
             return self._entries
-        f = self._filter.lower()
+        # Multi-word filter is AND-of-substrings: split the query on whitespace and
+        # keep a row only when EVERY term is a (case-insensitive) substring of the
+        # row's searchable text.  A single word reduces to the old contiguous
+        # substring test; "gemma dual" now matches a gemma dual row (it did not
+        # before, when the whole query was tested as one contiguous substring).
+        terms = self._filter.lower().split()
+        if not terms:
+            return self._entries
         out: list[CatalogEntry] = []
         for e in self._entries:
-            hay = f"{e.slug} {e.engine} {e.model} {e.status} {e.source}".lower()
-            if f in hay:
+            hay = (
+                f"{e.slug} {e.topology} {e.engine} {e.model} {e.status} {e.source}"
+            ).lower()
+            if all(t in hay for t in terms):
                 out.append(e)
         return out
 
@@ -3558,14 +3567,15 @@ class ModeSwitcher(Static):
 
     Focus model (vertical: Modes (rail) ↕ tab bar ↕ list):
       • Focusable with a VISIBLE focus style (the :focus accent border below).
-      • ``↑``/``↓`` (and ``←``/``→``, forgiving) switch the ACTIVE mode, clamped
-        to the modes VISIBLE on the current surface (the lean view has one mode,
-        so arrows are inert there).  Focus STAYS on the ModeSwitcher so the user
-        can keep arrowing.  Switching reuses the app's real mode-switch path so
-        content + highlight + bindings update exactly as 1/2 do.
-      • ``Tab``/``Enter`` DESCEND into the content (handled app-side — Tab via the
-        natural focus chain to the tab bar, Enter routed to descend).  ``↓`` is
-        NOT overloaded to exit downward — it switches mode.
+      • ``↑``/``↓`` SELECT the active mode (prev / next visible mode), clamped to
+        the modes VISIBLE on the current surface (the lean view has one mode, so
+        ↑/↓ are inert there).  Focus STAYS on the ModeSwitcher so the user can keep
+        arrowing.  Switching reuses the app's real mode-switch path so content +
+        highlight + bindings update exactly as 1/2 do.
+      • ``→`` (and ``Enter`` / ``Tab``) DESCEND into the selected mode's content —
+        "go operate the mode you picked".  ``→``/``Enter`` route to descend; ``Tab``
+        descends via the natural focus chain to the tab bar.
+      • ``←`` is INERT (round-4 — left/right are no longer mode-switchers).
     The arrows act ONLY while the ModeSwitcher is focused (key events reach the
     focused widget first), so they never leak to the app from a list/tab bar."""
 
@@ -3687,16 +3697,21 @@ class ModeSwitcher(Static):
     # unchanged.
     def on_key(self, event) -> None:
         key = event.key
-        # ↑/↓ + ←/→ (forgiving) switch the ACTIVE mode, clamped to the modes
-        # VISIBLE on this surface.  Focus STAYS here so the user can keep arrowing.
-        if key in ("up", "left", "down", "right"):
+        # Maintainer round-4 — the Modes arrow map is now AXIS-SPLIT:
+        #   ↑/↓  → SELECT the active mode (prev / next visible mode), clamped.
+        #          Focus STAYS here so the user can keep arrowing.
+        #   →    → DESCEND into the selected mode's content (Enter alias).
+        #   ←    → INERT (consumed so it doesn't leak, but does nothing).
+        # The old behaviour switched the mode on ←/→ too — removed: in Modes you
+        # pick with ↑/↓ and step INTO the flow with → (or Enter / Tab).
+        if key in ("up", "down"):
             visible = len(self._modes)
             # LEAN surface (one visible mode) → arrows are inert (nothing to switch).
             if visible <= 1:
                 event.stop()
                 event.prevent_default()
                 return
-            delta = -1 if key in ("up", "left") else 1
+            delta = -1 if key == "up" else 1
             target = self._active + delta
             if target < 0 or target >= visible:
                 # Clamp: already at the first/last visible mode → no-op.
@@ -3713,10 +3728,15 @@ class ModeSwitcher(Static):
             if switch is not None:
                 switch(target)
             return
-        # Enter DESCENDS into the content (Tab descends via the natural focus
-        # chain — the tab bar is the next focusable).  ↓ is NOT overloaded to exit
-        # downward (it switches mode above).
-        if key == "enter":
+        # ← is INERT — consumed (so it never leaks to the app) but does nothing.
+        if key == "left":
+            event.stop()
+            event.prevent_default()
+            return
+        # → (right) and Enter both DESCEND into the selected mode's content (Tab
+        # also descends via the natural focus chain — the tab bar is the next
+        # focusable).  ↓ is NOT overloaded to exit downward (it switches mode above).
+        if key in ("right", "enter"):
             event.stop()
             event.prevent_default()
             app = self.app
@@ -4227,17 +4247,18 @@ class CockpitApp(App):
                 if bar is None or focused is not bar:
                     return False
                 return self._primary_list_for_active_tab() is not None
-            # ascend_to_tabbar: [up] ascends in TWO cases (priority binding):
-            #   (a) focus is the active tab's PRIMARY DataTable at cursor row 0 →
-            #       ascend to the tab bar (above row 0 / off a primary list → the
-            #       binding is inert and the DataTable handles [up] = cursor up).
-            #   (b) BUG 2 — focus is the active mode's TAB BAR → ascend UP to the
-            #       ModeSwitcher (the tab bar is a horizontal Tabs that doesn't
-            #       consume [up], so the key bubbles here).  This is the "arrow up
-            #       to the Modes" ascent; action_ascend_to_tabbar routes by focus.
+            # ascend_to_tabbar: [up] ascends in EXACTLY ONE case (priority binding):
+            #   focus is the active tab's PRIMARY DataTable at cursor row 0 →
+            #   ascend to the tab bar (above row 0 / off a primary list → the
+            #   binding is inert and the DataTable handles [up] = cursor up).
+            #
+            # Maintainer round-4: [up] on the TAB BAR is now INERT — it must NOT
+            # jump to the ModeSwitcher (that round-3 behaviour is removed).  Return
+            # False when focus is the tab bar so the key is not consumed / no-ops;
+            # the ModeSwitcher stays reachable via Shift+Tab (focus chain).
             bar = self._active_tab_bar()
             if bar is not None and focused is bar:
-                return True
+                return False
             table = self._primary_list_for_active_tab()
             if table is None or focused is not table:
                 return False
@@ -5782,19 +5803,15 @@ class CockpitApp(App):
                 pass
 
     def action_ascend_to_tabbar(self) -> None:
-        """[up] ascent — routed by where focus currently is:
-          • focus on the active mode's TAB BAR → ascend UP to the ModeSwitcher
-            (BUG 2 — "arrow up to the Modes").
-          • focus on a primary list (at row 0) → ascend to the tab bar.
-        check_action only lets this priority binding fire in those two cases."""
+        """[up] ascent — focus on a primary list (at cursor row 0) ascends to the
+        active mode's tab bar.
+
+        Maintainer round-4: [up] on the TAB BAR no longer jumps to the
+        ModeSwitcher (that round-3 branch is removed — check_action returns False
+        for that case so this action never fires while focus is the tab bar).  The
+        ModeSwitcher stays reachable via Shift+Tab.  This action therefore only
+        handles the list-row0 → tab bar ascent."""
         bar = self._active_tab_bar()
-        if bar is not None and self.focused is bar:
-            # BUG 2 — already on the tab bar → go up to the Modes rail.
-            try:
-                self.query_one("#mode-switcher", ModeSwitcher).focus()
-            except Exception:
-                pass
-            return
         if bar is not None:
             try:
                 bar.focus()
