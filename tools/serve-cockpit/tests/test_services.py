@@ -1096,6 +1096,38 @@ class TestSupportingServiceEnrichment:
         by = {c.name: c for c in await cd._merge_known_services([])}
         assert by["openwebui"].host_port == 3000
 
+    @pytest.mark.asyncio
+    async def test_published_port_range_uses_first_host_port(self, tmp_path):
+        # qdrant publishes a RANGE (6333-6334->6333-6334) — the host port is 6333.
+        _seed_service_dirs(tmp_path, ["qdrant"])
+        cd = CockpitData(tmp_path, runner=full_runner(
+            **{"docker ps": ok("qdrant|0.0.0.0:6333-6334->6333-6334/tcp\n")}))
+        by = {c.name: c for c in await cd._merge_known_services([])}
+        assert by["qdrant"].host_port == 6333
+
+
+class TestGpuServiceDisplay:
+    """GPU rig services / studio stacks (comfyui, studio-*) get engine='studio' +
+    their real port (a non-engine port like :8188 that PORT_MAP_BROAD_RE misses)."""
+
+    @pytest.mark.asyncio
+    async def test_comfyui_engine_studio_and_port(self):
+        cd = CockpitData(ROOT, runner=full_runner(
+            **{"docker ps": ok("comfyui|0.0.0.0:8188->8188/tcp\n")}))
+        comfy = next(c for c in await cd.containers() if c.name == "comfyui")
+        assert comfy.kind == "service"
+        assert comfy.engine == "studio"
+        assert comfy.host_port == 8188
+
+    @pytest.mark.asyncio
+    async def test_studio_stack_engine_studio(self):
+        cd = CockpitData(ROOT, runner=full_runner(
+            **{"docker ps": ok("studio-tts|0.0.0.0:8192->8192/tcp\n")}))
+        tts = next(c for c in await cd.containers() if c.name == "studio-tts")
+        assert tts.kind == "stack"
+        assert tts.engine == "studio"
+        assert tts.host_port == 8192
+
 
 class TestServiceStart:
     """service_start: bring a stopped supporting service up via compose, mirroring

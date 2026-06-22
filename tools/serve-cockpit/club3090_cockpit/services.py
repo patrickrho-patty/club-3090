@@ -939,6 +939,11 @@ class CockpitData:
             engine = ""
             if kind == "engine":
                 engine = _classify_engine_from_container(name)
+            elif kind in ("service", "stack"):
+                # GPU rig services + AI-studio stacks (comfyui / step-audio /
+                # studio-*) aren't LLM engines; label them "studio" so the column
+                # isn't a bare "—" (parallels "web" for the supporting services).
+                engine = "studio"
             matched_port = False
             for match in PORT_MAP_BROAD_RE.finditer(ports_str):
                 host_port = int(match.group(1))
@@ -953,12 +958,18 @@ class CockpitData:
                 out.append((name, host_port, internal_port, eng, kind))
                 matched_port = True
             if not matched_port:
-                # A GPU-holding container with no published port (common for
-                # estate / service containers) is still a conflict.
-                key = (name, 0)
+                # PORT_MAP_BROAD_RE only knows the ENGINE internal ports
+                # (8000/8080/30000), so a service on another port (comfyui :8188,
+                # studio-* :819x) matches nothing above.  Fall back to the GENERAL
+                # host-port matcher so it still surfaces with its real port; a
+                # genuinely port-less GPU container (estate) keeps host_port 0 but
+                # is still recorded (it's a conflict the gate must see).
+                m = _HOST_PORT_RE.search(ports_str)
+                host_port = int(m.group(1)) if m else 0
+                key = (name, host_port)
                 if key not in seen:
                     seen.add(key)
-                    out.append((name, 0, 0, engine, kind))
+                    out.append((name, host_port, 0, engine, kind))
         return out
 
     # ── READ: container logs ──────────────────────────────────────────────────────
@@ -3082,10 +3093,12 @@ class _NullParser:
         return None
 
 
-# First published HOST port in a docker-ps ``Ports`` field (``0.0.0.0:4000->4000/
-# tcp`` → 4000).  GENERAL match (any internal port), unlike the engine-only
-# ``PORT_MAP_BROAD_RE`` — used to label a supporting service with the port it serves.
-_HOST_PORT_RE = re.compile(r":(\d+)->")
+# First published HOST port in a docker-ps ``Ports`` field.  GENERAL match (any
+# internal port), unlike the engine-only ``PORT_MAP_BROAD_RE`` — used to label a
+# service with the port it serves.  Handles a single mapping (``0.0.0.0:4000->4000
+# /tcp`` → 4000) AND a published RANGE (``0.0.0.0:6333-6334->6333-6334/tcp`` → 6333,
+# the first host port — qdrant publishes a range).
+_HOST_PORT_RE = re.compile(r":(\d+)(?:-\d+)?->")
 
 # Rig services that hold a GPU but share no naming prefix with the engines /
 # estate containers — matched by name so the reconcile gate sees them.
