@@ -490,10 +490,19 @@ class CockpitData:
         env_dir = (os.environ.get("MODEL_DIR") or "").strip()
         return getattr(self, "_model_dir", None) or env_dir or MODEL_DIR
 
+    # Backup / cruft a user leaves in the model dir when swapping weights (rename
+    # the old GGUF to *.bak, etc.).  EXCLUDED from the byte count — otherwise a
+    # leftover ~= full-size .bak pins download progress at a false ~99%.  NOTE:
+    # hf's in-progress ``*.incomplete`` staging files are deliberately NOT excluded
+    # (they ARE the live download — counting them is what makes the % move).
+    _BACKUP_SUFFIXES = (".bak", ".old", ".orig", ".disabled", ".save")
+
     def weights_bytes_on_disk(self, meta: WeightsMeta, *, model_dir: Optional[str] = None) -> int:
         """Total bytes currently under ``<model_dir>/huggingface/<subdir>`` — the
-        robust download-progress signal (vs parsing hf's tqdm bars).  0 when the
-        dir is absent."""
+        download-progress signal.  0 when the dir is absent.  Backup/cruft files
+        (``*.bak`` / ``*.old`` / ``*.orig`` / ``foo~`` …) are skipped so a leftover
+        old-quant copy can't inflate the count; hf's ``*.incomplete`` staging IS
+        counted so live progress tracks the transfer."""
         base = Path(model_dir or self.weights_model_dir()) / "huggingface" / meta.subdir
         if not base.is_dir():
             return 0
@@ -501,8 +510,12 @@ class CockpitData:
         try:
             for f in base.rglob("*"):
                 try:
-                    if f.is_file():
-                        total += f.stat().st_size
+                    if not f.is_file():
+                        continue
+                    name = f.name.lower()
+                    if name.endswith(self._BACKUP_SUFFIXES) or name.endswith("~"):
+                        continue
+                    total += f.stat().st_size
                 except OSError:
                     continue
         except OSError:

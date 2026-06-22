@@ -699,6 +699,35 @@ class TestLoadCatalog:
         }))
         assert [m.variant for m in cd.download_set_metas(e2, index)] == ["core"]
 
+    def test_weights_bytes_on_disk_ignores_backup_cruft(self, tmp_path):
+        """Swapping weights by renaming the old GGUF to *.bak must NOT pin progress
+        at a false ~99%: backup cruft is excluded from the byte count, while hf's
+        in-progress *.incomplete staging IS counted so live progress moves."""
+        from club3090_cockpit.data import WeightsMeta
+        cd = CockpitData(ROOT, runner=full_runner())
+        meta = WeightsMeta(model="m", variant="v", subdir="v", size_gb=10.0,
+                           verify_glob="*.gguf")
+        base = tmp_path / "huggingface" / "v"
+        base.mkdir(parents=True)
+        # Only a leftover full-size backup → ignored → 0 bytes → 0% (the bug was 99).
+        with open(base / "model.gguf.bak", "wb") as fh:
+            fh.truncate(8 * 10**9)
+        with open(base / "model.gguf.old", "wb") as fh:
+            fh.truncate(8 * 10**9)
+        with open(base / "notes.txt~", "wb") as fh:
+            fh.truncate(1 * 10**9)
+        assert cd.weights_bytes_on_disk(meta, model_dir=str(tmp_path)) == 0
+        assert cd.weights_download_progress(meta, model_dir=str(tmp_path)) == 0
+        # hf's in-progress staging IS counted → live progress tracks it (3/10 = 30%).
+        with open(base / "model.gguf.incomplete", "wb") as fh:
+            fh.truncate(3 * 10**9)
+        assert cd.weights_bytes_on_disk(meta, model_dir=str(tmp_path)) == 3 * 10**9
+        assert cd.weights_download_progress(meta, model_dir=str(tmp_path)) == 30
+        # the real completed weight counts too (the .bak/.old/~ stay excluded).
+        with open(base / "model.gguf", "wb") as fh:
+            fh.truncate(7 * 10**9)
+        assert cd.weights_bytes_on_disk(meta, model_dir=str(tmp_path)) == 10 * 10**9
+
 
 class TestExplainFit:
     @pytest.mark.asyncio
