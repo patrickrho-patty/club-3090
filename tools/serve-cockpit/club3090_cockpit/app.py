@@ -5168,6 +5168,12 @@ class CockpitApp(App):
         # a periodic poll NEVER auto-loads a docker drill for an unselected
         # container.  Set True by load_estate on a clamped re-render; consumed once.
         self._containers_suppress_clamp_echo: bool = False
+        # Studio guard — is the locally-built comfyui-local image present?  Cached
+        # off each estate poll (load_estate).  Defaults True so an action before the
+        # first poll never false-blocks; the first poll sets the real value.  When
+        # False, starting comfyui / switching to a studio scene guides the user to
+        # setup-image-studio.sh instead of a doomed start.
+        self._comfyui_ready: bool = True
         # Phase 5: the last BYO fit-check result (Run · BYO) — the arch facts
         # the Promote-to-catalog scaffold computes from.
         self._last_byo: Optional[ByoResult] = None
@@ -5751,6 +5757,13 @@ class CockpitApp(App):
         # rail's freshness from CACHED state (a pure read, no subprocess).  Also
         # feeds the generated-serve container-appearance baseline (MUST-FIX 1).
         self._last_estate_state = state
+        # Studio guard — refresh the comfyui-local image-present flag each poll
+        # (cheap `docker images -q`), so the user can run setup-image-studio.sh
+        # while the cockpit is open and have the guard clear within a tick.
+        try:
+            self._comfyui_ready = await self._data.comfyui_image_present()
+        except Exception:
+            pass
         # #6/A12 — the first estate poll that learns the real GPU count re-defaults
         # the profile-template dropdown to the rig topology (1 card → single, ≥2 →
         # dual).  reapply_default=True forces the re-default exactly once; a later
@@ -7102,8 +7115,29 @@ class CockpitApp(App):
             scene = None
         if scene is None:
             return
+        # Studio guard — the studio scenes need the comfyui-local image; if it's
+        # absent (setup-image-studio.sh not run), guide instead of a doomed switch.
+        if scene.name in self._STUDIO_SCENES and not self._comfyui_ready:
+            self._studio_not_ready_notice()
+            return
         plan = self._data.stop_all() if scene.name == "off" else self._data.scene_switch(scene.name)
         self.push_screen(ConfirmActionScreen(plan))
+
+    # Scenes (+ the comfyui service) that require the locally-built comfyui-local
+    # image.  Starting any of them before `setup-image-studio.sh` has built it just
+    # fails, so the cockpit intercepts and points the user at the setup script.
+    _STUDIO_SCENES: frozenset = frozenset({"comfyui", "image-studio", "video-studio"})
+
+    def _studio_not_ready_notice(self) -> None:
+        """Tell the user the studio bundle isn't set up + how to set it up."""
+        self.notify(
+            "Image/Video Studio isn't set up yet — the comfyui-local image is "
+            "missing.\nRun in a terminal:  bash scripts/setup-image-studio.sh\n"
+            "(builds ComfyUI + downloads the model set, then starts the bundle.)",
+            title="Studio setup needed",
+            severity="warning",
+            timeout=12,
+        )
 
     def action_help(self) -> None:
         # Thread the surface so the consumer help OMITS the producer lane (R3b-1).
@@ -7198,6 +7232,11 @@ class CockpitApp(App):
             return
         if self._is_stopped_service(con):
             if op == "restart":
+                # Studio guard — starting comfyui needs the comfyui-local image;
+                # if it's absent, guide to setup-image-studio.sh, don't fail.
+                if con.name == "comfyui" and not self._comfyui_ready:
+                    self._studio_not_ready_notice()
+                    return
                 # [s] on a STOPPED service = bring it UP (docker compose up), not
                 # restart a live container.  Reconcile-gated (service_start), so a
                 # GPU service can't silently collide; a web service starts freely.

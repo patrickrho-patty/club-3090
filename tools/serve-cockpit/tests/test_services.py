@@ -287,6 +287,7 @@ def full_runner(**overrides) -> FakeRunner:
         "estate_cli.py report-state --json": ok(ESTATE_REPORT_FREE),
         "health.sh": ok(HEALTH_DOWN),
         "docker ps": ok(DOCKER_PS_EMPTY),
+        "docker images -q": ok("sha256:abc123\n"),  # comfyui-local present by default
     }
     responses.update(overrides)
     return FakeRunner(responses)
@@ -1124,6 +1125,28 @@ class TestServiceStart:
         (d / "docker-compose.yaml").write_text("services: {}\n")
         plan = CockpitData(tmp_path).service_start("x")
         assert "services/x/docker-compose.yaml" in plan.cmd
+
+
+class TestComfyuiImagePresent:
+    """comfyui_image_present: the 'studio is set up' signal."""
+
+    @pytest.mark.asyncio
+    async def test_present(self):
+        cd = CockpitData(ROOT, runner=full_runner(
+            **{"docker images -q": ok("sha256:abc123\n")}))
+        assert await cd.comfyui_image_present() is True
+
+    @pytest.mark.asyncio
+    async def test_absent_clean_empty(self):
+        cd = CockpitData(ROOT, runner=full_runner(**{"docker images -q": ok("")}))
+        assert await cd.comfyui_image_present() is False
+
+    @pytest.mark.asyncio
+    async def test_docker_error_biases_present(self):
+        # A failed read must NOT false-block — bias toward present.
+        cd = CockpitData(ROOT, runner=full_runner(
+            **{"docker images -q": RunResult(returncode=1, stdout="", stderr="boom")}))
+        assert await cd.comfyui_image_present() is True
 
 
 # ===========================================================================

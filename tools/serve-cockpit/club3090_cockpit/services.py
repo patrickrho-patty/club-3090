@@ -1313,6 +1313,28 @@ class CockpitData:
                 probe.image = img
         return probe
 
+    async def comfyui_image_present(self) -> bool:
+        """READ — is the locally-built ``comfyui-local:latest`` image present?
+
+        The studio scenes (comfyui / image-studio / video-studio) + the comfyui
+        service all need it, and it isn't a registry pull — so its ABSENCE is the
+        reliable "the user hasn't run ``setup-image-studio.sh`` yet" signal the
+        cockpit uses to guide a setup instead of a doomed start.
+
+        ``docker images -q`` returns the id when present, empty when absent, rc=0
+        in BOTH cases — so only a CLEAN empty result counts as absent.  A failed
+        read (docker unreachable) biases toward PRESENT so a transient hiccup never
+        false-blocks (a real docker outage surfaces via the estate poll anyway).
+        Routed through the injected runner so tests stay mockable."""
+        res = await self._runner.run(
+            ["docker", "images", "-q", "comfyui-local:latest"],
+            cwd=str(self.repo_root),
+            timeout=10.0,
+        )
+        if not res.ok:
+            return True  # read failed — don't false-block
+        return bool((res.stdout or "").strip())
+
     async def scenes(self) -> list[Scene]:
         """gpu-mode --list-modes --json → Scene list.
 

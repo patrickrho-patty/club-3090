@@ -568,6 +568,9 @@ def fake_responses(**overrides) -> dict[str, RunResult]:
         "estate_cli.py report-state --json": ok(ESTATE_REPORT_FREE),
         "health.sh": ok(HEALTH_SERVING),
         "docker ps": ok(DOCKER_PS_EMPTY),
+        # Studio guard — default to a SET-UP rig (comfyui-local image present) so the
+        # studio-scene / comfyui-start guard doesn't fire; guard tests override empty.
+        "docker images -q": ok("sha256:abc123\n"),
         # Phase-4 reads:
         "diagnose-estate.sh --json": ok(DIAGNOSE_ESTATE_JSON),
         "diagnose-profile.sh": ok(DIAGNOSE_PROFILE_TEXT),
@@ -1706,6 +1709,48 @@ class TestBatch1KnownServices:
             assert cmd[:2] == ["docker", "compose"]
             assert "services/qdrant/docker-compose.yml" in cmd
             assert cmd[-4:] == ["-p", "qdrant", "up", "-d"]
+
+    @pytest.mark.asyncio
+    async def test_comfyui_start_blocked_when_image_absent(self, tmp_path):
+        """[s] on a stopped comfyui with NO comfyui-local image guides the user to
+        setup-image-studio.sh (no confirm) instead of a doomed compose up."""
+        _seed_services(tmp_path, ["comfyui"])
+        seed_repo(tmp_path)
+        responses = fake_responses(
+            **{"docker ps": ok(""), "docker images -q": ok("")})  # not built
+        app, _, _ = make_app(responses=responses, repo_root=tmp_path)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _enter_operate(pilot)
+            assert app._comfyui_ready is False
+            app.query_one("#operate-tabs", TabbedContent).active = "tab-containers"
+            await _settle(pilot)
+            pane = app.query_one("#operate-containers-pane", OperateContainersPane)
+            idx = next(i for i, c in enumerate(pane._containers) if c.name == "comfyui")
+            pane.query_one("#containers-table", DataTable).move_cursor(row=idx)
+            await pilot.press("s")  # start
+            await pilot.pause()
+            assert not isinstance(app.screen, ConfirmActionScreen)  # guarded → no confirm
+
+    @pytest.mark.asyncio
+    async def test_comfyui_start_allowed_when_image_present(self, tmp_path):
+        """With comfyui-local present, [s] proceeds to the compose-up confirm."""
+        _seed_services(tmp_path, ["comfyui"])
+        seed_repo(tmp_path)
+        responses = fake_responses(
+            **{"docker ps": ok(""), "docker images -q": ok("sha256:abc\n")})
+        app, _, _ = make_app(responses=responses, repo_root=tmp_path)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _enter_operate(pilot)
+            assert app._comfyui_ready is True
+            app.query_one("#operate-tabs", TabbedContent).active = "tab-containers"
+            await _settle(pilot)
+            pane = app.query_one("#operate-containers-pane", OperateContainersPane)
+            idx = next(i for i, c in enumerate(pane._containers) if c.name == "comfyui")
+            pane.query_one("#containers-table", DataTable).move_cursor(row=idx)
+            await pilot.press("s")
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmActionScreen)
+            assert "services/comfyui/docker-compose.yml" in app.screen._plan.cmd
 
     @pytest.mark.asyncio
     async def test_separator_mismatch_service_matched_as_running(self, tmp_path):
@@ -8740,6 +8785,52 @@ class TestScenePreview:
             prev = str(app.query_one("#scene-preview", Static).render())
             assert "inactive" in prev
             assert "○" in prev           # stopped bullet
+
+
+class TestStudioSceneGuard:
+    """⏎ on a studio scene (comfyui / image-studio / video-studio) when the
+    comfyui-local image is missing guides to setup-image-studio.sh, not a switch."""
+
+    SCENES = json.dumps([
+        {"name": "image-studio", "group": "studio", "description": "img gen",
+         "services": ["comfyui", "openwebui"], "ports": ["8188"], "gpus": "split"},
+        {"name": "off", "group": "ops", "description": "Stop all",
+         "services": [], "ports": [], "gpus": "none"},
+    ])
+
+    async def _enter_on_image_studio(self, app, pilot):
+        await _enter_operate(pilot)
+        pane = app.query_one("#operate-orch-pane", OperateOrchPane)
+        idx = next(i for i, s in enumerate(pane._scenes) if s.name == "image-studio")
+        app.query_one("#scene-table", DataTable).move_cursor(row=idx)
+        await pilot.pause()
+        app._operate_primary()
+        await pilot.pause()
+
+    @pytest.mark.asyncio
+    async def test_blocked_when_comfyui_absent(self):
+        responses = fake_responses(**{
+            "gpu-mode.sh --list-modes --json": ok(self.SCENES),
+            "docker images -q": ok(""),  # comfyui-local NOT built
+        })
+        app, _, _ = make_app(responses=responses)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await self._enter_on_image_studio(app, pilot)
+            assert app._comfyui_ready is False
+            assert not isinstance(app.screen, ConfirmActionScreen)  # guarded
+
+    @pytest.mark.asyncio
+    async def test_allowed_when_comfyui_present(self):
+        responses = fake_responses(**{
+            "gpu-mode.sh --list-modes --json": ok(self.SCENES),
+            "docker images -q": ok("sha256:abc\n"),
+        })
+        app, _, _ = make_app(responses=responses)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await self._enter_on_image_studio(app, pilot)
+            assert app._comfyui_ready is True
+            assert isinstance(app.screen, ConfirmActionScreen)
+            assert app.screen._plan.cmd == ["bash", "scripts/gpu-mode.sh", "image-studio"]
 
 
 class TestEvidenceAndGatePreview:
