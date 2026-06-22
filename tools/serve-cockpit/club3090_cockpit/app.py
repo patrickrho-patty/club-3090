@@ -93,6 +93,7 @@ from .data import (
     PromoteScaffold,
     ReconcileResult,
     Scene,
+    SceneServiceState,
     WEIGHTS_ABSENT,
     WEIGHTS_DOWNLOADING,
     WEIGHTS_PARTIAL,
@@ -1853,7 +1854,8 @@ class OperateOrchPane(Container):
             yield Label(
                 "[dim]\\[k] stop this model (gated)   \\[b] restart serving (gated)   "
                 "\\[n] switch model   \\[⏎] switch scene (gated)   \\[o] stop all (gated)   "
-                "\\[c] power cap… (default / clear / custom, gated)[/dim]",
+                "\\[c] power cap… (default / clear / custom, gated)   "
+                "[dim](per-service start/stop → Containers tab)[/dim][/dim]",
                 id="orch-hint",
             )
             # FIX 3 — the host disk-usage bars + system-RAM line MOVED out of this
@@ -1864,6 +1866,11 @@ class OperateOrchPane(Container):
         t = self.query_one("#scene-table", DataTable)
         t.add_columns("Scene", "Group", "GPUs", "Services")
         self._scenes: list[Scene] = []
+        # #11-ext — per-service running states for the HIGHLIGHTED scene, so the
+        # preview can render a live status bullet (● running · ○ stopped) per
+        # service.  Read-only for now (per-service actions live in the Containers
+        # tab); kept on the pane in case an interactive surface is added later.
+        self._scene_svc_states: list[SceneServiceState] = []
         # FIX 1 — last-rendered scene-row signature (skip-if-unchanged guard).
         self._scene_rows_sig: Optional[tuple] = None
         # #10: GPU-index → active cap (W) so the GPU cards can show "(cap NNNW)".
@@ -1903,6 +1910,16 @@ class OperateOrchPane(Container):
         self._populate_doctor(state)
         self._populate_scenes(state.scenes)
         self._populate_services(state)
+        # #11-ext — re-render the scene preview every poll (NOT only when the scene
+        # list changes, which _populate_scenes guards): the service status bullets
+        # track live container state, so they must refresh off each estate read.
+        # render_scene_preview self-guards to a no-op when Orchestration isn't the
+        # active sub-tab, so this never touches the (hidden) service table from a
+        # background poll while the user is on another tab.
+        try:
+            self.render_scene_preview(self.selected_scene())
+        except Exception:
+            pass
 
     def _populate_error(self, state: EstateState) -> None:
         """A2/N2: render the estate READ error (docker / nvidia-smi failure) as a
@@ -2209,13 +2226,15 @@ class OperateOrchPane(Container):
         # so the "what about all the OTHER services" gap closes and GPU0's holder
         # is visible in this list.  A "stack" container carries a [dim]studio[/dim]
         # tag so it's distinguishable from a first-class service (ComfyUI).
-        svc_names: list[str] = []
+        # (label, running) so the bullet reflects ACTUAL state: ● green = running,
+        # ○ red = a known service that's down (e.g. a stopped supporting service).
+        svc_rows: list[tuple[str, bool]] = []
         for c in state.containers:
             if c.kind == "service":
-                svc_names.append(c.name)
+                svc_rows.append((c.name, c.is_running))
             elif c.kind == "stack" and c.is_running:
-                svc_names.append(f"{c.name} [dim]studio[/dim]")
-        if not svc_names:
+                svc_rows.append((f"{c.name} [dim]studio[/dim]", True))
+        if not svc_rows:
             ae = (state.estate_report or {}).get("active_estate") or {}
             insts = ae.get("instances") or []
             if insts:
@@ -2229,7 +2248,13 @@ class OperateOrchPane(Container):
                 return
             strip.update("[dim]no stack services detected[/dim]")
             return
-        strip.update("  " + "   ".join(f"[green]●[/green] {n}" for n in svc_names))
+        strip.update(
+            "  "
+            + "   ".join(
+                (f"[green]●[/green] {n}" if running else f"[red]○[/red] {n}")
+                for n, running in svc_rows
+            )
+        )
 
     def selected_scene(self) -> Optional[Scene]:
         t = self.query_one("#scene-table", DataTable)
@@ -2238,28 +2263,53 @@ class OperateOrchPane(Container):
             return self._scenes[idx]
         return None
 
+    def _scene_running_names(self) -> list[str]:
+        """The running-container names from the LAST estate poll (sync, no I/O) —
+        the match source for the scene-preview service bullets, so the highlight
+        path never shells docker."""
+        st = self._last_state
+        if st is None:
+            return []
+        return [c.name for c in st.containers if getattr(c, "is_running", True)]
+
     def render_scene_preview(self, scene: Optional[Scene]) -> None:
-        """#11 — render the compact preview for the highlighted scene: what
-        switching to it brings up (description + services + ports + GPUs).  A
-        pure LOCAL read off the Scene the gpu-mode poll carried — no I/O."""
+        """#11/#11-ext — render the highlighted scene's preview: name · group ·
+        GPUs · ACTIVE/inactive · description · its services each with a LIVE status
+        bullet (● green = running · ○ red = stopped) · ports.  A pure LOCAL read off
+        the Scene the gpu-mode poll carried + the running-container set from the last
+        estate poll — no per-keystroke I/O.  Read-only (per-service start/stop lives
+        in the Containers tab)."""
         try:
             body = self.query_one("#scene-preview", Static)
         except Exception:
             return
         if scene is None:
             body.update("[dim]highlight a scene (move cursor) to preview what it brings up[/dim]")
+            self._scene_svc_states = []
             return
         from rich.markup import escape
 
+        states = CockpitData.scene_service_states_sync(scene, self._scene_running_names())
+        self._scene_svc_states = states
+        active = any(s.running for s in states)
+        tag = "[green]● ACTIVE[/green]" if active else "[dim]○ inactive[/dim]"
         lines = [
             f"  [bold]{escape(scene.name)}[/bold]"
             + (f"  [dim]·[/dim]  {escape(scene.group)}" if scene.group else "")
-            + f"  [dim]·[/dim]  GPUs {escape(scene.gpus or '—')}",
+            + f"  [dim]·[/dim]  GPUs {escape(scene.gpus or '—')}"
+            + f"  [dim]·[/dim]  {tag}",
         ]
         if scene.description:
             lines.append(f"  [dim]{escape(scene.description)}[/dim]")
-        svcs = ", ".join(escape(s) for s in scene.services) if scene.services else "—"
-        lines.append(f"  [bold]starts[/bold]  {svcs}")
+        if states:
+            svcs = "   ".join(
+                (f"[green]●[/green] {escape(s.name)}" if s.running
+                 else f"[red]○[/red] {escape(s.name)}")
+                for s in states
+            )
+            lines.append(f"  [bold]services[/bold]  {svcs}")
+        else:
+            lines.append("  [bold]services[/bold]  [dim]— none (frees GPUs)[/dim]")
         if scene.ports:
             lines.append(f"  [bold]ports[/bold]  {', '.join(escape(p) for p in scene.ports)}")
         body.update("\n".join(lines))

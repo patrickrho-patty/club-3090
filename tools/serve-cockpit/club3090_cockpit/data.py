@@ -380,6 +380,19 @@ class CatalogEntry:
 
 
 @dataclass
+class SceneServiceState:
+    """One service of a scene, paired with whether its container is running now.
+
+    Drives the Orchestration scene-preview service list (status bullet +
+    model-safe per-service action).  ``running`` is decided by matching the
+    scene's catalog service name against the live ``docker ps`` set — so a
+    GPU-engine service that's down (absent from docker ps) reads ``False``."""
+
+    name: str
+    running: bool = False
+
+
+@dataclass
 class Scene:
     """One gpu-mode scene from --list-modes --json."""
 

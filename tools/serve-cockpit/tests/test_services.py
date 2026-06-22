@@ -1028,10 +1028,55 @@ class TestActionBuilders:
         plan = cd.container_action("vllm-x", "stop")
         assert plan.requires_reconcile is True
 
+    def test_container_action_start(self):
+        cd = CockpitData(ROOT, runner=full_runner())
+        plan = cd.container_action("vllm-x", "start")
+        assert plan.cmd == ["docker", "start", "vllm-x"]
+        # start = bring back one container of an ACTIVE scene (sibling already holds
+        # the GPUs) → no new cross-scene contention → no reconcile.
+        assert plan.requires_reconcile is False
+
     def test_container_action_bad_op(self):
         cd = CockpitData(ROOT, runner=full_runner())
         with pytest.raises(ValueError):
             cd.container_action("vllm-x", "rm")
+
+
+class TestSceneServiceStates:
+    """scene_service_states: per-service running flag for a scene, matched against
+    the live docker-ps set (drives the Orchestration scene-preview status bullets)."""
+
+    def test_sync_matches_running_and_marks_absent_stopped(self):
+        scene = Scene(name="chat", group="ops",
+                      services=["open-webui", "litellm", "qdrant"])
+        # 'openwebui' (no separator) must normalize-match 'open-webui'; qdrant absent.
+        states = CockpitData.scene_service_states_sync(
+            scene, ["openwebui", "litellm-1"])
+        by = {s.name: s.running for s in states}
+        assert by == {"open-webui": True, "litellm": True, "qdrant": False}
+
+    def test_sync_empty_scene(self):
+        assert CockpitData.scene_service_states_sync(
+            Scene(name="off", services=[]), ["anything"]) == []
+
+    @pytest.mark.asyncio
+    async def test_async_reads_docker_ps(self):
+        cd = CockpitData(ROOT, runner=full_runner(
+            **{"docker ps": ok("vllm-qwen36-27b-dual|0.0.0.0:8010->8010/tcp\n")}))
+        states = await cd.scene_service_states(
+            Scene(name="27b", services=["vllm-qwen36-27b-dual"]))
+        assert [(s.name, s.running) for s in states] == [
+            ("vllm-qwen36-27b-dual", True)]
+
+    @pytest.mark.asyncio
+    async def test_async_docker_ps_fail_degrades_all_stopped(self):
+        # A failed running-set read degrades every service to stopped (the scene
+        # then reads inactive — the safe default).
+        cd = CockpitData(ROOT, runner=full_runner(
+            **{"docker ps": RunResult(returncode=1, stdout="", stderr="boom")}))
+        states = await cd.scene_service_states(
+            Scene(name="27b", services=["vllm-qwen36-27b-dual"]))
+        assert states[0].running is False
 
 
 # ===========================================================================

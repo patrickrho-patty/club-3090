@@ -8638,6 +8638,37 @@ class TestScenePreview:
             assert "off" in prev
             assert "Stop all" in prev
 
+    @pytest.mark.asyncio
+    async def test_scene_preview_active_bullet_when_service_running(self):
+        """#11-ext — the preview reflects LIVE service status: a running service
+        gets a ● bullet and the scene reads ACTIVE."""
+        responses = fake_responses(
+            **{"docker ps": ok("vllm-qwen36-27b-dual|0.0.0.0:8010->8010/tcp\n")})
+        app, _, _ = make_app(responses=responses)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _enter_operate(pilot)
+            t = app.query_one("#scene-table", DataTable)
+            t.move_cursor(row=0)  # "27b" — its engine container is running
+            await pilot.pause()
+            prev = str(app.query_one("#scene-preview", Static).render())
+            assert "vllm-qwen36-27b-dual" in prev
+            assert "ACTIVE" in prev      # a running service ⇒ scene active
+            assert "●" in prev           # running bullet
+
+    @pytest.mark.asyncio
+    async def test_scene_preview_inactive_bullet_when_no_service_running(self):
+        """#11-ext — with no matching running container, the service reads stopped
+        (○) and the scene reads inactive."""
+        app, _, _ = make_app()  # default docker ps is empty → nothing running
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _enter_operate(pilot)
+            t = app.query_one("#scene-table", DataTable)
+            t.move_cursor(row=0)  # "27b"
+            await pilot.pause()
+            prev = str(app.query_one("#scene-preview", Static).render())
+            assert "inactive" in prev
+            assert "○" in prev           # stopped bullet
+
 
 class TestEvidenceAndGatePreview:
     """N8 — ④ Measure evidence-tag + ③ Gate validation-step highlight previews."""

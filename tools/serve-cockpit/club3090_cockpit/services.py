@@ -75,6 +75,7 @@ from .data import (
     RamUsage,
     ReconcileResult,
     Scene,
+    SceneServiceState,
     ServedProbe,
     VerifyFull,
     VerifySmoke,
@@ -1638,14 +1639,56 @@ class CockpitData:
         )
 
     def container_action(self, name: str, op: str) -> ActionPlan:
-        """op ∈ {restart, stop}.  Builds a docker write — execution-gated."""
-        if op not in ("restart", "stop"):
-            raise ValueError(f"container op must be restart|stop, got {op!r}")
+        """op ∈ {restart, stop, start}.  Builds a docker write — execution-gated.
+
+        ``start`` is the "bring back one crashed container of the ACTIVE scene"
+        verb (a sibling is already running, so the scene already owns its GPUs →
+        no new cross-scene contention, hence ``requires_reconcile=False``).  To
+        bring up a scene that's fully DOWN, the caller routes to ``scene_switch``
+        (gpu-mode, reconcile-gated) instead — never a bare per-container start."""
+        if op not in ("restart", "stop", "start"):
+            raise ValueError(f"container op must be restart|stop|start, got {op!r}")
         return ActionPlan(
             kind="container",
             cmd=["docker", op, name],
             description=f"docker {op} {name}",
             requires_reconcile=(op == "stop"),
+        )
+
+    @staticmethod
+    def scene_service_states_sync(
+        scene: Scene, running_names: list[str]
+    ) -> list[SceneServiceState]:
+        """Per-service running state for ``scene`` against an ALREADY-FETCHED set
+        of running container names — a pure, I/O-free match so the scene-preview
+        highlight path can re-render every keystroke without a docker call.
+
+        Matches each ``scene.services`` name with the SAME normalized matcher the
+        Containers tab uses (``_service_dir_matches_running`` — tolerant of the
+        ``-server`` / ``-dual`` suffix a container name carries off the service
+        name).  A service absent from the running set reads ``running=False``."""
+        running_norm = {_normalize_service_name(n) for n in running_names}
+        running_norm.discard("")
+        return [
+            SceneServiceState(
+                name=svc,
+                running=any(
+                    _service_dir_matches_running(svc, rn) for rn in running_norm
+                ),
+            )
+            for svc in scene.services
+        ]
+
+    async def scene_service_states(self, scene: Scene) -> list[SceneServiceState]:
+        """Per-service running state for a scene — does its own ``docker ps``.
+
+        Thin async wrapper over :meth:`scene_service_states_sync` for callers
+        that don't already hold a running-container set (tests, the routing
+        layer).  A failed running-set read degrades every service to stopped (the
+        scene then reads inactive → ⏎ routes to a scene switch, the safe
+        default)."""
+        return self.scene_service_states_sync(
+            scene, await self._running_container_names()
         )
 
     async def _teardown_conflicts(self, reconcile: "ReconcileResult") -> list[str]:
