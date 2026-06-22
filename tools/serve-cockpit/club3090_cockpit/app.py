@@ -5102,6 +5102,11 @@ class CockpitApp(App):
         pane.refresh_enriched()
         await self._data.enrich_measurements(rows)
         pane.refresh_enriched()
+        # Download UX — which slugs' weights are on disk (one weights.py call +
+        # a stat per row).  Last enrichment phase; feeds the Download-vs-Start
+        # control + the listing's download glyph.
+        await self._data.enrich_weights(rows)
+        pane.refresh_enriched()
 
     # ── #6/A12 · profile-template dropdown ───────────────────────────────────────────
 

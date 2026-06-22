@@ -500,6 +500,46 @@ class TestLoadCatalog:
         assert entries == []
         assert err is not None
 
+    @pytest.mark.asyncio
+    async def test_enrich_weights_marks_present_absent_unknown(self, tmp_path):
+        """Download UX: enrich_weights joins each slug to weights.py list --json +
+        stats the model dir → present (subdir+glob), absent (no subdir),
+        unknown (no weights entry to join)."""
+        from club3090_cockpit.data import (
+            CatalogEntry, WEIGHTS_PRESENT, WEIGHTS_ABSENT, WEIGHTS_UNKNOWN,
+        )
+        from club3090_tui_core import VariantRow
+
+        listing = json.dumps([
+            {"model": "qwen3.6-27b", "variant": "fp8", "subdir": "qwen3.6-27b-fp8",
+             "hf_repo": "Qwen/Qwen3.6-27B-FP8", "size_gb": 29, "verify_glob": "*.safetensors",
+             "status": "experimental"},
+            {"model": "qwen3.6-27b", "variant": "autoround-int4",
+             "subdir": "qwen3.6-27b-autoround-int4", "hf_repo": "Lorbus/Qwen3.6-27B-int4-AutoRound",
+             "size_gb": 17.5, "verify_glob": "*.safetensors", "status": "production"},
+        ])
+        runner = full_runner(**{"weights.py list --json": ok(listing)})
+        cd = CockpitData(ROOT, runner=runner)
+        hf = tmp_path / "huggingface"
+        (hf / "qwen3.6-27b-autoround-int4").mkdir(parents=True)
+        (hf / "qwen3.6-27b-autoround-int4" / "m.safetensors").write_text("x")  # present
+
+        def _e(slug, path):
+            return CatalogEntry(row=VariantRow(
+                slug=slug, switch_engine="vllm", launch_engine="vllm",
+                compose_dir=path.rsplit("/", 1)[0], file=path.rsplit("/", 1)[-1],
+                port=8013, model="qwen3.6-27b", engine="vllm-stable", kvcalc_key="SKIP",
+                container="c", compose_path=path, status="x", ctx_label="", status_note=""))
+
+        e_ar = _e("vllm/dual", "models/qwen3.6-27b/vllm/compose/dual/autoround-int4/fp8-mtp.yml")
+        e_fp8 = _e("vllm/dual-max", "models/qwen3.6-27b/vllm/compose/dual/fp8/mtp.yml")
+        e_unk = _e("vllm/none", "models/qwen3.6-27b/vllm/compose/dual/no-such-quant/base.yml")
+        await cd.enrich_weights([e_ar, e_fp8, e_unk], model_dir=str(tmp_path))
+        assert e_ar.weights_state == WEIGHTS_PRESENT
+        assert e_ar.weights is not None and e_ar.weights.hf_repo.startswith("Lorbus")
+        assert e_fp8.weights_state == WEIGHTS_ABSENT          # fp8 subdir not created
+        assert e_unk.weights_state == WEIGHTS_UNKNOWN          # no weights entry to join
+
 
 class TestExplainFit:
     @pytest.mark.asyncio

@@ -76,6 +76,11 @@ from .data import (
     ServedProbe,
     VerifyFull,
     VerifySmoke,
+    WEIGHTS_ABSENT,
+    WEIGHTS_PARTIAL,
+    WEIGHTS_PRESENT,
+    WEIGHTS_UNKNOWN,
+    WeightsMeta,
     _bench_row_matches,
     _canon_engine_family,
     _canon_model_key,
@@ -321,6 +326,74 @@ class CockpitData:
         if not res.stdout.strip():
             return [], res.stderr.strip()[:200] or "no rows"
         return parse_variant_rows(res.stdout), None
+
+    # ── Download state (Download UX): which slugs' weights are on disk ────────────
+
+    async def weights_index(self) -> dict[tuple[str, str], WeightsMeta]:
+        """Static weights metadata for every ``(model, variant)`` — ONE
+        ``weights.py list --json`` subprocess, cached for the process (the model
+        profiles are static).  ``{}`` on error (download-state degrades to
+        'unknown'; the catalog still renders)."""
+        cache = getattr(self, "_weights_index_cache", None)
+        if cache is not None:
+            return cache
+        index: dict[tuple[str, str], WeightsMeta] = {}
+        try:
+            res = await self._runner.run(
+                ["python3", "scripts/lib/profiles/weights.py", "list", "--json"],
+                cwd=str(self.repo_root),
+                timeout=20.0,
+            )
+            rows = json.loads(res.stdout) if res.ok and res.stdout.strip() else []
+        except Exception:
+            rows = []
+        for d in rows if isinstance(rows, list) else []:
+            try:
+                m = WeightsMeta.from_dict(d)
+            except Exception:
+                continue
+            if m.model and m.variant:
+                index[(m.model, m.variant)] = m
+        self._weights_index_cache = index
+        return index
+
+    def weights_state_for(
+        self,
+        entry: CatalogEntry,
+        index: dict[tuple[str, str], WeightsMeta],
+        *,
+        model_dir: Optional[str] = None,
+    ) -> tuple[str, Optional[WeightsMeta]]:
+        """Join ``entry`` to its weights meta + stat the model dir → ``(state,
+        meta)``.  PRESENT = subdir has ≥1 verify_glob match; PARTIAL = subdir
+        exists but no match (interrupted / wrong); ABSENT = subdir missing;
+        UNKNOWN = no weights entry to join (e.g. a self-grabbed GGUF compose)."""
+        meta = index.get((entry.model, entry.weights_variant))
+        if meta is None or not meta.subdir:
+            return WEIGHTS_UNKNOWN, meta
+        base = Path(model_dir or MODEL_DIR) / "huggingface" / meta.subdir
+        try:
+            if not base.is_dir():
+                return WEIGHTS_ABSENT, meta
+            return (WEIGHTS_PRESENT if any(base.glob(meta.verify_glob)) else WEIGHTS_PARTIAL), meta
+        except OSError:
+            return WEIGHTS_UNKNOWN, meta
+
+    async def enrich_weights(
+        self, entries: list[CatalogEntry], *, model_dir: Optional[str] = None
+    ) -> None:
+        """Set each entry's ``weights_state`` + ``weights`` from the index (ONE
+        weights.py call + a stat per entry).  Best-effort — an error leaves the
+        entry at its default 'unknown'.  Mirrors enrich_fits/enrich_measurements:
+        a post-first-paint enrichment, NOT part of the fast registry-only paint."""
+        index = await self.weights_index()
+        for e in entries:
+            try:
+                e.weights_state, e.weights = self.weights_state_for(
+                    e, index, model_dir=model_dir
+                )
+            except Exception:
+                pass
 
     # enrich_measurements still fans out one switch --explain per slug; a
     # cap-bounded asyncio.gather keeps that to a few seconds without flooding

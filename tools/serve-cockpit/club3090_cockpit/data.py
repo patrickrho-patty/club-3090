@@ -74,6 +74,19 @@ def variant_topology(row: Any) -> str:
     return ""
 
 
+def variant_quant(row: Any) -> str:
+    """The weights-variant / quant TOKEN from a variant's compose path — the path
+    encodes it as ``…/compose/<topology>/<quant>/<file>`` and (CLAUDE.md) the
+    ``<quant>/`` dir name IS the ``weights_variant`` key in the model profile.
+    Pure path parse (no I/O); returns ``""`` when the path carries no token.
+
+    Used to join a catalog slug to its weights entry (subdir / hf_repo / glob)
+    for the download-state check."""
+    path = (getattr(row, "compose_path", "") or "").replace("\\", "/")
+    m = re.search(r"/compose/(?:single|dual|multi\d+)/([^/]+)/", path)
+    return m.group(1) if m else ""
+
+
 def topology_cards(row: Any) -> int:
     """A6: how many cards the row's compose places on (1 / 2 / N).
 
@@ -213,6 +226,52 @@ class Measurement:
         return self.quality_8pk or "—"
 
 
+# ── Weights download state ──────────────────────────────────────────────────────
+
+
+@dataclass
+class WeightsMeta:
+    """Static weights metadata for a ``(model, variant)`` — from
+    ``weights.py list --json``.  Tells the cockpit WHERE a slug's weights live
+    (``subdir`` under ``<model_dir>/huggingface/``) + HOW to fetch them
+    (``hf_repo``, ``size_gb``) + how to confirm presence (``verify_glob``)."""
+
+    model: str = ""
+    variant: str = ""
+    subdir: str = ""
+    hf_repo: str = ""
+    size_gb: Optional[float] = None
+    verify_glob: str = "*.safetensors"
+    status: str = ""
+    kind: str = ""
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "WeightsMeta":
+        size = d.get("size_gb")
+        try:
+            size = float(size) if size is not None else None
+        except (TypeError, ValueError):
+            size = None
+        return cls(
+            model=str(d.get("model") or ""),
+            variant=str(d.get("variant") or ""),
+            subdir=str(d.get("subdir") or ""),
+            hf_repo=str(d.get("hf_repo") or ""),
+            size_gb=size,
+            verify_glob=str(d.get("verify_glob") or "*.safetensors"),
+            status=str(d.get("status") or ""),
+            kind=str(d.get("kind") or ""),
+        )
+
+
+# Download-state tokens (CatalogEntry.weights_state).  "downloading" is overlaid
+# by the app from an active download worker, not computed at catalog-build.
+WEIGHTS_PRESENT = "present"     # subdir exists + verify_glob matches ≥1 file
+WEIGHTS_PARTIAL = "partial"     # subdir exists but no verify_glob match (interrupted / wrong)
+WEIGHTS_ABSENT = "absent"       # subdir missing
+WEIGHTS_UNKNOWN = "unknown"     # no weights entry joined (e.g. GGUF self-grabbed, or lookup failed)
+
+
 # ── Enriched catalog entry ──────────────────────────────────────────────────────
 
 
@@ -226,6 +285,12 @@ class CatalogEntry:
     row: VariantRow
     fit: FitVerdict = field(default_factory=FitVerdict)
     measurement: Measurement = field(default_factory=Measurement)
+    # Download state (Download UX): the on-disk presence of this slug's weights +
+    # the joined static meta (hf_repo / size_gb for the download action).  Set by
+    # the app at catalog-build; "downloading" is overlaid live from the worker.
+    # Appended LAST so positional CatalogEntry(row, fit, measurement) is unaffected.
+    weights_state: str = "unknown"
+    weights: Optional["WeightsMeta"] = None
 
     # Convenience pass-throughs (so panes can read entry.slug, not entry.row.slug)
     @property
@@ -273,6 +338,13 @@ class CatalogEntry:
         path encodes it as ``…/compose/<topology>/<quant>/<file>``).  Falls back to
         ``·`` when the path carries no recognizable token (the tab-form fallback)."""
         return variant_topology(self.row) or "·"
+
+    @property
+    def weights_variant(self) -> str:
+        """The weights-variant / quant token (the ``<quant>/`` compose dir, which is
+        the model-profile ``weights`` key) — used to join this slug to its weights
+        entry for the download-state check.  ``""`` when the path carries none."""
+        return variant_quant(self.row)
 
     @property
     def source(self) -> str:
