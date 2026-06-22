@@ -13,15 +13,17 @@ Estate mode to Operate and moved the Doctor surface into it.)
                           ConfirmActionScreen — on confirm the boot streams into
                           the transient Run LivePane (#serve-live).
   - Run / BYO            : ``CockpitData.byo_check`` → fit verdict + swap_path.
-  - Operate / Orch       : ``estate_state`` live (GPU cards, Doctor, scenes,
-                          services, power-cap); scene-switch → confirm modal that
-                          FIRST calls ``reconcile_before_write`` then ``scene_switch``;
-                          ``c`` cap on/off, ``w`` cap sweep, ``p`` prune (all gated).
+  - Operate / Orch       : ``estate_state`` live (GPU cards, scenes, services,
+                          power-cap); scene-switch → confirm modal that FIRST calls
+                          ``reconcile_before_write`` then ``scene_switch``; ``c``
+                          opens the power-cap menu (default 230W / clear / custom
+                          W), each gated.  (prune removed; cap-sweep → Doctor.)
   - Operate / Containers : ``containers`` real list; drill into Logs/Top/Config;
                           restart/stop/rm behind the reconcile-gated confirm.
   - Operate / Doctor     : "is it serving correctly?" — health.sh (live) + verify
                           ([v] verify.sh test query) + verify-full ([V]) cards, all
-                          READ-only; [R] basic report, [F] full battery (warned).
+                          READ-only; [R] basic report, [F] full battery (warned);
+                          ``w`` power-cap sweep (gated tuning bench).
   - Validate / Run       : launchable ladder + extra tools (``run_validation``,
                           confirm-gated, streamed into a LivePane) + §3.5 *tune*
                           gotchas inline.
@@ -33,7 +35,7 @@ EVERY GPU-claiming write (serve / scene-switch / estate-down / container
 restart|stop|rm) goes through ``CockpitData.execute_action``, which re-runs the
 reconcile gate first and refuses when unsafe (unless an explicit, reasoned force
 override).  Heavy/destructive non-GPU writes (validation launches, submit-bench
-POST, power-cap, prune) are confirm-gated too.  The write runner / network are
+POST, power-cap, cap-sweep) are confirm-gated too.  The write runner / network are
 NEVER executed live — tests inject fakes and conftest blocks the real spawn.
 """
 
@@ -497,11 +499,11 @@ class HelpScreen(ModalScreen):
             "  [cyan]O[/cyan] ▸ Optimize for my card (v0.10.0 seam — not available yet)",
             "[bold]Run & Operate · Orchestration[/bold]",
             "  [cyan]⏎[/cyan] switch scene   [cyan]k[/cyan] stop THIS model   [cyan]b[/cyan] restart serving   [cyan]n[/cyan] switch model (→ Catalog tab)   (writes gated)",
-            "  [cyan]o[/cyan] stop ALL (tears down the whole estate)   [cyan]c[/cyan] power-cap on/off   [cyan]w[/cyan] cap sweep   [cyan]p[/cyan] prune images   (all gated)",
+            "  [cyan]o[/cyan] stop ALL (tears down the whole estate)   [cyan]c[/cyan] power cap… (default 230W / clear / custom W)   (all gated)",
             "[bold]Run & Operate · Containers[/bold]",
             "  [cyan]l[/cyan] logs   [cyan]t[/cyan] top (read)   [cyan]s[/cyan] restart   [cyan]x[/cyan] stop   [cyan]X[/cyan] rm   (writes gated)",
-            "[bold]Run & Operate · Doctor[/bold]",
-            "  read-only — health + diagnose-estate + diagnose-profile cards ([cyan]r[/cyan] refreshes)",
+            "[bold]Run & Operate · Doctor[/bold]  — is it serving correctly?",
+            "  [cyan]r[/cyan] health (read)   [cyan]v[/cyan] verify   [cyan]V[/cyan] verify-full   [cyan]R[/cyan] report   [cyan]F[/cyan] report --full   [cyan]w[/cyan] power-cap sweep (gated)",
         ]
         # Producer-only lane section — OMITTED on the lean surface (clean help).
         if producer:
@@ -516,7 +518,7 @@ class HelpScreen(ModalScreen):
             "[bold]Safety — the reconcile gate[/bold]",
             "",
             "  Every write (serve, scene-switch, estate-down, container restart/stop/rm,",
-            "  power-cap, prune, submit-bench) goes through a confirm modal.  GPU-claiming",
+            "  power-cap, cap-sweep, submit-bench) goes through a confirm modal.  GPU-claiming",
             "  writes re-run a FRESH detect immediately before executing and refuse if a",
             "  running container / busy GPU / active estate claim would collide; the modal",
             "  shows exactly what a write would tear down.  Validation launches and the",
@@ -1846,8 +1848,7 @@ class OperateOrchPane(Container):
             yield Label(
                 "[dim]\\[k] stop this model (gated)   \\[b] restart serving (gated)   "
                 "\\[n] switch model   \\[⏎] switch scene (gated)   \\[o] stop all (gated)   "
-                "\\[c] cap on/off (gated)   \\[w] cap sweep (gated)   "
-                "\\[p] prune images (gated)[/dim]",
+                "\\[c] power cap… (default / clear / custom, gated)[/dim]",
                 id="orch-hint",
             )
             # FIX 3 — the host disk-usage bars + system-RAM line MOVED out of this
@@ -2778,7 +2779,8 @@ class DoctorPane(Container):
                 "[dim][cyan]v[/cyan] verify   ·   [cyan]V[/cyan] verify-full   ·   "
                 "[cyan]y[/cyan] re-run health   ·   [cyan]R[/cyan] basic system report "
                 "(report.sh · paste-ready)   ·   [cyan]F[/cyan] full battery report.sh "
-                "--full ([yellow]~43 min · uses the serving GPUs[/yellow])[/dim]",
+                "--full ([yellow]~43 min · uses the serving GPUs[/yellow])   ·   "
+                "[cyan]w[/cyan] power-cap sweep ([yellow]gated · benches each cap[/yellow])[/dim]",
                 id="doctor-hint",
             )
 
@@ -3317,6 +3319,99 @@ class SettingsScreen(ModalScreen):
 
     def action_cancel(self) -> None:
         self.app.pop_screen()
+
+
+class PowerCapMenuScreen(ModalScreen):
+    """[c] power-cap menu (Orchestration): apply the default 230W cap · clear the
+    cap (uncap to hardware default) · set a custom wattage.  The choice is returned
+    via ``dismiss`` and routed through the standard confirm gate by the app — this
+    modal never touches the rig itself.  dismiss value: ``("on"|"off", None)`` or
+    ``("custom", <watts:int>)``; ``None`` on cancel."""
+
+    DEFAULT_CSS = """
+    PowerCapMenuScreen {
+        align: center middle;
+    }
+    PowerCapMenuScreen > Vertical {
+        width: 80;
+        height: auto;
+        border: thick $accent;
+        background: $surface;
+        padding: 1 2;
+    }
+    PowerCapMenuScreen .pc-title {
+        text-style: bold;
+        color: $accent;
+    }
+    PowerCapMenuScreen .pc-row { margin-top: 1; }
+    PowerCapMenuScreen Input { margin-top: 1; }
+    """
+
+    # Don't auto-focus the wattage Input — otherwise it would swallow the d/u/m
+    # shortcut keys.  Nothing is focused on open, so d/u/m reach the screen
+    # bindings; [m] (or clicking) focuses the Input for custom-wattage entry.
+    AUTO_FOCUS = None
+
+    BINDINGS = [
+        # priority so the menu keys fire on the screen even when nothing is
+        # focused; check_action below frees d/u/m to be typed once the Input is.
+        Binding("d", "apply_default", "Default 230W", show=True, priority=True),
+        Binding("u", "clear_cap", "Clear", show=True, priority=True),
+        Binding("m", "focus_custom", "Custom", show=True, priority=True),
+        Binding("enter", "apply_custom", "Apply custom", show=True, priority=True),
+        Binding("escape", "cancel", "Cancel", show=True),
+    ]
+
+    def __init__(self, status_summary: str = "", **kwargs):
+        super().__init__(**kwargs)
+        self._status_summary = status_summary or ""
+
+    def on_mount(self) -> None:
+        # A focused Input swallows printable keys (d/u/m) before any binding sees
+        # them, so blur it on open — the menu shortcuts then reach the screen, and
+        # [m] focuses the Input when the user actually wants a custom wattage.
+        self.call_after_refresh(self.set_focus, None)
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Label("Power cap", classes="pc-title")
+            yield Static(f"  [dim]{self._status_summary}[/dim]", classes="pc-row")
+            yield Label(
+                "  [cyan]d[/cyan] apply default cap (230W)    "
+                "[cyan]u[/cyan] clear cap (uncap to hw default)",
+                classes="pc-row",
+            )
+            yield Label("  [cyan]m[/cyan] custom — focus the field, type a wattage, then [cyan]Enter[/cyan]:",
+                        classes="pc-row")
+            yield Input(placeholder="watts, e.g. 280", id="pc-watts")
+            yield Label(
+                "  [dim]each choice is confirmed before it touches the rig · Esc cancel[/dim]",
+                classes="pc-row",
+            )
+            yield Footer()
+
+    def action_apply_default(self) -> None:
+        self.dismiss(("on", None))
+
+    def action_clear_cap(self) -> None:
+        self.dismiss(("off", None))
+
+    def action_focus_custom(self) -> None:
+        try:
+            self.query_one("#pc-watts", Input).focus()
+        except Exception:
+            pass
+
+    def action_apply_custom(self) -> None:
+        raw = self.query_one("#pc-watts", Input).value.strip()
+        if raw.isdigit() and int(raw) > 0:
+            self.dismiss(("custom", int(raw)))
+        else:
+            self.app.notify("Enter a positive integer wattage (e.g. 280).",
+                            title="Power cap", severity="warning", timeout=4)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
 
 
 # ── Phase 5 · Promote-to-catalog scaffold preview modal (design §3.5b) ────────────
@@ -4424,9 +4519,8 @@ _PALETTE_COMMANDS: tuple[tuple[str, str, str], ...] = (
     ("serving_restart", "Restart serving", "Orchestration — restart the serving container (gated)"),
     ("serving_switch", "Switch model", "Orchestration — flip to the Catalog tab to pick another"),
     ("estate_off", "Stop ALL (estate down)", "Orchestration — tear down the whole estate (gated)"),
-    ("power_cap_toggle", "Power cap on/off", "Orchestration — toggle the power cap (gated)"),
-    ("power_cap_sweep", "Power cap sweep", "Orchestration — sweep power caps (gated)"),
-    ("prune_images", "Prune images", "Orchestration — docker image prune (gated)"),
+    ("power_cap", "Power cap…", "Orchestration — power-cap menu: default 230W / clear / custom W (gated)"),
+    ("power_cap_sweep", "Power cap sweep", "Doctor — sweep power caps + bench at each (gated)"),
     ("container_logs", "Container logs", "Containers — stream the selected container's logs"),
     ("doctor_rerun", "Re-run Doctor health", "Doctor — re-run the live health read (read-only)"),
     ("doctor_verify", "Verify serving", "Doctor — send a test query to the model (verify.sh · read)"),
@@ -4583,10 +4677,10 @@ class CockpitApp(App):
         Binding("X", "container_rm", "Remove", show=False),
         # Operate · Orchestration — stop all (estate down, gated write).
         Binding("o", "estate_off", "Stop all", show=False),
-        # Operate · Orchestration — power cap + prune (gated rig writes).
-        Binding("c", "power_cap_toggle", "Cap on/off", show=False),
+        # Operate · Orchestration — power-cap menu (default / clear / custom W).
+        Binding("c", "power_cap", "Power cap", show=False),
+        # Operate · Doctor — power-cap sweep (heavy A/B bench; gated rig write).
         Binding("w", "power_cap_sweep", "Cap sweep", show=False),
-        Binding("p", "prune_images", "Prune", show=False),
         # Operate · Containers / Validate — context-sensitive read keys.
         Binding("t", "context_t", "Top / Sort", show=False),
         # Phase 5 — the three v2 hooks:
@@ -4773,9 +4867,10 @@ class CockpitApp(App):
         "full_report":      ({0, 1}, {"tab-doctor", "tab-run"}),
         # Merged mode 0 · Orchestration tab
         "estate_off":       ({0}, {"tab-orchestration"}),
-        "power_cap_toggle": ({0}, {"tab-orchestration"}),
-        "power_cap_sweep":  ({0}, {"tab-orchestration"}),
-        "prune_images":     ({0}, {"tab-orchestration"}),
+        "power_cap":        ({0}, {"tab-orchestration"}),
+        # power-cap sweep lives on Doctor now (a tuning/diagnostic bench, not a
+        # live-estate control) — prune was removed from the cockpit entirely.
+        "power_cap_sweep":  ({0}, {"tab-doctor"}),
         # A4 — targeted serving verbs on the #serving-line (Orchestration).
         "serving_stop":     ({0}, {"tab-orchestration"}),
         "serving_restart":  ({0}, {"tab-orchestration"}),
@@ -5976,7 +6071,7 @@ class CockpitApp(App):
 
         A plan that does NOT claim a GPU (``requires_reconcile=False`` — a
         validation launch, the c3t Evaluate hand-off, submit-bench, power-cap,
-        prune, the promote write) is reported trivially-safe: the reconcile gate
+        cap-sweep, the promote write) is reported trivially-safe: the reconcile gate
         only models GPU contention, and these actions legitimately run WHILE a
         model is serving (busy GPUs are EXPECTED — gating Evaluate on 'GPU free'
         would wrongly disable it against the very target it evaluates).  These
@@ -7452,44 +7547,54 @@ class CockpitApp(App):
         plan = self._data.submit_bench(tag.tag)
         self.push_screen(ConfirmActionScreen(plan))
 
-    # ── Operate · Orchestration: power-cap + prune (gated rig writes) ───────────────────
+    # ── Operate · Orchestration: power cap (gated rig write) ────────────────────────────
 
-    def action_power_cap_toggle(self) -> None:
-        """[c] in Operate · Orchestration: confirm-gated power-cap on/off.
-
-        Reads the current cap state to decide the toggle direction (on→off /
-        off→on), then routes the WRITE through the standard confirm gate.  A
-        cap write is a rig mutation — NEVER auto-fired."""
+    def action_power_cap(self) -> None:
+        """[c] in Operate · Orchestration: open the power-cap MENU — apply the
+        default 230W cap / clear the cap (uncap) / set a custom wattage.  The
+        chosen WRITE routes through the standard confirm gate; NEVER auto-fired."""
         if self._active_mode != 0 or self._active_operate_tab() != "tab-orchestration":
             return
-        self._toggle_power_cap()
+        self._open_power_cap_menu()
 
-    @work(group="power-cap-toggle")
-    async def _toggle_power_cap(self) -> None:
+    @work(group="power-cap-menu")
+    async def _open_power_cap_menu(self) -> None:
         st = await self._data.power_cap_get()
-        # If any GPU is below its default, treat the rig as "capped" → turn off.
-        capped = any(
-            g.limit_w is not None and g.default_w is not None and g.limit_w < g.default_w
-            for g in st.gpus
-        )
-        target = "off" if capped else "on"
-        plan = self._data.power_cap_set(target)
+        self.push_screen(PowerCapMenuScreen(self._power_cap_summary(st)),
+                         self._on_power_cap_choice)
+
+    @staticmethod
+    def _power_cap_summary(st) -> str:
+        """One-line current per-GPU cap state for the menu header."""
+        if getattr(st, "error", ""):
+            return f"[red]{st.error}[/red]"
+        parts = []
+        for g in getattr(st, "gpus", []) or []:
+            lim = f"{g.limit_w:.0f}W" if g.limit_w is not None else "?"
+            dflt = f"{g.default_w:.0f}W" if g.default_w is not None else "?"
+            capped = (g.limit_w is not None and g.default_w is not None
+                      and g.limit_w < g.default_w)
+            mark = "capped" if capped else "uncapped"
+            parts.append(f"GPU{g.index}: {lim} ({mark}, default {dflt})")
+        return "  ·  ".join(parts) if parts else "power-cap state unavailable"
+
+    def _on_power_cap_choice(self, result) -> None:
+        """Menu dismiss → build the chosen power-cap WRITE + route through the gate.
+        ``result`` is ``("on"|"off", None)`` or ``("custom", <watts:int>)``; ``None``
+        on cancel."""
+        if not result:
+            return
+        kind, watts = result
+        plan = self._data.power_cap_set(watts if kind == "custom" else kind)
         self.push_screen(ConfirmActionScreen(plan))
 
     def action_power_cap_sweep(self) -> None:
-        """[w] in Operate · Orchestration: confirm-gated power-cap sweep (heavy +
-        mutating — runs benches at each cap).  NEVER auto-fired."""
-        if self._active_mode != 0 or self._active_operate_tab() != "tab-orchestration":
+        """[w] in Operate · Doctor: confirm-gated power-cap sweep (heavy + mutating
+        — runs benches at each cap).  A tuning/diagnostic bench, so it lives on
+        Doctor (not the live-estate Orchestration tab).  NEVER auto-fired."""
+        if self._active_mode != 0 or self._active_operate_tab() != "tab-doctor":
             return
         plan = self._data.power_cap_sweep()
-        self.push_screen(ConfirmActionScreen(plan))
-
-    def action_prune_images(self) -> None:
-        """[p] in Operate · Orchestration: confirm-gated image prune (DESTRUCTIVE —
-        deletes unreferenced images).  NEVER auto-fired."""
-        if self._active_mode != 0 or self._active_operate_tab() != "tab-orchestration":
-            return
-        plan = self._data.prune()
         self.push_screen(ConfirmActionScreen(plan))
 
     # ── Estate stop-all (Operate · Orchestration) ──────────────────────────────────────

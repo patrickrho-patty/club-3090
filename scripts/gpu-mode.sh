@@ -780,6 +780,40 @@ mode_powercap() {
         echo -e "${RED}✗ nvidia-smi not found.${NC} Install the NVIDIA driver / utils first." >&2
         exit 1
     fi
+    # A numeric action = an explicit CUSTOM wattage applied to both cards (the
+    # serve-cockpit power-cap menu's "custom" option).  Validated against each
+    # card's [min,max] range; session-scoped like `off` (the boot service still
+    # re-applies 230W on reboot/reload).
+    if [[ "$action" =~ ^[0-9]+$ ]]; then
+        echo -e "${CYAN}═══ Setting custom GPU power cap (${action}W) ═══${NC}"
+        local cidx cmin cmax crc=0 capplied=0
+        while IFS=',' read -r cidx cmin cmax; do
+            cidx="${cidx// /}"; cmin="${cmin%%.*}"; cmin="${cmin// /}"
+            cmax="${cmax%%.*}"; cmax="${cmax// /}"
+            [ -z "$cidx" ] && continue
+            if [ -n "$cmin" ] && [ -n "$cmax" ] && { [ "$action" -lt "$cmin" ] || [ "$action" -gt "$cmax" ]; }; then
+                echo -e "  ${RED}✗ GPU ${cidx}: ${action}W out of range [${cmin},${cmax}]W${NC}" >&2
+                crc=1; continue
+            fi
+            echo "  Setting GPU ${cidx} → ${action} W..."
+            if ! sudo nvidia-smi -i "$cidx" -pl "$action" >/dev/null 2>&1; then
+                echo -e "  ${RED}✗ Failed to set GPU ${cidx} to ${action} W${NC} (sudo? driver?)." >&2
+                crc=1
+            else
+                capplied=1
+            fi
+        done < <(nvidia-smi --query-gpu=index,power.min_limit,power.max_limit \
+            --format=csv,noheader,nounits 2>/dev/null)
+        if [ "$capplied" -eq 0 ]; then
+            echo -e "${RED}✗ No GPUs updated.${NC} Check the value is within range: nvidia-smi -q -d POWER" >&2
+            exit 1
+        fi
+        echo -e "${GREEN}Custom cap ${action}W applied.${NC} ${YELLOW}Session-scoped — a reboot or driver"
+        echo -e "reload re-applies 230W via ${POWER_CAP_SERVICE}.${NC}"
+        powercap_echo_enforced
+        [ "$crc" -eq 0 ] || exit 1
+        return
+    fi
     case "$action" in
         on)
             echo -e "${CYAN}═══ Re-applying GPU power cap (230W) ═══${NC}"
@@ -830,7 +864,7 @@ mode_powercap() {
             ;;
         *)
             echo -e "${RED}Unknown power-cap action:${NC} $action" >&2
-            echo "Usage: gpu-mode power-cap <on|off|status>" >&2
+            echo "Usage: gpu-mode power-cap <on|off|status|WATTS>" >&2
             exit 1
             ;;
     esac
@@ -965,6 +999,8 @@ usage() {
     echo "  power-cap on       Re-apply the 230W cap (via nvidia-power-cap.service)"
     echo "  power-cap off      Uncap to hardware default for a true-TPS bench"
     echo "                     (session-scoped — a reboot / driver reload re-caps at 230W)"
+    echo "  power-cap <WATTS>  Apply a custom cap to both cards (e.g. 'power-cap 280';"
+    echo "                     validated against each card's [min,max]; session-scoped)"
     echo "  power-cap status   Show per-GPU enforced / default / min / max power limits"
     echo "                     (alias: powercap)"
     echo ""

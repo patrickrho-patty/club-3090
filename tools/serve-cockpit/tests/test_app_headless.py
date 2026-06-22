@@ -1810,14 +1810,19 @@ class TestBatch1PowerCapCard:
             assert len(wr.started) == 1
 
     @pytest.mark.asyncio
-    async def test_cap_toggle_is_confirm_gated(self):
-        # [c] toggle routes through the confirm modal (gate NOT bypassed).
+    async def test_cap_menu_choice_is_confirm_gated(self):
+        # [c] opens the power-cap menu; a chosen option routes through the confirm
+        # modal (the write is NOT bypassed).
+        from club3090_cockpit.app import PowerCapMenuScreen
         app, _, _ = make_app()
         async with app.run_test(size=(120, 40)) as pilot:
             await _enter_operate(pilot)
             app.query_one("#operate-tabs", TabbedContent).active = "tab-orchestration"
             await _settle(pilot)
-            app.action_power_cap_toggle()
+            await pilot.press("c")
+            await _settle(pilot)
+            assert isinstance(app.screen, PowerCapMenuScreen)
+            await pilot.press("d")
             await _settle(pilot)
             assert isinstance(app.screen, ConfirmActionScreen)
             assert app.screen._plan.kind == "power_cap"
@@ -3085,12 +3090,17 @@ class TestEstateExtrasWired:
             assert "capped" in strip  # GPU0 limit 230 < default 370
 
     @pytest.mark.asyncio
-    async def test_power_cap_toggle_opens_confirm_off(self):
-        """GPU0 is capped → [c] stages a 'power-cap off' (uncap) confirm."""
+    async def test_power_cap_opens_menu_then_clear_confirms_off(self):
+        """[c] opens the power-cap MENU (not a direct write); choosing 'clear' (u)
+        stages a gated 'power-cap off' (uncap) confirm."""
+        from club3090_cockpit.app import PowerCapMenuScreen
         app, _, _ = make_app()
         async with app.run_test(size=(120, 40)) as pilot:
             await _enter_operate(pilot)
             await pilot.press("c")
+            await _settle(pilot)
+            assert isinstance(app.screen, PowerCapMenuScreen)   # menu, not a write
+            await pilot.press("u")                              # clear cap (uncap)
             await _settle(pilot)
             assert isinstance(app.screen, ConfirmActionScreen)
             assert app.screen._plan.cmd == ["bash", "scripts/gpu-mode.sh", "power-cap", "off"]
@@ -3098,35 +3108,47 @@ class TestEstateExtrasWired:
             assert app.screen._plan.requires_reconcile is False
 
     @pytest.mark.asyncio
-    async def test_power_cap_sweep_opens_confirm(self):
+    async def test_power_cap_menu_default_confirms_on(self):
+        """The menu's 'default' (d) → gated 'power-cap on' (re-apply 230W)."""
+        from club3090_cockpit.app import PowerCapMenuScreen
         app, _, _ = make_app()
         async with app.run_test(size=(120, 40)) as pilot:
             await _enter_operate(pilot)
+            await pilot.press("c")
+            await _settle(pilot)
+            assert isinstance(app.screen, PowerCapMenuScreen)
+            await pilot.press("d")
+            await _settle(pilot)
+            assert isinstance(app.screen, ConfirmActionScreen)
+            assert app.screen._plan.cmd[-1] == "on"
+
+    @pytest.mark.asyncio
+    async def test_power_cap_menu_custom_wattage_confirms(self):
+        """Typing a custom wattage + Enter → gated 'power-cap <W>' confirm."""
+        from club3090_cockpit.app import PowerCapMenuScreen
+        from textual.widgets import Input
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _enter_operate(pilot)
+            await pilot.press("c")
+            await _settle(pilot)
+            assert isinstance(app.screen, PowerCapMenuScreen)
+            app.screen.query_one("#pc-watts", Input).value = "280"
+            await pilot.press("enter")
+            await _settle(pilot)
+            assert isinstance(app.screen, ConfirmActionScreen)
+            assert app.screen._plan.cmd == ["bash", "scripts/gpu-mode.sh", "power-cap", "280"]
+
+    @pytest.mark.asyncio
+    async def test_power_cap_sweep_opens_confirm_on_doctor(self):
+        """Cap-sweep moved to the Doctor tab — [w] there stages the gated sweep."""
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _enter_operate(pilot, tab="tab-doctor")
             await pilot.press("w")
             await pilot.pause()
             assert isinstance(app.screen, ConfirmActionScreen)
             assert "power-cap-sweep" in " ".join(app.screen._plan.cmd)
-
-    @pytest.mark.asyncio
-    async def test_prune_opens_confirm_modal(self):
-        app, _, _ = make_app()
-        async with app.run_test(size=(120, 40)) as pilot:
-            await _enter_operate(pilot)
-            await pilot.press("p")
-            await pilot.pause()
-            assert isinstance(app.screen, ConfirmActionScreen)
-            assert app.screen._plan.cmd == ["bash", "scripts/gpu-mode.sh", "prune"]
-
-    @pytest.mark.asyncio
-    async def test_prune_dispatches_through_gate(self):
-        wr = FakeWriteRunner()
-        app, _, _ = make_app(write_runner=wr)
-        async with app.run_test(size=(120, 40)) as pilot:
-            await _settle(pilot)
-            app.dispatch_action(app._data.prune())
-            await _settle(pilot)
-            assert len(wr.started) == 1
-            assert wr.started[0]["cmd"] == ["bash", "scripts/gpu-mode.sh", "prune"]
 
     @pytest.mark.asyncio
     async def test_container_top_reads_into_drill(self):
@@ -3874,7 +3896,7 @@ class TestFilterInputSafety:
             assert isinstance(app.focused, Input)
             # Context keys must be hidden while typing.
             for action in ("filter_catalog", "explain", "set_default", "container_logs",
-                           "estate_off", "power_cap_toggle", "evaluate_target"):
+                           "estate_off", "power_cap", "evaluate_target"):
                 result = app.check_action(action, ())
                 assert result is False, (
                     f"check_action({action!r}) should return False while Input focused, "
@@ -3910,8 +3932,8 @@ class TestCheckActionPerModeSubtab:
         async with app.run_test(size=(120, 40)) as pilot:
             await _settle(pilot)
             assert app._active_mode == 0
-            for action in ("container_logs", "estate_off", "power_cap_toggle",
-                           "prune_images", "evaluate_target", "context_t"):
+            for action in ("container_logs", "estate_off", "power_cap",
+                           "power_cap_sweep", "evaluate_target", "context_t"):
                 result = app.check_action(action, ())
                 assert result is False, (
                     f"Run must not enable estate action {action!r}, got {result!r}"
@@ -3923,15 +3945,22 @@ class TestCheckActionPerModeSubtab:
         async with app.run_test(size=(120, 40)) as pilot:
             await _enter_operate(pilot)
             assert app._active_mode == 0  # merged Run & Operate
-            # On orchestration tab
+            # On orchestration tab: estate-off + the power-cap menu are enabled;
+            # cap-sweep moved to Doctor (and prune was removed entirely).
             tc = app.query_one("#operate-tabs", TabbedContent)
             tc.active = "tab-orchestration"
             await pilot.pause()
-            for action in ("estate_off", "power_cap_toggle", "power_cap_sweep", "prune_images"):
+            for action in ("estate_off", "power_cap"):
                 result = app.check_action(action, ())
                 assert result is True, (
                     f"Operate·Orchestration must enable {action!r}, got {result!r}"
                 )
+            assert app.check_action("power_cap_sweep", ()) is False  # → Doctor now
+            # On the Doctor tab, cap-sweep is the enabled one.
+            tc.active = "tab-doctor"
+            await pilot.pause()
+            assert app.check_action("power_cap_sweep", ()) is True
+            assert app.check_action("power_cap", ()) is False        # menu is Orchestration-only
 
     @pytest.mark.asyncio
     async def test_estate_orchestration_disables_containers_keys(self):

@@ -2619,22 +2619,34 @@ class CockpitData:
             return st
         return parse_power_cap_status(res.stdout or res.stderr)
 
-    def power_cap_set(self, state: str) -> ActionPlan:
+    def power_cap_set(self, state) -> ActionPlan:
         """Build the power-cap WRITE ActionPlan (WIRED, mock-only — rig mutation).
 
-        Verified live: ``gpu-mode power-cap`` takes ``on`` (re-apply the 230W
-        cap) / ``off`` (uncap to hardware default) — NOT an arbitrary wattage.
+        ``gpu-mode power-cap`` takes ``on`` (re-apply the default 230W cap) /
+        ``off`` (uncap to hardware default) / a positive integer **wattage**
+        (a custom cap applied to both cards, validated by gpu-mode against each
+        card's [min,max] — the cockpit power-cap menu's "custom" option).
         Mutating a GPU power limit is a rig change, so this is built but NEVER
         run live this phase; it goes through a confirm modal.  It does not claim
         a GPU → ``requires_reconcile=False``."""
-        if state not in ("on", "off"):
+        if isinstance(state, bool):  # guard: bool is an int subclass
+            raise ValueError(f"power-cap state must be 'on'/'off'/<watts>, got {state!r}")
+        if isinstance(state, int) or (isinstance(state, str) and state.isdigit()):
+            watts = int(state)
+            if watts <= 0:
+                raise ValueError(f"power-cap wattage must be a positive integer, got {watts!r}")
+            arg, desc = str(watts), f"gpu-mode power-cap {watts}W (custom)"
+        elif state in ("on", "off"):
+            arg = state
+            desc = f"gpu-mode power-cap {state} ({'default 230W' if state == 'on' else 'uncap'})"
+        else:
             raise ValueError(
-                f"power-cap state must be 'on' (re-apply 230W) or 'off' (uncap), got {state!r}"
+                f"power-cap state must be 'on' (default 230W) / 'off' (uncap) / <watts>, got {state!r}"
             )
         return ActionPlan(
             kind="power_cap",
-            cmd=["bash", "scripts/gpu-mode.sh", "power-cap", state],
-            description=f"gpu-mode power-cap {state}",
+            cmd=["bash", "scripts/gpu-mode.sh", "power-cap", arg],
+            description=desc,
             requires_reconcile=False,
             requires_confirm=True,
         )
@@ -2660,23 +2672,9 @@ class CockpitData:
             requires_confirm=True,
         )
 
-    # ── Prune: gpu-mode prune / prune-all (WIRED, mock-only, confirm) ─────────────
-
-    def prune(self, *, all: bool = False) -> ActionPlan:
-        """Build the image-prune ActionPlan (WIRED, mock-only — DESTRUCTIVE).
-
-        ``gpu-mode prune`` = ``docker image prune -a`` (unreferenced images);
-        ``gpu-mode prune-all`` ALSO drops build cache + dangling networks.  Both
-        DELETE data, so this is built but NEVER run live this phase and is
-        confirm-gated.  It does not claim a GPU → ``requires_reconcile=False``."""
-        mode = "prune-all" if all else "prune"
-        return ActionPlan(
-            kind="prune",
-            cmd=["bash", "scripts/gpu-mode.sh", mode],
-            description=f"gpu-mode {mode}",
-            requires_reconcile=False,
-            requires_confirm=True,
-        )
+    # (image prune / prune-all removed from the cockpit — it was Orchestration-only
+    # and the maintainer dropped it from the tab; ``gpu-mode prune[-all]`` stays
+    # available on the CLI for manual cleanup.)
 
     # ── Container: top (READ) + rm (WIRED, mock-only, reconcile-gated) ────────────
 

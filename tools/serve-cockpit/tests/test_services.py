@@ -2423,11 +2423,21 @@ class TestPhase4PowerCap:
         off = cd.power_cap_set("off")
         assert off.cmd[-1] == "off"
 
-    def test_power_cap_set_rejects_wattage(self):
-        """gpu-mode power-cap takes on/off, NOT a wattage (verified live)."""
+    def test_power_cap_set_custom_wattage(self):
+        """gpu-mode power-cap now ALSO takes a custom wattage (cockpit menu's
+        'custom' option) — gpu-mode.sh validates it against each card's range."""
         cd = CockpitData(ROOT, runner=full_runner())
-        with pytest.raises(ValueError):
-            cd.power_cap_set("330")
+        for w in (280, "330"):
+            plan = cd.power_cap_set(w)
+            assert plan.cmd == ["bash", "scripts/gpu-mode.sh", "power-cap", str(int(w))]
+            assert plan.kind == "power_cap"
+            assert plan.requires_confirm is True and plan.requires_reconcile is False
+
+    def test_power_cap_set_rejects_invalid(self):
+        cd = CockpitData(ROOT, runner=full_runner())
+        for bad in ("hi", 0, -5, True):           # non-numeric / non-positive / bool
+            with pytest.raises(ValueError):
+                cd.power_cap_set(bad)
 
     def test_power_cap_sweep_plan(self):
         cd = CockpitData(ROOT, runner=full_runner())
@@ -2435,25 +2445,6 @@ class TestPhase4PowerCap:
         assert plan.kind == "power_cap_sweep"
         assert "--caps" in plan.cmd and "300,330,370" in plan.cmd
         assert plan.requires_confirm is True
-
-
-# ===========================================================================
-# PHASE 4 — prune (WIRED mock-only, destructive → confirm)
-# ===========================================================================
-
-
-class TestPhase4Prune:
-    def test_prune_plan(self):
-        cd = CockpitData(ROOT, runner=full_runner())
-        p = cd.prune()
-        assert p.cmd == ["bash", "scripts/gpu-mode.sh", "prune"]
-        assert p.requires_confirm is True
-        assert p.requires_reconcile is False  # deletes images, not GPU contention
-
-    def test_prune_all_plan(self):
-        cd = CockpitData(ROOT, runner=full_runner())
-        p = cd.prune(all=True)
-        assert p.cmd[-1] == "prune-all"
 
 
 # ===========================================================================
@@ -2615,21 +2606,22 @@ class TestPhase4GatedWriteExecution:
         assert write_runner.started == []  # destructive rm never reached the runner
 
     @pytest.mark.asyncio
-    async def test_prune_skips_reconcile_but_runs_via_mocked_runner(self):
-        """prune has requires_reconcile=False → no detect; reaches mocked runner."""
+    async def test_power_cap_custom_skips_reconcile_but_runs_via_mocked_runner(self):
+        """A custom-wattage power-cap has requires_reconcile=False → no detect;
+        reaches the mocked write runner with the gpu-mode power-cap <W> command."""
         write_runner = FakeWriteRunner()
 
         async def detect_should_not_be_called():
-            raise AssertionError("prune must not reconcile (no GPU contention)")
+            raise AssertionError("power-cap must not reconcile (no GPU contention)")
 
         cd = CockpitData(
             ROOT, runner=full_runner(), write_runner=write_runner,
             detect_endpoint_fn=detect_should_not_be_called,
         )
-        executed, rec, _ = await cd.execute_action(cd.prune())
+        executed, rec, _ = await cd.execute_action(cd.power_cap_set(280))
         assert executed is True and rec is None
         assert len(write_runner.started) == 1
-        assert write_runner.started[0]["cmd"] == ["bash", "scripts/gpu-mode.sh", "prune"]
+        assert write_runner.started[0]["cmd"] == ["bash", "scripts/gpu-mode.sh", "power-cap", "280"]
 
     @pytest.mark.asyncio
     async def test_submit_bench_runs_via_mocked_runner_only(self):
