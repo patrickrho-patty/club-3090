@@ -270,6 +270,7 @@ WEIGHTS_PRESENT = "present"     # subdir exists + verify_glob matches ≥1 file
 WEIGHTS_PARTIAL = "partial"     # subdir exists but no verify_glob match (interrupted / wrong)
 WEIGHTS_ABSENT = "absent"       # subdir missing
 WEIGHTS_UNKNOWN = "unknown"     # no weights entry joined (e.g. GGUF self-grabbed, or lookup failed)
+WEIGHTS_DOWNLOADING = "downloading"  # an active download worker — overlaid by the app, not stat'd
 
 
 # ── Enriched catalog entry ──────────────────────────────────────────────────────
@@ -291,6 +292,7 @@ class CatalogEntry:
     # Appended LAST so positional CatalogEntry(row, fit, measurement) is unaffected.
     weights_state: str = "unknown"
     weights: Optional["WeightsMeta"] = None
+    download_pct: Optional[int] = None   # 0-99 while weights_state == "downloading"
 
     # Convenience pass-throughs (so panes can read entry.slug, not entry.row.slug)
     @property

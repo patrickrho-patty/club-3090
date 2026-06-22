@@ -9332,3 +9332,149 @@ class TestBatch5StudioServiceSet:
                 if getattr(c, "status", "running") == "stopped"
             ]
             assert stopped == []
+
+
+class _FakeDLRunner:
+    """Stand-in download runner: start_raw returns a CoreRunState already 'done'
+    (exit 0), so run_download's await returns immediately; records launch + cancel."""
+
+    def __init__(self):
+        self.started: list = []
+        self.cancelled = False
+
+    def set_callbacks(self, **k):
+        pass
+
+    async def start_raw(self, cmd, env, run_type, parser):
+        from club3090_tui_core.runner import CoreRunState
+        self.started.append({"cmd": cmd, "env": env})
+        st = CoreRunState(run_type=run_type)
+        st.exit_code = 0
+        st.done.set()
+        return st
+
+    async def cancel(self):
+        self.cancelled = True
+        return []
+
+
+class TestDownloadUX:
+    """Download UX — Download-vs-Start pop-up modes, the listing glyph, and the
+    download worker (launch / progress / complete-restat / cancel)."""
+
+    @staticmethod
+    def _entry(state, hf="Some/Repo", size=29.0, slug="vllm/qwen-27b-dual-max"):
+        from club3090_cockpit.data import CatalogEntry, WeightsMeta
+        from club3090_tui_core import VariantRow
+        e = CatalogEntry(row=VariantRow(
+            slug=slug, switch_engine="vllm", launch_engine="vllm", compose_dir="x",
+            file="mtp.yml", port=8013, model="qwen3.6-27b", engine="vllm-stable",
+            kvcalc_key="SKIP", container="c",
+            compose_path="models/qwen3.6-27b/vllm/compose/dual/fp8/mtp.yml",
+            status="experimental", ctx_label="262K", status_note=""))
+        e.weights_state = state
+        e.weights = WeightsMeta(model="qwen3.6-27b", variant="fp8", subdir="qwen3.6-27b-fp8",
+                                hf_repo=hf or "", size_gb=size, verify_glob="*.safetensors")
+        return e
+
+    @pytest.mark.asyncio
+    async def test_listing_glyph_states(self):
+        from club3090_cockpit.app import _weights_glyph
+        from club3090_cockpit.data import (
+            WEIGHTS_ABSENT, WEIGHTS_DOWNLOADING, WEIGHTS_PRESENT, WEIGHTS_PARTIAL,
+        )
+        assert "⬇" in _weights_glyph(self._entry(WEIGHTS_ABSENT))
+        assert "⚠" in _weights_glyph(self._entry(WEIGHTS_PARTIAL))
+        e_dl = self._entry(WEIGHTS_DOWNLOADING); e_dl.download_pct = 37
+        g = _weights_glyph(e_dl)
+        assert "⏳" in g and "37%" in g
+        assert _weights_glyph(self._entry(WEIGHTS_PRESENT)) == ""   # present → no badge
+
+    @pytest.mark.asyncio
+    async def test_start_download_manual_no_repo(self):
+        from club3090_cockpit.data import WEIGHTS_ABSENT
+        app, _, _ = make_app()
+        notes: list = []
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            orig = app.notify
+            app.notify = lambda *a, **k: (notes.append(a[0] if a else ""), orig(*a, **k))[1]
+            e = self._entry(WEIGHTS_ABSENT, hf=None)   # no hf_repo → manual, can't download
+            app.start_download(e)
+            await _settle(pilot)
+            assert e.slug not in app._active_downloads()
+            assert e.weights_state == WEIGHTS_ABSENT   # unchanged
+            assert any("manual" in n.lower() or "no direct" in n.lower() for n in notes)
+
+    @pytest.mark.asyncio
+    async def test_start_download_disk_guard(self):
+        from club3090_cockpit.data import WEIGHTS_ABSENT
+        app, _, _ = make_app()
+        app._data.weights_fits_disk = lambda meta, **k: (False, 1.0, 99.0)
+        notes: list = []
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            orig = app.notify
+            app.notify = lambda *a, **k: (notes.append(a[0] if a else ""), orig(*a, **k))[1]
+            e = self._entry(WEIGHTS_ABSENT)
+            app.start_download(e)
+            await _settle(pilot)
+            assert e.slug not in app._active_downloads()
+            assert any("disk" in n.lower() for n in notes)
+
+    @pytest.mark.asyncio
+    async def test_start_download_marks_then_completes_present(self):
+        from club3090_cockpit.data import WEIGHTS_ABSENT, WEIGHTS_DOWNLOADING, WEIGHTS_PRESENT
+        app, _, _ = make_app()
+        app._data._download_runner = _FakeDLRunner()
+        app._data.weights_fits_disk = lambda meta, **k: (True, 500.0, 32.0)
+
+        async def _enrich(entries, **k):           # simulate verify-after → present
+            for e in entries:
+                e.weights_state = WEIGHTS_PRESENT
+        app._data.enrich_weights = _enrich
+
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            e = self._entry(WEIGHTS_ABSENT)
+            app.start_download(e)
+            assert e.slug in app._active_downloads()           # immediately tracked
+            assert e.weights_state == WEIGHTS_DOWNLOADING
+            await _settle(pilot)                                # worker runs to done
+            assert e.slug not in app._active_downloads()        # finished
+            assert e.weights_state == WEIGHTS_PRESENT           # re-stat → present
+            assert app._data._download_runner.started           # the download launched
+            assert app._data._download_runner.started[0]["env"].get("WEIGHT_KEY") == "qwen3.6-27b:fp8"
+
+    @pytest.mark.asyncio
+    async def test_cancel_download_resets_and_kills(self):
+        from club3090_cockpit.data import WEIGHTS_DOWNLOADING, WEIGHTS_ABSENT
+        app, _, _ = make_app()
+        app._data._download_runner = _FakeDLRunner()
+
+        async def _enrich(entries, **k):
+            for e in entries:
+                e.weights_state = WEIGHTS_ABSENT
+        app._data.enrich_weights = _enrich
+
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            e = self._entry(WEIGHTS_DOWNLOADING)
+            e.download_pct = 12
+            app._active_downloads()[e.slug] = {"entry": e, "meta": e.weights}
+            app.cancel_download(e.slug)
+            await _settle(pilot)
+            assert e.slug not in app._active_downloads()
+            assert app._data._download_runner.cancelled
+
+    @pytest.mark.asyncio
+    async def test_serve_context_picks_mode_by_weights_state(self):
+        from club3090_cockpit.data import WEIGHTS_ABSENT, WEIGHTS_PRESENT, WEIGHTS_DOWNLOADING
+        app, _, _ = make_app(gpus=_FREE_GPUS, target=ServingTarget(gpus=_FREE_GPUS))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            assert app._serve_context_for(self._entry(WEIGHTS_ABSENT)).mode == "download"
+            assert app._serve_context_for(self._entry(WEIGHTS_PRESENT)).mode == "start"
+            e_dl = self._entry(WEIGHTS_DOWNLOADING)
+            app._active_downloads()[e_dl.slug] = {"entry": e_dl, "meta": e_dl.weights}
+            assert app._serve_context_for(e_dl).mode == "downloading"

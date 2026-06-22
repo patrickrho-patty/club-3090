@@ -207,6 +207,7 @@ class CockpitData:
         get_gpu_info_fn: Optional[GetGpuInfoFn] = None,
         probe_served_fn: Optional[ProbeServedFn] = None,
         write_runner: Optional[SubprocessRunner] = None,
+        download_runner: Optional[SubprocessRunner] = None,
     ):
         self.repo_root = Path(repo_root)
         self.card = card
@@ -225,6 +226,13 @@ class CockpitData:
         self._probe_served: ProbeServedFn = probe_served_fn or self._real_probe_served
         # Write runner is constructed lazily and NEVER invoked in this phase.
         self._write_runner = write_runner or SubprocessRunner(self.repo_root)
+        # SEPARATE runner for weight downloads (Download UX): a download streams
+        # for minutes/hours, so it must NOT occupy the write-runner (which serves
+        # GPU writes) — otherwise a serve couldn't run while a download is going,
+        # and a second start_raw would clobber the download's process handle.
+        # conftest blocks SubprocessRunner.start_raw at the class level, so this
+        # default is test-safe; download tests inject a fake.
+        self._download_runner = download_runner or SubprocessRunner(self.repo_root)
         # Dual-writer serialization (design §3.2): the reconcile→execute window
         # must be ATOMIC.  Without this, two confirmed plans can both reconcile
         # "safe" before either claims VRAM (TOCTOU).  Held across the whole gate
@@ -432,10 +440,19 @@ class CockpitData:
         env["WEIGHT_KEY"] = f"{model}:{variant}"
         env.setdefault("HF_HOME", str(Path(self.weights_model_dir()) / ".cache" / "huggingface"))
         if on_line is not None:
-            self._write_runner.set_callbacks(on_line=on_line)
-        return await self._write_runner.start_raw(
+            self._download_runner.set_callbacks(on_line=on_line)
+        return await self._download_runner.start_raw(
             plan.cmd, env=env, run_type=plan.kind, parser=None
         )
+
+    async def cancel_weights_download(self) -> None:
+        """Cancel the in-flight download (kills the setup.sh/hf process group via
+        the download runner's SIGINT→TERM→KILL).  Best-effort; safe to call when
+        nothing is running."""
+        try:
+            await self._download_runner.cancel()
+        except Exception:
+            pass
 
     def weights_model_dir(self) -> str:
         """The configured model dir (where ``huggingface/<subdir>`` lives).  A

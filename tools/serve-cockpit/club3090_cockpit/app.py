@@ -91,6 +91,10 @@ from .data import (
     PromoteScaffold,
     ReconcileResult,
     Scene,
+    WEIGHTS_ABSENT,
+    WEIGHTS_DOWNLOADING,
+    WEIGHTS_PARTIAL,
+    WEIGHTS_PRESENT,
     _bench_row_matches,
     _canon_engine_family,
     _ctx_label,
@@ -127,6 +131,22 @@ def _error_headline(err: str) -> str:
 
 def _status_glyph(status: str) -> str:
     return _STATUS_GLYPH.get(status.lower(), status)
+
+
+def _weights_glyph(e: CatalogEntry) -> str:
+    """Download-state prefix for the catalog slug cell (Download UX).  ⏳NN%
+    downloading · ⬇ absent (not on disk) · ⚠ partial (interrupted/wrong).
+    present / unknown → "" (no clutter: present needs no badge, unknown means we
+    can't tell — e.g. a self-grabbed GGUF compose)."""
+    st = getattr(e, "weights_state", "") or ""
+    if st == WEIGHTS_DOWNLOADING:
+        pct = getattr(e, "download_pct", None)
+        return f"[yellow]⏳{pct}%[/yellow]" if pct is not None else "[yellow]⏳[/yellow]"
+    if st == WEIGHTS_ABSENT:
+        return "[dim]⬇[/dim]"
+    if st == WEIGHTS_PARTIAL:
+        return "[yellow]⚠[/yellow]"
+    return ""
 
 
 # ── Profile-template derivation (#6 / A12) ──────────────────────────────────────
@@ -643,6 +663,12 @@ class CatalogPane(Container):
             is_serving_row = bool(serving and e.slug == serving)
             if is_serving_row:
                 slug_cell = f"[green]●[/green] {e.slug} [green]serving[/green]"
+            else:
+                # Download UX — a glyph for the on-disk state: ⏳NN% downloading,
+                # ⬇ absent (not downloaded), ⚠ partial.  present/unknown → clean.
+                dg = _weights_glyph(e)
+                if dg:
+                    slug_cell = f"{dg} {e.slug}"
             # The fit glyph is NO LONGER a Catalog column (it moved into the serve
             # confirm pop-up — see ConfirmActionScreen._render_serve_card).  Fit is
             # STILL computed here for the serving-row exemption + the pop-up; we
@@ -1031,10 +1057,18 @@ class ServeContext(NamedTuple):
     present only for ``mode == "stop"``.
     """
 
-    mode: str                                   # "stop" | "start"
+    mode: str                                   # "stop" | "start" | "download" | "downloading"
     entry: Optional[CatalogEntry] = None
     stop_plan: Optional[ActionPlan] = None
     serving_container: str = ""                 # the container Stop tears down
+    # Download UX modes (when the slug's weights aren't present):
+    #   "download"    — weights ABSENT/partial + downloadable (hf_repo) → the modal
+    #                   offers **Download** (Enter) instead of Start.  No reconcile
+    #                   gate (a disk write, not a GPU claim).
+    #   "downloading" — a download is already in flight for this slug → the modal
+    #                   shows live ⏳NN% progress + **Cancel** (Esc closes, leaving
+    #                   it running in the background).
+    # Start is gated OFF until the weights are present.
     # force_required — the staged slug is NON-functional (experimental / preview /
     # incubating / upstream-gated / deprecated), which ``switch.sh`` REFUSES to
     # launch without ``--force``.  So a plain Start would just fail; the modal
@@ -1042,6 +1076,7 @@ class ServeContext(NamedTuple):
     # warning instead.  Production / caveats slugs leave this False (plain Start;
     # ``--force`` folds in only on a GPU conflict, per the warned-Start path).
     force_required: bool = False
+    weights_state: str = ""                     # present|partial|absent|downloading|unknown
 
 
 # ── Confirm modal (used for serve + scene + container writes) ────────────────────
@@ -1120,7 +1155,12 @@ class ConfirmActionScreen(ModalScreen):
     BINDINGS = [
         Binding("enter", "confirm", "Confirm", show=True, priority=True),
         Binding("enter", "start", "Start", show=True, priority=True),
+        # Download UX: a 3rd ``enter`` (Download — weights absent) + ``k`` Cancel
+        # for a download in flight.  Disjoint with start/stop via check_action
+        # (mode-gated), same proven pattern as the dual confirm/start enter.
+        Binding("enter", "download", "Download", show=True, priority=True),
         Binding("k", "stop", "Stop", show=True, priority=True),
+        Binding("k", "cancel_download", "Cancel download", show=True, priority=True),
         Binding("f", "force", "Force", show=True, priority=True),
         Binding("escape", "cancel", "Cancel", show=True),
     ]
@@ -1150,6 +1190,16 @@ class ConfirmActionScreen(ModalScreen):
         return bool(self._serve_ctx is not None and self._serve_ctx.mode == "stop")
 
     @property
+    def _serve_mode(self) -> str:
+        return self._serve_ctx.mode if self._serve_ctx is not None else ""
+
+    @property
+    def _is_download_modal(self) -> bool:
+        """Download UX mode — 'download' (offer Download) or 'downloading' (show
+        progress + Cancel).  A DISK action: NO reconcile gate (claims no GPU)."""
+        return self._serve_mode in ("download", "downloading")
+
+    @property
     def _has_conflict(self) -> bool:
         """Reconcile landed AND it is unsafe (a live model holds the GPU)."""
         rec = self._reconcile
@@ -1158,7 +1208,9 @@ class ConfirmActionScreen(ModalScreen):
     def compose(self) -> ComposeResult:
         if self._is_serve:
             ctx = self._serve_ctx
-            verb = "Stop" if ctx.mode == "stop" else "Start"
+            verb = {
+                "stop": "Stop", "download": "Download", "downloading": "Downloading",
+            }.get(ctx.mode, "Start")
             slug = getattr(ctx.entry, "slug", "") or self._serve_slug()
             with Vertical():
                 yield Label(f"{verb} · {slug}", classes="confirm-title")
@@ -1187,6 +1239,14 @@ class ConfirmActionScreen(ModalScreen):
         # write never does.
         if self._is_serve:
             self._render_serve_card()
+        # Download modes are a DISK action — no GPU claim, so NO reconcile gate.
+        # Render the card + (while downloading) tick live ⏳NN% progress; the
+        # Download/Cancel keys are enabled immediately (no detect to wait for).
+        if self._is_download_modal:
+            if self._serve_mode == "downloading":
+                self._dl_timer = self.set_interval(1.0, self._render_serve_card)
+            self.refresh_bindings()
+            return
         # Re-run the gate (fresh detect) before enabling any commit affordance.
         self.app.run_reconcile_for_modal(self, self._plan)  # type: ignore[attr-defined]
         self.refresh_bindings()
@@ -1196,6 +1256,51 @@ class ConfirmActionScreen(ModalScreen):
         if ctx is not None and ctx.entry is not None:
             return getattr(ctx.entry, "slug", "") or ""
         return ""
+
+    def _download_card_text(self, entry) -> str:
+        """The Download-UX card body — what fetching this slug's weights entails
+        (mode 'download') or live progress (mode 'downloading')."""
+        w = getattr(entry, "weights", None) if entry is not None else None
+        slug = getattr(entry, "slug", "") or self._serve_slug()
+        if self._serve_mode == "downloading":
+            pct = getattr(entry, "download_pct", None)
+            bar = ""
+            if pct is not None:
+                fill = max(0, min(20, round(pct / 5)))
+                bar = f"  [{'█' * fill}{'░' * (20 - fill)}] {pct}%"
+            repo = (w.hf_repo if w else "") or "?"
+            return (
+                f"  [bold]{slug}[/bold]\n"
+                f"  downloading [dim]{repo}[/dim]\n"
+                f"{bar or '  ⏳ starting…'}\n\n"
+                "  [dim]⏳ runs in the background — Esc closes this (download "
+                "continues) · [cyan]k[/cyan] cancels the download[/dim]"
+            )
+        # mode "download"
+        if w is None or not w.hf_repo:
+            return (
+                f"  [bold]{slug}[/bold]\n\n"
+                "  [yellow]⚠ no direct download recipe[/yellow] — these weights are "
+                "manual (no HF repo wired).\n  See the model profile's manual_note."
+            )
+        size = f"~{w.size_gb:.0f} GiB" if w.size_gb else "size unknown"
+        fits, free_gb, need_gb = self.app._data.weights_fits_disk(w)  # type: ignore[attr-defined]
+        disk = (
+            f"  [green]● fits[/green] — {free_gb:.0f} GiB free / ~{need_gb:.0f} GiB needed"
+            if fits else
+            f"  [red]✗ may not fit[/red] — {free_gb:.0f} GiB free / ~{need_gb:.0f} GiB needed"
+        )
+        warn = ""
+        if (getattr(entry, "weights_state", "") or "") == WEIGHTS_PARTIAL:
+            warn = "  [yellow]⚠ partial download on disk — Download resumes it[/yellow]\n"
+        return (
+            f"  [bold]{slug}[/bold]   [dim]weights not on disk[/dim]\n"
+            f"  repo   [dim]{w.hf_repo}[/dim]   ({size})\n"
+            f"{disk}\n"
+            f"{warn}\n"
+            "  [dim]⏎ Download (streams in the background, progress in the list) · "
+            "Esc Cancel[/dim]"
+        )
 
     # ── SERVE card (immediate, then reconcile-enriched) ───────────────────────────
 
@@ -1210,6 +1315,9 @@ class ConfirmActionScreen(ModalScreen):
             return
         ctx = self._serve_ctx
         entry = ctx.entry if ctx is not None else None
+        if self._is_download_modal:
+            body.update(self._download_card_text(entry))
+            return
         lines: list[str] = []
         if entry is not None:
             lines.append(
@@ -1428,8 +1536,12 @@ class ConfirmActionScreen(ModalScreen):
         explicit `f` (legacy force) / `k` (serve stop) keys are untouched."""
         if event.key != "enter":
             return
-        primary = "start" if self._is_serve else "confirm"
-        if self.check_action(primary, ()) is not True:
+        # Stop Enter iff NO enter-bound action is currently enabled.  In the serve
+        # modal the active enter-action depends on mode (start | download); the
+        # legacy modal uses confirm.  Stop/downloading modes have NO enter-action
+        # (their key is `k`), so Enter is correctly inert there too.
+        enter_actions = ("confirm", "start", "download") if self._is_serve else ("confirm",)
+        if not any(self.check_action(a, ()) is True for a in enter_actions):
             event.stop()
             event.prevent_default()
 
@@ -1454,10 +1566,18 @@ class ConfirmActionScreen(ModalScreen):
         resolved = rec is not None
         if self._is_serve:
             ctx = self._serve_ctx
+            mode = ctx.mode if ctx is not None else ""
+            # Download UX modes are a DISK action (no reconcile gate) — enabled
+            # immediately, no ``resolved`` requirement.
+            if action == "download":
+                return mode == "download"
+            if action == "cancel_download":
+                return mode == "downloading"
+            # Start/Stop need the fresh detect to have resolved (GPU writes).
             if action == "stop":
-                return bool(resolved and ctx is not None and ctx.mode == "stop")
+                return bool(resolved and mode == "stop")
             if action == "start":
-                return bool(resolved and ctx is not None and ctx.mode == "start")
+                return bool(resolved and mode == "start")
             # confirm/force never apply in serve mode.
             if action in ("confirm", "force"):
                 return False
@@ -1466,8 +1586,8 @@ class ConfirmActionScreen(ModalScreen):
             return bool(resolved and rec.safe)
         if action == "force":
             return bool(resolved and not rec.safe)
-        # stop/start never apply in the legacy modal.
-        if action in ("stop", "start"):
+        # stop/start/download/cancel_download never apply in the legacy modal.
+        if action in ("stop", "start", "download", "cancel_download"):
             return False
         return True
 
@@ -1506,6 +1626,24 @@ class ConfirmActionScreen(ModalScreen):
             return
         self.app.pop_screen()
         self.app.dispatch_action(ctx.stop_plan)  # type: ignore[attr-defined]
+
+    def action_download(self) -> None:
+        """⏎ in download mode → start the weights download (DISK action, no GPU
+        gate).  Closes the modal; progress shows live in the catalog listing."""
+        ctx = self._serve_ctx
+        if ctx is None or ctx.entry is None:
+            return
+        self.app.pop_screen()
+        self.app.start_download(ctx.entry)  # type: ignore[attr-defined]
+
+    def action_cancel_download(self) -> None:
+        """k in downloading mode → cancel the in-flight download (Esc just closes,
+        leaving it running)."""
+        ctx = self._serve_ctx
+        if ctx is None or ctx.entry is None:
+            return
+        self.app.pop_screen()
+        self.app.cancel_download(ctx.entry.slug)  # type: ignore[attr-defined]
 
     def _commit(self, *, force: bool) -> None:
         plan = self._plan
@@ -5108,6 +5246,125 @@ class CockpitApp(App):
         await self._data.enrich_weights(rows)
         pane.refresh_enriched()
 
+    # ── Download UX · fetch a slug's weights (setup.sh WEIGHT_KEY=…, streamed) ────────
+
+    def _active_downloads(self) -> dict:
+        """slug → {entry, meta} for in-flight downloads (lazy)."""
+        d = getattr(self, "_downloads", None)
+        if d is None:
+            d = {}
+            self._downloads = d
+        return d
+
+    def _refresh_catalog_rows_safe(self) -> None:
+        try:
+            self.query_one("#catalog-pane", CatalogPane).refresh_enriched()
+        except Exception:
+            pass
+
+    def start_download(self, entry: CatalogEntry) -> None:
+        """Begin downloading ``entry``'s weights.  Disk pre-check + manual-only
+        gate, then launch the streamed worker; the listing shows ⏳NN% live.
+        No-op if already downloading this slug."""
+        slug = entry.slug
+        dls = self._active_downloads()
+        if slug in dls:
+            return
+        meta = entry.weights
+        if meta is None or not meta.hf_repo:
+            self.notify(
+                "No direct download recipe for this variant (manual weights).",
+                title="Download", severity="warning", timeout=4,
+            )
+            return
+        fits, free_gb, need_gb = self._data.weights_fits_disk(meta)
+        if not fits:
+            self.notify(
+                f"Not enough disk for {slug}: need ~{need_gb:.0f} GB, {free_gb:.0f} GB free "
+                "on the model dir.",
+                title="Download", severity="error", timeout=6,
+            )
+            return
+        entry.weights_state = WEIGHTS_DOWNLOADING
+        entry.download_pct = 0
+        dls[slug] = {"entry": entry, "meta": meta}
+        self._refresh_catalog_rows_safe()
+        size = f" (~{meta.size_gb:.0f} GB)" if meta.size_gb else ""
+        self.notify(f"Downloading {meta.hf_repo}{size}…", title="Download", timeout=4)
+        self.run_download(entry)
+
+    @work(group="weights-download", exclusive=False)
+    async def run_download(self, entry: CatalogEntry) -> None:
+        """Stream the download; poll bytes-on-disk for ⏳NN% until the process
+        completes; then re-stat to confirm 'present' (authoritative over rc)."""
+        import asyncio
+        slug = entry.slug
+        meta = entry.weights
+        try:
+            run = await self._data.run_weights_download(entry.model, entry.weights_variant)
+        except Exception as exc:  # pragma: no cover - defensive
+            self._active_downloads().pop(slug, None)
+            entry.weights_state = WEIGHTS_ABSENT
+            entry.download_pct = None
+            self._refresh_catalog_rows_safe()
+            self.notify(f"Download failed to start: {exc}", title="Download",
+                        severity="error", timeout=6)
+            return
+        # Progress loop: refresh ⏳NN% every ~2s until the run signals done.
+        while not run.done.is_set():
+            if slug not in self._active_downloads():
+                return  # cancelled — cancel_download already reset + re-stat'd
+            if meta is not None:
+                pct = self._data.weights_download_progress(meta)
+                if pct is not None and entry.download_pct != pct:
+                    entry.download_pct = pct
+                    self._refresh_catalog_rows_safe()
+            try:
+                await asyncio.wait_for(run.done.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+                continue
+        if slug not in self._active_downloads():
+            return  # cancelled at the tail
+        # Done — re-stat (verify_glob) is authoritative over the exit code.
+        self._active_downloads().pop(slug, None)
+        entry.download_pct = None
+        await self._data.enrich_weights([entry])
+        self._refresh_catalog_rows_safe()
+        if entry.weights_state == WEIGHTS_PRESENT:
+            self.notify(f"✓ {slug} weights downloaded.", title="Download", timeout=4)
+        else:
+            self.notify(
+                f"✗ {slug} download incomplete ({entry.weights_state}) — "
+                "check disk / HF_TOKEN, then retry.",
+                title="Download", severity="warning", timeout=7,
+            )
+
+    def cancel_download(self, slug: str) -> None:
+        """Cancel an in-flight download: stop the poll worker, kill the process
+        group, reset + re-stat the entry."""
+        info = self._active_downloads().pop(slug, None)
+        if info is None:
+            return
+        try:
+            self.workers.cancel_group(self, "weights-download")
+        except Exception:
+            pass
+        self._kill_download()
+        entry = info["entry"]
+        entry.download_pct = None
+        self._restat_after_cancel(entry)
+        self.notify(f"Cancelled download of {slug}.", title="Download", timeout=3)
+
+    @work(group="weights-download-ctl")
+    async def _kill_download(self) -> None:
+        await self._data.cancel_weights_download()
+
+    @work(group="weights-download-restat")
+    async def _restat_after_cancel(self, entry: CatalogEntry) -> None:
+        await self._data.enrich_weights([entry])   # → partial / absent
+        entry.download_pct = None
+        self._refresh_catalog_rows_safe()
+
     # ── #6/A12 · profile-template dropdown ───────────────────────────────────────────
 
     def _known_profile_likes(self) -> list[str]:
@@ -6520,12 +6777,21 @@ class CockpitApp(App):
                 )
             # Serving slug matched but we couldn't resolve the container — fall
             # back to a Start presentation (no stop target to offer).
-        # A non-functional slug (experimental/preview/incubating/…) needs --force
-        # to launch (switch.sh refuses it otherwise) → the modal presents Force
-        # Start.  Functional (production/caveats) slugs get a plain Start.
+        # Download UX takes precedence over a (doomed) Start when the weights
+        # aren't on disk: a Start with no weights would just boot-fail.
+        ws = getattr(entry, "weights_state", "") or ""
+        if entry.slug in self._active_downloads():
+            return ServeContext(mode="downloading", entry=entry, weights_state=WEIGHTS_DOWNLOADING)
+        if ws in (WEIGHTS_ABSENT, WEIGHTS_PARTIAL):
+            # Download mode (start_download gates manual/no-hf_repo with a notify).
+            return ServeContext(mode="download", entry=entry, weights_state=ws)
+        # present / unknown → Start.  A non-functional slug (experimental/preview/…)
+        # needs --force to launch (switch.sh refuses it) → the modal presents Force
+        # Start; functional (production/caveats) slugs get a plain Start.
         return ServeContext(
             mode="start",
             entry=entry,
+            weights_state=ws,
             force_required=not _status_is_functional(entry.status),
         )
 
