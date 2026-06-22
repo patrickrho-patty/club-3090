@@ -9447,6 +9447,27 @@ class TestDownloadUX:
             assert app._data._download_runner.started[0]["env"].get("WEIGHT_KEY") == "qwen3.6-27b:fp8"
 
     @pytest.mark.asyncio
+    async def test_download_state_survives_catalog_refresh(self):
+        """A catalog rebuild (r) must not orphan an in-flight download: the
+        slug-keyed tracker re-stamps the NEW entry (DOWNLOADING + pct) and
+        re-points info['entry'] at it, so the ⏳ glyph + pop-up % persist."""
+        from club3090_cockpit.data import WEIGHTS_DOWNLOADING, WEIGHTS_PARTIAL
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            # In-flight download tracked by slug, with a live pct.
+            old = self._entry(WEIGHTS_DOWNLOADING)
+            old.download_pct = 42
+            app._active_downloads()[old.slug] = {"entry": old, "meta": old.weights, "pct": 42}
+            # A refresh produced a NEW entry, re-stat'd to partial (⏳ would vanish).
+            fresh = self._entry(WEIGHTS_PARTIAL)
+            assert fresh is not old and fresh.slug == old.slug
+            app._reapply_active_downloads([fresh])
+            assert fresh.weights_state == WEIGHTS_DOWNLOADING
+            assert fresh.download_pct == 42
+            assert app._active_downloads()[old.slug]["entry"] is fresh   # re-pointed
+
+    @pytest.mark.asyncio
     async def test_cancel_download_resets_and_kills(self):
         from club3090_cockpit.data import WEIGHTS_DOWNLOADING, WEIGHTS_ABSENT
         app, _, _ = make_app()

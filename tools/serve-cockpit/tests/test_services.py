@@ -652,6 +652,53 @@ class TestLoadCatalog:
         await cd.enrich_weights([e], model_dir=str(tmp_path))
         assert e.weights_state == WEIGHTS_PRESENT
 
+    def test_download_progress_aggregates_core_and_companion(self, tmp_path):
+        """Live-progress regression: progress must aggregate bytes across the WHOLE
+        set (core + companions) / total size — so a core-already-present slug shows
+        a MOVING % as the companion lands, not a static 99 off the core subdir."""
+        from club3090_cockpit.data import WeightsMeta
+        cd = CockpitData(ROOT, runner=full_runner())
+        core = WeightsMeta(model="m", variant="core", subdir="core", size_gb=8.0,
+                           verify_glob="*.gguf")
+        comp = WeightsMeta(model="m", variant="comp", subdir="comp", size_gb=2.0,
+                           verify_glob="*.gguf")
+        hf = tmp_path / "huggingface"
+        (hf / "core").mkdir(parents=True)
+        with open(hf / "core" / "a.gguf", "wb") as fh:
+            fh.truncate(8 * 10**9)                          # core FULL, companion absent
+        # core-only signal = the static-99 bug; the aggregate = 8/(8+2) = 80%
+        assert cd.weights_download_progress(core, model_dir=str(tmp_path)) == 99
+        assert cd.weights_download_progress_set([core, comp], model_dir=str(tmp_path)) == 80
+        (hf / "comp").mkdir(parents=True)
+        with open(hf / "comp" / "d.gguf", "wb") as fh:
+            fh.truncate(1 * 10**9)                          # half the companion → (8+1)/10 = 90%
+        assert cd.weights_download_progress_set([core, comp], model_dir=str(tmp_path)) == 90
+
+    @pytest.mark.asyncio
+    async def test_download_set_metas_includes_companions(self):
+        """download_set_metas resolves the core variant + each companion via the
+        index (the set the progress aggregates over)."""
+        from club3090_cockpit.data import CatalogEntry, WeightsMeta
+        cd = CockpitData(ROOT, runner=full_runner())
+        index = {
+            ("m", "core"): WeightsMeta(model="m", variant="core", subdir="core", size_gb=8.0),
+            ("m", "comp"): WeightsMeta(model="m", variant="comp", subdir="comp", size_gb=2.0),
+        }
+        e = CatalogEntry(row=_variant_row_from_dict({
+            "slug": "x/y", "port": 1, "model": "m",
+            "compose_path": "models/m/e/compose/dual/core/f.yml",
+            "weights_companions": ["comp"],
+        }))
+        metas = cd.download_set_metas(e, index)
+        assert [m.variant for m in metas] == ["core", "comp"]
+        # a companion absent from the index is skipped, not fatal
+        e2 = CatalogEntry(row=_variant_row_from_dict({
+            "slug": "x/z", "port": 1, "model": "m",
+            "compose_path": "models/m/e/compose/dual/core/f.yml",
+            "weights_companions": ["nope"],
+        }))
+        assert [m.variant for m in cd.download_set_metas(e2, index)] == ["core"]
+
 
 class TestExplainFit:
     @pytest.mark.asyncio

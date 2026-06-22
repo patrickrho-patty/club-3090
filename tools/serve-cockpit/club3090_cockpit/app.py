@@ -1280,6 +1280,15 @@ class ConfirmActionScreen(ModalScreen):
         slug = getattr(entry, "slug", "") or self._serve_slug()
         if self._serve_mode == "downloading":
             pct = getattr(entry, "download_pct", None)
+            # Prefer the slug-keyed tracker: it survives a catalog refresh that
+            # rebuilt `entry` (whose download_pct is briefly None until the worker's
+            # next tick re-stamps it), so the card never falls back to "starting…".
+            try:
+                info = self.app._active_downloads().get(slug)  # type: ignore[attr-defined]
+                if info is not None and info.get("pct") is not None:
+                    pct = info["pct"]
+            except Exception:
+                pass
             bar = ""
             if pct is not None:
                 fill = max(0, min(20, round(pct / 5)))
@@ -5339,6 +5348,10 @@ class CockpitApp(App):
         # a stat per row).  Last enrichment phase; feeds the Download-vs-Start
         # control + the listing's download glyph.
         await self._data.enrich_weights(rows)
+        # In-flight downloads must survive a refresh: enrich_weights just re-stat'd
+        # the rebuilt rows (a downloading slug would read partial/absent), so
+        # re-apply the live DOWNLOADING state from the slug-keyed tracker.
+        self._reapply_active_downloads(rows)
         pane.refresh_enriched()
         # Prompt to set the model dir if it's missing (weights-state can't be
         # trusted otherwise) — a banner on the catalog status line ([S] to set).
@@ -5350,12 +5363,38 @@ class CockpitApp(App):
     # ── Download UX · fetch a slug's weights (setup.sh WEIGHT_KEY=…, streamed) ────────
 
     def _active_downloads(self) -> dict:
-        """slug → {entry, meta} for in-flight downloads (lazy)."""
+        """slug → {entry, meta, pct} for in-flight downloads (lazy).  Slug-keyed so
+        the in-flight state SURVIVES a catalog refresh that rebuilds the entry
+        objects; ``pct`` is the live aggregate %, ``entry`` is re-pointed to the
+        rendered entry by _reapply_active_downloads on each reload."""
         d = getattr(self, "_downloads", None)
         if d is None:
             d = {}
             self._downloads = d
         return d
+
+    def _reapply_active_downloads(self, rows: "list[CatalogEntry]") -> None:
+        """Re-apply in-flight download state onto freshly-rebuilt catalog rows.
+
+        A refresh (``r`` → load_catalog) builds NEW CatalogEntry objects, which
+        would orphan a running download — its DOWNLOADING state + ⏳% live on the
+        OLD entry, so the rebuilt row re-stats to partial/absent (⏳ vanishes) and
+        the pop-up shows 'starting…' (the new entry's download_pct is None) while
+        the worker keeps mutating the orphan.  ``_active_downloads`` is slug-keyed
+        and survives the rebuild, so re-stamp the new entries from it and re-point
+        the tracker at the rendered entry (run_download reads ``info['entry']``
+        each tick → its next update lands on THIS one, and the % keeps moving)."""
+        dls = self._active_downloads()
+        if not dls:
+            return
+        by_slug = {e.slug: e for e in rows}
+        for slug, info in dls.items():
+            e = by_slug.get(slug)
+            if e is None:
+                continue
+            e.weights_state = WEIGHTS_DOWNLOADING
+            e.download_pct = info.get("pct")
+            info["entry"] = e
 
     def _refresh_catalog_rows_safe(self) -> None:
         try:
@@ -5388,7 +5427,7 @@ class CockpitApp(App):
             return
         entry.weights_state = WEIGHTS_DOWNLOADING
         entry.download_pct = 0
-        dls[slug] = {"entry": entry, "meta": meta}
+        dls[slug] = {"entry": entry, "meta": meta, "pct": 0}
         self._refresh_catalog_rows_safe()
         size = f" (~{meta.size_gb:.0f} GB)" if meta.size_gb else ""
         self.notify(f"Downloading {meta.hf_repo}{size}…", title="Download", timeout=4)
@@ -5413,31 +5452,50 @@ class CockpitApp(App):
             self.notify(f"Download failed to start: {exc}", title="Download",
                         severity="error", timeout=6)
             return
-        # Progress loop: refresh ⏳NN% every ~2s until the run signals done.
+        # Aggregate progress over the WHOLE download set (core + companions) so the
+        # ⏳NN% MOVES even when the core is already on disk and only a companion is
+        # being fetched — a core-only signal would sit at a static ~99% off the
+        # core subdir while the companion lands in its own subdir uncounted.
+        try:
+            _index = await self._data.weights_index()
+            dl_metas = self._data.download_set_metas(entry, _index)
+        except Exception:
+            dl_metas = [meta] if meta is not None else []
+        # Progress loop: refresh ⏳NN% every ~2s until the run signals done.  Read
+        # the CURRENT entry from the tracker each tick — a catalog refresh rebuilds
+        # entries and _reapply_active_downloads re-points info['entry'] at the
+        # rendered one, so updates always land on what's on screen (not the orphan).
         while not run.done.is_set():
-            if slug not in self._active_downloads():
+            info = self._active_downloads().get(slug)
+            if info is None:
                 return  # cancelled — cancel_download already reset + re-stat'd
-            if meta is not None:
-                pct = self._data.weights_download_progress(meta)
-                if pct is not None and entry.download_pct != pct:
-                    entry.download_pct = pct
-                    self._refresh_catalog_rows_safe()
+            if dl_metas:
+                pct = self._data.weights_download_progress_set(dl_metas)
+                if pct is not None:
+                    info["pct"] = pct                        # slug-keyed → survives refresh
+                    cur = info.get("entry", entry)
+                    if cur.download_pct != pct:
+                        cur.download_pct = pct
+                        self._refresh_catalog_rows_safe()
             try:
                 await asyncio.wait_for(run.done.wait(), timeout=2.0)
             except asyncio.TimeoutError:
                 continue
-        if slug not in self._active_downloads():
+        info = self._active_downloads().get(slug)
+        if info is None:
             return  # cancelled at the tail
-        # Done — re-stat (verify_glob) is authoritative over the exit code.
+        # Done — re-stat (verify_glob) is authoritative over the exit code.  Re-stat
+        # the CURRENT (rendered) entry, not the possibly-orphaned original.
+        cur = info.get("entry", entry)
         self._active_downloads().pop(slug, None)
-        entry.download_pct = None
-        await self._data.enrich_weights([entry])
+        cur.download_pct = None
+        await self._data.enrich_weights([cur])
         self._refresh_catalog_rows_safe()
-        if entry.weights_state == WEIGHTS_PRESENT:
+        if cur.weights_state == WEIGHTS_PRESENT:
             self.notify(f"✓ {slug} weights downloaded.", title="Download", timeout=4)
         else:
             self.notify(
-                f"✗ {slug} download incomplete ({entry.weights_state}) — "
+                f"✗ {slug} download incomplete ({cur.weights_state}) — "
                 "check disk / HF_TOKEN, then retry.",
                 title="Download", severity="warning", timeout=7,
             )

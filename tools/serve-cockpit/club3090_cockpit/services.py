@@ -521,6 +521,39 @@ class CockpitData:
         pct = int(got / (float(meta.size_gb) * 1e9) * 100)
         return max(0, min(99, pct))
 
+    def download_set_metas(
+        self, entry: CatalogEntry, index: dict[tuple[str, str], WeightsMeta]
+    ) -> list[WeightsMeta]:
+        """The FULL weight-meta set a slug's download fetches: the core
+        ``weights_variant`` PLUS each companion (resolved via the index).  The
+        download-progress signal must aggregate over this whole set — otherwise a
+        slug whose core is already on disk (only a companion is missing) reads a
+        static ~99% off the core subdir while the companion downloads into its own
+        subdir uncounted.  Companions that don't resolve in the index are skipped."""
+        metas: list[WeightsMeta] = []
+        core = index.get((entry.model, entry.weights_variant))
+        if core is not None:
+            metas.append(core)
+        for ck in (entry.weights_companions or []):
+            cvar = ck.split(":", 1)[1] if ":" in ck else ck
+            cm = index.get((entry.model, cvar))
+            if cm is not None:
+                metas.append(cm)
+        return metas
+
+    def weights_download_progress_set(
+        self, metas: list[WeightsMeta], *, model_dir: Optional[str] = None
+    ) -> Optional[int]:
+        """Aggregate download progress across a set (core + companions): total
+        bytes-on-disk / total ``size_gb``, capped at 99.  ``None`` when no size is
+        known.  This is the value the cockpit shows for an in-flight download so
+        the % MOVES as each artifact lands (vs the core-only static-99 trap)."""
+        total_size = sum(float(m.size_gb) for m in metas if m.size_gb)
+        if total_size <= 0:
+            return None
+        got = sum(self.weights_bytes_on_disk(m, model_dir=model_dir) for m in metas)
+        return max(0, min(99, int(got / (total_size * 1e9) * 100)))
+
     def weights_fits_disk(
         self, meta: WeightsMeta, *, model_dir: Optional[str] = None
     ) -> tuple[bool, float, float]:
