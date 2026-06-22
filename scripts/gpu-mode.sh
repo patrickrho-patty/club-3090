@@ -203,10 +203,9 @@ stop_gemma_12b_chat() {
 }
 
 # --- Gemma 4 31B dual-card serving variants ---------------------------------
-start_gemma_mtp() {
-    printf "  ${GREEN}▲${NC} Starting gemma-mtp..."
-    compose_at "$GEMMA_DUAL_DIR" "up -d" bf16-mtp.yml && echo "done" || echo "failed"
-}
+# (start_gemma_mtp + the gemma-mtp/gemma-int8 scenes were removed — only 'gemma'
+#  (INT8 PTH KV, 262K, :8032) remains.  stop_gemma_mtp is KEPT: stop_all_gemma
+#  (→ mode_off) defensively tears down a stray bf16 gemma container.)
 stop_gemma_mtp() {
     printf "  ${RED}▼${NC} Stopping gemma-mtp..."
     compose_at "$GEMMA_DUAL_DIR" "down" bf16-mtp.yml && echo "done" || echo "skipped"
@@ -437,27 +436,9 @@ mode_27b() {
     echo -e "${YELLOW}Tail: sudo docker logs -f vllm-qwen36-27b-dual${NC}"
 }
 
-mode_gemma() {
-    echo -e "${CYAN}═══ Switching to Gemma 4 31B MTP mode (bf16 fallback) ═══${NC}"
-    echo "Starting: Gemma 4 31B (Intel AutoRound INT4) + MTP n=3 + bf16 KV + 32K + vision (TP=2)"
-    echo "Port: 8030 | Container: vllm-gemma-4-31b-mtp"
-    echo "Stopping: Ollama, all 27B Qwen variants, other Gemma variants"
-    echo ""
-    stop_service ollama
-    stop_all_27b
-    stop_deckard
-    stop_gemma_int8
-    start_gemma_mtp
-    start_service litellm
-    start_service qdrant
-    start_service openwebui
-    start_service searxng
-    echo ""
-    echo -e "${GREEN}Gemma 4 31B MTP mode active.${NC} API: http://192.168.86.33:8030"
-    echo -e "${YELLOW}109 narr / 141 code TPS (AL 3.05 / 3.99). 32K ctx (BF16 ceiling).${NC}"
-    echo -e "${YELLOW}For 262K ctx use 'gemma' (the default — INT8 PTH KV). Boot ~2-3 min.${NC}"
-    echo -e "${YELLOW}Tail: sudo docker logs -f vllm-gemma-4-31b-mtp${NC}"
-}
+# (mode_gemma — the bf16 'gemma-mtp' fallback scene — was removed; only the INT8
+#  'gemma' scene (mode_gemma_int8) remains.  The bf16 compose is still serveable
+#  via its catalog slug if needed.)
 
 mode_gemma_dflash() {
     echo -e "${CYAN}═══ Switching to Gemma 4 31B DFlash mode ═══${NC}"
@@ -864,8 +845,6 @@ list_modes_data() {
 chat	ops	Open WebUI + LiteLLM + Qdrant + SearXNG (browser chat, no GPU model)	openwebui,litellm,qdrant,searxng	8080,4000	none
 27b	models	Qwen3.6-27B MTP n=3 + fp8 KV + 262K + vision (TP=2) — default	vllm-qwen36-27b-dual,litellm,qdrant,openwebui,searxng	8010,8080,4000	both
 gemma	models	Gemma 4 31B INT8 PTH KV + 262K + vision (TP=2) — dual default	vllm-gemma-4-31b-mtp-int8,litellm,qdrant,openwebui,searxng	8032,8080,4000	both
-gemma-int8	models	alias for gemma (Gemma 4 31B INT8 PTH KV, 262K, TP=2)	vllm-gemma-4-31b-mtp-int8,litellm,qdrant,openwebui,searxng	8032,8080,4000	both
-gemma-mtp	models	Gemma 4 31B bf16 KV fallback — 32K, stock vLLM, no overlay (TP=2)	vllm-gemma-4-31b-mtp,litellm,qdrant,openwebui,searxng	8030,8080,4000	both
 deckard	models	Qwen3.6-40B-Deckard Q6_K + MTP n=2 + q8_0 KV + 128K (llama.cpp, dual)	llama-cpp-deckard-40b,litellm,qdrant,openwebui,searxng	8199,8080,4000	both
 comfyui	studio	ComfyUI image/video gen only, all GPUs (mutex with LLM)	comfyui	8188	both
 image-studio	studio	Ideogram-4 image gen (GPU0) + gemma-4-12b chat (GPU1) + Open WebUI	comfyui,llama-cpp-gemma4-12b,studio-director,studio-image-shim,openwebui,litellm,searxng	8188,8069,8090,8191,8080,4000	split
@@ -935,8 +914,6 @@ usage() {
     echo ""
     echo "  Gemma 4 31B (dual 3090, TP=2):"
     echo "  gemma              ⭐ DEFAULT — Gemma 4 31B INT8 PTH KV + 262K + vision (:8032)"
-    echo "  gemma-int8         alias for 'gemma' (INT8 PTH KV; 98K default, CTX=262144 MAX_NUM_SEQS=1 for native 262K)"
-    echo "  gemma-mtp          bf16 KV fallback — 32K, stock vLLM v0.22.0, no overlay (:8030)"
     echo ""
     echo "  Qwen 3.6 40B Deckard (uncensored, dual 3090, llama.cpp):"
     echo "  deckard            Q6_K + MTP n=2 + q8_0 KV + 128K ctx (:8199) — text-only, both cards"
@@ -970,8 +947,6 @@ case "${1:-}" in
     chat)               mode_chat ;;
     27b)                mode_27b ;;
     gemma)              mode_gemma_int8 ;;
-    gemma-int8)         mode_gemma_int8 ;;
-    gemma-mtp)          mode_gemma ;;
     deckard)            mode_deckard ;;
     comfyui)            mode_comfyui ;;
     image-studio|imagestudio) mode_image_studio ;;
