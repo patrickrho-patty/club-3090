@@ -381,11 +381,27 @@ class CockpitData:
         meta = index.get((entry.model, entry.weights_variant))
         if meta is None or not meta.subdir:
             return WEIGHTS_UNKNOWN, meta
-        base = Path(model_dir or self.weights_model_dir()) / "huggingface" / meta.subdir
+        root = Path(model_dir or self.weights_model_dir()) / "huggingface"
+        base = root / meta.subdir
         try:
             if not base.is_dir():
                 return WEIGHTS_ABSENT, meta
-            return (WEIGHTS_PRESENT if any(base.glob(meta.verify_glob)) else WEIGHTS_PARTIAL), meta
+            if not any(base.glob(meta.verify_glob)):
+                return WEIGHTS_PARTIAL, meta
+            # Core is present — but a slug with companions (a DFlash draft / mmproj
+            # projector its compose mounts) is only truly READY when those are on
+            # disk too; otherwise Start would serve-fail.  Treat a present-core but
+            # missing-companion as PARTIAL so the Download action still fires.  A
+            # companion we can't resolve in the index doesn't block (degrade open).
+            for ck in (getattr(entry, "weights_companions", None) or []):
+                cvar = ck.split(":", 1)[1] if ":" in ck else ck
+                cmeta = index.get((entry.model, cvar))
+                if cmeta is None or not cmeta.subdir:
+                    continue
+                cbase = root / cmeta.subdir
+                if not (cbase.is_dir() and any(cbase.glob(cmeta.verify_glob))):
+                    return WEIGHTS_PARTIAL, meta
+            return WEIGHTS_PRESENT, meta
         except OSError:
             return WEIGHTS_UNKNOWN, meta
 
@@ -428,16 +444,23 @@ class CockpitData:
         model: str,
         variant: str,
         *,
+        companions: Optional[list[str]] = None,
         on_line: Optional[Callable[[str], None]] = None,
     ) -> Any:
         """Launch the weights download, streamed via the core runner (no GPU
-        claim).  ``WEIGHT_KEY`` selects the exact variant; ``HF_HOME`` is derived
-        from the model dir so HF's staging cache lands on the big models disk
-        (off root).  WIRED-BUT-MOCK-ONLY in tests (conftest blocks the real
+        claim).  ``WEIGHT_KEY`` selects the core variant; ``companions`` (the
+        slug's registry ``weights_companions`` — a DFlash draft / mmproj projector)
+        are passed as ``WEIGHT_EXTRA_KEYS`` so setup.sh fetches them ALONGSIDE the
+        core (otherwise the slug reads "present" then fails to boot).  ``HF_HOME``
+        is derived from the model dir so HF's staging cache lands on the big models
+        disk (off root).  WIRED-BUT-MOCK-ONLY in tests (conftest blocks the real
         spawn); returns the streaming run handle."""
         plan = self.weights_download_plan(model, variant)
         env = dict(os.environ)
         env["WEIGHT_KEY"] = f"{model}:{variant}"
+        comp_keys = [c if ":" in c else f"{model}:{c}" for c in (companions or []) if c]
+        if comp_keys:
+            env["WEIGHT_EXTRA_KEYS"] = " ".join(comp_keys)
         env.setdefault("HF_HOME", str(Path(self.weights_model_dir()) / ".cache" / "huggingface"))
         if on_line is not None:
             self._download_runner.set_callbacks(on_line=on_line)
@@ -2928,6 +2951,17 @@ def _variant_row_from_dict(d: dict[str, Any]) -> VariantRow:
             object.__setattr__(row, "source", str(src))
         except Exception:
             pass
+    # Per-slug download artifacts + facets, attached without touching the shared
+    # tui-core schema (same pattern as 'source'): weights_companions = the extra
+    # weight-variant keys (DFlash draft / mmproj projector) the slug needs beyond
+    # its core weights_variant; drafter / vision = display + companion derivation.
+    try:
+        comp = d.get("weights_companions") or []
+        object.__setattr__(row, "weights_companions", [str(c) for c in comp])
+        object.__setattr__(row, "drafter", str(d.get("drafter") or ""))
+        object.__setattr__(row, "vision", bool(d.get("vision")))
+    except Exception:
+        pass
     return row
 
 

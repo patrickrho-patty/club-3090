@@ -349,6 +349,27 @@ class CatalogEntry:
         return variant_quant(self.row)
 
     @property
+    def weights_companions(self) -> list[str]:
+        """Extra weight-variant keys (a DFlash draft / mmproj vision projector) this
+        slug needs at serve time BEYOND its core ``weights_variant`` — straight from
+        the registry (``weights_companions``).  Bare keys, scoped to ``model``; the
+        Download action fetches these alongside the core so the slug actually serves.
+        ``[]`` for the common single-artifact slug."""
+        return list(getattr(self.row, "weights_companions", []) or [])
+
+    @property
+    def drafter(self) -> str:
+        """The slug's spec-dec drafter id from the registry (e.g. ``anbeeld-qwen-dflash``
+        / ``qwen-mtp-builtin`` / ``""``) — for display + companion reasoning."""
+        return str(getattr(self.row, "drafter", "") or "")
+
+    @property
+    def vision(self) -> bool:
+        """Whether this slug serves vision (registry, derived from the vision-coding
+        workload) — drives the mmproj companion + a future catalog badge."""
+        return bool(getattr(self.row, "vision", False))
+
+    @property
     def source(self) -> str:
         """Provenance string for the catalog 'source' column (registry source
         field, e.g. 'curated' / 'community' / 'local')."""

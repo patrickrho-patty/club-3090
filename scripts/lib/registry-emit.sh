@@ -426,6 +426,22 @@ for vr in _tui_registry.parse_variant_rows(tab):
             # probed running ctx against the slug's CONFIGURED ctx as an exact int,
             # never round-tripping through the colloquial ÷1000 label.
             "configured_ctx": (COMPOSE_REGISTRY.get(d["slug"], {}) or {}).get("max_ctx"),
+            # Per-slug download artifacts BEYOND the core weights_variant — the
+            # extra weight-variant keys (a DFlash draft / an mmproj vision
+            # projector) the slug's compose mounts from a separate subdir.  The
+            # cockpit Download action fetches these ALONGSIDE the core so the slug
+            # actually serves; without them it reads "present" then fails to boot
+            # for the missing companion.  Bare keys, scoped to the row's model.
+            "weights_companions": list(
+                (COMPOSE_REGISTRY.get(d["slug"], {}) or {}).get("weights_companions") or []
+            ),
+            # Drafter / vision facets (display + companion derivation): drafter is
+            # the registry's per-slug spec-dec drafter id; vision is derived from
+            # the vision-coding workload (there is no separate vision field).
+            "drafter": (COMPOSE_REGISTRY.get(d["slug"], {}) or {}).get("drafter"),
+            "vision": (
+                (COMPOSE_REGISTRY.get(d["slug"], {}) or {}).get("workload") == "vision-coding"
+            ),
             "status_note": d["status_note"],
             "source": "curated",
         }

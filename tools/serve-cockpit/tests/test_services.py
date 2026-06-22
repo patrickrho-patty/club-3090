@@ -564,6 +564,94 @@ class TestLoadCatalog:
         assert cd.weights_download_progress(m0, model_dir=str(tmp_path)) is None
         assert cd.weights_fits_disk(m0, model_dir=str(tmp_path))[0] is True
 
+    def test_variant_row_from_dict_attaches_companions(self):
+        """The --json variant carries weights_companions/drafter/vision; they're
+        attached to the row (same pattern as 'source') for the per-slug companion
+        download + display."""
+        row = _variant_row_from_dict({
+            "slug": "beellama/qwen-dflash-dual", "port": 8065, "status": "experimental",
+            "weights_companions": ["anbeeld-dflash-iq4xs"],
+            "drafter": "anbeeld-qwen-dflash", "vision": False,
+        })
+        assert getattr(row, "weights_companions") == ["anbeeld-dflash-iq4xs"]
+        assert getattr(row, "drafter") == "anbeeld-qwen-dflash"
+        assert getattr(row, "vision") is False
+        # absent → safe defaults
+        bare = _variant_row_from_dict({"slug": "x/y", "port": 1})
+        assert getattr(bare, "weights_companions") == []
+        assert getattr(bare, "vision") is False
+
+    @pytest.mark.asyncio
+    async def test_run_weights_download_injects_companion_keys(self):
+        """The download passes the slug's companions as a model-qualified
+        WEIGHT_EXTRA_KEYS list so setup.sh fetches them alongside the core; a slug
+        with no companions sets no WEIGHT_EXTRA_KEYS."""
+        import asyncio
+
+        class _CaptureDL:
+            def __init__(self): self.env = None
+            def set_callbacks(self, **kw): pass
+            async def start_raw(self, cmd, env=None, run_type=None, parser=None):
+                self.env = env
+                h = type("H", (), {})()
+                h.done = asyncio.Event(); h.done.set(); h.exit_code = 0
+                return h
+
+        cap = _CaptureDL()
+        cd = CockpitData(ROOT, runner=full_runner(), download_runner=cap)
+        await cd.run_weights_download(
+            "qwen3.6-27b", "beellama-q8kxl-dflash", companions=["anbeeld-dflash-iq4xs"]
+        )
+        assert cap.env["WEIGHT_KEY"] == "qwen3.6-27b:beellama-q8kxl-dflash"
+        assert cap.env["WEIGHT_EXTRA_KEYS"] == "qwen3.6-27b:anbeeld-dflash-iq4xs"
+
+        cap2 = _CaptureDL()
+        cd2 = CockpitData(ROOT, runner=full_runner(), download_runner=cap2)
+        await cd2.run_weights_download("qwen3.6-27b", "autoround-int4")
+        assert "WEIGHT_EXTRA_KEYS" not in cap2.env
+
+    @pytest.mark.asyncio
+    async def test_weights_state_partial_until_companion_present(self, tmp_path):
+        """A slug with a companion (DFlash draft) is PARTIAL while the core is on
+        disk but the companion subdir is missing, and PRESENT once both exist —
+        so Start stays gated until the whole serve set is fetched."""
+        from club3090_cockpit.data import (
+            CatalogEntry, WEIGHTS_PRESENT, WEIGHTS_PARTIAL,
+        )
+
+        listing = json.dumps([
+            {"model": "qwen3.6-27b", "variant": "beellama-q8kxl-dflash",
+             "subdir": "qwen3.6-27b-gguf/unsloth-mtp-q8kxl", "hf_repo": "unsloth/x",
+             "size_gb": 35.8, "verify_glob": "*.gguf", "status": "experimental"},
+            {"model": "qwen3.6-27b", "variant": "anbeeld-dflash-iq4xs",
+             "subdir": "qwen3.6-27b-gguf/anbeeld-dflash-iq4xs", "hf_repo": "Anbeeld/x",
+             "size_gb": 1.6, "verify_glob": "*.gguf", "status": "experimental"},
+        ])
+        cd = CockpitData(ROOT, runner=full_runner(**{"weights.py list --json": ok(listing)}))
+        hf = tmp_path / "huggingface"
+        core = hf / "qwen3.6-27b-gguf" / "unsloth-mtp-q8kxl"
+        core.mkdir(parents=True)
+        (core / "m.gguf").write_text("x")  # core present, companion NOT yet
+
+        e = CatalogEntry(row=_variant_row_from_dict({
+            "slug": "beellama/qwen-dflash-dual", "port": 8065, "model": "qwen3.6-27b",
+            "switch_engine": "beellama", "launch_engine": "beellama", "engine": "beellama-local",
+            "compose_dir": "models/qwen3.6-27b/beellama/compose/dual/beellama-q8kxl-dflash",
+            "file": "dflash.yml",
+            "compose_path": "models/qwen3.6-27b/beellama/compose/dual/beellama-q8kxl-dflash/dflash.yml",
+            "kvcalc_key": "SKIP", "container": "c", "status": "experimental",
+            "ctx_label": "", "status_note": "",
+            "weights_companions": ["anbeeld-dflash-iq4xs"],
+        }))
+        await cd.enrich_weights([e], model_dir=str(tmp_path))
+        assert e.weights_state == WEIGHTS_PARTIAL          # core present, companion missing
+
+        comp = hf / "qwen3.6-27b-gguf" / "anbeeld-dflash-iq4xs"
+        comp.mkdir(parents=True)
+        (comp / "d.gguf").write_text("x")                  # now the companion is here too
+        await cd.enrich_weights([e], model_dir=str(tmp_path))
+        assert e.weights_state == WEIGHTS_PRESENT
+
 
 class TestExplainFit:
     @pytest.mark.asyncio

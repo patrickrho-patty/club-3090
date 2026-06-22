@@ -5402,7 +5402,9 @@ class CockpitApp(App):
         slug = entry.slug
         meta = entry.weights
         try:
-            run = await self._data.run_weights_download(entry.model, entry.weights_variant)
+            run = await self._data.run_weights_download(
+                entry.model, entry.weights_variant, companions=entry.weights_companions
+            )
         except Exception as exc:  # pragma: no cover - defensive
             self._active_downloads().pop(slug, None)
             entry.weights_state = WEIGHTS_ABSENT

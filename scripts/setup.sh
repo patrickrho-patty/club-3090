@@ -320,6 +320,22 @@ fi
 
 load_weight_recipe "${PRIMARY_WEIGHT_KEY}"
 
+# ---------- Companion artifacts (cockpit Download) ----------
+# The serve-cockpit Download action reads the slug's `weights_companions` from the
+# registry (a DFlash draft model / mmproj vision projector its compose mounts from
+# a separate subdir) and passes them as a space/comma-separated WEIGHT_EXTRA_KEYS
+# list of fully-qualified <model>:<variant> keys.  Fetch them ALONGSIDE the core
+# so a downloaded slug actually serves — otherwise it reads "present" then fails
+# to boot for the missing companion.  Each is a normal catalog entry pulled by the
+# EXTRA_WEIGHT_KEYS loop below (after the SKIP_MODEL guard), with its own SHA verify.
+if [[ -n "${WEIGHT_EXTRA_KEYS:-}" ]]; then
+  read -ra _COMPANION_KEYS <<< "${WEIGHT_EXTRA_KEYS//,/ }"
+  for _ck in "${_COMPANION_KEYS[@]}"; do
+    [[ -n "${_ck}" ]] && EXTRA_WEIGHT_KEYS+=("${_ck}")
+  done
+  [[ -n "${_COMPANION_KEYS[*]:-}" ]] && echo "[model]   + companion(s): ${_COMPANION_KEYS[*]}"
+fi
+
 # ---------- MODEL_DIR resolution ----------
 # Order of precedence:
 #   1. MODEL_DIR already exported in the calling shell  → use as-is
