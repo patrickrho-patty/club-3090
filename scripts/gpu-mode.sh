@@ -21,9 +21,8 @@ DECKARD_DIR="$CLUB3090_DIR/models/qwen3.6-40b-deckard/llama-cpp/compose/dual/pie
 # DiffusionGemma 26B-A4B — vLLM's first dLLM (TP=2, official :gemma image + 3 fix-mounts).
 # Dual-only (both cards); served via the catalog slug vllm/diffusiongemma-dual (the dgemma scene was removed). 🧪
 DGEMMA_DIR="$CLUB3090_DIR/models/diffusiongemma-26b-a4b/vllm/compose/dual/fp8"
-# Image-studio chat brain: gemma-4-12b single-card (llama.cpp), pinned to the spare GPU
-# so it coexists with ComfyUI image gen (different card). See `gpu-mode image-studio`.
-GEMMA_12B_DIR="$CLUB3090_DIR/models/gemma-4-12b/llama-cpp/compose/single/unsloth-q8kxl"
+# (gemma-4-12b chat brain retired from the studio 2026-06-23 — ai-studio uses the qwen
+#  director only. Weights kept on disk; gemma stays a core model via `gpu-mode gemma`.)
 
 # Estate planner state file (v0.7.0+). Instances booted via launch.sh --estate
 # or --estate-file are tracked here and persist via Docker `restart:
@@ -182,25 +181,8 @@ start_studio_tts() {
     compose_at "$COMPOSE_BASE/studio/tts" "up -d --build" && echo "done" || echo "failed"
 }
 
-# ComfyUI pinned to GPU 0 (image-studio split — leaves the other card for the chat LLM).
-start_comfyui_gpu0() {
-    printf "  ${GREEN}▲${NC} Starting comfyui (GPU0)..."
-    compose_at_env "$COMPOSE_BASE/comfyui" "up -d" docker-compose.yml COMFYUI_CUDA_VISIBLE_DEVICES=0 \
-        && echo "done" || echo "failed"
-}
-
-# --- gemma-4-12b chat brain (llama.cpp single-card) — image-studio's coexisting LLM ---
-# Pinned to the spare GPU (1) so it runs alongside ComfyUI on GPU0. Serves OpenAI API :8069.
-start_gemma_12b_chat() {
-    printf "  ${GREEN}▲${NC} Starting gemma-4-12b-chat (GPU1)..."
-    compose_at_env "$GEMMA_12B_DIR" "up -d" base.yml ESTATE_GPUS=1 CTX_SIZE=32768 PORT=8069 \
-        && echo "done" || echo "failed"
-}
-stop_gemma_12b_chat() {
-    printf "  ${RED}▼${NC} Stopping gemma-4-12b-chat..."
-    compose_at_env "$GEMMA_12B_DIR" "down" base.yml ESTATE_GPUS=1 CTX_SIZE=32768 PORT=8069 \
-        && echo "done" || echo "skipped"
-}
+# (start_comfyui_gpu0 + the gemma-4-12b chat brain were retired with the
+#  image-studio→ai-studio consolidation 2026-06-23 — ComfyUI now always spans both GPUs.)
 
 # --- Gemma 4 31B dual-card serving variants ---------------------------------
 # (start_gemma_mtp + the gemma-mtp/gemma-int8 scenes were removed — only 'gemma'
@@ -297,10 +279,8 @@ show_status() {
         m=$(curl -sf -m 2 http://localhost:8032/v1/models | python3 -c "import sys,json;d=json.load(sys.stdin);print(', '.join(x['id'] for x in d.get('data',[])))" 2>/dev/null)
         echo -e "  ${GREEN}▶${NC} gemma-int8 @ :8032        → ${m:-unknown} (INT8 PTH KV)"
     fi
-    if curl -sf -m 2 http://localhost:8069/v1/models >/dev/null 2>&1; then
-        local m
-        m=$(curl -sf -m 2 http://localhost:8069/v1/models | python3 -c "import sys,json;d=json.load(sys.stdin);print(', '.join(x['id'] for x in d.get('data',[])))" 2>/dev/null)
-        echo -e "  ${GREEN}▶${NC} gemma-4-12b @ :8069      → ${m:-unknown} (image-studio chat brain, GPU1, llama.cpp)"
+    if curl -sf -m 2 http://localhost:8090/v1/models >/dev/null 2>&1; then
+        echo -e "  ${GREEN}▶${NC} studio director @ :8090  → qwen3.5-4b-uncensored (prompt crafter, GPU0, llama.cpp)"
     fi
     if curl -sf -m 2 http://localhost:8188/ >/dev/null 2>&1; then
         echo -e "  ${GREEN}▶${NC} ComfyUI @ :8188          → image/video generation (GPU-bound, mutex with LLM)"
@@ -480,7 +460,6 @@ mode_deckard() {
     echo ""
     stop_all_27b
     stop_all_gemma
-    stop_gemma_12b_chat
     stop_comfyui
     start_deckard
     start_service litellm
@@ -553,41 +532,55 @@ mode_gemma_awq() {
 # protects both.  Skip: STUDIO_NO_PREFLIGHT=1.
 preflight_studio_models() {
     if [ "${STUDIO_NO_PREFLIGHT:-0}" = "1" ]; then return 0; fi
-    local scene="$1"
-    # MODEL_DIR from the repo .env (the source compose_at passes via --env-file);
-    # the ComfyUI models tree alongside it.
-    local model_dir
+    # Drive the check off the SHARED manifest (scripts/lib/studio-models.tsv) — the SAME
+    # file c3 reads — so "what ai-studio needs" is defined once (director · image · video
+    # · audio) and the two surfaces can't drift.  director = HARD requirement (no lane can
+    # craft without it); every other lane's models missing is a WARNING (studio still boots).
+    local manifest="$CLUB3090_DIR/scripts/lib/studio-models.tsv"
+    if [ ! -f "$manifest" ]; then
+        echo -e "${YELLOW}[preflight] studio manifest missing ($manifest) — skipping model check.${NC}" >&2
+        return 0
+    fi
+    # Roots: weights (director, MODEL_DIR from .env) · comfy (image/video/audio tree).
+    local model_dir comfy_models
     model_dir="$(grep -E '^MODEL_DIR=' "$CLUB3090_DIR/.env" 2>/dev/null | tail -1 | cut -d= -f2-)"
     model_dir="${model_dir:-/mnt/models/huggingface}"
-    local comfy_models="${COMFYUI_MODELS_DIR:-/mnt/models/comfyui/models}"
-    local missing=()
-    # Director GGUF — the qwen prompt crafter, needed by BOTH studio scenes.
-    if [ ! -f "$model_dir/qwen3.5-4b-gguf/hauhaucs-uncensored-q4km/Qwen3.5-4B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf" ]; then
-        missing+=("studio director GGUF  → $model_dir/qwen3.5-4b-gguf/hauhaucs-uncensored-q4km/")
+    comfy_models="${COMFYUI_MODELS_DIR:-/mnt/models/comfyui/models}"
+    local director_missing=0 warns=() modality label root rel size installer base
+    while IFS=$'\t' read -r modality label root rel size installer; do
+        case "$modality" in ''|\#*) continue ;; esac        # skip blank / comment rows
+        [ -n "$rel" ] || continue
+        if [ "$root" = "weights" ]; then base="$model_dir"; else base="$comfy_models"; fi
+        [ -e "$base/$rel" ] && continue                      # model present
+        if [ "$modality" = "director" ]; then
+            director_missing=1
+            echo -e "${RED}[preflight] ai-studio director GGUF not on disk — no lane can craft a prompt:${NC}" >&2
+            echo "  - $label  → $base/$rel" >&2
+            echo -e "${YELLOW}[preflight] Fix:  bash $installer${NC}" >&2
+        else
+            warns+=("$modality: $label → bash $installer")
+        fi
+    done < "$manifest"
+    if [ "$director_missing" = "1" ]; then
+        echo -e "${YELLOW}[preflight] Skip: STUDIO_NO_PREFLIGHT=1 gpu-mode ai-studio${NC}" >&2
+        return 1
     fi
-    # Image-studio also needs the Ideogram-4 image model.
-    if [ "$scene" = "image-studio" ] && [ ! -f "$comfy_models/diffusion_models/ideogram4_fp8_scaled.safetensors" ]; then
-        missing+=("Ideogram-4 image set  → $comfy_models/diffusion_models/")
-    fi
-    if [ ${#missing[@]} -eq 0 ]; then return 0; fi
-    echo -e "${RED}[preflight] $scene models not on disk — the bundle would boot broken:${NC}" >&2
-    local m
-    for m in "${missing[@]}"; do echo "  - $m" >&2; done
-    echo -e "${YELLOW}[preflight] Fix:  bash scripts/setup-image-studio.sh   (builds + downloads, then starts)${NC}" >&2
-    echo -e "${YELLOW}[preflight] Skip: STUDIO_NO_PREFLIGHT=1 gpu-mode $scene${NC}" >&2
-    return 1
+    local w
+    for w in "${warns[@]}"; do
+        echo -e "${YELLOW}[preflight] lane models absent — $w${NC}" >&2
+    done
+    return 0
 }
 
-mode_video_studio() {
-    preflight_studio_models video-studio || return 1
-    echo -e "${CYAN}═══ Switching to VIDEO-STUDIO mode (text/image → video) ═══${NC}"
-    echo "Starting: ComfyUI :8188 (both GPUs) + director :8090 + gallery :8189 + Open WebUI"
+mode_ai_studio() {
+    preflight_studio_models ai-studio || return 1
+    echo -e "${CYAN}═══ Switching to AI-STUDIO mode (image · video · audio · voice) ═══${NC}"
+    echo "Starting: ComfyUI :8188 (both GPUs) + director :8090 + gallery/orchestrator/image-shim/tts + Open WebUI"
     echo "Stopping: all GPU-bound LLM serving (Qwen + Gemma + DiffusionGemma)"
     echo ""
     stop_all_27b
     stop_deckard
     stop_all_gemma
-    stop_gemma_12b_chat
     stop_diffusiongemma
     start_comfyui
     start_studio_director
@@ -599,50 +592,13 @@ mode_video_studio() {
     start_service litellm
     start_service searxng
     echo ""
-    echo -e "${GREEN}Video-studio mode active.${NC}"
-    echo -e "  Open WebUI:  http://192.168.86.33:8080   (pick 🎬 Studio · LTX or 🔓 Studio · Sulphur)"
+    echo -e "${GREEN}AI-studio mode active.${NC} — one scene; pick the lane in Open WebUI."
+    echo -e "  Open WebUI:  http://192.168.86.33:8080   (image · video · music · SFX · voice lanes)"
     echo -e "  Gallery:     http://192.168.86.33:8189   (all generated media; survives ComfyUI down)"
     echo -e "  ComfyUI:     http://192.168.86.33:8188   (full node graph / control)"
-    echo -e "${YELLOW}First ComfyUI boot can take a few min (clones + node deps). The 22B DiT splits across both 3090s (DisTorch).${NC}"
-    echo -e "${YELLOW}GPU-mutex with the dual-card LLMs. Clips default ~10s, cap ~15s — see docs/ai-studio/video.md.${NC}"
+    echo -e "${YELLOW}First ComfyUI boot can take a few min (clones + node deps). Video DiT splits across both 3090s (DisTorch); image/audio lanes run on GPU0 beside the director.${NC}"
+    echo -e "${YELLOW}GPU-mutex with the dual-card LLMs. Premium voice (step-audio-editx) is on-demand on GPU1 — mutually exclusive with an active video render.${NC}"
     echo -e "${YELLOW}Tail: sudo docker logs -f comfyui${NC}"
-}
-
-mode_image_studio() {
-    preflight_studio_models image-studio || return 1
-    echo -e "${CYAN}═══ Switching to IMAGE-STUDIO mode (image gen + chat, 2-card split) ═══${NC}"
-    echo "Starting: ComfyUI/Ideogram-4 on GPU0 + gemma-4-12b chat on GPU1 + Open WebUI"
-    echo "Stopping: all dual-card LLM serving (Qwen + Gemma-31B)"
-    echo ""
-    local ngpu
-    ngpu=$(nvidia-smi -L 2>/dev/null | wc -l)
-    stop_all_27b
-    stop_deckard
-    stop_all_gemma
-    if [ "${ngpu:-0}" -lt 2 ]; then
-        echo -e "${YELLOW}⚠ Only ${ngpu:-0} GPU detected — image gen + a local chat model can't coexist"
-        echo -e "  (both are GPU-resident). Starting ComfyUI image gen only.${NC}"
-        echo -e "  ${YELLOW}For chat: use 'gpu-mode chat' (LiteLLM) or run gemma-4-12b when ComfyUI is down.${NC}"
-        start_comfyui   # default (all GPUs) — single-card box, nothing to split
-    else
-        start_comfyui_gpu0
-        start_gemma_12b_chat
-        start_studio_director       # qwen director on GPU0 (~4.6GB) — crafts Ideogram JSON for the image shim
-        start_studio_image_shim     # native 🖼️ button -> clean Ideogram images (see docs/ai-studio/video.md)
-    fi
-    start_service openwebui
-    start_service litellm
-    start_service searxng
-    echo ""
-    echo -e "${GREEN}Image-studio mode active.${NC}"
-    echo -e "  Open WebUI:  http://192.168.86.33:8080   (chat + 🖼️ image button)"
-    echo -e "  ComfyUI:     http://192.168.86.33:8188   (full node graph / control)"
-    if [ "${ngpu:-0}" -ge 2 ]; then
-        echo -e "  Chat model:  gemma-4-12b @ :8069 (GPU1) — OpenWebUI default"
-    fi
-    echo -e "${YELLOW}First ComfyUI boot ~2-3 min (clones HEAD + nodes); first image ~2 min cold / ~70 s warm.${NC}"
-    echo -e "${YELLOW}If the OpenWebUI image button is missing on an existing volume: Admin → Settings → Images.${NC}"
-    echo -e "${YELLOW}Tail: sudo docker logs -f comfyui | sudo docker logs -f llama-cpp-gemma4-12b${NC}"
 }
 
 # ('bigmodel' was removed — it was ~redundant with 'off' (both stop everything).
@@ -851,8 +807,7 @@ chat	ops	Open WebUI + LiteLLM + Qdrant + SearXNG (browser chat, no GPU model)	op
 27b	models	Qwen3.6-27B MTP n=3 + fp8 KV + 262K + vision (TP=2) — default	vllm-qwen36-27b-dual,litellm,qdrant,openwebui,searxng	8010,8080,4000	both
 gemma	models	Gemma 4 31B INT8 PTH KV + 262K + vision (TP=2) — dual default	vllm-gemma-4-31b-mtp-int8,litellm,qdrant,openwebui,searxng	8032,8080,4000	both
 deckard	models	Qwen3.6-40B-Deckard Q6_K + MTP n=2 + q8_0 KV + 128K (llama.cpp, dual)	llama-cpp-deckard-40b,litellm,qdrant,openwebui,searxng	8199,8080,4000	both
-image-studio	studio	Ideogram-4 image gen (GPU0) + gemma-4-12b chat (GPU1) + Open WebUI	comfyui,llama-cpp-gemma4-12b,studio-director,studio-image-shim,openwebui,litellm,searxng	8188,8069,8090,8191,8080,4000	split
-video-studio	studio	text/image to video (LTX/Sulphur) — ComfyUI both GPUs + studio sidecars + Open WebUI	comfyui,studio-director,studio-gallery,studio-orchestrator,studio-image-shim,studio-tts,openwebui,litellm,searxng	8188,8090,8189,8190,8191,8192,8080,4000	both
+ai-studio	studio	image · video · audio · voice — ComfyUI both GPUs + qwen director + sidecars + Open WebUI (pick the lane in OWUI)	comfyui,studio-director,studio-gallery,studio-orchestrator,studio-image-shim,studio-tts,openwebui,litellm,searxng	8188,8090,8189,8190,8191,8192,8080,4000	both
 off	ops	Stop all services	all-stopped		none
 power-cap	ops	GPU power-cap controls (on/off/status; both 3090s, 230W default cap)			both
 prune	ops	docker image prune -a (safe — only unreferenced images)			none
@@ -922,11 +877,9 @@ usage() {
     echo "  Qwen 3.6 40B Deckard (uncensored, dual 3090, llama.cpp):"
     echo "  deckard            Q6_K + MTP n=2 + q8_0 KV + 128K ctx (:8199) — text-only, both cards"
     echo ""
-    echo "  Image / Video Gen:"
-    echo "  image-studio       ⭐ Ideogram-4 image gen (GPU0) + gemma-4-12b chat (GPU1) + Open WebUI"
-    echo "                     — chat + image coexist on 2 cards (alias: imagestudio)"
-    echo "  video-studio       text/image→video (LTX-2.3 / Sulphur) — ComfyUI both GPUs +"
-    echo "                     director (:8090) + gallery (:8189) + Open WebUI (alias: videostudio)"
+    echo "  AI Studio (image · video · audio · voice — one scene, pick the lane in OWUI):"
+    echo "  ai-studio          ⭐ ComfyUI both GPUs + qwen director (:8090) + gallery/orchestrator/tts"
+    echo "                     + Open WebUI (:8080) — image/video/music/SFX/voice lanes (alias: aistudio)"
     echo ""
     echo "  off                Stop all services"
     echo "  status             Show running services, GPU, RAM, disk, Docker disk"
@@ -951,8 +904,7 @@ case "${1:-}" in
     27b)                mode_27b ;;
     gemma)              mode_gemma_int8 ;;
     deckard)            mode_deckard ;;
-    image-studio|imagestudio) mode_image_studio ;;
-    video-studio|videostudio) mode_video_studio ;;
+    ai-studio|aistudio)       mode_ai_studio ;;
     off)                mode_off ;;
     status)             show_status ;;
     power-cap|powercap) mode_powercap "${2:-status}" ;;

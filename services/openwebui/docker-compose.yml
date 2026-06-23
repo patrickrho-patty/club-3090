@@ -14,9 +14,9 @@ services:
       # FRESH volume; on an existing volume set it in Admin → Settings → Images instead.
       - ./imagegen.env
     environment:
-      # Chat model — DEFAULT: gemma-4-12b on the spare GPU (coexists with ComfyUI image gen).
-      # Bring it up with `gpu-mode image-studio`; it serves an OpenAI API on :8069 (no auth).
-      - OPENAI_API_BASE_URL=http://host.docker.internal:8069/v1
+      # Chat model — the ai-studio qwen director (:8090, uncensored prompt crafter). The
+      # studio lanes call it internally; exposing it here also gives one general chat model.
+      - OPENAI_API_BASE_URL=http://host.docker.internal:8090/v1
       - OPENAI_API_KEY=sk-noauth
       # Alternative — route chat through LiteLLM (the full catalog, but GPU-mutex with
       # ComfyUI). Swap the two lines above for these:
