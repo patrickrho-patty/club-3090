@@ -1753,6 +1753,30 @@ class TestBatch1KnownServices:
             assert "services/comfyui/docker-compose.yml" in app.screen._plan.cmd
 
     @pytest.mark.asyncio
+    async def test_stopped_studio_sidecar_listed_and_restartable(self, tmp_path):
+        """A stopped studio sidecar (exists, but no top-level services/ dir) is
+        listed in Containers and [s] starts it via `docker restart`."""
+        seed_repo(tmp_path)
+        responses = fake_responses(**{
+            "docker ps": ok(""),                       # nothing running
+            "docker container ls": ok("studio-director\n"),  # exists, stopped
+        })
+        app, _, _ = make_app(responses=responses, repo_root=tmp_path)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _enter_operate(pilot)
+            app.query_one("#operate-tabs", TabbedContent).active = "tab-containers"
+            await _settle(pilot)
+            pane = app.query_one("#operate-containers-pane", OperateContainersPane)
+            sd = next(c for c in pane._containers if c.name == "studio-director")
+            assert sd.status == "stopped" and sd.kind == "stack" and sd.engine == "studio"
+            idx = pane._containers.index(sd)
+            pane.query_one("#containers-table", DataTable).move_cursor(row=idx)
+            await pilot.press("s")  # start → docker restart (existing container)
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmActionScreen)
+            assert app.screen._plan.cmd == ["docker", "restart", "studio-director"]
+
+    @pytest.mark.asyncio
     async def test_separator_mismatch_service_matched_as_running(self, tmp_path):
         """MUST-FIX #2 (b): a service dir ``open-webui`` whose running container
         is named ``openwebui`` (separator mismatch) must NORMALIZE-match → shown
@@ -3200,13 +3224,16 @@ class TestValidateRunWired:
 
 class TestEstateExtrasWired:
     @pytest.mark.asyncio
-    async def test_power_cap_strip_populates(self):
+    async def test_power_cap_annotated_on_gpu_card(self):
+        # The dedicated power-cap strip was removed; the cap now shows ONLY on the
+        # GPU card at the top (GPU0 limit 230 < default 370 → "(cap 230W)").
         app, _, _ = make_app()
         async with app.run_test(size=(120, 40)) as pilot:
             await _enter_operate(pilot)
-            strip = str(app.query_one("#powercap-strip", Static).render())
-            assert "GPU0" in strip and "230W" in strip
-            assert "capped" in strip  # GPU0 limit 230 < default 370
+            pane = app.query_one("#operate-orch-pane", OperateOrchPane)
+            assert pane._gpu_cap.get(0) == 230.0
+            bar = str(app.query_one("#gpu0-bar", Static).render())
+            assert "cap 230W" in bar
 
     @pytest.mark.asyncio
     async def test_power_cap_opens_menu_then_clear_confirms_off(self):

@@ -1776,16 +1776,6 @@ class OperateOrchPane(Container):
         height: auto;
         margin: 0 1 1 1;
     }
-    OperateOrchPane #powercap-heading {
-        text-style: bold;
-        padding: 0 1;
-        margin: 0 1 0 1;
-    }
-    OperateOrchPane #powercap-strip {
-        padding: 0 1;
-        margin: 0 1 1 1;
-        color: $text;
-    }
     OperateOrchPane #scene-preview {
         height: auto;
         max-height: 6;
@@ -1838,8 +1828,6 @@ class OperateOrchPane(Container):
                 "[dim]highlight a scene (move cursor) to preview what it brings up[/dim]",
                 id="scene-preview",
             )
-            yield Label("Power cap", id="powercap-heading")
-            yield Static("[dim]reading power-cap status…[/dim]", id="powercap-strip")
             yield Label(
                 "[dim]\\[k] stop this model (gated)   \\[b] restart serving (gated)   "
                 "\\[n] switch model   \\[⏎] switch scene (gated)   \\[o] stop all (gated)   "
@@ -2004,26 +1992,17 @@ class OperateOrchPane(Container):
         return "\n   " + "  ·  ".join(bits)
 
     def populate_power_cap(self, st: PowerCapState) -> None:
-        strip = self.query_one("#powercap-strip", Static)
-        if st.error and not st.gpus:
-            strip.update(f"[dim]{st.error}[/dim]")
-            return
         # #10(a): cache the active cap per GPU so the GPU cards can annotate it.
-        # Only a card BELOW its default counts as capped (an uncapped card has no
-        # cap to show).
+        # Only a card BELOW its default counts as capped.  (The dedicated power-cap
+        # strip was removed — the cap shows on the GPU cards at the TOP of the pane,
+        # so a bottom strip just duplicated it; the [c] menu still adjusts it.)
         cap_map: dict[int, float] = {}
-        bits: list[str] = []
         for g in st.gpus:
-            lim = f"{g.limit_w:.0f}W" if g.limit_w is not None else "—"
-            dflt = f"{g.default_w:.0f}W" if g.default_w is not None else "—"
             capped = (
                 g.limit_w is not None and g.default_w is not None and g.limit_w < g.default_w
             )
             if capped:
                 cap_map[g.index] = g.limit_w  # type: ignore[assignment]
-            tag = "[yellow]capped[/yellow]" if capped else "[green]uncapped[/green]"
-            bits.append(f"GPU{g.index} {lim}/{dflt} {tag}")
-        strip.update("  " + "   ·   ".join(bits) if bits else "[dim]no GPUs[/dim]")
         self._gpu_cap = cap_map
         # Re-render the GPU cards now that the cap is known (power-cap is read
         # AFTER the estate poll, so the first card paint had no cap note).
@@ -7123,10 +7102,12 @@ class CockpitApp(App):
         plan = self._data.stop_all() if scene.name == "off" else self._data.scene_switch(scene.name)
         self.push_screen(ConfirmActionScreen(plan))
 
-    # Scenes (+ the comfyui service) that require the locally-built comfyui-local
-    # image.  Starting any of them before `setup-image-studio.sh` has built it just
-    # fails, so the cockpit intercepts and points the user at the setup script.
-    _STUDIO_SCENES: frozenset = frozenset({"comfyui", "image-studio", "video-studio"})
+    # Scenes that require the locally-built comfyui-local image.  Starting one
+    # before `setup-image-studio.sh` has built it just fails, so the cockpit
+    # intercepts and points the user at the setup script.  (The standalone comfyui
+    # scene was removed — comfyui runs via image/video-studio; the comfyui SERVICE
+    # start in Containers is guarded separately by name.)
+    _STUDIO_SCENES: frozenset = frozenset({"image-studio", "video-studio"})
 
     def _studio_not_ready_notice(self) -> None:
         """Tell the user the studio bundle isn't set up + how to set it up."""
@@ -7237,10 +7218,10 @@ class CockpitApp(App):
                 if con.name == "comfyui" and not self._comfyui_ready:
                     self._studio_not_ready_notice()
                     return
-                # [s] on a STOPPED service = bring it UP (docker compose up), not
-                # restart a live container.  Reconcile-gated (service_start), so a
-                # GPU service can't silently collide; a web service starts freely.
-                plan = self._data.service_start(con.name)
+                # [s] on a STOPPED service = bring it UP.  A top-level service dir
+                # → compose up (reconcile-gated, GPU-safe); an existing scene-managed
+                # container without such a dir (studio-* sidecar) → docker restart.
+                plan = self._data.service_start_or_restart(con.name)
                 self.push_screen(ConfirmActionScreen(plan))
                 return
             self.notify(

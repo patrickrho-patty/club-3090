@@ -544,23 +544,6 @@ mode_gemma_awq() {
 #  was redundant with the catalog slug vllm/diffusiongemma-dual, which is the way
 #  to serve it.  'off' still tears down any running dgemma container.)
 
-mode_comfyui() {
-    echo -e "${CYAN}═══ Switching to ComfyUI mode (image / video gen) ═══${NC}"
-    echo "Starting: ComfyUI :8188"
-    echo "Stopping: all GPU-bound LLM serving (Qwen + Gemma)"
-    echo ""
-    stop_all_27b
-    stop_deckard
-    stop_all_gemma
-    stop_gemma_12b_chat
-    start_comfyui
-    echo ""
-    echo -e "${GREEN}ComfyUI mode active.${NC} UI: http://192.168.86.33:8188"
-    echo -e "${YELLOW}First boot ~2-3 min while entrypoint clones ComfyUI + custom nodes.${NC}"
-    echo -e "${YELLOW}GPU-bound, mutex with vLLM/SGLang. No LiteLLM routing (ComfyUI is non-OpenAI).${NC}"
-    echo -e "${YELLOW}Tail: sudo docker logs -f comfyui${NC}"
-}
-
 mode_video_studio() {
     echo -e "${CYAN}═══ Switching to VIDEO-STUDIO mode (text/image → video) ═══${NC}"
     echo "Starting: ComfyUI :8188 (both GPUs) + director :8090 + gallery :8189 + Open WebUI"
@@ -832,7 +815,6 @@ chat	ops	Open WebUI + LiteLLM + Qdrant + SearXNG (browser chat, no GPU model)	op
 27b	models	Qwen3.6-27B MTP n=3 + fp8 KV + 262K + vision (TP=2) — default	vllm-qwen36-27b-dual,litellm,qdrant,openwebui,searxng	8010,8080,4000	both
 gemma	models	Gemma 4 31B INT8 PTH KV + 262K + vision (TP=2) — dual default	vllm-gemma-4-31b-mtp-int8,litellm,qdrant,openwebui,searxng	8032,8080,4000	both
 deckard	models	Qwen3.6-40B-Deckard Q6_K + MTP n=2 + q8_0 KV + 128K (llama.cpp, dual)	llama-cpp-deckard-40b,litellm,qdrant,openwebui,searxng	8199,8080,4000	both
-comfyui	studio	ComfyUI image/video gen only, all GPUs (mutex with LLM)	comfyui	8188	both
 image-studio	studio	Ideogram-4 image gen (GPU0) + gemma-4-12b chat (GPU1) + Open WebUI	comfyui,llama-cpp-gemma4-12b,studio-director,studio-image-shim,openwebui,litellm,searxng	8188,8069,8090,8191,8080,4000	split
 video-studio	studio	text/image to video (LTX/Sulphur) — ComfyUI both GPUs + studio sidecars + Open WebUI	comfyui,studio-director,studio-gallery,studio-orchestrator,studio-image-shim,studio-tts,openwebui,litellm,searxng	8188,8090,8189,8190,8191,8192,8080,4000	both
 off	ops	Stop all services	all-stopped		none
@@ -907,7 +889,6 @@ usage() {
     echo "  Image / Video Gen:"
     echo "  image-studio       ⭐ Ideogram-4 image gen (GPU0) + gemma-4-12b chat (GPU1) + Open WebUI"
     echo "                     — chat + image coexist on 2 cards (alias: imagestudio)"
-    echo "  comfyui            ComfyUI :8188 only, all GPUs (FLUX/Hunyuan/Wan; mutex with LLM)"
     echo "  video-studio       text/image→video (LTX-2.3 / Sulphur) — ComfyUI both GPUs +"
     echo "                     director (:8090) + gallery (:8189) + Open WebUI (alias: videostudio)"
     echo ""
@@ -934,7 +915,6 @@ case "${1:-}" in
     27b)                mode_27b ;;
     gemma)              mode_gemma_int8 ;;
     deckard)            mode_deckard ;;
-    comfyui)            mode_comfyui ;;
     image-studio|imagestudio) mode_image_studio ;;
     video-studio|videostudio) mode_video_studio ;;
     off)                mode_off ;;

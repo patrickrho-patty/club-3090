@@ -878,12 +878,16 @@ class CockpitData:
                     match_name, match_port = orig, port
                     break
             is_running = match_name is not None
-            # Non-GPU supporting services (litellm / qdrant / searxng / open-webui)
-            # carry an ``engine="web"`` tag + the port they serve on, so the
-            # Containers table shows what they are instead of a bare "—".  A
-            # GPU-holding rig service (ComfyUI / Step-Audio — classifies non-None)
-            # keeps no web tag; it surfaces with its real engine as a stack row.
-            engine = "" if _classify_container_kind(svc) is not None else "web"
+            # Engine label (mirrors the running path so a service reads the same
+            # stopped or running): non-GPU supporting services (litellm / qdrant /
+            # searxng / open-webui) → "web"; GPU rig services → comfyui carries its
+            # own name, the rest (step-audio / studio-*) → "studio".
+            if _classify_container_kind(svc) is None:
+                engine = "web"
+            elif _normalize_service_name(svc) == "comfyui":
+                engine = "comfyui"
+            else:
+                engine = "studio"
             out.append(
                 ContainerInfo(
                     # real container name when up (for stop/restart/logs); the dir
@@ -894,6 +898,53 @@ class CockpitData:
                     engine=engine,
                     host_port=match_port,
                 )
+            )
+        return out
+
+    async def _stopped_studio_containers(
+        self, existing: list[ContainerInfo]
+    ) -> list[ContainerInfo]:
+        """Stopped-but-EXISTING GPU rig services + AI-studio stacks (comfyui /
+        step-audio / studio-* ) from ``docker container ls -a``.
+
+        These are scene-managed containers (the image-studio / video-studio
+        bundles) that EXIST on disk even when their scene is down — but the running
+        ``docker ps`` view doesn't show them and they aren't top-level
+        ``services/<name>/`` dirs, so they'd otherwise be invisible in the
+        Containers tab.  Surfacing them lets the user see + operate them.
+
+        Only the ``service`` / ``stack`` kinds are surfaced — a stopped ENGINE
+        container (an old vLLM/llama.cpp run) is deliberately excluded so the table
+        isn't buried in stale engine cruft (engines are managed via serve).  Anything
+        already in ``existing`` (running, or a known service dir) is de-duped.
+
+        Uses ``docker container ls -a`` (NOT ``docker ps -a``) so the read can't be
+        confused with the running-only ``docker ps`` probe.  A failed read degrades
+        to an empty list."""
+        res = await self._runner.run(
+            ["docker", "container", "ls", "-a", "--format", "{{.Names}}"],
+            cwd=str(self.repo_root),
+            timeout=10.0,
+        )
+        if not res.ok:
+            return []
+        have = {_normalize_service_name(c.name) for c in existing}
+        have.discard("")
+        out: list[ContainerInfo] = []
+        for line in res.stdout.splitlines():
+            name = line.split("|", 1)[0].strip()  # tolerate name|... test shapes
+            if not name:
+                continue
+            kind = _classify_container_kind(name)
+            if kind not in ("service", "stack"):
+                continue  # only GPU services + studio stacks (skip engines/estate)
+            norm = _normalize_service_name(name)
+            if norm in have:
+                continue  # already surfaced (running, or a known dir)
+            have.add(norm)
+            engine = "comfyui" if norm == "comfyui" else "studio"
+            out.append(
+                ContainerInfo(name=name, kind=kind, status="stopped", engine=engine)
             )
         return out
 
@@ -940,10 +991,10 @@ class CockpitData:
             if kind == "engine":
                 engine = _classify_engine_from_container(name)
             elif kind in ("service", "stack"):
-                # GPU rig services + AI-studio stacks (comfyui / step-audio /
-                # studio-*) aren't LLM engines; label them "studio" so the column
-                # isn't a bare "—" (parallels "web" for the supporting services).
-                engine = "studio"
+                # GPU rig services + AI-studio stacks aren't LLM engines; label them
+                # so the column isn't a bare "—" (parallels "web" for the supporting
+                # services).  ComfyUI carries its own name; the rest read "studio".
+                engine = "comfyui" if _normalize_service_name(name) == "comfyui" else "studio"
             matched_port = False
             for match in PORT_MAP_BROAD_RE.finditer(ports_str):
                 host_port = int(match.group(1))
@@ -1064,7 +1115,8 @@ class CockpitData:
         # WRITE gate keeps its own raise → writes still fail loudly.
         try:
             running = await self.containers(variants=variants)
-            state.containers = await self._merge_known_services(running)
+            merged = await self._merge_known_services(running)
+            state.containers = merged + await self._stopped_studio_containers(merged)
         except Exception as exc:
             state.error = (
                 "docker unreachable — daemon running? in the docker group? "
@@ -1743,6 +1795,21 @@ class CockpitData:
             description=f"docker compose up {name}",
             requires_reconcile=True,
         )
+
+    def service_start_or_restart(self, name: str) -> ActionPlan:
+        """Bring a stopped service UP, picking the right mechanism:
+          - a top-level ``services/<name>/`` compose dir exists → ``compose up``
+            (``service_start`` — creates the container if needed);
+          - otherwise it's an EXISTING scene-managed container with no such dir (a
+            studio-* sidecar lives under ``services/studio/<sub>/`` and its dir name
+            doesn't match its container name) → ``docker restart`` STARTS the
+            stopped-but-created container."""
+        base = self.repo_root / "services" / name
+        if (base / "docker-compose.yml").is_file() or (
+            base / "docker-compose.yaml"
+        ).is_file():
+            return self.service_start(name)
+        return self.container_action(name, "restart")
 
     @staticmethod
     def scene_service_states_sync(

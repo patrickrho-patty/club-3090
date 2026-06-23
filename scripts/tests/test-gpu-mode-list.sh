@@ -55,10 +55,11 @@ REQUIRED = {"name", "group", "description", "services", "ports", "gpus"}
 GROUPS = {"models", "studio", "ops"}
 # Every dispatch keyword the catalog must expose, with its contract group.
 # (serving → models; chat → ops — browser-chat infra, no GPU model.  bigmodel +
-#  diffusiongemma scenes were removed — bigmodel ≈ off, dgemma → catalog slug.)
+#  diffusiongemma scenes were removed — bigmodel ≈ off, dgemma → catalog slug.  The
+#  standalone comfyui scene was removed — comfyui runs via image/video-studio.)
 EXPECT = {
     "27b": "models", "gemma": "models", "deckard": "models",
-    "comfyui": "studio", "image-studio": "studio", "video-studio": "studio",
+    "image-studio": "studio", "video-studio": "studio",
     "chat": "ops", "off": "ops", "power-cap": "ops", "prune": "ops", "prune-all": "ops",
 }
 

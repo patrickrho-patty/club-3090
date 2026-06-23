@@ -58,6 +58,7 @@ class FailedSpawnWriteRunner:
 from club3090_cockpit.data import (
     ActionPlan,
     ByoResult,
+    ContainerInfo,
     DoctorRead,
     FitVerdict,
     Measurement,
@@ -1074,8 +1075,8 @@ class TestSupportingServiceEnrichment:
         assert by["litellm"].engine == "web"
         assert by["litellm"].host_port == 4000
         assert by["litellm"].status == "running"
-        # A GPU-holding rig service (comfyui) keeps NO web tag.
-        assert by["comfyui"].engine == ""
+        # A GPU-holding rig service is NOT "web" — comfyui carries its own name.
+        assert by["comfyui"].engine == "comfyui"
 
     @pytest.mark.asyncio
     async def test_stopped_support_service_web_no_port(self, tmp_path):
@@ -1105,18 +1106,66 @@ class TestSupportingServiceEnrichment:
         by = {c.name: c for c in await cd._merge_known_services([])}
         assert by["qdrant"].host_port == 6333
 
+    @pytest.mark.asyncio
+    async def test_stopped_comfyui_engine_is_comfyui(self, tmp_path):
+        # A stopped GPU service reads the same engine as when running.
+        _seed_service_dirs(tmp_path, ["comfyui"])
+        cd = CockpitData(tmp_path, runner=full_runner(**{"docker ps": ok("")}))
+        by = {c.name: c for c in await cd._merge_known_services([])}
+        assert by["comfyui"].engine == "comfyui"
+        assert by["comfyui"].status == "stopped"
+
+
+class TestStoppedStudioContainers:
+    """_stopped_studio_containers: scene-managed studio/GPU containers that EXIST
+    but are stopped (not in `docker ps`, not a top-level services/ dir)."""
+
+    @pytest.mark.asyncio
+    async def test_surfaces_studio_skips_engines_and_dups(self):
+        cd = CockpitData(ROOT, runner=full_runner(**{
+            "docker container ls": ok(
+                "studio-tts\nstudio-director\nvllm-qwen36-27b-dual\nlitellm\n")}))
+        # litellm already in `existing` (running) → deduped; vllm = engine → skipped.
+        existing = [ContainerInfo(name="litellm", kind="service", status="running")]
+        out = {c.name: c for c in await cd._stopped_studio_containers(existing)}
+        assert set(out) == {"studio-tts", "studio-director"}
+        assert all(c.status == "stopped" and c.engine == "studio" for c in out.values())
+        assert all(c.kind == "stack" for c in out.values())
+
+    @pytest.mark.asyncio
+    async def test_comfyui_carries_its_name(self):
+        cd = CockpitData(ROOT, runner=full_runner(
+            **{"docker container ls": ok("comfyui\n")}))
+        out = await cd._stopped_studio_containers([])
+        assert out[0].name == "comfyui" and out[0].engine == "comfyui"
+
+
+class TestServiceStartOrRestart:
+    """service_start_or_restart: compose-up for a real service dir, docker restart
+    for an existing scene-managed container (studio-*) with no such dir."""
+
+    def test_dir_uses_compose_up(self, tmp_path):
+        _seed_service_dirs(tmp_path, ["comfyui"])
+        plan = CockpitData(tmp_path).service_start_or_restart("comfyui")
+        assert plan.kind == "service-up"
+        assert plan.cmd[-4:] == ["-p", "comfyui", "up", "-d"]
+
+    def test_no_dir_uses_docker_restart(self, tmp_path):
+        plan = CockpitData(tmp_path).service_start_or_restart("studio-director")
+        assert plan.cmd == ["docker", "restart", "studio-director"]
+
 
 class TestGpuServiceDisplay:
     """GPU rig services / studio stacks (comfyui, studio-*) get engine='studio' +
     their real port (a non-engine port like :8188 that PORT_MAP_BROAD_RE misses)."""
 
     @pytest.mark.asyncio
-    async def test_comfyui_engine_studio_and_port(self):
+    async def test_comfyui_engine_and_port(self):
         cd = CockpitData(ROOT, runner=full_runner(
             **{"docker ps": ok("comfyui|0.0.0.0:8188->8188/tcp\n")}))
         comfy = next(c for c in await cd.containers() if c.name == "comfyui")
         assert comfy.kind == "service"
-        assert comfy.engine == "studio"
+        assert comfy.engine == "comfyui"   # comfyui carries its own name
         assert comfy.host_port == 8188
 
     @pytest.mark.asyncio
