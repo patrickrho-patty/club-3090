@@ -1151,8 +1151,24 @@ class TestServiceStartOrRestart:
         assert plan.cmd[-4:] == ["-p", "comfyui", "up", "-d"]
 
     def test_no_dir_uses_docker_restart(self, tmp_path):
+        # studio-director's dir is services/studio/enhancer/ (name mismatch) — no
+        # resolvable compose → restart the scene-created container.
         plan = CockpitData(tmp_path).service_start_or_restart("studio-director")
         assert plan.cmd == ["docker", "restart", "studio-director"]
+
+    def test_nested_studio_sidecar_uses_compose_up(self, tmp_path):
+        # step-voice lives at services/studio/step-voice/ (NOT services/<name>/) and
+        # its container is studio-step-voice. c3 must CREATE it from that nested
+        # compose — with the project pinned to the DIR basename (step-voice) to match
+        # gpu-mode's compose_at — not docker restart (which fails on a fresh install).
+        d = tmp_path / "services" / "studio" / "step-voice"
+        d.mkdir(parents=True)
+        (d / "docker-compose.yml").write_text("services: {}\n")
+        plan = CockpitData(tmp_path).service_start_or_restart("studio-step-voice")
+        assert plan.kind == "service-up"
+        assert plan.cmd[-6:] == [
+            "-f", "services/studio/step-voice/docker-compose.yml",
+            "-p", "step-voice", "up", "-d"]
 
 
 class TestGpuServiceDisplay:
@@ -1261,6 +1277,93 @@ class TestStudioReady:
         cd = CockpitData(tmp_path, runner=full_runner(**{"docker images -q": ok("")}))
         cd._model_dir = md
         assert await cd.studio_ready() is False
+
+
+class TestStudioMissingModels:
+    """studio_missing_models / studio_models_progress — the ai-studio first-install
+    manifest detection (director under the weights root; image/video/audio canaries
+    under the ComfyUI models tree)."""
+
+    def _cd(self, tmp_path, monkeypatch):
+        cd = CockpitData(tmp_path)
+        cd._model_dir = str(tmp_path / "weights")                 # director root
+        monkeypatch.setenv("COMFYUI_MODELS_DIR", str(tmp_path / "comfy"))  # image/video/audio root
+        return cd
+
+    def _seed(self, cd, m):
+        p = cd._studio_model_path(m)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"x")
+
+    def test_all_missing_when_empty(self, tmp_path, monkeypatch):
+        from club3090_cockpit.services import STUDIO_MODELS
+        cd = self._cd(tmp_path, monkeypatch)
+        assert len(cd.studio_missing_models()) == len(STUDIO_MODELS)
+        assert cd.studio_models_progress() == 0
+
+    def test_present_canaries_drop_from_missing(self, tmp_path, monkeypatch):
+        from club3090_cockpit.services import STUDIO_MODELS
+        cd = self._cd(tmp_path, monkeypatch)
+        director = next(m for m in STUDIO_MODELS if m.modality == "director")  # weights root
+        kokoro = next(m for m in STUDIO_MODELS if "Kokoro" in m.label)         # comfy root
+        for m in (director, kokoro):
+            self._seed(cd, m)
+        missing = cd.studio_missing_models()
+        assert director not in missing and kokoro not in missing
+        assert len(missing) == len(STUDIO_MODELS) - 2
+        assert 0 < cd.studio_models_progress() < 100          # some size present, not all
+
+    def test_all_present_is_complete(self, tmp_path, monkeypatch):
+        from club3090_cockpit.services import STUDIO_MODELS
+        cd = self._cd(tmp_path, monkeypatch)
+        for m in STUDIO_MODELS:
+            self._seed(cd, m)
+        assert cd.studio_missing_models() == []
+        assert cd.studio_models_progress() == 100
+
+    def test_missing_preserves_modality_order(self, tmp_path, monkeypatch):
+        cd = self._cd(tmp_path, monkeypatch)               # nothing seeded → all missing
+        mods = [m.modality for m in cd.studio_missing_models()]
+        assert mods[0] == "director"                       # manifest order kept (director first)
+        assert {"image", "video", "audio"} <= set(mods)
+
+    def test_download_plan_runs_orchestrator(self, tmp_path):
+        plan = CockpitData(tmp_path).studio_download_plan()
+        assert plan.cmd == ["bash", "services/comfyui/download_studio_models.sh"]
+        assert plan.kind == "studio-download"
+        # disk/network fetch, no GPU claim — the modal's Download button is the confirm
+        assert plan.requires_reconcile is False and plan.requires_confirm is False
+
+
+class TestStudioVoiceGuard:
+    """studio_voice_blocked — the GPU1 video⊕voice mutex (premium voice ~14 GB on GPU1
+    vs the 22 B video DiT donor; the two GPU1 tenants are mutually exclusive)."""
+
+    def _tel(self, gpu_apps):
+        from club3090_cockpit.data import EstateTelemetry
+        return EstateTelemetry(gpu_apps=gpu_apps)
+
+    def _holder(self, gpu_index, used_mib, container="comfyui"):
+        from club3090_cockpit.data import GpuCompApp
+        return GpuCompApp(pid=1, used_mib=used_mib, container=container, gpu_index=gpu_index)
+
+    def test_allows_when_gpu1_idle(self, tmp_path):
+        assert CockpitData(tmp_path).studio_voice_blocked(self._tel({1: []})) is None
+
+    def test_blocks_when_video_render_holds_gpu1(self, tmp_path):
+        tel = self._tel({1: [self._holder(1, 22000, "comfyui")]})   # ~22 GB donor on GPU1
+        reason = CockpitData(tmp_path).studio_voice_blocked(tel)
+        assert reason is not None and "GPU1" in reason and "comfyui" in reason
+
+    def test_allows_on_no_telemetry(self, tmp_path):
+        # telemetry-honest: never false-block on a missing read
+        assert CockpitData(tmp_path).studio_voice_blocked(None) is None
+
+    def test_respects_voice_card_override(self, tmp_path):
+        tel = self._tel({0: [self._holder(0, 22000, "comfyui")]})   # busy GPU0, GPU1 free
+        cd = CockpitData(tmp_path)
+        assert cd.studio_voice_blocked(tel, voice_card=1) is None        # voice on GPU1 → fine
+        assert cd.studio_voice_blocked(tel, voice_card=0) is not None    # voice on GPU0 → blocked
 
 
 # ===========================================================================

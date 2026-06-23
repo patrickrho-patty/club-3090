@@ -3441,6 +3441,112 @@ class PowerCapMenuScreen(ModalScreen):
 # ── Phase 5 · Promote-to-catalog scaffold preview modal (design §3.5b) ────────────
 
 
+class StudioSetupScreen(ModalScreen):
+    """ai-studio first-install setup — lists the MISSING studio models (grouped by
+    modality, with sizes + total) and offers [d] "download all missing", launched
+    DETACHED with polled progress (close it and the download keeps going).  Models
+    only; if the comfyui-local IMAGE isn't built it also points at setup-*.sh (which
+    builds it).  Reached from ⏎ on the ai-studio scene when it isn't set up."""
+
+    BINDINGS = [
+        Binding("d", "download", "Download all missing", show=True, priority=True),
+        Binding("escape", "dismiss", "Close", show=True),
+    ]
+
+    DEFAULT_CSS = """
+    StudioSetupScreen { align: center middle; }
+    StudioSetupScreen #studio-setup-card {
+        width: 86; max-width: 90%; height: auto; max-height: 80%;
+        border: round $primary; background: $surface; padding: 1 2;
+    }
+    StudioSetupScreen #studio-setup-title { text-style: bold; color: $accent; margin-bottom: 1; }
+    StudioSetupScreen #studio-setup-progress { margin-top: 1; }
+    StudioSetupScreen #studio-setup-foot { margin-top: 1; color: $text-muted; }
+    """
+
+    _MOD_ORDER = ("director", "image", "video", "audio")
+    _MOD_LABEL = {"director": "Director", "image": "🖼️ Image", "video": "🎬 Video", "audio": "🔊 Audio"}
+
+    def __init__(self, missing, image_built: bool, data) -> None:
+        super().__init__()
+        self._missing = list(missing)
+        self._image_built = image_built
+        self._data = data
+        self._downloading = False
+        self._poll = None
+
+    def compose(self) -> ComposeResult:
+        total = sum(m.size_gb for m in self._missing)
+        with Container(id="studio-setup-card"):
+            yield Label(
+                f"AI-Studio setup — {len(self._missing)} model(s) missing (~{total:.0f} GB)",
+                id="studio-setup-title",
+            )
+            yield Static(self._body_text(), id="studio-setup-body")
+            yield Static("", id="studio-setup-progress")
+            yield Label(
+                "[cyan]d[/cyan] download all missing   ·   [cyan]escape[/cyan] close",
+                id="studio-setup-foot",
+            )
+
+    def _body_text(self) -> str:
+        lines: list[str] = []
+        if not self._image_built:
+            lines.append(
+                "[yellow]⚠ ComfyUI image not built — run [b]bash scripts/setup-image-studio.sh[/b] "
+                "(builds it, then downloads).[/yellow]\n"
+            )
+        if not self._missing:
+            lines.append("[green]✓ all ai-studio models present.[/green]")
+            return "\n".join(lines)
+        for mod in self._MOD_ORDER:
+            ms = [m for m in self._missing if m.modality == mod]
+            if not ms:
+                continue
+            sub = sum(m.size_gb for m in ms)
+            lines.append(f"[b]{self._MOD_LABEL.get(mod, mod)}[/b]  [dim](~{sub:.0f} GB)[/dim]")
+            for m in ms:
+                lines.append(f"   ○ {m.label}  [dim](~{m.size_gb:.1f} GB)[/dim]")
+        return "\n".join(lines)
+
+    def action_download(self) -> None:
+        if self._downloading or not self._missing:
+            return
+        self._downloading = True
+        self.app.run_studio_download_worker()
+        self.query_one("#studio-setup-progress", Static).update(
+            "[yellow]⏳ downloading… (runs in the background — you can close this)[/yellow]"
+        )
+        self._poll = self.set_interval(2.0, self._refresh)
+
+    def _refresh(self) -> None:
+        try:
+            self._missing = self._data.studio_missing_models()
+            pct = self._data.studio_models_progress()
+        except Exception:
+            return
+        prog = self.query_one("#studio-setup-progress", Static)
+        if not self._missing:
+            prog.update("[green]✓ all ai-studio models present — ready to launch ai-studio.[/green]")
+            if self._poll is not None:
+                self._poll.stop()
+                self._poll = None
+        else:
+            prog.update(
+                f"[yellow]⏳ downloading… {pct}%  ({len(self._missing)} model(s) remaining)[/yellow]"
+            )
+        try:
+            self.query_one("#studio-setup-body", Static).update(self._body_text())
+        except Exception:
+            pass
+
+    def action_dismiss(self) -> None:
+        if self._poll is not None:
+            self._poll.stop()
+            self._poll = None
+        self.dismiss()
+
+
 class PromoteScaffoldScreen(ModalScreen):
     """Preview the computed catalog-promotion scaffold (SCAFFOLD + GATE).
 
@@ -5227,6 +5333,9 @@ class CockpitApp(App):
         # A3: the last estate snapshot, cached so the periodic as-of re-render can
         # re-stamp the rail's freshness WITHOUT a fresh subprocess poll.
         self._last_estate_state: Optional[EstateState] = None
+        # Last GPU/host telemetry (cached for the video⊕voice guard — read in the
+        # sync container-write path without a fresh async poll).
+        self._last_telemetry: Optional[EstateTelemetry] = None
         # #6/A12: the registry-derived profile-template options + whether the
         # rig-topology default has already been applied (so a later estate poll
         # re-defaults the dropdown only ONCE — never clobbering a user's pick).
@@ -5936,6 +6045,7 @@ class CockpitApp(App):
         if self._active_mode == 0:
             try:
                 tel = await self._data.estate_telemetry()
+                self._last_telemetry = tel   # cache for the video⊕voice start guard
                 # FIX 3 — disk + RAM bars render into the LEFT RAIL (estate column),
                 # NOT the Orchestration sub-tab.  The GPU-VRAM "held by:" attribution
                 # stays on the orch GPU cards (populate_telemetry re-renders those).
@@ -7134,7 +7244,7 @@ class CockpitApp(App):
         # Studio guard — the studio scenes need the comfyui-local image; if it's
         # absent (setup-image-studio.sh not run), guide instead of a doomed switch.
         if scene.name in self._STUDIO_SCENES and not self._studio_ready:
-            self._studio_not_ready_notice()
+            self.open_studio_setup()       # missing-models setup modal (download all)
             return
         plan = self._data.stop_all() if scene.name == "off" else self._data.scene_switch(scene.name)
         self.push_screen(ConfirmActionScreen(plan))
@@ -7142,9 +7252,9 @@ class CockpitApp(App):
     # Scenes that require the locally-built comfyui-local image.  Starting one
     # before `setup-image-studio.sh` has built it just fails, so the cockpit
     # intercepts and points the user at the setup script.  (The standalone comfyui
-    # scene was removed — comfyui runs via image/video-studio; the comfyui SERVICE
-    # start in Containers is guarded separately by name.)
-    _STUDIO_SCENES: frozenset = frozenset({"image-studio", "video-studio"})
+    # scene was removed — comfyui runs via ai-studio; the comfyui SERVICE start in
+    # Containers is guarded separately by name.)
+    _STUDIO_SCENES: frozenset = frozenset({"ai-studio"})
 
     def _studio_not_ready_notice(self) -> None:
         """Tell the user the studio bundle isn't set up + how to set it up."""
@@ -7157,6 +7267,30 @@ class CockpitApp(App):
             severity="warning",
             timeout=12,
         )
+
+    @work(exclusive=True, group="studio-setup-open")
+    async def open_studio_setup(self) -> None:
+        """Gather the ai-studio missing-model state (image build + the manifest scan),
+        then push the StudioSetupScreen — the first-install "what's missing + download
+        all" modal (replaces the bare not-ready notify on the scene switch)."""
+        image_built = await self._data.comfyui_image_present()
+        missing = self._data.studio_missing_models()
+        self.push_screen(StudioSetupScreen(missing, image_built, self._data))
+
+    @work(exclusive=True, group="studio-download")
+    async def run_studio_download_worker(self) -> None:
+        """Launch the DETACHED 'download all missing ai-studio models' run.  Progress is
+        polled by the StudioSetupScreen (disk), not streamed here — so the user can close
+        the modal and the download keeps going.  Mock-only in tests (conftest blocks the
+        real spawn)."""
+        try:
+            await self._data.run_studio_download()
+        except Exception as exc:  # pragma: no cover - defensive
+            self.notify(f"Studio download failed to start: {exc}", title="Studio setup",
+                        severity="error", timeout=6)
+            return
+        self.notify("Downloading ai-studio models in the background…",
+                    title="Studio setup", timeout=5)
 
     def action_help(self) -> None:
         # Thread the surface so the consumer help OMITS the producer lane (R3b-1).
@@ -7256,6 +7390,14 @@ class CockpitApp(App):
                 if con.name == "comfyui" and not self._studio_ready:
                     self._studio_not_ready_notice()
                     return
+                # GPU1 video⊕voice mutex — premium voice (step-audio-editx) needs ~14 GB
+                # on GPU1; if a video render already holds that card, refuse instead of
+                # OOMing.  Telemetry-honest (no telemetry ⇒ allowed).
+                if con.name == "studio-step-voice":
+                    reason = self._data.studio_voice_blocked(getattr(self, "_last_telemetry", None))
+                    if reason:
+                        self.notify(reason, title="Premium voice", severity="warning", timeout=8)
+                        return
                 # [s] on a STOPPED service = bring it UP.  A top-level service dir
                 # → compose up (reconcile-gated, GPU-safe); an existing scene-managed
                 # container without such a dir (studio-* sidecar) → docker restart.

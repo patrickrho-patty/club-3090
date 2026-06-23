@@ -8858,21 +8858,20 @@ class TestScenePreview:
 
 
 class TestStudioSceneGuard:
-    """⏎ on a studio scene (image-studio / video-studio) when the studio isn't set
-    up (comfyui-local image OR director GGUF missing) guides to setup-image-studio.sh,
-    not a scene switch."""
+    """⏎ on the studio scene (ai-studio) when the studio isn't set up (comfyui-local
+    image OR director GGUF missing) guides to setup-image-studio.sh, not a scene switch."""
 
     SCENES = json.dumps([
-        {"name": "image-studio", "group": "studio", "description": "img gen",
-         "services": ["comfyui", "openwebui"], "ports": ["8188"], "gpus": "split"},
+        {"name": "ai-studio", "group": "studio", "description": "creative studio",
+         "services": ["comfyui", "openwebui"], "ports": ["8188"], "gpus": "both"},
         {"name": "off", "group": "ops", "description": "Stop all",
          "services": [], "ports": [], "gpus": "none"},
     ])
 
-    async def _enter_on_image_studio(self, app, pilot):
+    async def _enter_on_studio_scene(self, app, pilot):
         await _enter_operate(pilot)
         pane = app.query_one("#operate-orch-pane", OperateOrchPane)
-        idx = next(i for i, s in enumerate(pane._scenes) if s.name == "image-studio")
+        idx = next(i for i, s in enumerate(pane._scenes) if s.name == "ai-studio")
         app.query_one("#scene-table", DataTable).move_cursor(row=idx)
         await pilot.pause()
         app._operate_primary()
@@ -8886,7 +8885,7 @@ class TestStudioSceneGuard:
         })
         app, _, _ = make_app(responses=responses)
         async with app.run_test(size=(120, 40)) as pilot:
-            await self._enter_on_image_studio(app, pilot)
+            await self._enter_on_studio_scene(app, pilot)
             assert app._studio_ready is False
             assert not isinstance(app.screen, ConfirmActionScreen)  # guarded
 
@@ -8899,10 +8898,30 @@ class TestStudioSceneGuard:
         app, _, _ = make_app(responses=responses)
         _seed_studio_director(app, tmp_path)  # image present + director on disk
         async with app.run_test(size=(120, 40)) as pilot:
-            await self._enter_on_image_studio(app, pilot)
+            await self._enter_on_studio_scene(app, pilot)
             assert app._studio_ready is True
             assert isinstance(app.screen, ConfirmActionScreen)
-            assert app.screen._plan.cmd == ["bash", "scripts/gpu-mode.sh", "image-studio"]
+            assert app.screen._plan.cmd == ["bash", "scripts/gpu-mode.sh", "ai-studio"]
+
+    @pytest.mark.asyncio
+    async def test_shows_setup_modal_with_missing_models(self, tmp_path, monkeypatch):
+        """Not-ready ⏎ opens the StudioSetupScreen listing the MISSING models grouped
+        by modality (the first-install download affordance), not just a notify."""
+        from club3090_cockpit.app import StudioSetupScreen
+        monkeypatch.setenv("COMFYUI_MODELS_DIR", str(tmp_path / "comfy"))  # nothing seeded
+        responses = fake_responses(**{
+            "gpu-mode.sh --list-modes --json": ok(self.SCENES),
+            "docker images -q": ok(""),  # comfyui-local absent → not ready
+        })
+        app, _, _ = make_app(responses=responses)
+        app._data._model_dir = str(tmp_path / "weights")  # director root empty → director missing
+        async with app.run_test(size=(120, 40)) as pilot:
+            await self._enter_on_studio_scene(app, pilot)
+            await pilot.pause()
+            await pilot.pause()  # let the open_studio_setup worker push the modal
+            assert isinstance(app.screen, StudioSetupScreen)
+            body = str(app.screen.query_one("#studio-setup-body", Static).render())
+            assert "Director" in body and "Video" in body  # missing models, grouped by modality
 
 
 class TestEvidenceAndGatePreview:

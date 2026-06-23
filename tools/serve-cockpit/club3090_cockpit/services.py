@@ -77,6 +77,7 @@ from .data import (
     Scene,
     SceneServiceState,
     ServedProbe,
+    StudioModel,
     VerifyFull,
     VerifySmoke,
     WEIGHTS_ABSENT,
@@ -131,6 +132,51 @@ STUDIO_DIRECTOR_REL = (
     "qwen3.5-4b-gguf/hauhaucs-uncensored-q4km/"
     "Qwen3.5-4B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf"
 )
+
+# The ComfyUI models tree — image/video/audio checkpoints live here (alongside the
+# HF weights root that holds the director).  On this rig /mnt/models/comfyui/models.
+# Env COMFYUI_MODELS_DIR overrides (the same var gpu-mode + the download scripts honour).
+COMFYUI_MODELS_DIR = "/mnt/models/comfyui/models"
+
+# ── ai-studio model manifest — loaded from the SHARED SoT ──────────────────────────
+# scripts/lib/studio-models.tsv is read by BOTH c3 (here) AND gpu-mode's
+# preflight_studio_models, so "what ai-studio needs" is defined once (no canary drift).
+# Loaded relative to the repo this code ships in (__file__) — the manifest is code data;
+# only the model ROOTS (weights vs comfy) are per-rig (resolved at call time).  Roster
+# note: the uncensored picks (Krea / Z-Image / Wan) get appended in the TSV after the
+# bake-off — the detection/progress machinery here is roster-independent.
+STUDIO_MANIFEST_REL = "scripts/lib/studio-models.tsv"
+
+
+def _load_studio_models() -> "list[StudioModel]":
+    tsv = Path(__file__).resolve().parents[3] / STUDIO_MANIFEST_REL
+    models: list[StudioModel] = []
+    try:
+        text = tsv.read_text()
+    except OSError:
+        return models  # defensive — manifest absent (e.g. non-editable install)
+    for line in text.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) < 6:
+            continue
+        modality, label, root, rel_path, size_s, installer = (p.strip() for p in parts[:6])
+        try:
+            size = float(size_s)
+        except ValueError:
+            size = 0.0
+        models.append(StudioModel(modality, label, root, rel_path, size, installer))
+    return models
+
+
+STUDIO_MODELS = _load_studio_models()
+
+# Premium-voice (Step-Audio-EditX) container + its GPU need — for the GPU1 video⊕voice
+# mutex guard: voice is ~14 GB on GPU1, and the 22B video DiT donor is the OTHER GPU1
+# tenant, so they're mutually exclusive (§ ai-studio-consolidation-design).
+STUDIO_VOICE_CONTAINER = "studio-step-voice"
+STUDIO_VOICE_GPU_NEED_MIB = 14000
 
 
 # ── Subprocess runner protocol (dependency injection seam) ───────────────────────
@@ -479,6 +525,24 @@ class CockpitData:
         if comp_keys:
             env["WEIGHT_EXTRA_KEYS"] = " ".join(comp_keys)
         env.setdefault("HF_HOME", str(Path(root) / ".cache" / "huggingface"))
+        if on_line is not None:
+            self._download_runner.set_callbacks(on_line=on_line)
+        return await self._download_runner.start_raw(
+            plan.cmd, env=env, run_type=plan.kind, parser=None
+        )
+
+    async def run_studio_download(self, *, on_line=None):
+        """Launch the "download all missing ai-studio models" orchestrator DETACHED;
+        returns the streaming run handle (poll ``studio_models_progress`` for the bar,
+        like the weights download).  Pins MODEL_DIR + COMFYUI_MODELS_DIR to the SAME
+        roots the cockpit reads, so the fetch lands where the manifest is checked.
+        Shares the single download runner (only one download runs at a time).
+        WIRED-BUT-MOCK-ONLY in tests (conftest blocks the real spawn)."""
+        plan = self.studio_download_plan()
+        env = dict(os.environ)
+        env["MODEL_DIR"] = self.weights_model_dir()
+        env["COMFYUI_MODELS_DIR"] = self.comfyui_models_dir()
+        env.setdefault("HF_HOME", str(Path(self.weights_model_dir()) / ".cache" / "huggingface"))
         if on_line is not None:
             self._download_runner.set_callbacks(on_line=on_line)
         return await self._download_runner.start_raw(
@@ -1420,6 +1484,82 @@ class CockpitData:
         director = Path(self.weights_model_dir()) / STUDIO_DIRECTOR_REL
         return director.is_file()
 
+    def comfyui_models_dir(self) -> str:
+        """The ComfyUI models tree root (image/video/audio checkpoints).  Env
+        COMFYUI_MODELS_DIR overrides the on-rig default."""
+        return os.environ.get("COMFYUI_MODELS_DIR") or COMFYUI_MODELS_DIR
+
+    def _studio_model_path(self, m: StudioModel) -> Path:
+        root = self.weights_model_dir() if m.root == "weights" else self.comfyui_models_dir()
+        return Path(root) / m.rel_path
+
+    def studio_missing_models(self) -> list[StudioModel]:
+        """Which ai-studio manifest models are NOT on disk — the first-install gap.
+        READ — a pure filesystem scan (the canary file per model), safe to call
+        before the scene-switch confirm.  Order preserves the manifest (director →
+        image → video → audio) so the modal can group by modality."""
+        missing: list[StudioModel] = []
+        for m in STUDIO_MODELS:
+            try:
+                if not self._studio_model_path(m).exists():
+                    missing.append(m)
+            except OSError:
+                missing.append(m)
+        return missing
+
+    def studio_models_progress(self) -> Optional[int]:
+        """Coarse % of the ai-studio model set on disk, by SIZE (present models'
+        size_gb / total).  None when the manifest has no sizes.  Drives the download
+        modal's progress bar — polled like the catalog-download set progress, so the
+        download can run detached and the modal just reflects what's landed."""
+        total = sum(m.size_gb for m in STUDIO_MODELS)
+        if total <= 0:
+            return None
+        # Completion keys off the MISSING LIST (exact presence), not a float compare —
+        # nothing missing ⇒ 100; otherwise cap at 99 so it never reads "done" while a
+        # model is still absent.
+        missing = self.studio_missing_models()
+        if not missing:
+            return 100
+        present = total - sum(m.size_gb for m in missing)
+        return max(0, min(99, int(present / total * 100)))
+
+    def studio_download_plan(self) -> ActionPlan:
+        """Plan for "download all missing ai-studio models" — runs the orchestrator
+        (services/comfyui/download_studio_models.sh): idempotent, skips what's on disk,
+        fetches what's missing.  A DISK/network write, NOT a GPU write → no reconcile
+        gate; the setup modal's Download button is itself the confirm.  Progress is
+        POLLED (studio_models_progress), not streamed, so it runs detached and the modal
+        just reflects what's landed."""
+        return ActionPlan(
+            kind="studio-download",
+            cmd=["bash", "services/comfyui/download_studio_models.sh"],
+            description="download all missing ai-studio models",
+            requires_reconcile=False,
+            requires_confirm=False,
+        )
+
+    def studio_voice_blocked(self, tel, *, voice_card: Optional[int] = None) -> Optional[str]:
+        """GPU1 video⊕voice mutex: is starting premium voice (Step-Audio-EditX, ~14 GB
+        on GPU1) blocked by a video render already holding that card?  Returns a reason
+        string to refuse, or None to allow.  Reads the polled GPU telemetry's per-card
+        VRAM holders.  Telemetry-honest: None telemetry ⇒ ALLOW (never false-block on a
+        missing read — the gpu-mode/ComfyUI OOM is the backstop)."""
+        if tel is None:
+            return None
+        try:
+            card = int(voice_card if voice_card is not None
+                       else os.environ.get("STEP_VOICE_CUDA", "1"))
+        except (TypeError, ValueError):
+            card = 1
+        holders = (getattr(tel, "gpu_apps", None) or {}).get(card, []) or []
+        used = sum(int(getattr(h, "used_mib", 0) or 0) for h in holders)
+        if (24576 - used) >= STUDIO_VOICE_GPU_NEED_MIB:   # ~24 GB card; ~14 GB needed
+            return None
+        names = ", ".join(sorted({h.container for h in holders if getattr(h, "container", "")})) or "a render"
+        return (f"GPU{card} is busy (~{used // 1024} GB used by {names}) — premium voice needs "
+                f"~14 GB there.  Stop the video render (or wait for it), then start voice.")
+
     async def scenes(self) -> list[Scene]:
         """gpu-mode --list-modes --json → Scene list.
 
@@ -1780,6 +1920,38 @@ class CockpitData:
             requires_reconcile=(op == "stop"),
         )
 
+    def _resolve_service_compose(self, name: str) -> Optional[tuple[str, str]]:
+        """Map a Containers-row service NAME → ``(compose_rel_path, project)``.
+
+        Two shapes:
+          - **top-level** supporting service → ``services/<name>/docker-compose.yml``,
+            project == ``name`` (matches gpu-mode running it from that dir).
+          - **nested studio sidecar** → the row carries the CONTAINER name
+            ``studio-<sub>`` while the compose lives at
+            ``services/studio/<sub>/docker-compose.yml`` (e.g. the on-demand
+            ``studio-step-voice`` → ``services/studio/step-voice/``).  Project ==
+            ``<sub>`` — the dir basename gpu-mode's ``compose_at`` uses, so the
+            cockpit and gpu-mode track the SAME compose project (avoids the
+            duplicate-``container_name`` collision the gallery hit).
+
+        Returns ``None`` when no compose dir backs the name (caller then falls
+        back to ``docker restart`` of an already-created container)."""
+        def _find(dir_rel: str) -> Optional[str]:
+            for ext in ("yml", "yaml"):
+                rel = f"{dir_rel}/docker-compose.{ext}"
+                if (self.repo_root / rel).is_file():
+                    return rel
+            return None
+        top = _find(f"services/{name}")
+        if top:
+            return top, name
+        if name.startswith("studio-"):
+            sub = name[len("studio-"):]
+            nested = _find(f"services/studio/{sub}")
+            if nested:
+                return nested, sub
+        return None
+
     def service_start(self, name: str) -> ActionPlan:
         """Bring a KNOWN supporting service UP — ``docker compose up -d`` for its
         ``services/<name>/`` dir (the verb for a STOPPED service row in the
@@ -1801,16 +1973,15 @@ class CockpitData:
         silently collide with whatever holds the cards, while a non-GPU web
         service (litellm / qdrant / …) clears the gate immediately.  Tolerates the
         ``.yml`` / ``.yaml`` spelling."""
-        rel = f"services/{name}/docker-compose.yml"
-        if (
-            not (self.repo_root / rel).is_file()
-            and (self.repo_root / f"services/{name}/docker-compose.yaml").is_file()
-        ):
-            rel = f"services/{name}/docker-compose.yaml"
+        resolved = self._resolve_service_compose(name)
+        rel, project = resolved if resolved is not None else (
+            f"services/{name}/docker-compose.yml",
+            name,
+        )
         cmd = ["docker", "compose"]
         if (self.repo_root / ".env").is_file():
             cmd += ["--env-file", ".env"]
-        cmd += ["-f", rel, "-p", name, "up", "-d"]
+        cmd += ["-f", rel, "-p", project, "up", "-d"]
         return ActionPlan(
             kind="service-up",
             cmd=cmd,
@@ -1820,16 +1991,15 @@ class CockpitData:
 
     def service_start_or_restart(self, name: str) -> ActionPlan:
         """Bring a stopped service UP, picking the right mechanism:
-          - a top-level ``services/<name>/`` compose dir exists → ``compose up``
-            (``service_start`` — creates the container if needed);
-          - otherwise it's an EXISTING scene-managed container with no such dir (a
-            studio-* sidecar lives under ``services/studio/<sub>/`` and its dir name
-            doesn't match its container name) → ``docker restart`` STARTS the
-            stopped-but-created container."""
-        base = self.repo_root / "services" / name
-        if (base / "docker-compose.yml").is_file() or (
-            base / "docker-compose.yaml"
-        ).is_file():
+          - a compose dir backs the name (top-level ``services/<name>/`` OR a
+            nested studio sidecar ``services/studio/<sub>/`` for ``studio-<sub>``
+            — e.g. the on-demand ``studio-step-voice``) → ``compose up``
+            (``service_start`` — CREATES the container if it doesn't exist yet, so
+            it works on a fresh install, not just a re-start);
+          - otherwise it's a scene-managed container whose dir name doesn't match
+            (e.g. ``studio-director`` → ``services/studio/enhancer/``) → ``docker
+            restart`` STARTS the stopped-but-created container."""
+        if self._resolve_service_compose(name) is not None:
             return self.service_start(name)
         return self.container_action(name, "restart")
 

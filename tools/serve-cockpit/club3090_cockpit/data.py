@@ -264,6 +264,26 @@ class WeightsMeta:
         )
 
 
+@dataclass(frozen=True)
+class StudioModel:
+    """One model the unified ``ai-studio`` scene needs — the SoT for first-install
+    missing-detection + the download modal (the preflight, the setup scripts, and
+    the cockpit all key off the same set, so the canaries can't drift).
+
+    ``root`` selects which tree ``rel_path`` is under: ``"weights"`` (the HF weights
+    root — e.g. the director GGUF) or ``"comfy"`` (the ComfyUI models tree — e.g.
+    image/video/audio checkpoints).  ``rel_path`` is the representative ("canary")
+    file whose presence means the model is installed; ``installer`` is the
+    ``services/comfyui/<x>.sh`` script that fetches it."""
+
+    modality: str          # "director" | "image" | "video" | "audio"
+    label: str
+    root: str              # "weights" | "comfy"
+    rel_path: str
+    size_gb: float
+    installer: str
+
+
 # Download-state tokens (CatalogEntry.weights_state).  "downloading" is overlaid
 # by the app from an active download worker, not computed at catalog-build.
 WEIGHTS_PRESENT = "present"     # subdir exists + verify_glob matches ≥1 file
