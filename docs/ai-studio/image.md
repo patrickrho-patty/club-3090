@@ -116,16 +116,16 @@ OWUI's `COMFYUI_BASE_URL` points at it (`imagegen.env`), with OWUI's image-promp
 for a rich Ideogram-4 JSON caption, and rewrites the node before forwarding. The escaping is done in
 **Python** (reliable). Blast radius = image generation only — title/tag task-generation is untouched.
 
-`gpu-mode video-studio` and `image-studio` start the shim (and, in image-studio, the director). If
-the shim is down, point `COMFYUI_BASE_URL` back at `:8188` (plain text then hits the placeholder) or
-use the **Studio · Image lane**.
+`gpu-mode ai-studio` starts the shim and the director. If the shim is down, point
+`COMFYUI_BASE_URL` back at `:8188` (plain text then hits the placeholder) or use the
+**Studio · Image lane**.
 
 ## VRAM / GPU split
 
 All three image lanes render on **GPU0** and coexist with the ~4.6 GB director. Ideogram ~18.5 GB
 @1024² + director ≈ 23 GB (fits; 2048² would OOM with the director resident). HiDream is fixed at
-2048² (~15 GB) + director ≈ 20 GB. Because ComfyUI holds both cards in `video-studio`, you can do
-**video and a ≤1024² image in the same mode with no switch**.
+2048² (~15 GB) + director ≈ 20 GB. Because ComfyUI holds both cards in `ai-studio`, you can do
+**video and a ≤1024² image in the same scene with no switch**.
 
 ## Models (obtain separately → `/mnt/models/comfyui/models/...`)
 

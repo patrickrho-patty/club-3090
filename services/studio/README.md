@@ -34,10 +34,11 @@ python3 build_studio_pipe.py            # writes studio_pipe.py
 ```
 
 Then in Open WebUI: **Admin → Functions → +**, paste the contents of `studio_pipe.py`,
-save, enable. Eight models appear in the picker:
+save, enable. Nine models appear in the picker:
 
 - `🎬 Studio · LTX-2.3` — video + audio (stock model)
-- `🔓 Studio · Sulphur` — uncensored video lane
+- `🔓 Studio · Sulphur` — uncensored video lane (LTX-2.3-22B-dev fine-tune)
+- `🔓 Studio · 10Eros` — uncensored video lane (LTX-2.3-native dev fine-tune; A/B vs Sulphur)
 - `✨ Studio · Image (HiDream-O1)` — top-quality / photoreal stills (natural-language prompt)
 - `🖼️ Studio · Image` — Ideogram-4 (graphic design / logo / photo / text)
 - `🔓 Studio · Image (Chroma)` — uncensored stills (natural-language prompt)
@@ -66,13 +67,13 @@ Set the pipe's **Valves** (gear icon on the function):
 
 ## Bring it up
 
-`bash scripts/gpu-mode.sh video-studio` brings up ComfyUI (both GPUs) + the director +
+`bash scripts/gpu-mode.sh ai-studio` brings up ComfyUI (both GPUs) + the director +
 the gallery + Open WebUI as a unit. Or start pieces individually:
 
 ```bash
 docker compose -f services/studio/gallery/docker-compose.yml up -d     # always-on gallery
 docker compose -f services/studio/enhancer/docker-compose.yml up -d    # director :8090
-bash scripts/gpu-mode.sh comfyui                                       # ComfyUI :8188
+docker compose -f services/comfyui/docker-compose.yml up -d            # ComfyUI :8188
 ```
 
 ## Use

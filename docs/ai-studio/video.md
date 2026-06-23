@@ -66,7 +66,7 @@ manifest below); the director GGUF → `/mnt/models/huggingface/qwen3.5-4b-gguf/
 **2. Bring the stack up:**
 
 ```bash
-bash scripts/gpu-mode.sh video-studio
+bash scripts/gpu-mode.sh ai-studio
 ```
 
 Stops the GPU LLMs and starts ComfyUI (both cards) + director (`:8090`) + gallery (`:8189`) +
@@ -148,7 +148,7 @@ scene-cuts inside one segment; exact object counts.
 | **Audio** | yes — LTX-2.3 generates synced ambient audio; optional Kokoro voiceover ([audio.md](audio.md)) |
 | **Resolution** | Sulphur 1280×720 · LTX 768×512 (set in the workflow) |
 | **Length** | default ~10 s; see the ceiling below |
-| **Video lanes** | `🎬 LTX-2.3` (video+audio) · `🔓 Sulphur` (uncensored) — image/audio lanes in [image.md](image.md) / [audio.md](audio.md), full matrix in [README.md](README.md) |
+| **Video lanes** | `🎬 LTX-2.3` (video+audio) · `🔓 Sulphur` · `🔓 10Eros` (uncensored) — image/audio lanes in [image.md](image.md) / [audio.md](audio.md), full matrix in [README.md](README.md) |
 
 ### Length ceiling (measured on 2× 3090, 1280×720, frames = 24·seconds + 1)
 
@@ -204,8 +204,8 @@ LoRA onto the base sampler, 8 steps, cfg 1, no upscaler. Clean output. The workf
 
 Video and the dual-card LLMs are **mutually exclusive** (both want the GPUs). In video mode: GPU1
 holds the 22B DiT weights (~22 GB, DisTorch donor); GPU0 does compute (~7–14 GB) **and** hosts the
-~4 GB director — they coexist on one card. Because ComfyUI holds both cards in `video-studio`, you
-can also run a ≤1024² **image** lane in the same mode with no switch (it fits on GPU0 beside the
+~4 GB director — they coexist on one card. Because ComfyUI holds both cards in `ai-studio`, you
+can also run a ≤1024² **image** lane in the same scene with no switch (it fits on GPU0 beside the
 director). Full per-lane VRAM in [image.md](image.md) / [audio.md](audio.md) / [README.md](README.md).
 
 ## On the uncensored models
@@ -223,9 +223,10 @@ meaningful censorship lever, so it's not abliterated.)
 |---|---|---|
 | `ltx-2.3-22b-distilled-1.1-Q8_0.gguf` | `unet/ltx2.3/distilled-1.1/` | LTX |
 | `sulphur-2/sulphur_dev-Q8_0.gguf` | `unet/` | Sulphur |
-| `ltx-2.3-22b-distilled-lora-384.safetensors` | `loras/` | both (single-stage splice) |
-| `ltx-2.3-22b-{distilled,dev}_{audio,video}_vae.safetensors` | `vae/` | LTX / Sulphur |
-| `ltx-2.3-22b-{distilled,dev}_embeddings_connectors.safetensors` | `text_encoders/` | LTX / Sulphur |
+| `10eros/10Eros_v1-Q8_0.gguf` | `unet/` | 10Eros |
+| `ltx-2.3-22b-distilled-lora-384-1.1.safetensors` | `loras/` | all dev lanes (single-stage splice) |
+| `ltx-2.3-22b-{distilled,dev}_{audio,video}_vae.safetensors` | `vae/` | LTX / Sulphur / 10Eros |
+| `ltx-2.3-22b-{distilled,dev}_embeddings_connectors.safetensors` | `text_encoders/` | LTX / Sulphur / 10Eros |
 
 Director GGUF (`Qwen3.5-4B-Uncensored-…`) → `/mnt/models/huggingface/qwen3.5-4b-gguf/…`. Image +
 audio model manifests are in [image.md](image.md) / [audio.md](audio.md).

@@ -22,14 +22,17 @@ gallery, one refine-by-reply UX across the creative modalities.
 
 ---
 
-## The 8 lanes
+## The 9 lanes
 
 Pick a lane in the OWUI model picker; the director crafts the right prompt shape for it.
+They all live in the single **`ai-studio`** scene — `gpu-mode ai-studio` brings the whole
+creative surface up; you switch *lanes* in OWUI, not gpu-mode *modes*.
 
 | Lane | Model | Modality | License |
 |---|---|---|---|
 | 🎬 `Studio · LTX-2.3` | LTX-2.3 distilled 22B | video + synced audio | open |
 | 🔓 `Studio · Sulphur` | Sulphur (LTX-2.3 dev FT) | video (uncensored) | open |
+| 🔓 `Studio · 10Eros` | 10Eros (LTX-2.3 dev FT) | video (uncensored) | open |
 | ✨ `Studio · Image (HiDream-O1)` | HiDream-O1-Image-Dev-2604 | image — **top-quality / photoreal** (AA #1 single-model open-weight) | MIT |
 | 🖼️ `Studio · Image` | Ideogram-4 fp8 | image — design / logo / text | open |
 | 🔓 `Studio · Image (Chroma)` | Chroma1-HD fp8 | image (uncensored) | open |
@@ -75,21 +78,25 @@ Studio only borrows a small qwen "director" to craft prompts.)_
 
 The qwen **director** crafts the right prompt shape per lane; **ComfyUI** renders image/video/music/SFX; the **step-voice** and **studio-tts** services handle premium + narration voice; the **orchestrator** chains long videos; everything lands in the always-on **gallery**. Text/LLM chat is the separate core stack (this is image/video/audio only).
 
-### Lanes vs. modes
+### One scene, lanes inside it
 
-> A **lane** is anything light enough to coexist with the director on **GPU0** — it's just a pipe
-> route, no GPU-mode switch. A **mode** (`gpu-mode <name>`) is for anything that needs **both
-> GPUs** (video) or evicts the LLMs. Same trade-off as switching tools in a DAW/NLE on one box.
+> There's a **single** `ai-studio` gpu-mode scene now (it replaced the old separate
+> `image-studio`/`video-studio` modes). `gpu-mode ai-studio` brings up ComfyUI on **both
+> GPUs** + the director + all the sidecars; you pick image / video / audio / voice **as a
+> lane in OWUI** — no gpu-mode switching between modalities. Same trade-off as switching
+> tools in a DAW/NLE on one box, but it's all one workspace.
 
-- **Lanes (coexist on GPU0):** all 3 image lanes, music, SFX — single-device, run in either mode.
-- **Modes (need both cards / evict):** **video** (22B DiT split across both 3090s via DisTorch).
-- **Premium voice** (Step-Audio-EditX, ~14 GB) and the future realtime voice agent run as their
-  own services, brought up on demand.
+ComfyUI runs **one workflow at a time**, so the lanes time-share the cards:
+
+- **GPU0 lanes (coexist with the director):** all 3 image lanes, music, SFX — single-device.
+- **Both-GPU lane:** **video** (the 22B DiT splits across both 3090s via DisTorch).
+- **GPU1 ⊕ video:** **premium voice** (Step-Audio-EditX, ~14 GB on GPU1) is on-demand and
+  **mutually exclusive with an active video render** (both want GPU1) — c3 guards this.
 
 **The hardware truth (measured):** during a video render GPU1 holds the 22B DiT (~22 GB donor) and
 GPU0 does compute (~7–14 GB) **+** the ~4.6 GB director — so a ≤1024² image lane *also* fits on
-GPU0 in `video-studio` with no switch. Heavy modalities are mode-switched, not simultaneous — a
-workstation reality, framed like switching tools in a creative suite.
+GPU0 in `ai-studio` with no switch. Heavy modalities time-share (one ComfyUI queue), not
+simultaneous — a workstation reality, framed like switching tools in a creative suite.
 
 ## Shared substrate (services)
 
@@ -102,7 +109,7 @@ workstation reality, framed like switching tools in a creative suite.
 | **Image shim** (`image-shim/`) | 8191 | ComfyUI reverse-proxy — crafts Ideogram JSON for the native 🖼️ button |
 | **Studio TTS** (`tts/`) | 8192 | Kokoro-82M (CPU) voiceover + layer-aware ffmpeg mixdown |
 | **Step-Voice** (`step-voice/`) | 8193 | Step-Audio-EditX premium voice (isolated, transformers 4.53.3, GPU, on-demand) |
-| **`gpu-mode`** | — | the mode switcher (`video-studio` / `image-studio` / chat / off) |
+| **`gpu-mode`** | — | the mode switcher (`ai-studio` / chat / off) |
 
 The OWUI Studio pipe (`services/studio/build_studio_pipe.py` → `studio_pipe.py`) routes each lane
 to the right backend and returns a gallery link. Install it once: **Admin → Functions → +**, paste
@@ -127,8 +134,7 @@ gemma-4-12b — the uncensored DiTs still render, only the prompt-writing change
 ## Bring it up
 
 ```bash
-bash scripts/gpu-mode.sh video-studio   # ComfyUI (both cards) + director + gallery + orchestrator + shim + tts + OWUI
-# image-only:  bash scripts/gpu-mode.sh image-studio
+bash scripts/gpu-mode.sh ai-studio   # ComfyUI (both cards) + director + gallery + orchestrator + shim + tts + OWUI
 # premium voice (on demand):  docker compose -f services/studio/step-voice/docker-compose.yml up -d
 ```
 
