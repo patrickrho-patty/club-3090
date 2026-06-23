@@ -1230,6 +1230,39 @@ class TestComfyuiImagePresent:
         assert await cd.comfyui_image_present() is True
 
 
+class TestStudioReady:
+    """studio_ready: comfyui-local image AND the director GGUF on disk."""
+
+    def _seed_director(self, tmp_path):
+        from club3090_cockpit.services import STUDIO_DIRECTOR_REL
+        d = tmp_path / "weights" / STUDIO_DIRECTOR_REL
+        d.parent.mkdir(parents=True, exist_ok=True)
+        d.write_bytes(b"x")
+        return str(tmp_path / "weights")
+
+    @pytest.mark.asyncio
+    async def test_ready_when_image_and_director(self, tmp_path):
+        md = self._seed_director(tmp_path)
+        cd = CockpitData(tmp_path, runner=full_runner(
+            **{"docker images -q": ok("sha256:abc\n")}))
+        cd._model_dir = md
+        assert await cd.studio_ready() is True
+
+    @pytest.mark.asyncio
+    async def test_not_ready_when_director_missing(self, tmp_path):
+        cd = CockpitData(tmp_path, runner=full_runner(
+            **{"docker images -q": ok("sha256:abc\n")}))  # image present
+        cd._model_dir = str(tmp_path / "empty")            # but no director
+        assert await cd.studio_ready() is False
+
+    @pytest.mark.asyncio
+    async def test_not_ready_when_image_missing(self, tmp_path):
+        md = self._seed_director(tmp_path)
+        cd = CockpitData(tmp_path, runner=full_runner(**{"docker images -q": ok("")}))
+        cd._model_dir = md
+        assert await cd.studio_ready() is False
+
+
 # ===========================================================================
 # THE RECONCILE GATE — dual-writer safety core
 # ===========================================================================

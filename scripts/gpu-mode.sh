@@ -544,7 +544,42 @@ mode_gemma_awq() {
 #  was redundant with the catalog slug vllm/diffusiongemma-dual, which is the way
 #  to serve it.  'off' still tears down any running dgemma container.)
 
+# Verify a studio scene's MODELS are on disk BEFORE starting its containers —
+# else they boot with no weights (silent failure: the director llama.cpp has no
+# GGUF, ComfyUI has no checkpoint).  gpu-mode only STARTS the bundle; the models
+# are fetched by setup-image-studio.sh.  This mirrors preflight_compose_deps for
+# the LLM composes — it CHECKS + points at the installer, never auto-downloads.
+# Both the CLI and the cockpit reach the studio scenes through here, so one gate
+# protects both.  Skip: STUDIO_NO_PREFLIGHT=1.
+preflight_studio_models() {
+    if [ "${STUDIO_NO_PREFLIGHT:-0}" = "1" ]; then return 0; fi
+    local scene="$1"
+    # MODEL_DIR from the repo .env (the source compose_at passes via --env-file);
+    # the ComfyUI models tree alongside it.
+    local model_dir
+    model_dir="$(grep -E '^MODEL_DIR=' "$CLUB3090_DIR/.env" 2>/dev/null | tail -1 | cut -d= -f2-)"
+    model_dir="${model_dir:-/mnt/models/huggingface}"
+    local comfy_models="${COMFYUI_MODELS_DIR:-/mnt/models/comfyui/models}"
+    local missing=()
+    # Director GGUF — the qwen prompt crafter, needed by BOTH studio scenes.
+    if [ ! -f "$model_dir/qwen3.5-4b-gguf/hauhaucs-uncensored-q4km/Qwen3.5-4B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf" ]; then
+        missing+=("studio director GGUF  → $model_dir/qwen3.5-4b-gguf/hauhaucs-uncensored-q4km/")
+    fi
+    # Image-studio also needs the Ideogram-4 image model.
+    if [ "$scene" = "image-studio" ] && [ ! -f "$comfy_models/diffusion_models/ideogram4_fp8_scaled.safetensors" ]; then
+        missing+=("Ideogram-4 image set  → $comfy_models/diffusion_models/")
+    fi
+    if [ ${#missing[@]} -eq 0 ]; then return 0; fi
+    echo -e "${RED}[preflight] $scene models not on disk — the bundle would boot broken:${NC}" >&2
+    local m
+    for m in "${missing[@]}"; do echo "  - $m" >&2; done
+    echo -e "${YELLOW}[preflight] Fix:  bash scripts/setup-image-studio.sh   (builds + downloads, then starts)${NC}" >&2
+    echo -e "${YELLOW}[preflight] Skip: STUDIO_NO_PREFLIGHT=1 gpu-mode $scene${NC}" >&2
+    return 1
+}
+
 mode_video_studio() {
+    preflight_studio_models video-studio || return 1
     echo -e "${CYAN}═══ Switching to VIDEO-STUDIO mode (text/image → video) ═══${NC}"
     echo "Starting: ComfyUI :8188 (both GPUs) + director :8090 + gallery :8189 + Open WebUI"
     echo "Stopping: all GPU-bound LLM serving (Qwen + Gemma + DiffusionGemma)"
@@ -574,6 +609,7 @@ mode_video_studio() {
 }
 
 mode_image_studio() {
+    preflight_studio_models image-studio || return 1
     echo -e "${CYAN}═══ Switching to IMAGE-STUDIO mode (image gen + chat, 2-card split) ═══${NC}"
     echo "Starting: ComfyUI/Ideogram-4 on GPU0 + gemma-4-12b chat on GPU1 + Open WebUI"
     echo "Stopping: all dual-card LLM serving (Qwen + Gemma-31B)"

@@ -124,6 +124,14 @@ DEFAULT_CARD = "rtx-3090"
 # SAFE to surface (it's the model dir, not a secret).
 MODEL_DIR = "/mnt/models/huggingface"
 
+# The studio director GGUF, relative to the weights root (weights_model_dir) — its
+# presence (+ the comfyui-local image) is the "studio is set up" signal.  Kept in
+# lock-step with setup-image-studio.sh's download + gpu-mode's preflight_studio_models.
+STUDIO_DIRECTOR_REL = (
+    "qwen3.5-4b-gguf/hauhaucs-uncensored-q4km/"
+    "Qwen3.5-4B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf"
+)
+
 
 # ── Subprocess runner protocol (dependency injection seam) ───────────────────────
 
@@ -1397,6 +1405,20 @@ class CockpitData:
         if not res.ok:
             return True  # read failed — don't false-block
         return bool((res.stdout or "").strip())
+
+    async def studio_ready(self) -> bool:
+        """Is the studio bundle set up enough to start? — the comfyui-local image
+        is built AND the studio director GGUF is on disk.
+
+        Either missing ⇒ the studio scene / comfyui-start guard points the user at
+        setup-image-studio.sh instead of a bundle that boots broken (no image → no
+        ComfyUI; no director GGUF → the 🖼️ prompt crafter has no model).  Mirrors
+        gpu-mode's preflight_studio_models so the cockpit catches it BEFORE the
+        scene-switch confirm (gpu-mode is the backstop on the switch itself)."""
+        if not await self.comfyui_image_present():
+            return False
+        director = Path(self.weights_model_dir()) / STUDIO_DIRECTOR_REL
+        return director.is_file()
 
     async def scenes(self) -> list[Scene]:
         """gpu-mode --list-modes --json → Scene list.

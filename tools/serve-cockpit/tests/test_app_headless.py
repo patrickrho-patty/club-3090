@@ -1560,6 +1560,18 @@ def _seed_services(root: Path, names: list[str]) -> None:
         (d / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
 
 
+def _seed_studio_director(app, root: Path) -> None:
+    """Make CockpitData.studio_ready() see the director GGUF: put it under a MODEL_DIR
+    we pin on the app's data layer (highest weights_model_dir precedence).  Pair with
+    a 'docker images -q' = present mock so studio_ready() resolves True."""
+    from club3090_cockpit.services import STUDIO_DIRECTOR_REL
+    md = root / "weights"
+    director = md / STUDIO_DIRECTOR_REL
+    director.parent.mkdir(parents=True, exist_ok=True)
+    director.write_bytes(b"x")
+    app._data._model_dir = str(md)
+
+
 class TestBatch1OperateServingPanel:
     """#1 — Operate · Orchestration surfaces WHAT'S SERVING."""
 
@@ -1721,7 +1733,7 @@ class TestBatch1KnownServices:
         app, _, _ = make_app(responses=responses, repo_root=tmp_path)
         async with app.run_test(size=(120, 40)) as pilot:
             await _enter_operate(pilot)
-            assert app._comfyui_ready is False
+            assert app._studio_ready is False
             app.query_one("#operate-tabs", TabbedContent).active = "tab-containers"
             await _settle(pilot)
             pane = app.query_one("#operate-containers-pane", OperateContainersPane)
@@ -1732,16 +1744,40 @@ class TestBatch1KnownServices:
             assert not isinstance(app.screen, ConfirmActionScreen)  # guarded → no confirm
 
     @pytest.mark.asyncio
-    async def test_comfyui_start_allowed_when_image_present(self, tmp_path):
-        """With comfyui-local present, [s] proceeds to the compose-up confirm."""
+    async def test_comfyui_start_blocked_when_director_missing(self, tmp_path):
+        """Image built but the director GGUF absent → still guarded (the studio
+        needs both — the image alone boots a director with no model)."""
+        _seed_services(tmp_path, ["comfyui"])
+        seed_repo(tmp_path)
+        responses = fake_responses(
+            **{"docker ps": ok(""), "docker images -q": ok("sha256:abc\n")})  # image present
+        app, _, _ = make_app(responses=responses, repo_root=tmp_path)
+        # point MODEL_DIR at an empty dir → director absent
+        app._data._model_dir = str(tmp_path / "empty-weights")
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _enter_operate(pilot)
+            assert app._studio_ready is False
+            app.query_one("#operate-tabs", TabbedContent).active = "tab-containers"
+            await _settle(pilot)
+            pane = app.query_one("#operate-containers-pane", OperateContainersPane)
+            idx = next(i for i, c in enumerate(pane._containers) if c.name == "comfyui")
+            pane.query_one("#containers-table", DataTable).move_cursor(row=idx)
+            await pilot.press("s")
+            await pilot.pause()
+            assert not isinstance(app.screen, ConfirmActionScreen)  # guarded
+
+    @pytest.mark.asyncio
+    async def test_comfyui_start_allowed_when_studio_ready(self, tmp_path):
+        """Image + director GGUF present → [s] proceeds to the compose-up confirm."""
         _seed_services(tmp_path, ["comfyui"])
         seed_repo(tmp_path)
         responses = fake_responses(
             **{"docker ps": ok(""), "docker images -q": ok("sha256:abc\n")})
         app, _, _ = make_app(responses=responses, repo_root=tmp_path)
+        _seed_studio_director(app, tmp_path)  # director on disk + MODEL_DIR pinned
         async with app.run_test(size=(120, 40)) as pilot:
             await _enter_operate(pilot)
-            assert app._comfyui_ready is True
+            assert app._studio_ready is True
             app.query_one("#operate-tabs", TabbedContent).active = "tab-containers"
             await _settle(pilot)
             pane = app.query_one("#operate-containers-pane", OperateContainersPane)
@@ -8815,8 +8851,9 @@ class TestScenePreview:
 
 
 class TestStudioSceneGuard:
-    """⏎ on a studio scene (comfyui / image-studio / video-studio) when the
-    comfyui-local image is missing guides to setup-image-studio.sh, not a switch."""
+    """⏎ on a studio scene (image-studio / video-studio) when the studio isn't set
+    up (comfyui-local image OR director GGUF missing) guides to setup-image-studio.sh,
+    not a scene switch."""
 
     SCENES = json.dumps([
         {"name": "image-studio", "group": "studio", "description": "img gen",
@@ -8843,19 +8880,20 @@ class TestStudioSceneGuard:
         app, _, _ = make_app(responses=responses)
         async with app.run_test(size=(120, 40)) as pilot:
             await self._enter_on_image_studio(app, pilot)
-            assert app._comfyui_ready is False
+            assert app._studio_ready is False
             assert not isinstance(app.screen, ConfirmActionScreen)  # guarded
 
     @pytest.mark.asyncio
-    async def test_allowed_when_comfyui_present(self):
+    async def test_allowed_when_studio_ready(self, tmp_path):
         responses = fake_responses(**{
             "gpu-mode.sh --list-modes --json": ok(self.SCENES),
             "docker images -q": ok("sha256:abc\n"),
         })
         app, _, _ = make_app(responses=responses)
+        _seed_studio_director(app, tmp_path)  # image present + director on disk
         async with app.run_test(size=(120, 40)) as pilot:
             await self._enter_on_image_studio(app, pilot)
-            assert app._comfyui_ready is True
+            assert app._studio_ready is True
             assert isinstance(app.screen, ConfirmActionScreen)
             assert app.screen._plan.cmd == ["bash", "scripts/gpu-mode.sh", "image-studio"]
 
