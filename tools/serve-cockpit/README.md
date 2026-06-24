@@ -46,6 +46,13 @@ c3
 Either way the launch is `c3` (or `python -m club3090_cockpit`). The app finds the repo root from its
 own location; override with **`C3_REPO_ROOT=/path/to/club-3090`** if you installed it elsewhere.
 
+**First run — set your Model Dir + HF token:** press **`S`** to open Settings, set your **Model Dir**
+(where weights download to) and your **HuggingFace token** (needed for gated / private repos), then
+**`Ctrl+S`** to save (`HF_HOME` is auto-derived under the model dir). Then hit **`r`** to browse the catalog.
+
+**Keeping current:** the cockpit moves fast — after a `git pull`, **re-run the install**
+(`uv pip install -e tools/serve-cockpit`) to pick up new deps (e.g. PyYAML) and UI changes.
+
 ## Keybindings
 
 | Key | Action |
@@ -56,6 +63,7 @@ own location; override with **`C3_REPO_ROOT=/path/to/club-3090`** if you install
 | `k` | stop a service / cancel a download |
 | `f` | force-start (experimental — skips the fit gate) |
 | `r` | refresh the catalog (re-reads the registry) |
+| `S` | settings — set Model Dir + HF token (`Ctrl+S` saves) |
 | `Y` | copy the focused context to the clipboard |
 | `.` | toggle the left rail (full-width content) |
 | `C` | toggle lean view (hide / restore the Bring & Validate mode) |
