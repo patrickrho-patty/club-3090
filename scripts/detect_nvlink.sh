@@ -5,17 +5,38 @@
 # Handles 2-GPU setups (single NVLink bridge) and N-GPU setups (e.g. 2 bridges on 4 cards).
 #
 # NVLINK_MODE values:
-#   auto       — detect NVLink via nvidia-smi topo (default). No NVLink => P2P off.
+#   auto       — detect a fast P2P interconnect via nvidia-smi (default): NVLink (topo -m)
+#                OR, failing that, PCIe P2P that `nvidia-smi topo -p2p r` reports as OK
+#                between all pairs — i.e. a patched consumer-GPU driver (tinygrad/geohot/
+#                aikitoria) on a P2P-capable layout (shared root complex / switch). Neither
+#                => P2P off. NOTE: stock GeForce drivers software-disable P2P (report CNS),
+#                and cards on separate root complexes can't P2P — both correctly stay off.
 #   force_on   — assert NVLink present (NCCL_P2P_LEVEL=NVL).
 #   force_off  — no P2P at all (NCCL_P2P_DISABLE=1).
-#   pcie_p2p   — PCIe P2P WITHOUT NVLink (e.g. a patched consumer-GPU driver — the
-#                tinygrad/geohot P2P patch). Sets NCCL_P2P_LEVEL=PHB (or your own
-#                NCCL_P2P_LEVEL), leaves P2P ENABLED, and turns custom all-reduce ON.
-#                Explicit opt-in (like force_on) — auto can't tell the patch is loaded.
-#                See club-3090 #290.
+#   pcie_p2p   — FORCE PCIe P2P on (assert the patched driver is loaded + working),
+#                bypassing auto-detect. Sets NCCL_P2P_LEVEL=PHB (or your own NCCL_P2P_LEVEL),
+#                P2P ENABLED, custom all-reduce ON. Use when you trust the patch but auto's
+#                `topo -p2p r` probe doesn't report OK. See club-3090 #290.
 
 NVLINK_MODE="${NVLINK_MODE:-auto}"
 _P2P_LEVEL=NVL   # NCCL_P2P_LEVEL used when _NVLINK_ENABLED=1 (overridden by pcie_p2p)
+
+# True (0) when nvidia-smi reports working P2P between ALL GPU pairs — e.g. a patched
+# consumer-GPU driver (NVIDIA's stock driver software-disables P2P → reports "CNS") on a
+# P2P-capable PCIe layout. Parses `topo -p2p r`: a data row carries the self-"X" (header /
+# legend rows don't, so they're skipped); ANY off-diagonal cell that isn't OK => unavailable.
+_pcie_p2p_available() {
+  nvidia-smi topo -p2p r 2>/dev/null | awk '
+    $1 ~ /^GPU[0-9]+$/ {
+      hasX = 0
+      for (i = 2; i <= NF; i++) if ($i == "X") hasX = 1
+      if (!hasX) next                                  # header row (no self-X) — skip
+      rows++
+      for (i = 2; i <= NF; i++) if ($i != "X" && $i != "OK") bad = 1
+    }
+    END { exit (rows > 0 && !bad) ? 0 : 1 }
+  '
+}
 
 case "$NVLINK_MODE" in
   force_on)
@@ -39,18 +60,24 @@ case "$NVLINK_MODE" in
       if nvidia-smi topo -m 2>/dev/null | grep -qP '\bNV[0-9]+\b'; then
         _NVLINK_ENABLED=1
         echo "[nvlink] $GPU_COUNT GPUs detected — NVLink found, enabling NVLink mode"
+      elif _pcie_p2p_available; then
+        _NVLINK_ENABLED=1; _P2P_LEVEL="${NCCL_P2P_LEVEL:-PHB}"
+        echo "[nvlink] $GPU_COUNT GPUs — no NVLink, but nvidia-smi reports P2P=OK (patched driver / P2P-capable layout) — auto-enabling PCIe P2P (NCCL_P2P_LEVEL=$_P2P_LEVEL, custom all-reduce ON)"
       else
         _NVLINK_ENABLED=0
-        echo "[nvlink] $GPU_COUNT GPUs detected — no NVLink found, using PCIe mode"
+        echo "[nvlink] $GPU_COUNT GPUs detected — no NVLink, no P2P — using PCIe mode"
       fi
     elif [ "$GPU_COUNT" -eq 2 ]; then
       LINK=$(nvidia-smi topo -m 2>/dev/null | awk '/^GPU0/{print $3}')
       if [[ "$LINK" =~ ^NV[0-9]+$ ]]; then
         _NVLINK_ENABLED=1
         echo "[nvlink] detected NVLink ($LINK) between GPU0-GPU1 — enabling NVLink mode"
+      elif _pcie_p2p_available; then
+        _NVLINK_ENABLED=1; _P2P_LEVEL="${NCCL_P2P_LEVEL:-PHB}"
+        echo "[nvlink] PCIe topology ($LINK) but nvidia-smi reports P2P=OK (patched driver / shared root complex) — auto-enabling PCIe P2P (NCCL_P2P_LEVEL=$_P2P_LEVEL, custom all-reduce ON)"
       else
         _NVLINK_ENABLED=0
-        echo "[nvlink] PCIe topology ($LINK) — using PCIe mode (no NVLink; for patched-driver PCIe P2P set NVLINK_MODE=pcie_p2p)"
+        echo "[nvlink] PCIe topology ($LINK), P2P not available (topo -p2p: no OK) — using PCIe mode (no P2P; for a patched driver on a P2P-capable layout this auto-enables, or set NVLINK_MODE=pcie_p2p to force)"
       fi
     else
       _NVLINK_ENABLED=0
@@ -89,3 +116,5 @@ else
   export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True,max_split_size_mb:512}"
   echo "[nvlink] P2P DISABLED — NCCL_P2P_DISABLE=1, custom all-reduce OFF, expandable_segments ON"
 fi
+
+unset -f _pcie_p2p_available 2>/dev/null || true   # don't leak the probe into the sourcing shell
