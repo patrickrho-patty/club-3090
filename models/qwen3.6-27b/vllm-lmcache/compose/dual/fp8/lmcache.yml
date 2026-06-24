@@ -13,8 +13,8 @@
 #                incubating, not production: (1) runs LMCache's third-party image
 #                (lmcache/vllm-openai, DIGEST-pinned — the tag is mutable) bundling a NEWER vLLM
 #                (0.23.1-dev) than the stack's v0.22.0 pin; promotion to ✅ wants LMCache on our
-#                own image. (2) L2 disk tier (--l2-adapter) is wired but OFF by default + its
-#                spill/rehydrate latency is not yet measured on-rig. (3) 38 GB image pulled
+#                own image. (2) L2 disk tier (--l2-adapter) is wired but OFF by default
+#                (rehydrate ~5.3 s, compute-bound not disk-bound — cross-rig #423). (3) 38 GB image pulled
 #                on-demand. RAM-gated: --l1-size-gb 30 needs ~58 GB free; preflight rejects
 #                over-allocation (the l1=100→reboot lesson). Hidden from `switch.sh --list`
 #                (see --list --all); `--force` to launch.
@@ -55,7 +55,12 @@
 #   # opt into disk L2:  LMCACHE_L2_ADAPTER='{"type":"fs","base_path":"/mnt/ssd/lmcache-kv"}' docker compose ...
 #   #   (use the `fs` adapter, not `nixl_store` — this image's NIXL backend is broken.
 #   #    L2 disk ~125 KB/token measured (~33 GB per 262K session); rehydrate ~4.8 s vs
-#   #    ~43 s cold re-prefill for a 37K session, and it survives container restarts.)
+#   #    ~43 s cold re-prefill for a 37K session, and it survives container restarts.
+#   #    Warm-L2 is COMPUTE-bound not disk-bound (~4.8 s recompute vs <0.5 s disk on NVMe,
+#   #    cross-rig #423) — a faster SSD won't speed warm-load on this GDN hybrid.)
+#   # ⚠️ The first long prefill must run to COMPLETION — LMCache banks a session's blocks only
+#   #    on request completion; a client timeout mid-prefill leaves orphaned-but-unindexed L2
+#   #    (only the completed prefix cached) and re-prefills from scratch (#423, 2026-06-24).
 # ===========================================================================
 # Hardware metadata (parsed by scripts/preflight.sh):
 # Requires-min-vram-gb: 24
