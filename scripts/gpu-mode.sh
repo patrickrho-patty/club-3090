@@ -23,7 +23,7 @@ DECKARD_DIR="$CLUB3090_DIR/models/qwen3.6-40b-deckard/llama-cpp/compose/dual/pie
 # Dual-only (both cards); served via the catalog slug vllm/diffusiongemma-dual (the dgemma scene was removed). 🧪
 DGEMMA_DIR="$CLUB3090_DIR/models/diffusiongemma-26b-a4b/vllm/compose/dual/fp8"
 # (gemma-4-12b chat brain retired from the studio 2026-06-23 — ai-studio uses the qwen
-#  director only. Weights kept on disk; gemma stays a core model via `gpu-mode gemma`.)
+#  director only. Weights kept on disk; gemma stays a core model via `gpu-mode gemma-31b`.)
 
 # Estate planner state file (v0.7.0+). Instances booted via launch.sh --estate
 # or --estate-file are tracked here and persist via Docker `restart:
@@ -787,9 +787,9 @@ list_modes_data() {
     # name<TAB>group<TAB>description<TAB>services<TAB>ports<TAB>gpus
     cat <<'TSV'
 chat	ops	Open WebUI + LiteLLM + Qdrant + SearXNG (browser chat, no GPU model)	openwebui,litellm,qdrant,searxng	8080,4000	none
-27b	models	Qwen3.6-27B MTP n=3 + fp8 KV + 262K + vision (TP=2) — default	vllm-qwen36-27b-dual,litellm,qdrant,openwebui,searxng	8010,8080,4000	both
-35b-a3b	models	Qwen3.6-35B-A3B MoE (3B active / 35B total) AutoRound INT4 + fp8 KV + 262K + vision (TP=2)	vllm-qwen36-35b-a3b-dual,litellm,qdrant,openwebui,searxng	8051,8080,4000	both
-gemma	models	Gemma 4 31B INT8 PTH KV + 262K + vision (TP=2) — dual default	vllm-gemma-4-31b-mtp-int8,litellm,qdrant,openwebui,searxng	8032,8080,4000	both
+qwen27b	models	Qwen3.6-27B MTP n=3 + fp8 KV + 262K + vision (TP=2) — default	vllm-qwen36-27b-dual,litellm,qdrant,openwebui,searxng	8010,8080,4000	both
+qwen35b-a3b	models	Qwen3.6-35B-A3B MoE (3B active / 35B total) AutoRound INT4 + fp8 KV + 262K + vision (TP=2)	vllm-qwen36-35b-a3b-dual,litellm,qdrant,openwebui,searxng	8051,8080,4000	both
+gemma-31b	models	Gemma 4 31B INT8 PTH KV + 262K + vision (TP=2) — dual default	vllm-gemma-4-31b-mtp-int8,litellm,qdrant,openwebui,searxng	8032,8080,4000	both
 deckard	models	Qwen3.6-40B-Deckard Q6_K + MTP n=2 + q8_0 KV + 128K (llama.cpp, dual)	llama-cpp-deckard-40b,litellm,qdrant,openwebui,searxng	8199,8080,4000	both
 ai-studio	studio	image · video · audio · voice — ComfyUI both GPUs + qwen director + sidecars + Open WebUI (pick the lane in OWUI)	comfyui,studio-director,studio-gallery,studio-orchestrator,studio-image-shim,studio-tts,openwebui,litellm,searxng	8188,8090,8189,8190,8191,8192,8080,4000	both
 off	ops	Stop all services	all-stopped		none
@@ -853,13 +853,13 @@ usage() {
     echo "  chat               Open WebUI + LiteLLM + Qdrant + SearXNG (browser chat, no GPU model)"
     echo ""
     echo "  Qwen 3.6 27B (dual 3090, TP=2):"
-    echo "  27b                ⭐ DEFAULT — Qwen3.6-27B MTP + fp8 + 262K + vision + 2 streams (:8010)"
+    echo "  qwen27b            ⭐ DEFAULT — Qwen3.6-27B MTP + fp8 + 262K + vision + 2 streams (:8010) — alias: 27b"
     echo ""
     echo "  Qwen 3.6 35B-A3B MoE (dual 3090, TP=2):"
-    echo "  35b-a3b            AutoRound INT4 + fp8 KV + 262K + vision (:8051) — alias: a3b, 35b"
+    echo "  qwen35b-a3b        AutoRound INT4 + fp8 KV + 262K + vision (:8051) — alias: 35b-a3b, a3b, 35b"
     echo ""
     echo "  Gemma 4 31B (dual 3090, TP=2):"
-    echo "  gemma              ⭐ DEFAULT — Gemma 4 31B INT8 PTH KV + 262K + vision (:8032)"
+    echo "  gemma-31b          ⭐ DEFAULT — Gemma 4 31B INT8 PTH KV + 262K + vision (:8032) — alias: gemma"
     echo ""
     echo "  Qwen 3.6 40B Deckard (uncensored, dual 3090, llama.cpp):"
     echo "  deckard            Q6_K + MTP n=2 + q8_0 KV + 128K ctx (:8199) — text-only, both cards"
@@ -888,9 +888,9 @@ usage() {
 
 case "${1:-}" in
     chat)               mode_chat ;;
-    27b)                mode_27b ;;
-    35b-a3b|a3b|35b)    mode_35b_a3b ;;
-    gemma)              mode_gemma_int8 ;;
+    qwen27b|27b)        mode_27b ;;
+    qwen35b-a3b|35b-a3b|a3b|35b)  mode_35b_a3b ;;
+    gemma-31b|gemma)    mode_gemma_int8 ;;
     deckard)            mode_deckard ;;
     ai-studio|aistudio)       mode_ai_studio ;;
     off)                mode_off ;;
