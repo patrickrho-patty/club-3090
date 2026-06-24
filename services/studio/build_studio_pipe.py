@@ -20,6 +20,8 @@ CHROMA_TEMPLATE = os.path.join(_HERE, 'workflows', 'chroma1_hd.json')         # 
 MUSIC_TEMPLATE = os.path.join(_HERE, 'workflows', 'ace_step_music.json')      # ACE-Step v1 3.5B graph (music/song, GPU0 ~8GB; tags + lyrics, seconds-duration)
 SFX_TEMPLATE = os.path.join(_HERE, 'workflows', 'stable_audio_sfx.json')      # Stable Audio Open 1.0 graph (SFX/ambient/sound, GPU0; natural-language, <=47s)
 HIDREAM_TEMPLATE = os.path.join(_HERE, 'workflows', 'hidream_o1.json')         # HiDream-O1-Image-Dev-2604 fp8 graph (top-quality image, GPU0 ~10GB; natural-language, 28-step CFG-off; custom node)
+ZIMAGE_TEMPLATE = os.path.join(_HERE, 'workflows', 'z_image_turbo.json')        # Z-Image-Turbo fp8 graph (uncensored image, GPU0 ~7GB; natural-language, 8-step cfg=1; Lumina2-encoder native nodes)
+WAN_TEMPLATE = os.path.join(_HERE, 'workflows', 'wan22_rapid.json')             # Wan2.2-Rapid-AllInOne Mega NSFW Q8 GGUF graph (uncensored video, both GPUs; umt5 encoder, 4-step cfg=1 distill-baked)
 OUT_PATH = os.path.join(_HERE, 'studio_pipe.py')
 
 def build(dit, audio_vae, video_vae, connectors, width, height, frames=121, lora=None):
@@ -81,6 +83,12 @@ WF = {
     # Top-quality image lane: HiDream-O1-Image-Dev-2604 fp8 (pixel-level unified transformer,
     # AA #1 single-model open-weight T2I). Natural-language prompt, 28-step CFG-off. GPU0 (~10GB).
     "hidream": json.load(open(HIDREAM_TEMPLATE)),
+    # Uncensored image lane: Z-Image-Turbo fp8 (Alibaba 6B, Apache, trained permissive). Lumina2
+    # encoder, natural-language prompt, 8-step cfg=1 (~7GB GPU0, ~25s/image — fast + coherent).
+    "zimage": json.load(open(ZIMAGE_TEMPLATE)),
+    # Uncensored video lane: Wan2.2-Rapid-AllInOne Mega NSFW v10 Q8 GGUF (14B, distill-baked
+    # 4-step). umt5 encoder, both GPUs, 832x480x81 @16fps (~3 min/clip). No synced audio (unlike LTX).
+    "wan": json.load(open(WAN_TEMPLATE)),
     # Music lane: ACE-Step v1 3.5B (text->music/song). Tags (style) + lyrics or [instrumental],
     # seconds-duration. Single-device GPU0 (~8GB) — a lane, not a separate mode (it's light enough).
     "music": json.load(open(MUSIC_TEMPLATE)),
@@ -93,17 +101,20 @@ PIPE = r'''
 """
 title: Studio (text/image -> video · image · music)
 author: club-3090
-description: Type a rough idea — the studio director (qwen) crafts it and generates. Video: LTX (video+audio) or Sulphur/10Eros (uncensored), text->video or attach an image, with optional voiceover. Image: HiDream-O1 (top quality), Ideogram-4 (design/logo/photo/text), or Chroma (uncensored). Music: ACE-Step (songs + instrumentals). SFX: Stable Audio (sound effects + ambient). Voice: Step-Audio-EditX (premium cloned voice + emotion/style). Refine anytime by just saying what to change.
+description: Type a rough idea — the studio director (qwen) crafts it and generates. Video: LTX (video+audio) or Sulphur/10Eros (uncensored, text->video or attach an image, with optional voiceover) or Wan2.2 (uncensored, text->video). Image: HiDream-O1 (top quality), Ideogram-4 (design/logo/photo/text), Chroma (uncensored), or Z-Image (uncensored, fast). Music: ACE-Step (songs + instrumentals). SFX: Stable Audio (sound effects + ambient). Voice: Step-Audio-EditX (premium cloned voice + emotion/style). Refine anytime by just saying what to change.
 required_open_webui_version: 0.5.0
-version: 0.13.4
+version: 0.14.0
 """
 # ── Pipeline defaults (this rig, 2x 3090, measured 2026-06-11) ──────────────────
-#  Video lanes: ltx = LTX-2.3-distilled (video+audio) · sulphur, 10eros = uncensored LTX-2.3 dev fine-tunes
+#  Video lanes (LTX family): ltx = LTX-2.3-distilled (video+audio) · sulphur, 10eros = uncensored LTX-2.3 dev fine-tunes
 #    Render:  SINGLE-STAGE, 8-step, cfg=1 (no 2-stage upscaler — it injects mesh)
 #    Res:     sulphur/10eros 1280x720 · ltx 768x512
 #    Frames:  default 241 (=10s @24fps, crisp). Valve range to 361 (=15s, coherent).
 #             HARD-CAPPED at 361 in _comfy — ~481/20s collapses to corrupted output.
 #    VRAM:    weights on GPU1 (DisTorch donor ~21.9GB), compute on GPU0 (~14GB peak).
+#  Video lane (Wan): wan = Wan2.2-Rapid-AllInOne Mega NSFW v10 Q8 GGUF (14B), uncensored, TEXT->video only
+#             (no synced audio, no LTX i2v/chaining). umt5 encoder, 4-step cfg=1 (distill baked into the
+#             AllInOne merge), 832x480x81 @16fps (~5s, ~3 min/clip incl. the 18GB GGUF load). Both GPUs.
 #  Image lanes (all single-device GPU0, run in EITHER gpu-mode; coexist w/ director ~4.6GB):
 #    hidream= HiDream-O1-Image-Dev-2604 fp8 (pixel-level unified transformer) — top-quality
 #             general/photoreal (AA #1 single-model open-weight). NATURAL-LANGUAGE prompt; 28-step
@@ -113,6 +124,8 @@ version: 0.13.4
 #             text/logos/graphic design. SAFETY-TRAINED (blocks some content). 1024x1024, 20 steps.
 #    chroma = Chroma1-HD fp8 (Flux-based, de-distilled, ~9GB) — NATURAL-LANGUAGE prompt + negative
 #             + real CFG; trained UNCENSORED. The "Sulphur/10Eros for stills." 1024x1024, 26 steps, cfg 3.5.
+#    zimage = Z-Image-Turbo fp8 (Alibaba 6B, Apache, ~7GB) — NATURAL-LANGUAGE prompt, Lumina2 encoder,
+#             8-step cfg=1 (turbo/distilled) — uncensored + FAST (~25s/image, fastest image lane). 1024x1024.
 #    All capped at image_max_edge (1024) so they coexist with the director on GPU0 (2048^2 = OOM).
 #  Music lane: ace-step = ACE-Step v1 3.5B (text->music/song). Tags + lyrics/[instrumental],
 #    seconds-duration; single-device GPU0 (~8GB), 50-step euler, cfg 5 — a lane, not a mode.
@@ -144,6 +157,12 @@ class Pipe:
         hidream_steps: int = Field(default=0, description="HiDream sampler steps. 0 = auto (the Dev-2604 build uses its native 28-step, CFG-off schedule).")
         chroma_steps: int = Field(default=26, description="Chroma (uncensored image lane) sampler steps.")
         chroma_cfg: float = Field(default=3.5, description="Chroma CFG scale (Chroma is de-distilled — real CFG + negative prompt, unlike Ideogram).")
+        zimage_steps: int = Field(default=8, description="Z-Image-Turbo (uncensored image lane) sampler steps. Turbo schedule is 8-step cfg=1 (distilled); more steps rarely helps.")
+        wan_width: int = Field(default=832, description="Wan2.2 video lane width (480p-class is the 14B model's tuned regime; 832x480 ≈ 3 min/clip on 2x 3090).")
+        wan_height: int = Field(default=480, description="Wan2.2 video lane height.")
+        wan_frames: int = Field(default=81, description="Wan2.2 video length in frames (81 @16fps ≈ 5s — the model's native window).")
+        wan_steps: int = Field(default=4, description="Wan2.2-Rapid sampler steps. The AllInOne build bakes a 4-step distill LoRA in → 4 steps cfg=1; raising this won't help (it's distilled).")
+        wan_fps: int = Field(default=16, description="Wan2.2 output frames-per-second (the model's native 16fps).")
         enable_narration: bool = Field(default=True, description="Video lanes only: if the message includes a voiceover (e.g. 'voiceover: ...' or 'narration: \"...\"'), generate a Kokoro voice and mix it over the clip's audio (ducked + normalized).")
         tts_url: str = Field(default="http://host.docker.internal:8192", description="Studio TTS + mixdown service (Kokoro, CPU). Generates the voiceover and ducks it over the clip's native audio. If unreachable, the clip is returned without narration.")
         narrate_voice: str = Field(default="af_heart", description="Kokoro voice id for narration (e.g. af_heart, af_bella, am_adam, bf_emma, bm_george).")
@@ -160,12 +179,14 @@ class Pipe:
 
     def pipes(self):
         return [
-            {"id": "ltx", "name": "\U0001F3AC Studio · LTX-2.3 (video+audio · text or image)"},
-            {"id": "sulphur", "name": "\U0001F513 Studio · Sulphur (uncensored · text or image)"},
-            {"id": "10eros", "name": "\U0001F513 Studio · 10Eros (uncensored · text or image)"},
+            {"id": "ltx", "name": "\U0001F3AC Studio · Video (LTX-2.3 · +synced audio · text or image)"},
+            {"id": "sulphur", "name": "\U0001F513 Studio · Video (Sulphur · uncensored · text or image)"},
+            {"id": "10eros", "name": "\U0001F513 Studio · Video (10Eros · uncensored · text or image)"},
+            {"id": "wan", "name": "\U0001F513 Studio · Video (Wan2.2 · uncensored)"},
             {"id": "hidream", "name": "\U00002728 Studio · Image (HiDream-O1 · top-quality / photoreal)"},
             {"id": "image", "name": "\U0001F5BC️ Studio · Image (Ideogram-4 · graphic / logo / photo / text)"},
             {"id": "chroma", "name": "\U0001F513 Studio · Image (Chroma · uncensored)"},
+            {"id": "zimage", "name": "\U0001F513 Studio · Image (Z-Image · uncensored · fast)"},
             {"id": "music", "name": "\U0001F3B5 Studio · Music (ACE-Step · songs + instrumentals)"},
             {"id": "sfx", "name": "\U0001F50A Studio · SFX (Stable Audio · sound effects + ambient)"},
             {"id": "voice", "name": "\U0001F399️ Studio · Voice (Step-Audio-EditX · premium clone)"},
@@ -359,7 +380,7 @@ class Pipe:
     def _enhance(self, user_prompt, i2v, prior_spec=None, kind="video"):
         # kind: "video" (LTX/Sulphur/10Eros) · "image" (Ideogram JSON) · "chroma" (prose) · "music" (ACE-Step JSON)
         sys = {"image": self.DIRECTOR_IMG_SYS, "chroma": self.DIRECTOR_IMG_PROSE_SYS,
-               "hidream": self.DIRECTOR_HIDREAM_SYS,
+               "zimage": self.DIRECTOR_IMG_PROSE_SYS, "hidream": self.DIRECTOR_HIDREAM_SYS,
                "music": self.DIRECTOR_MUSIC_SYS, "sfx": self.DIRECTOR_SFX_SYS}.get(kind, self.DIRECTOR_SYS)
         if i2v and kind == "video":
             sys += (" The user attached an image to animate — describe how it should MOVE "
@@ -381,7 +402,7 @@ class Pipe:
         else:
             msgs.append({"role": "user", "content": user_prompt})
         body = json.dumps({"model": self.valves.chat_model, "messages": msgs,
-                           "max_tokens": 700 if kind in ("image", "music") else 320, "temperature": 0.7 if kind in ("image", "chroma", "hidream", "music") else 0.8,
+                           "max_tokens": 700 if kind in ("image", "music") else 320, "temperature": 0.7 if kind in ("image", "chroma", "zimage", "hidream", "music") else 0.8,
                            "chat_template_kwargs": {"enable_thinking": False}}).encode()
         req = urllib.request.Request(self.valves.chat_url + "/chat/completions", data=body,
                                      headers={"Content-Type": "application/json"})
@@ -516,6 +537,26 @@ class Pipe:
         wf["noise"]["inputs"]["noise_seed"] = seed
         return self._await_output(self._submit(wf), "image")
 
+    def _comfy_zimage(self, prompt_text, width, height, steps, seed):
+        wf = json.loads(json.dumps(WORKFLOWS["zimage"]))
+        wf["pos"]["inputs"]["text"] = prompt_text
+        wf["latent"]["inputs"]["width"] = width
+        wf["latent"]["inputs"]["height"] = height
+        wf["ksampler"]["inputs"]["steps"] = steps
+        wf["ksampler"]["inputs"]["seed"] = seed
+        return self._await_output(self._submit(wf), "image")
+
+    def _comfy_wan(self, prompt_text, width, height, frames, steps, seed):
+        wf = json.loads(json.dumps(WORKFLOWS["wan"]))
+        wf["pos"]["inputs"]["text"] = prompt_text
+        wf["latent"]["inputs"]["width"] = width
+        wf["latent"]["inputs"]["height"] = height
+        wf["latent"]["inputs"]["length"] = frames
+        wf["ksampler"]["inputs"]["steps"] = steps
+        wf["ksampler"]["inputs"]["seed"] = seed
+        wf["video"]["inputs"]["fps"] = float(self.valves.wan_fps)
+        return self._await_output(self._submit(wf), "video")
+
     def _comfy_music(self, tags, lyrics, seconds, steps, cfg, seed):
         wf = json.loads(json.dumps(WORKFLOWS["music"]))
         wf["pos"]["inputs"]["tags"] = tags
@@ -571,18 +612,23 @@ class Pipe:
             lane = "hidream"
         elif "chroma" in model:
             lane = "chroma"
+        elif "zimage" in model:        # before "image" — "zimage" contains the substring "image"
+            lane = "zimage"
         elif "image" in model:
             lane = "image"
         elif "10eros" in model:
             lane = "10eros"
         elif "sulphur" in model:
             lane = "sulphur"
+        elif "wan" in model:
+            lane = "wan"
         else:
             lane = "ltx"
         label = {"image": "Image (Ideogram-4)", "chroma": "Image · Chroma (uncensored)",
-                 "hidream": "Image (HiDream-O1)",
+                 "hidream": "Image (HiDream-O1)", "zimage": "Image · Z-Image (uncensored)",
                  "music": "Music (ACE-Step)", "sfx": "SFX (Stable Audio)", "voice": "Voice (Step-Audio-EditX)",
-                 "sulphur": "Sulphur (uncensored)", "10eros": "10Eros (uncensored)", "ltx": "LTX-2.3 (video+audio)"}[lane]
+                 "sulphur": "Sulphur (uncensored)", "10eros": "10Eros (uncensored)", "wan": "Wan2.2 (uncensored)",
+                 "ltx": "LTX-2.3 (video+audio)"}[lane]
         loop = asyncio.get_event_loop()
 
         # ── SFX LANE (Stable Audio · natural-language sound · <=47s) ──────────────────────────────
@@ -702,8 +748,8 @@ class Pipe:
                     "“make it instrumental” — and I’ll re-craft and regenerate._ "
                     "_(Browse all media: " + base + "/ )_")
 
-        # ── STILL-IMAGE LANES (HiDream-O1 prose · Ideogram-4 JSON caption · Chroma prose · single still) ──
-        if lane in ("image", "chroma", "hidream"):
+        # ── STILL-IMAGE LANES (HiDream-O1 prose · Ideogram-4 JSON caption · Chroma/Z-Image prose · single still) ──
+        if lane in ("image", "chroma", "hidream", "zimage"):
             up = ""
             for m in reversed(body.get("messages", [])):
                 if m.get("role") == "user":
@@ -743,6 +789,12 @@ class Pipe:
                     await status("\U0001F513 Rendering on Chroma (uncensored)… (~1-2 min)")
                     fn, sub = await loop.run_in_executor(None, self._comfy_chroma, human, w, h,
                                                          int(self.valves.chroma_steps), float(self.valves.chroma_cfg), seed)
+                elif lane == "zimage":
+                    human = crafted if crafted.strip() else up
+                    spec_text = human
+                    await status("\U0001F513 Rendering on Z-Image (uncensored)… (~25s)")
+                    fn, sub = await loop.run_in_executor(None, self._comfy_zimage, human, w, h,
+                                                         int(self.valves.zimage_steps), seed)
                 else:
                     spec_text, human = self._coerce_caption(crafted, up)   # Ideogram-4 needs a JSON caption
                     await status("\U0001F5BC️ Rendering on Ideogram-4… (~1-2 min)")
@@ -756,11 +808,56 @@ class Pipe:
                 return "Generation finished but no image output was found."
             base = self.valves.browser_base.rstrip("/")
             url = base + "/" + ((sub + "/") if sub else "") + fn
-            tweaks = "“more dramatic”, “at night”, “close-up”" if lane in ("chroma", "hidream") else "“monochrome”, “tighter crop”, “flat vector style”"
+            tweaks = "“more dramatic”, “at night”, “close-up”" if lane in ("chroma", "hidream", "zimage") else "“monochrome”, “tighter crop”, “flat vector style”"
             return ("**\U0001F5BC️ " + label + " · " + str(w) + "x" + str(h) + "**\n\n"
                     "**Prompt used:** " + human + "\n\n"
                     "\U0001F5BC️ **[Open / download the image](" + url + ")**\n\n"
                     "_Want changes? Just say what to tweak — e.g. " + tweaks + " — and I’ll re-craft from this and regenerate._ "
+                    "_(Browse all media: " + base + "/ )_")
+
+        # ── WAN VIDEO LANE (Wan2.2-Rapid AllInOne · uncensored T2V · no synced audio, no LTX chaining) ──
+        if lane == "wan":
+            up = ""
+            for m in reversed(body.get("messages", [])):
+                if m.get("role") == "user":
+                    c = m.get("content")
+                    up = (" ".join(p.get("text", "") for p in c if isinstance(p, dict) and p.get("type") == "text").strip()
+                          if isinstance(c, list) else (c or "").strip())
+                    break
+            if not up:
+                return "Type a scene to generate a video — e.g. “a red fox trotting through autumn woods, slow motion, cinematic”."
+            prior_spec = self._prior_spec(body)
+            crafted = up
+            if self.valves.enhance:
+                await status("\U0001F3AC Director crafting the shot…")
+                try:
+                    crafted = await loop.run_in_executor(None, self._enhance, up, False, prior_spec, "video")
+                except Exception:
+                    crafted = up
+            reply = self._chat_gate(crafted)
+            if reply is not None:
+                await status("", True); return reply
+            prompt_used = crafted if crafted.strip() else up
+            seed = int(time.time() * 1000) % 2147483647
+            w = int(self.valves.wan_width); h = int(self.valves.wan_height); fr = int(self.valves.wan_frames)
+            await status("\U0001F513 Rendering on Wan2.2 (uncensored)… (~3 min)")
+            try:
+                fn, sub = await loop.run_in_executor(None, self._comfy_wan, prompt_used, w, h, fr,
+                                                     int(self.valves.wan_steps), seed)
+            except Exception as e:
+                await status("Failed", True)
+                return "⚠️ Video generation failed: " + str(e)
+            await status("Done", True)
+            if not fn:
+                return "Generation finished but no video output was found."
+            base = self.valves.browser_base.rstrip("/")
+            url = base + "/" + ((sub + "/") if sub else "") + fn
+            secs = round(fr / max(1, int(self.valves.wan_fps)), 1)
+            return ("**\U0001F3AC " + label + " · " + str(w) + "x" + str(h) + " · ~" + str(secs) + "s**\n\n"
+                    "**Prompt used:** " + prompt_used + "\n\n"
+                    "\U000025B6️ **[Open / download the video](" + url + ")**\n\n"
+                    "_Want changes? Just say what to tweak — e.g. “slower”, “at night”, “wider shot” — "
+                    "and I’ll re-craft from this and regenerate._ "
                     "_(Browse all media: " + base + "/ )_")
 
         data_uri = self._extract_image(body)
@@ -884,4 +981,4 @@ class Pipe:
 '''.replace('__WF_JSON__', WF_JSON)
 
 open(OUT_PATH, 'w').write(PIPE)
-print("wrote %s (%d bytes; 11 workflows (video x6: ltx/sulphur/10eros x t2v+i2v + image x3 + music + sfx) + narration + voice service)" % (OUT_PATH, len(PIPE)))
+print("wrote %s (%d bytes; %d workflows (video: ltx/sulphur/10eros x t2v+i2v + wan · image x4: ideogram/chroma/hidream/zimage · music · sfx) + narration + voice service)" % (OUT_PATH, len(PIPE), len(WF)))
