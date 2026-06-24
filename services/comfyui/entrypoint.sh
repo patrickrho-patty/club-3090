@@ -52,6 +52,11 @@ chown -R "$(id -u):$(id -g)" "$PIP_CACHE_DIR" 2>/dev/null || true
 COMFYUI_REF="${COMFYUI_REF:-f6c162ddcfbd7eefb39c06fe5b8d4c46e8d09f40}"   # v0.26.0
 checkout_comfy_ref() {  # $1 = repo dir
     local r="$1"
+    # The repo dir is bind-mounted from the host, so it's owned by the host UID — git run
+    # as the container user then refuses it ("fatal: detected dubious ownership") and EVERY
+    # fetch/checkout below fails silently, leaving the pin un-applied (the dir runs at
+    # whatever it was last left at, and the WARN misreports it as "offline"). Whitelist it.
+    git config --global --add safe.directory "$r" 2>/dev/null || true
     if [ "$COMFYUI_REF" = "HEAD" ] || [ "$COMFYUI_REF" = "latest" ]; then
         echo "[bootstrap] ComfyUI: floating on origin/master (COMFYUI_REF=$COMFYUI_REF)"
         git -C "$r" fetch --depth 1 origin 2>/dev/null || true
