@@ -16,6 +16,7 @@ gallery, one refine-by-reply UX across the creative modalities.
 
 | Deep-dive | Covers |
 |---|---|
+| **[requirements.md](requirements.md)** | **Can I run this?** — GPU / CPU / RAM / disk / software, single-vs-dual-card, the director-placement VRAM lever |
 | **[image.md](image.md)** | HiDream-O1 (top quality) · Ideogram-4 (design/logo/text) · Chroma + Z-Image (uncensored) · the native-button shim |
 | **[video.md](video.md)** | LTX-2.3 (video+audio) · Sulphur / 10Eros (uncensored) · Wan2.2 (uncensored T2V) · 60 s+ chaining · the single-stage rule |
 | **[audio.md](audio.md)** | Step-Audio-EditX (premium voice clone+edit) · Kokoro (narration) · ACE-Step (music) · Stable Audio (SFX) |

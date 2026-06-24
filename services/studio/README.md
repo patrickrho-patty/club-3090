@@ -21,7 +21,7 @@ architecture, capabilities and the measured length limits live in **[../../docs/
 | `workflows/stable_audio_sfx.json` | The **Stable Audio Open 1.0** sound graph (natural-language, ≤47 s). Single-device GPU0 — SFX / ambience / textures to `.mp3`. |
 | `studio_pipe.py` | Built artifact (committed for convenience; regenerate with the builder). |
 | `gallery/` | `docker compose` for an always-on nginx media gallery (`:8189`) over ComfyUI's output dir — keeps generated media browsable + links alive even when ComfyUI is down. |
-| `enhancer/` | `docker compose` for the "director" LLM (`:8090`, OpenAI-compatible). |
+| `enhancer/` | `docker compose` for the **director** LLM — **Qwen3.5-4B-Uncensored** (llama.cpp, `:8090`, OpenAI-compatible). ~4.5 GB; `STUDIO_DIRECTOR_GPU` pins its card, `-ngl 0` runs it on CPU. |
 | `orchestrator/` | `docker compose` + Dockerfile for the long-clip engine (`:8190`): chains ~10 s segments into one combined video for requests >15 s. The pipe POSTs here when you ask for a length. |
 | `image-shim/` | `docker compose` + Dockerfile for the native-button image shim (`:8191`): a transparent ComfyUI reverse-proxy that crafts an Ideogram-4 JSON caption (via the director) on `POST /prompt`, so OWUI's built-in 🖼️ image button renders instead of the "blocked by safety filter" placeholder. Point OWUI's `COMFYUI_BASE_URL` at it. See ai-studio/video.md "Native image button". |
 | `tts/` | `docker compose` + Dockerfile for integrated voices (`:8192`): **Kokoro-82M** (ONNX, CPU) generates a voiceover and a **layer-aware ffmpeg mixdown** ducks it over the clip's native audio + loudness-normalizes. The pipe POSTs `/narrate` when the message has a `voiceover:`/`narration:` directive. No GPU. See ai-studio/video.md "Integrated audio". |
