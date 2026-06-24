@@ -14,14 +14,16 @@ services:
       # FRESH volume; on an existing volume set it in Admin → Settings → Images instead.
       - ./imagegen.env
     environment:
-      # Chat model — the ai-studio qwen director (:8090, uncensored prompt crafter). The
-      # studio lanes call it internally; exposing it here also gives one general chat model.
-      - OPENAI_API_BASE_URL=http://host.docker.internal:8090/v1
-      - OPENAI_API_KEY=sk-noauth
-      # Alternative — route chat through LiteLLM (the full catalog, but GPU-mutex with
-      # ComfyUI). Swap the two lines above for these:
-      #   - OPENAI_API_BASE_URL=http://host.docker.internal:4000/v1
-      #   - OPENAI_API_KEY=sk-litellm-master-key
+      # Chat models — bootstrap BOTH connections on a FRESH volume (PersistentConfig):
+      #   :8090 = the ai-studio qwen director (uncensored prompt crafter — the studio lanes
+      #           call it internally; it also doubles as one general chat model).
+      #   :4000 = LiteLLM gateway → the full LLM catalog (qwen3.6-27b / 35b-a3b / gemma-4-31b /
+      #           gemma-4-12b / deckard-40b). Only the ACTIVE gpu-mode scene's upstream responds
+      #           (GPU-mutex); the rest appear in the picker but error until you switch to them.
+      # Plural *_URLS / *_KEYS are ;-separated. On an EXISTING volume the stored config wins —
+      # set connections in Admin → Settings → Connections (or edit webui.db) instead.
+      - OPENAI_API_BASE_URLS=http://host.docker.internal:8090/v1;http://host.docker.internal:4000/v1
+      - OPENAI_API_KEYS=sk-noauth;sk-litellm-master-key
       # Ollama removed from the stack 2026-06-22 — disable the API so OWUI doesn't
       # probe a dead :11434 on boot (chat routes through the OpenAI API above).
       - ENABLE_OLLAMA_API=false
