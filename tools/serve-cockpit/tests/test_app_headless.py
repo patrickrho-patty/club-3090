@@ -1406,6 +1406,28 @@ class TestEstateWired:
 
 
 @pytest.mark.asyncio
+async def test_scene_preview_caps_services_with_overflow():
+    """A busy scene (ai-studio, ~7 services) caps the preview bullets to
+    _SCENE_PREVIEW_MAX_SVCS and collapses the rest to '+N more', so the services
+    line doesn't wrap past the preview box (max-height 6) and clip."""
+    from club3090_cockpit.app import _SCENE_PREVIEW_MAX_SVCS
+    busy = Scene(name="ai-studio", group="studio", description="creative studio",
+                 services=["comfyui", "studio-director", "studio-gallery", "studio-tts",
+                           "studio-image-shim", "studio-orchestrator", "step-voice"],
+                 ports=["8188"], gpus="both")
+    app, _, _ = make_app()
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _enter_operate(pilot)
+        orch = app.query_one("#operate-orch-pane", OperateOrchPane)
+        orch.render_scene_preview(busy)
+        await pilot.pause()
+        txt = str(app.query_one("#scene-preview", Static).render())
+        svc_line = next(l for l in txt.splitlines() if "services" in l)       # the services row only (header also has a ○ tag)
+        assert svc_line.count("○") == _SCENE_PREVIEW_MAX_SVCS                  # only the cap shown (none running → ○)
+        assert f"+{len(busy.services) - _SCENE_PREVIEW_MAX_SVCS} more" in svc_line  # "+3 more"
+
+
+@pytest.mark.asyncio
 class TestFix1CursorPreserveAcrossPoll:
     """FIX 1 — the B2 periodic refresh re-populates the scene + container tables
     every 4s.  The cursor must NOT snap back to row 0 on each tick: preserve it by
