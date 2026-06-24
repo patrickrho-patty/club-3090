@@ -1778,7 +1778,6 @@ class OperateOrchPane(Container):
     }
     OperateOrchPane #scene-preview {
         height: auto;
-        max-height: 6;
         border: solid $primary;
         padding: 0 1;
         margin: 0 1 1 1;
@@ -2230,10 +2229,14 @@ class OperateOrchPane(Container):
         if scene.description:
             lines.append(f"  [dim]{escape(scene.description)}[/dim]")
         if states:
+            # Show every service (running first so active ones lead). The preview box
+            # auto-grows (no max-height) — a busy scene like ai-studio (~7 services) wraps
+            # across rows without clipping; the pane scrolls if it ever needs to.
+            ordered = sorted(states, key=lambda s: not s.running)
             svcs = "   ".join(
                 (f"[green]●[/green] {escape(s.name)}" if s.running
                  else f"[red]○[/red] {escape(s.name)}")
-                for s in states
+                for s in ordered
             )
             lines.append(f"  [bold]services[/bold]  {svcs}")
         else:

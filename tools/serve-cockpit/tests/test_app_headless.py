@@ -1406,6 +1406,30 @@ class TestEstateWired:
 
 
 @pytest.mark.asyncio
+async def test_scene_preview_shows_all_services_no_clip():
+    """A busy scene (ai-studio, ~7 services) renders EVERY service in the preview —
+    no cap, no "+N more". The box has no max-height so it auto-grows to fit instead
+    of clipping (the pane scrolls if needed)."""
+    busy = Scene(name="ai-studio", group="studio", description="creative studio",
+                 services=["comfyui", "studio-director", "studio-gallery", "studio-tts",
+                           "studio-image-shim", "studio-orchestrator", "step-voice"],
+                 ports=["8188"], gpus="both")
+    app, _, _ = make_app()
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _enter_operate(pilot)
+        orch = app.query_one("#operate-orch-pane", OperateOrchPane)
+        orch.render_scene_preview(busy)
+        await pilot.pause()
+        txt = str(app.query_one("#scene-preview", Static).render())
+        for svc in busy.services:                       # every service is present, none dropped
+            assert svc in txt
+        assert "more" not in txt                          # no "+N more" collapse
+        # the #scene-preview rule carries no max-height cap (box auto-grows to fit)
+        preview_rule = OperateOrchPane.DEFAULT_CSS.split("#scene-preview")[1].split("}")[0]
+        assert "max-height" not in preview_rule
+
+
+@pytest.mark.asyncio
 class TestFix1CursorPreserveAcrossPoll:
     """FIX 1 — the B2 periodic refresh re-populates the scene + container tables
     every 4s.  The cursor must NOT snap back to row 0 on each tick: preserve it by
