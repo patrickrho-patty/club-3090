@@ -119,6 +119,28 @@ reach for Chroma when you want real-CFG/negative control, HiDream for top-qualit
 > cloud APIs" rule. It's also aligned (not uncensored). Re-evaluate if ComfyUI adds local Krea2
 > detection. Z-Image is the uncensored image pick instead.
 
+## Quality ceiling & the optional HQ upgrade path (parked)
+
+The image lanes ship the **fast / distilled** checkpoints (Z-Image-**Turbo**, HiDream-O1-**Dev**). They
+look great, and we're keeping them — but if a no-compromise quality tier is ever wanted, the lever is
+the **model variant, not settings or resolution.** Measured on this rig (2026-06-24):
+
+- **Tuning a distilled model is a dead end.** Z-Image: 8 vs 16 steps, `res_multistep` vs `dpmpp_2m`,
+  shift 3 vs 6 → all visually identical. HiDream-O1-Dev: the `negative_prompt` is a no-op (it's
+  guidance-distilled), and `noise_scale` is a **calibrated constant, not a knob** — dropping it 7.5→5.0
+  produced a **blank image**. So don't chase steps / sampler / shift / negative / noise for these.
+- **The real lever = the non-distilled sibling** (both are separately-released checkpoints):
+
+  | Lane | Ships | HQ variant | Fits our 24 GB card? |
+  |---|---|---|---|
+  | Z-Image | Turbo · 8-step · no CFG | **Z-Image base** · 50-step · real CFG | ✅ **yes** — same 6B arch; ~14–16 GB w/ director, like HiDream-O1. Clean drop-in, ~5–6× slower |
+  | HiDream | O1-Dev · 28-step distilled | **HiDream-I1-Full** · 50-step · real CFG | ⚠️ **not at 2048²** — 17B + 4 encoders (incl. Llama-3.1-8B) + CFG vs only ~9.7 GB headroom (HiDream-O1 peaks at 14.9 GB w/ director). Needs the director off GPU0 + 1024²/DisTorch |
+
+**Status: parked, not wired.** Z-Image base is the clean future win (fits, no layout change); HiDream
+I1-Full needs VRAM gymnastics for an incremental gain over the already-excellent Dev lane. The
+[director-placement lever](requirements.md) (free 4.5 GB off GPU0) is what would make the heavy
+variant feasible — i.e. the same lever that matters for video.
+
 ## Native image button (via the image shim)
 
 OWUI's built-in 🖼️ image button (on a chat message) also renders Ideogram-4 stills — but it sends
