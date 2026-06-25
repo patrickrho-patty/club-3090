@@ -1,0 +1,172 @@
+# ===========================================================================
+# Profile (at-a-glance):
+#   Model:     Qwen3-Embedding-4B LawyerKit v2 (BF16, Matryoshka 2048-dim)
+#   Topology:  4× 3090 (4 independent vLLM instances, one per GPU)
+#   Drafter:   none (encode-only)
+#   KV:        fp8_e5m2 (LOAD-BEARING — BF16 KV would OOM at 131K batched tokens)
+#   Vision:    no
+#   Max ctx:   4096
+#   Genesis:   N/A — not a Qwen3-Next model
+#   Status:    🧪 Experimental
+#   Best for:  Maximum embedding throughput — 4 independent instances, no DP coordinator
+# ---------------------------------------------------------------------------
+# 4 independent vLLM embedding instances, one per GPU, each on its own port.
+# No DP coordinator overhead — each instance is a fully standalone vLLM server.
+# Client-side load balancing required (round-robin across ports).
+#
+# Endpoints:
+#   GPU0: http://<host>:${PORT_GPU0:-8030}/v1/embeddings
+#   GPU1: http://<host>:${PORT_GPU1:-8031}/v1/embeddings
+#   GPU2: http://<host>:${PORT_GPU2:-8032}/v1/embeddings
+#   GPU3: http://<host>:${PORT_GPU3:-8033}/v1/embeddings
+#
+# Served model names (same on all instances):
+#   - lex-embedding-4b
+#   - qwen3-embedding-4b-lawyerkit
+#
+# VRAM budget per GPU: same as single-card compose (see single/bf16/base.yml).
+# ===========================================================================
+
+name: lex-embedding-4b-v2-independent
+
+x-common-env: &common-env
+  HF_HOME: /root/.cache/huggingface
+  HUGGING_FACE_HUB_TOKEN: "${HF_TOKEN:-}"
+  VLLM_WORKER_MULTIPROC_METHOD: "spawn"
+  VLLM_NO_USAGE_STATS: "1"
+  OMP_NUM_THREADS: "1"
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True,max_split_size_mb:512
+  VLLM_FLOAT32_MATMUL_PRECISION: high
+  TRITON_CACHE_DIR: /root/.triton/cache
+  VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: "0"
+  CUDA_DEVICE_MAX_CONNECTIONS: "8"
+
+x-common-command: &common-command
+  - patrick-patty/qwen3-embedding-4b-lawyerkit-v2-merged
+  - --served-model-name
+  - lex-embedding-4b
+  - qwen3-embedding-4b-lawyerkit
+  - --runner
+  - pooling
+  - --convert
+  - embed
+  - --dtype
+  - bfloat16
+  - --hf-overrides
+  - '{"is_matryoshka": true, "matryoshka_dimensions": [2048]}'
+  - --pooler-config
+  - '{"dimensions": 2048}'
+  - --max-model-len
+  - "4096"
+  - --gpu-memory-utilization
+  - "0.95"
+  - --max-num-seqs
+  - "256"
+  - --max-num-batched-tokens
+  - "131072"
+  - --kv-cache-dtype
+  - fp8_e5m2
+  - --enable-prefix-caching
+  - --enable-chunked-prefill
+  - --trust-remote-code
+  - --host
+  - 0.0.0.0
+  - --port
+  - "8000"
+
+services:
+  gpu0:
+    image: vllm/vllm-openai:nightly
+    container_name: vllm-lex-embedding-gpu0
+    restart: "no"
+    ports:
+      - "${PORT_GPU0:-8030}:8000"
+    volumes:
+      - ${HF_CACHE:-/data/huggingface}:/root/.cache/huggingface
+      - ../../../cache/torch_compile:/root/.cache/vllm/torch_compile_cache
+      - ../../../cache/triton:/root/.triton/cache
+    environment:
+      <<: *common-env
+      CUDA_VISIBLE_DEVICES: "0"
+    shm_size: "16gb"
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+    command: *common-command
+
+  gpu1:
+    image: vllm/vllm-openai:nightly
+    container_name: vllm-lex-embedding-gpu1
+    restart: "no"
+    ports:
+      - "${PORT_GPU1:-8031}:8000"
+    volumes:
+      - ${HF_CACHE:-/data/huggingface}:/root/.cache/huggingface
+      - ../../../cache/torch_compile:/root/.cache/vllm/torch_compile_cache
+      - ../../../cache/triton:/root/.triton/cache
+    environment:
+      <<: *common-env
+      CUDA_VISIBLE_DEVICES: "1"
+    shm_size: "16gb"
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["1"]
+              capabilities: [gpu]
+    command: *common-command
+
+  gpu2:
+    image: vllm/vllm-openai:nightly
+    container_name: vllm-lex-embedding-gpu2
+    restart: "no"
+    ports:
+      - "${PORT_GPU2:-8032}:8000"
+    volumes:
+      - ${HF_CACHE:-/data/huggingface}:/root/.cache/huggingface
+      - ../../../cache/torch_compile:/root/.cache/vllm/torch_compile_cache
+      - ../../../cache/triton:/root/.triton/cache
+    environment:
+      <<: *common-env
+      CUDA_VISIBLE_DEVICES: "2"
+    shm_size: "16gb"
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["2"]
+              capabilities: [gpu]
+    command: *common-command
+
+  gpu3:
+    image: vllm/vllm-openai:nightly
+    container_name: vllm-lex-embedding-gpu3
+    restart: "no"
+    ports:
+      - "${PORT_GPU3:-8033}:8000"
+    volumes:
+      - ${HF_CACHE:-/data/huggingface}:/root/.cache/huggingface
+      - ../../../cache/torch_compile:/root/.cache/vllm/torch_compile_cache
+      - ../../../cache/triton:/root/.triton/cache
+    environment:
+      <<: *common-env
+      CUDA_VISIBLE_DEVICES: "3"
+    shm_size: "16gb"
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["3"]
+              capabilities: [gpu]
+    command: *common-command
