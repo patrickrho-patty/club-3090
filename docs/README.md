@@ -26,6 +26,7 @@ Start here if you want to run a model.
 | [`GLOSSARY.md`](GLOSSARY.md) | TPS / KV / MTP / TP and the rest of the vocabulary. |
 | [`FAQ.md`](FAQ.md) | Common setup and operational questions. |
 | [`COMPARISONS.md`](COMPARISONS.md) | Self-host vs cloud APIs — cost crossover and when each wins. |
+| [`EMBEDDINGS.md`](EMBEDDINGS.md) | Embedding models on 3090 — which generative techniques transfer, skeleton compose. |
 | [`EXAMPLES.md`](EXAMPLES.md) | Worked end-to-end usage examples. |
 | [`ai-studio/`](ai-studio/README.md) | **Club 3090 AI Studio** — chat-driven, all-modality creative studio (text · image · video · audio) on 2× 3090. **Start here** for the architecture + the full 8-lane matrix. |
 | [`ai-studio/image.md`](ai-studio/image.md) | **Image** lanes — HiDream-O1 (top-quality/photoreal) · Ideogram-4 (design/logo/text) · Chroma (uncensored). |
