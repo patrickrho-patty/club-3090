@@ -87,7 +87,6 @@ services:
       - ../../../cache/triton:/root/.triton/cache
     environment:
       <<: *common-env
-      CUDA_VISIBLE_DEVICES: "0"
     shm_size: "16gb"
     ipc: host
     deploy:
@@ -111,7 +110,6 @@ services:
       - ../../../cache/triton:/root/.triton/cache
     environment:
       <<: *common-env
-      CUDA_VISIBLE_DEVICES: "1"
     shm_size: "16gb"
     ipc: host
     deploy:
@@ -135,7 +133,6 @@ services:
       - ../../../cache/triton:/root/.triton/cache
     environment:
       <<: *common-env
-      CUDA_VISIBLE_DEVICES: "2"
     shm_size: "16gb"
     ipc: host
     deploy:
@@ -159,7 +156,6 @@ services:
       - ../../../cache/triton:/root/.triton/cache
     environment:
       <<: *common-env
-      CUDA_VISIBLE_DEVICES: "3"
     shm_size: "16gb"
     ipc: host
     deploy:
