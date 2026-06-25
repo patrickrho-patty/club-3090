@@ -1,0 +1,125 @@
+# ===========================================================================
+# Profile (at-a-glance):
+#   Model:     Qwen3-Embedding-4B LawyerKit v2 (BF16, Matryoshka 2048-dim)
+#   Topology:  4× 3090 (DP=4, one model replica per GPU)
+#   Drafter:   none (encode-only)
+#   KV:        fp8_e5m2 (LOAD-BEARING — BF16 KV would OOM at 131K batched tokens)
+#   Vision:    no
+#   Max ctx:   4096
+#   Genesis:   N/A — not a Qwen3-Next model
+#   Status:    🧪 Experimental
+#   Best for:  ⭐ Maximum embedding throughput — 4× replicas via vLLM data parallelism
+# ---------------------------------------------------------------------------
+# Lex Embedding 4B v2 — 4-GPU data-parallel vLLM embedding API.
+#
+# Uses --data-parallel-size 4 to run 4 independent model replicas, one per
+# GPU. vLLM's built-in load balancer distributes requests across replicas.
+# This is 4× the single-GPU throughput (linear scaling — no inter-GPU comms).
+#
+# Endpoint: http://<host>:${PORT:-8030}/v1/embeddings
+# Served model names:
+#   - lex-embedding-4b
+#   - qwen3-embedding-4b-lawyerkit
+#
+# This uses the already-downloaded Hugging Face cache under /data/huggingface.
+# If the private model is not cached yet, make sure the host has a valid HF token
+# (host token file or HF_TOKEN env var — passed through below).
+#
+# VRAM budget per GPU (24 GB, gpu_memory_utilization=0.95 → ~22.8 GB usable):
+#   Weights:      ~8.0 GB (4B params × BF16, loaded independently per replica)
+#   KV (FP8):     ~9.2 GB (131K tokens × 36 layers × 8 heads × 128 dim × 2)
+#   Activations:  ~1-2 GB (chunked prefill keeps peak bounded)
+#   Headroom:     ~2.6-3.6 GB (CUDA graphs + allocator fragmentation)
+#   ⚠️  GPU0 has ~334 MB VGA overhead — still fits at 0.95 util.
+#   ⚠️  FP8 KV is load-bearing: BF16 KV → ~18.4 GB KV → OOM.
+#   ⚠️  If CUDA graph capture OOMs at startup, lower gpu_memory_utilization
+#       to 0.92 or set VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1.
+#
+# Embedding-specific tuning (vs generative composes — see docs/EMBEDDINGS.md):
+#   - --data-parallel-size 4              (4 replicas, one per GPU)
+#   - --runner pooling / --convert embed  (encode-only, no decode loop)
+#   - --max-num-seqs 256                  (per replica — 1024 total across cluster)
+#   - --max-num-batched-tokens 131072     (per replica)
+#   - --max-model-len 4096               (short inputs → frees VRAM for batching)
+#   - --kv-cache-dtype fp8_e5m2           (halves KV VRAM — required to fit at 131K)
+#   - --enable-prefix-caching             (may help if shared Instruct: prefix — unverified in pooling mode)
+#   - --enable-chunked-prefill            (overlap long-doc prefills within batch)
+#   - --pooler-config                     (forces 2048-dim default output)
+#   - Matryoshka enabled (2048-dim via hf-overrides + pooler-config)
+#   - CUDA graphs enabled (no --enforce-eager → captures uniform batch shapes)
+#
+# Power cap: embedding is prefill-heavy. 250–290W recommended for sustained
+# throughput. Use: scripts/gpu-mode.sh or nvidia-smi -pl 250.
+#
+# Startup time: ~2-3 min (torch.compile + CUDA graph capture × 4 replicas).
+# Subsequent boots reuse cache volumes and are faster.
+# ===========================================================================
+
+name: lex-embedding-4b-v2-dp4
+
+services:
+  vllm-lex-embedding-4b-v2:
+    image: vllm/vllm-openai:nightly
+    container_name: vllm-lex-embedding-4b-v2-dp4
+    restart: "no"
+    ports:
+      - "${PORT:-8030}:8000"
+    volumes:
+      - ${HF_CACHE:-/data/huggingface}:/root/.cache/huggingface
+      # torch.compile + Triton caches (shared across replicas, reused across restarts)
+      - ../../../cache/torch_compile:/root/.cache/vllm/torch_compile_cache
+      - ../../../cache/triton:/root/.triton/cache
+    environment:
+      HF_HOME: /root/.cache/huggingface
+      HUGGING_FACE_HUB_TOKEN: "${HF_TOKEN:-}"
+      VLLM_WORKER_MULTIPROC_METHOD: "spawn"
+      VLLM_NO_USAGE_STATS: "1"
+      OMP_NUM_THREADS: "1"
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True,max_split_size_mb:512
+      VLLM_FLOAT32_MATMUL_PRECISION: high
+      TRITON_CACHE_DIR: /root/.triton/cache
+      VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: "0"
+      CUDA_DEVICE_MAX_CONNECTIONS: "8"
+    shm_size: "16gb"
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 4
+              capabilities: [gpu]
+    command:
+      - patrick-patty/qwen3-embedding-4b-lawyerkit-v2-merged
+      - --served-model-name
+      - lex-embedding-4b
+      - qwen3-embedding-4b-lawyerkit
+      - --runner
+      - pooling
+      - --convert
+      - embed
+      - --dtype
+      - bfloat16
+      - --hf-overrides
+      - '{"is_matryoshka": true, "matryoshka_dimensions": [2048]}'
+      - --pooler-config
+      - '{"dimensions": 2048}'
+      - --max-model-len
+      - "4096"
+      - --gpu-memory-utilization
+      - "0.95"
+      - --max-num-seqs
+      - "256"
+      - --max-num-batched-tokens
+      - "131072"
+      - --kv-cache-dtype
+      - fp8_e5m2
+      - --data-parallel-size
+      - "4"
+      - --enable-prefix-caching
+      - --enable-chunked-prefill
+      - --trust-remote-code
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
