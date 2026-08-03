@@ -8,7 +8,10 @@
 #   Max ctx:   131K default @ 4 streams (NIAH-validated to 120K) — BF16 KV pool
 #              196,527 tok @ mem-util 0.95. For native 262K use vllm/gemma-int8-mtp.
 #   Genesis:   N/A — Genesis is Qwen3-Next-specific
-#   Status:    ✅ Production
+#   Status:    🗑️ Deprecated
+#   Caveats:   Superseded by vllm/gemma-31b-dual (cyankiwi bf16 @224K, stock v0.24.0, overlay-free) in the
+#              v0.24.0 consolidation (2026-07-02) — this was the v0.22.0 131K bf16 + #42006 path. Kept for
+#              history; use vllm/gemma-31b-dual.
 #   Quality:   reasoning-ON 111/150 (74%) — det 65/75 · sandbox 46/75
 #                TC 14/15 · IF 14/15 · SO 14/15 · DE 11/15 · RM 12/15 · BF 15/15 · HA 12/20 · CLI 19/40
 #                (--full, --enable-thinking, --reasoning-parser gemma4, v0.22.0, 2026-05-31). Thinking-OFF
@@ -67,9 +70,12 @@ services:
     container_name: "${ESTATE_CONTAINER:-vllm-gemma-4-31b-mtp}"
     restart: ${CLUB3090_RESTART:-unless-stopped}
     ports:
-      - "${ESTATE_PORT:-${PORT:-8030}}:8000"
+      - "${BIND_HOST:-0.0.0.0}:${ESTATE_PORT:-${PORT:-8030}}:8000"
     volumes:
       - ${MODEL_DIR:-../../../../../../models-cache}:/root/.cache/huggingface
+      # Google Gemma 4 CANONICAL chat template (published 2026-07-09) — vendored;
+      # the image-bundled example predates Google's fix (see the patch README).
+      - ../../../patches/google-canonical-chat-template/chat_template.jinja:/etc/club3090/gemma-canonical-template.jinja:ro
       # torch.compile + Triton kernel caches — first boot warms (~5-7 min);
       # subsequent boots reuse cached graphs (~3 min). Pattern from dual-turbo.yml.
       - ../../../cache/torch_compile:/root/.cache/vllm/torch_compile_cache
@@ -84,6 +90,12 @@ services:
       - ../../../../../../scripts/detect_nvlink.sh:/etc/club3090/detect_nvlink.sh:ro
     environment:
       - NVIDIA_VISIBLE_DEVICES=${ESTATE_GPUS:-${NVIDIA_VISIBLE_DEVICES:-all}}
+      # CUDA-level GPU mask — the runtime-agnostic half of GPU selection
+      # (#610): launch.sh --gpus exports GPU UUIDs here. CDI runtimes (NixOS,
+      # nvidia-ctk cdi) IGNORE NVIDIA_VISIBLE_DEVICES, so this mask is what
+      # actually pins cards there; on the classic runtime the UUID form is
+      # renumbering-proof. Unset → absent (no masking).
+      - CUDA_VISIBLE_DEVICES
       - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
       - HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-${OFFLINE:-0}}
       - TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-${OFFLINE:-0}}
@@ -132,6 +144,7 @@ services:
       - --model
       - /root/.cache/huggingface/gemma-4-31b-autoround-int4
       - --served-model-name
+      - gemma-4-31b
       - gemma-4-31b-autoround
       - --tensor-parallel-size
       - "${TP:-2}"
@@ -164,7 +177,7 @@ services:
       - "${MAX_NUM_SEQS:-4}"
       # Vision tower: max_tokens_per_mm_item=2496 must fit in batched tokens.
       - --max-num-batched-tokens
-      - "4096"
+      - "${MAX_NUM_BATCHED_TOKENS:-4096}"
       - --trust-remote-code
       # Tool-call support per vLLM Gemma 4 recipe — required for any soak /
       # agent traffic that includes a `tools: [...]` array. Without these,
@@ -181,6 +194,6 @@ services:
       - --reasoning-parser
       - gemma4
       - --chat-template
-      - /vllm-workspace/examples/tool_chat_template_gemma4.jinja
+      - /etc/club3090/gemma-canonical-template.jinja
       - --speculative-config
       - '{"model":"/root/.cache/huggingface/gemma-4-31b-it-assistant","num_speculative_tokens":4}'

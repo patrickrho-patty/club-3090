@@ -22,6 +22,15 @@
 #      the old drop-unknown-keys behaviour).
 set -euo pipefail
 
+# Force Python's UTF-8 mode (PEP 540) for every python3 this script runs.
+# Repo sources are full of unicode (— × → ⚠), and without this a rig on a real
+# non-UTF-8 locale (de_DE.iso88591 and friends) decodes reads, stdout AND argv
+# with the locale codec, which crashes the launcher/emit paths (#779). Python
+# already auto-enables UTF-8 mode for the C/POSIX locale, so this covers the
+# case it does NOT: a genuine non-UTF-8, non-C locale. Exported, so child
+# processes and nested scripts inherit it. Guarded by test-locale-utf8.sh.
+export PYTHONUTF8="${PYTHONUTF8:-1}"
+
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 export PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}"
@@ -413,6 +422,53 @@ check(
 # derive() returns unsupported-format if a tier1 hit's variant were gguf.
 # (Real catalog has none, so this is covered by the gguf_with_repos check
 # above + the deriver's explicit guard.)
+
+# compressed-tensors config_groups bit-width resolution (the Agents-A1
+# FP8-dynamic producer-zero dogfood finding, 2026-07-02): bits live nested at
+# config_groups.<g>.weights.num_bits, NOT top-level — resolve_quant_dtype must
+# read them (previously -> quant-dtype-unknown for every llm-compressor
+# checkpoint: FP8-dynamic, INT8 W8A8, INT4 pack-quantized).
+CT_FP8_CFG = {
+    "quant_method": "compressed-tensors",
+    "format": "float-quantized",
+    "config_groups": {
+        "group_0": {
+            "weights": {"num_bits": 8, "type": "float", "strategy": "channel", "dynamic": False},
+            "input_activations": {"num_bits": 8, "type": "float", "dynamic": True},
+            "targets": ["Linear"],
+        }
+    },
+}
+wf, bpw, err = D.resolve_quant_dtype("fixtures/ct-fp8", {"quantization_config": CT_FP8_CFG}, [], None, None)
+check(
+    err is None and wf == "compressed-tensors" and bpw == 8.0,
+    f"compressed-tensors FP8-dynamic config_groups -> bpw 8.0 (got wf={wf} bpw={bpw} err={err})",
+)
+CT_INT4_CFG = {
+    "quant_method": "compressed-tensors",
+    "format": "pack-quantized",
+    "config_groups": {
+        "group_0": {"weights": {"num_bits": 4, "type": "int", "group_size": 128}}
+    },
+}
+wf4, bpw4, err4 = D.resolve_quant_dtype("fixtures/ct-int4", {"quantization_config": CT_INT4_CFG}, [], None, None)
+check(
+    err4 is None and bpw4 == 4.0,
+    f"compressed-tensors INT4 pack-quantized config_groups -> bpw 4.0 (got bpw={bpw4} err={err4})",
+)
+# mixed groups: the WIDEST weights num_bits wins (footprint-dominant).
+CT_MIXED_CFG = {
+    "quant_method": "compressed-tensors",
+    "config_groups": {
+        "g0": {"weights": {"num_bits": 4, "type": "int"}},
+        "g1": {"weights": {"num_bits": 8, "type": "float"}},
+    },
+}
+_, bpwm, errm = D.resolve_quant_dtype("fixtures/ct-mixed", {"quantization_config": CT_MIXED_CFG}, [], None, None)
+check(
+    errm is None and bpwm == 8.0,
+    f"compressed-tensors mixed groups -> widest bpw 8.0 (got bpw={bpwm} err={errm})",
+)
 
 if failures:
     print(f"\n{len(failures)} assertion(s) failed.", file=sys.stderr)

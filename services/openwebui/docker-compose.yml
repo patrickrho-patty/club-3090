@@ -1,12 +1,20 @@
 services:
   open-webui:
-    # Pinned (was :main) — v0.9.6 live-validated 2026-06-09: image-gen + chat config
-    # survive the migration. Bump deliberately, re-validate the image-gen wiring.
-    image: ghcr.io/open-webui/open-webui:v0.9.6
+    # Pinned (was :main) — v0.11.0 bumped 2026-08-02 (#807) from v0.9.6.
+    # ⚠️ v0.10.0 AND v0.11.0 both carry ONE-WAY DB migrations — back up the
+    #    open-webui-data volume before any bump (downgrade is unsupported).
+    # ⚠️ v0.11.0 flips tool-calling default to NATIVE — chats/models relying on
+    #    the old behavior must opt back into "Legacy" (per chat/model/global).
+    # Bump deliberately, re-validate the image-gen (ComfyUI) wiring when that
+    # stack is next active (mutexed with dual-LLM serving).
+    image: ghcr.io/open-webui/open-webui:v0.11.0
     container_name: open-webui
     restart: unless-stopped
     ports:
-      - "8080:8080"
+      # Host port is a knob (#715 gap 3): set OWUI_PORT in the repo .env (compose reads
+      # it via --env-file) AND export it for setup-ai-studio.sh + the pipe helper.
+      # The container-internal port stays 8080 (docker-exec helpers rely on it).
+      - "${OWUI_PORT:-8080}:8080"
     volumes:
       - open-webui-data:/app/backend/data
     env_file:
@@ -23,16 +31,16 @@ services:
       # leaves OWUI's picker.) Served names match the catalog, so model IDs are unchanged:
       #   :8090 = ai-studio qwen director (uncensored prompt crafter; studio lanes call it internally,
       #           and it doubles as a general chat model). Up only in the ai-studio scene.
-      #   :8010 = qwen3.6-27b-autoround     (gpu-mode qwen27b)
+      #   :8010 = qwen3.6-27b     (gpu-mode qwen27b)
       #   :8051 = qwen3.6-35b-a3b-autoround (gpu-mode qwen35b-a3b)
-      #   :8032 = gemma-4-31b-autoround     (gpu-mode gemma-31b)
+      #   :8032 = gemma-4-31b     (gpu-mode gemma-31b)
       #   :8038 = gemma-4-12b-int8          (gpu-mode gemma12b)
       #   :8199 = deckard-40b               (gpu-mode deckard)
       # Plural *_URLS / *_KEYS are ;-separated. On an EXISTING volume the stored config wins — re-run
       # scripts/setup-ai-studio.sh (it registers these + drops a stale :4000) or set them in
       # Admin → Settings → Connections. Backends are no-auth on localhost, so the key is a placeholder.
-      - OPENAI_API_BASE_URLS=http://host.docker.internal:8090/v1;http://host.docker.internal:8010/v1;http://host.docker.internal:8051/v1;http://host.docker.internal:8032/v1;http://host.docker.internal:8038/v1;http://host.docker.internal:8199/v1
-      - OPENAI_API_KEYS=sk-noauth;sk-noauth;sk-noauth;sk-noauth;sk-noauth;sk-noauth
+      - OPENAI_API_BASE_URLS=http://host.docker.internal:8090/v1;http://host.docker.internal:8030/v1;http://host.docker.internal:8010/v1;http://host.docker.internal:8051/v1;http://host.docker.internal:8032/v1;http://host.docker.internal:8038/v1;http://host.docker.internal:8199/v1
+      - OPENAI_API_KEYS=sk-noauth;sk-noauth;sk-noauth;sk-noauth;sk-noauth;sk-noauth;sk-noauth
       # Ollama removed from the stack 2026-06-22 — disable the API so OWUI doesn't
       # probe a dead :11434 on boot (chat routes through the OpenAI API above).
       - ENABLE_OLLAMA_API=false

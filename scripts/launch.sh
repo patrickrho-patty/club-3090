@@ -52,6 +52,15 @@
 
 set -euo pipefail
 
+# Force Python's UTF-8 mode (PEP 540) for every python3 this script runs.
+# Repo sources are full of unicode (— × → ⚠), and without this a rig on a real
+# non-UTF-8 locale (de_DE.iso88591 and friends) decodes reads, stdout AND argv
+# with the locale codec, which crashes the launcher/emit paths (#779). Python
+# already auto-enables UTF-8 mode for the C/POSIX locale, so this covers the
+# case it does NOT: a genuine non-UTF-8, non-C locale. Exported, so child
+# processes and nested scripts inherit it. Guarded by test-locale-utf8.sh.
+export PYTHONUTF8="${PYTHONUTF8:-1}"
+
 # The VRAM-budget block formats dot-decimal numbers emitted by kv-calc.py JSON
 # (e.g. "9.0") with `printf "%.2f"`. Under a comma-decimal LC_NUMERIC locale
 # (de_DE, fr_FR, …) bash printf rejects the dot — `printf: 9.0: invalid number`
@@ -81,7 +90,15 @@ if [[ -f "${ROOT_DIR}/.env" ]]; then
     _env_line="${_env_line#"${_env_line%%[![:space:]]*}"}"   # strip leading whitespace
     _env_line="${_env_line%$'\r'}"                           # strip trailing CR
     [[ "$_env_line" == "export "* ]] && _env_line="${_env_line#export }"
-    [[ "$_env_line" == CLUB3090_DEFAULT_* ]] || continue
+    # #632 — pass model-default pins AND user engine-image overrides through to
+    # docker compose.  IK_LLAMA_IMAGE/LLAMACPP_IMAGE were silently dropped here
+    # (only CLUB3090_DEFAULT_* passed), so a .env cu12 pin never reached the
+    # ik-llama/llama.cpp composes.  Shell env still wins (checked below); the
+    # vllm/beellama images get profile-injected later regardless.
+    case "$_env_line" in
+      CLUB3090_DEFAULT_*|VLLM_IMAGE=*|BEELLAMA_IMAGE=*|IK_LLAMA_IMAGE=*|LLAMACPP_IMAGE=*|VLLM_NIGHTLY_SHA=*) ;;
+      *) continue ;;
+    esac
     _env_key="${_env_line%%=*}"
     [[ "$_env_key" == "$_env_line" || -z "$_env_key" ]] && continue
     [[ -n "${!_env_key+x}" ]] && continue                    # already set in env → shell wins
@@ -92,9 +109,17 @@ if [[ -f "${ROOT_DIR}/.env" ]]; then
   done < "${ROOT_DIR}/.env"
   unset _env_line _env_key _env_val
 fi
+# #632 — surface a user engine-image pin (ik-llama / llama.cpp images are NOT
+# profile-injected, so a .env/shell pin is the only override path; echo it so a
+# wrong-image boot is never silent).  Fires only when actually set.
+[[ -n "${IK_LLAMA_IMAGE:-}" ]] && echo "[launch] ik-llama image pinned: ${IK_LLAMA_IMAGE}"
+[[ -n "${LLAMACPP_IMAGE:-}" ]] && echo "[launch] llama.cpp image pinned: ${LLAMACPP_IMAGE}"
 MODEL_DIR="${MODEL_DIR:-${ROOT_DIR}/models-cache}"
 # shellcheck source=preflight.sh
 source "${ROOT_DIR}/scripts/preflight.sh"
+# Runtime-agnostic GPU selection helpers (#610 Phase A) — gpu_select_export
+# (UUID-pin the --gpus set) + gpu_select_assert_placement (post-boot check).
+source "${ROOT_DIR}/scripts/lib/gpu-select.sh"
 
 # --- arg parsing ---
 ENGINE=""
@@ -866,12 +891,12 @@ suggest_default_variant() {
     echo "llamacpp/deckard40B-dual-mtp"
   else
     if (( cards >= 2 )); then
-      echo "vllm/gemma-bf16-mtp"
+      echo "vllm/gemma-31b-dual"
     else
-      # Single card: beellama/gemma-dflash is the recommended Gemma-4 path — the
-      # only viable fast single-card config on Ampere. vLLM single-card is dead
-      # here (no fp8 KV path on sm_86; the old vllm/gemma-mtp-tp1 was deprecated).
-      echo "beellama/gemma-dflash"
+      # Single card: no functional Gemma-4-31B single-card config exists since the
+      # beellama retirement (2026-07-27, Anbeeld #98 won't-fix) — suggest the dual
+      # (functional) and the 12B single as the on-one-card alternative.
+      echo "vllm/gemma-31b-dual"
     fi
   fi
 }
@@ -915,7 +940,7 @@ resolve_launch_default_variant() {
     topology="$(launch_topology_from_selected)"
     MODEL_NAME="${MODEL_NAME:-$PRIMARY_MODEL}"
     MODEL_NAME="$(normalize_model_name "$MODEL_NAME")"
-    if ! target="$(x_default_dispatch "$ROOT_DIR" "$variant" "$topology" "$MODEL_NAME")"; then
+    if ! target="$(x_default_dispatch "$ROOT_DIR" "$variant" "$topology" "$MODEL_NAME" "$(primary_sm_from_gpu_spec "$(selected_gpu_profile_spec 2>/dev/null || true)")")"; then
       echo "[launch] ERROR: cannot resolve default variant '${variant}'." >&2
       exit 1
     fi
@@ -967,7 +992,7 @@ try_bare_launch_default() {
   local pin_key pin_value
   pin_key="$(model_pin_key "$model")"
   pin_value="${!pin_key:-}"
-  if ! target="$(model_default_target "$ROOT_DIR" "$model" "$topology")"; then
+  if ! target="$(model_default_target "$ROOT_DIR" "$model" "$topology" "$(primary_sm_from_gpu_spec "$(selected_gpu_profile_spec 2>/dev/null || true)")")"; then
     return 1
   fi
   MODEL_NAME="$model"
@@ -1000,7 +1025,7 @@ try_pinned_fast_path() {
   fi
   local topology target
   topology="$(launch_topology_from_selected)"
-  if ! target="$(model_default_target "$ROOT_DIR" "$model" "$topology")"; then
+  if ! target="$(model_default_target "$ROOT_DIR" "$model" "$topology" "$(primary_sm_from_gpu_spec "$(selected_gpu_profile_spec 2>/dev/null || true)")")"; then
     return 1
   fi
   if [[ ! -t 0 ]]; then
@@ -1156,9 +1181,12 @@ validate_selected_variant() {
 }
 
 export_variant_engine_pin() {
-  local variant="$1" output line key value
+  local variant="$1" output line key value gpu_spec
   [[ "$variant" == vllm/* || "$variant" == beellama/* ]] || return 0
-  if ! output="$(python3 "$LAUNCH_PROFILE" resolve-variant-pin --variant "$variant" --format shell 2>&1)"; then
+  # detected-GPU spec enables the #246 arch-aware env for pilot variants;
+  # empty (no selection yet / no nvidia-smi) -> pin exports only.
+  gpu_spec="$(selected_gpu_profile_spec 2>/dev/null || true)"
+  if ! output="$(python3 "$LAUNCH_PROFILE" resolve-variant-pin --variant "$variant" --format shell --gpu-spec "$gpu_spec" 2>&1)"; then
     echo "$output" >&2
     exit 2
   fi
@@ -1168,6 +1196,27 @@ export_variant_engine_pin() {
       VLLM_NIGHTLY_SHA) export VLLM_NIGHTLY_SHA="$value" ;;
       VLLM_IMAGE) export VLLM_IMAGE="$value" ;;
       BEELLAMA_IMAGE) export BEELLAMA_IMAGE="$value" ;;
+      # #246 arch-aware env (pilot slugs; hardware-profile balanced default)
+      KV_CACHE_DTYPE)
+        export KV_CACHE_DTYPE="$value"
+        echo "[launch] arch-aware KV dtype: ${value} (hardware-profile default for detected GPUs — #246)" ;;
+      MAX_NUM_SEQS)
+        export MAX_NUM_SEQS="$value"
+        echo "[launch] memory-envelope concurrency: MAX_NUM_SEQS=${value} (measured for this card class — #246 Phase 2)" ;;
+      GPU_MEMORY_UTILIZATION)
+        export GPU_MEMORY_UTILIZATION="$value"
+        echo "[launch] memory-fraction floor: GPU_MEMORY_UTILIZATION=${value} (unified-memory card can't safely give the default — #246 Phase 2)" ;;
+      VLLM_USE_DEEP_GEMM)
+        export VLLM_USE_DEEP_GEMM="$value"
+        echo "[launch] fp8 weights: VLLM_USE_DEEP_GEMM=${value} (consumer card has no DeepGEMM recipe — disc #571)" ;;
+      VLLM_ATTENTION_BACKEND) export VLLM_ATTENTION_BACKEND="$value" ;;
+      # #809 — the model's declared decode class. A block-diffusion (dLLM)
+      # model has no measurable decode window on a single-canvas response,
+      # so decode_TPS is not a decode rate for it; the harness labels the
+      # output instead of printing a divide-by-epsilon figure.
+      DECODE_GRANULARITY)
+        export DECODE_GRANULARITY="$value"
+        echo "[launch] decode granularity: DECODE_GRANULARITY=${value} (declared by the model profile; decode_TPS is not a decode rate for this class — #809)" ;;
       *) echo "[launch] ERROR: unexpected engine pin export: $key" >&2; exit 2 ;;
     esac
   done <<< "$output"
@@ -1241,6 +1290,11 @@ if [[ -z "$VARIANT" ]]; then
   echo "[launch] model: $(model_label "$MODEL_NAME")" >&2
   if (( HET_VRAM_MIXED == 1 && TP_VALUE > 1 )); then
     echo "[launch] Note: heterogeneous TP is bottlenecked by the smallest selected card (${MIN_VRAM_GB} GB)." >&2
+    # This note is about CAPACITY only. Architecture heterogeneity is a separate
+    # and more dangerous axis, checked in preflight.sh (mixed-arch TP guard, #762):
+    # a 3090+4090 pair has equal 24 GB and never trips this VRAM check at all,
+    # despite spanning sm_86/sm_89.
+    echo "[launch]       (VRAM only -- architecture mismatch is checked separately; see #762.)" >&2
   fi
   if (( PP_VALUE > 1 )) && [[ "$VARIANT" == vllm/* ]]; then
     echo "[launch] WARN: PP + vLLM drafter/spec-decode paths are experimental on this stack." >&2
@@ -1292,8 +1346,10 @@ case "$_launch_status" in
 esac
 echo ""
 if [[ -n "$SELECTED_GPU_CSV" ]]; then
-  export CUDA_VISIBLE_DEVICES="$SELECTED_GPU_CSV"
-  export NVIDIA_VISIBLE_DEVICES="$SELECTED_GPU_CSV"
+  # Resolve the selected indices to GPU UUIDs and export both CUDA_/NVIDIA_
+  # VISIBLE_DEVICES so ONE selection mechanism works on both container GPU
+  # runtimes (#610). Logic lives in the shared gpu-select.sh lib (Phase A).
+  gpu_select_export "$SELECTED_GPU_CSV" "launch"
 fi
 if [[ -n "$TP_VALUE" ]]; then
   export TP="$TP_VALUE"
@@ -1321,6 +1377,12 @@ else
     echo "  - 'Genesis patches' / 'MTP acceptance' skipped on llama.cpp = expected (vLLM-only checks)"
     exit 1
   }
+  # Post-boot placement assertion (#610 Phase A): when the user pinned a GPU
+  # set, confirm the model actually landed there (loud warn on mismatch, never
+  # fatal). Runs after verify so the compute processes exist to inspect.
+  if [[ -n "$SELECTED_GPU_CSV" ]]; then
+    gpu_select_assert_placement "$ENDPOINT_CONTAINER" "${CUDA_VISIBLE_DEVICES:-}" "launch"
+  fi
 fi
 
 echo ""
@@ -1334,7 +1396,7 @@ maybe_offer_set_default "$VARIANT"
 echo "[launch] sample request:"
 echo "  curl -sf ${ENDPOINT_URL}/v1/chat/completions \\"
 echo "    -H 'Content-Type: application/json' \\"
-echo "    -d '{\"model\":\"qwen3.6-27b-autoround\",\"messages\":[{\"role\":\"user\",\"content\":\"Capital of France?\"}],\"max_tokens\":200}'"
+echo "    -d '{\"model\":\"qwen3.6-27b\",\"messages\":[{\"role\":\"user\",\"content\":\"Capital of France?\"}],\"max_tokens\":200}'"
 echo ""
 echo "[launch] switch later with:  bash scripts/switch.sh <variant>"
 echo "[launch] list variants:      bash scripts/switch.sh --list"

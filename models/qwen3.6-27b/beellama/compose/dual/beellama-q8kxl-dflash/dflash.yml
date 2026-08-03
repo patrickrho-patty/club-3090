@@ -20,11 +20,37 @@
 #              main-model layers to card0 to compensate → BALANCED ~21.2/21.2 GB, ~2.8 GB
 #              free per card (validated 2026-06-01). Re-tune via TENSOR_SPLIT if VRAM shifts.
 #   Genesis:   N/A — beellama is a llama.cpp-family engine
-#   Status:    🧪 EXPERIMENTAL — boots + serves coherently at full 262K (confirmed 2026-06-01:
-#              code accept 0.58, prose accept ~0.41 net-positive (re-tested 2026-06-03), 10K-prefill clean @262K, 0 OOM).
-#              Counterpart to the dual MTP compose; same dev-branch image gate. Full
-#              verify/soak/bench (#455) pending, so NOT git-tracked yet.
-#   Caveats:   Local test compose (untracked). beellama v0.3.0 is a DEV branch (efe856397),
+#   Status:    🗑️ Deprecated
+#              Re-statused from 🧪 Experimental 2026-07-26 (#740, @alexpolo1): 🧪 implies
+#              "under validation", which understates "refuses to start".
+#              Historical: DID boot + serve coherently at full 262K on beellama v0.3.0
+#              (2026-06-01: code accept 0.58, prose accept ~0.41 net-positive re-tested
+#              2026-06-03, 10K-prefill clean @262K, 0 OOM). That validation stands for the
+#              image it ran on; it is not reachable from the currently pinned one.
+#   Caveats:   [Engine RETIRED 2026-07-27: Anbeeld closed #98 won't-fix (v0.4.x DFlash = upstream impl with the VRAM regression, ~32K ceiling); pin v0.3.2-preview unmaintained. Migration target: llama-cpp-mainline (see the retire plan). Launch requires --force.] ⛔ BLOCKED ON: an UPSTREAM llama.cpp fix to DFlash memory. NOT on a beellama
+#              pin bump — that was tried and rejected (see below). Slug is queued for
+#              retirement with the rest of the beellama engine (todo 2026-07-26).
+#              Failure mechanism on the CURRENT pin: Anbeeld re-exported the drafter repo in
+#              UPSTREAM format on 2026-07-19 and dropped IQ4_XS. Our pinned v0.3.2-preview is
+#              a fork build whose llama.cpp base predates the current Qwen3.6 GGUF conversion,
+#              so it refuses the new-format drafter with a missing `hidden_norm.weight`
+#              tensor — and the old IQ4_XS artifact this compose references (registry
+#              weights_companions=anbeeld-dflash-iq4xs) no longer exists to fall back to.
+#              ⚠️ CORRECTION (2026-07-26): an earlier version of this block claimed the Ada
+#              gibberish (#693) and the load failure "BOTH un-break on the same event: v0.4.0
+#              rebases on current upstream". FALSE. v0.4.x replaces fork-DFlash with upstream
+#              `draft-dflash`, which builds a full MTP context for the drafter → this compose
+#              OOMs card0 at 262K (live Ampere validation 2026-07-21; single-card sibling
+#              102K → ~27K). It trades one break for a worse one. Anbeeld CLOSED our report
+#              (Anbeeld#98) as won't-fix: "the issue is on their side… architectural level so
+#              I'm not touching that. You can use v0.3.1/v0.3.2 for the time being." And
+#              v0.4.1 stable (2026-07-26) is the SAME COMMIT as the preview we OOM'd on
+#              (0 commits between the tags) — do not re-test against it.
+#              ⚠️ If this is ever revived: the companion + `--spec-type draft-dflash` rename +
+#              drafter quant must all move in the SAME commit as the image — none works alone.
+#              Mainline llama.cpp is NOT an escape: its DFlash is the same upstream code
+#              (~32K single-card ceiling measured in #759).
+#              Local test compose (untracked). beellama v0.3.0 was a DEV branch (efe856397),
 #              not a tagged release — same upstream gate as the gemma dual (Anbeeld #39 / #48).
 #              ✅ Qwen DFlash is net-positive on BOTH code (~145 TPS) AND prose: 35.6 t/s
 #              @262K = +52% over the 23.4 no-spec baseline (AR ~0.41, re-tested 2026-06-03).
@@ -71,7 +97,7 @@ services:
     container_name: "${ESTATE_CONTAINER:-beellama-qwen36-27b-dual-dflash}"
     restart: unless-stopped
     ports:
-      - "${ESTATE_PORT:-${PORT:-8065}}:8080"
+      - "${BIND_HOST:-0.0.0.0}:${ESTATE_PORT:-${PORT:-8065}}:8080"
     volumes:
       - "${MODEL_DIR:-../../../../../../models-cache}:/models:ro"
     command: >-

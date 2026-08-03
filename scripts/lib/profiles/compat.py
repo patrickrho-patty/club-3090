@@ -198,6 +198,15 @@ class ModelProfile:
     # hybrid models can set kv_calc_supported=false to skip C12 until
     # kv-calc gains MoE-aware activation/KV formulas.
     kv_calc_supported: bool = True
+    # #809 — how this model emits tokens, which decides whether `decode_TPS`
+    # means anything for it. "token" (the default, and correct for every
+    # autoregressive model) or "canvas" for a block-diffusion dLLM, which
+    # denoises a whole canvas in parallel and emits ~one SSE chunk per canvas —
+    # so TTFT == wall on a single-canvas response and the decode window is
+    # zero-width. Declaring it here is what lets the launchers export
+    # DECODE_GRANULARITY instead of the operator remembering the knob.
+    decode_granularity: str = "token"
+    canvas_tokens: int | None = None
 
     def hf_repos_for(self, variant: str) -> tuple[str, ...]:
         """v0.8.0 Pull-Gate — full HF slugs that resolve to this model's
@@ -437,7 +446,23 @@ def _model(data: dict[str, Any]) -> ModelProfile:
         valid_tp=tuple(int(x) for x in _tuple(data.get("valid_tp"))),
         requires_genesis=bool(data.get("requires_genesis", False)),
         kv_calc_supported=bool(data.get("kv_calc_supported", True)),
+        decode_granularity=_decode_granularity(data),
+        canvas_tokens=(int(data["canvas_tokens"])
+                       if data.get("canvas_tokens") is not None else None),
     )
+
+
+def _decode_granularity(data: dict[str, Any]) -> str:
+    """#809. Unknown values FAIL rather than silently degrading to "token":
+    a typo'd `canvass` would otherwise re-arm the epsilon divide on the exact
+    model class the field exists to protect, and nothing would say so."""
+    raw = data.get("decode_granularity", "token")
+    value = str(raw).strip().lower()
+    if value not in ("token", "canvas"):
+        raise ValueError(
+            f"model {data.get('id', '?')}: decode_granularity must be "
+            f"'token' or 'canvas' (got {raw!r})")
+    return value
 
 
 def _workload(data: dict[str, Any]) -> WorkloadProfile:
@@ -887,7 +912,40 @@ def fits(
     else:
         ok("C4")
 
-    unsupported_hw = [hw.id for hw in hardware if effective_kv not in hw.supported_kv_formats]
+    # fp8_e4m3 KV runs on Ampere (sm_86) ONLY for fp8-weights checkpoints: those route
+    # to FlashInfer (native fp8 storage on Ampere), whereas non-fp8 weights (e.g. Gemma
+    # W4A16) route to Triton, whose fp8e4nv path needs SM89+. `weights_variant` is a
+    # validated proxy for that backend split — Qwen fp8 dual/multi-max WORK on the 3090
+    # (#594: boot/decode/NIAH/quality/soak all green), while gemma-4-31b + fp8_e4m3 FAILS
+    # at KV-init on the same sm_86/v0.24.0 stack (learnings/gemma-4-31b.md 2026-07-01).
+    # So bypass the hardware supported_kv_formats gate for fp8_e4m3 + fp8/nvfp4-weights on
+    # sm>=8.6 without listing fp8_e4m3 in the Ampere profile (keeps Gemma correctly
+    # rejected). See docs/DTYPE_MATRIX.md. Caveat: a future Gemma-*fp8-weights* checkpoint
+    # would route to Triton and still fail — this proxy would wrongly allow it; revisit then.
+    # nvfp4 weights added 2026-07-13 (#686): tess/qwen NVFP4 run e4m3 KV via FlashInfer
+    # on sm_86 — live-validated (A0 8-pack on 2x3090, BENCHMARKS) — while gemma stays rejected.
+    # Qwen3-Next family added 2026-07-14: autoround-int4 weights + e4m3 KV ALSO route to
+    # FlashInfer on sm_86 (live-verified — dual-fast + 35b-a3b-dual boot: block_size 1600/2096,
+    # FlashInfer selected, coherent). The backend split is model-driven (DeltaNet hybrid attn),
+    # NOT weight-variant-driven, so key on family here — gemma (gemma4-swa-dense) stays on
+    # Triton → correctly rejected regardless of weight variant. See docs/DTYPE_MATRIX.md.
+    # bf16/fp16 (full-precision) weights added 2026-07-14: no W4A16 quant kernel to force
+    # Triton, so fp8_e4m3 KV routes to FlashInfer on sm_86 — live-verified on vibethinker-3b
+    # (bf16 Qwen2-dense: FlashInfer selected, coherent). Only gemma-style W4A16 on a non-
+    # qwen3-next family still routes to Triton → stays correctly rejected.
+    # qwen35-dense family added 2026-07-17: same DeltaNet-hybrid attention class as
+    # qwen3-next (the family label predates the hybrid correction) — Tess-4-27B AutoRound
+    # W4A16 + e4m3 KV live-validated on 2x3090 sm_86 @262K (rebench-full: verify-stress
+    # 8/8 incl. NIAH ceiling ladder, soak PASS, 8-pack both legs). FlashInfer path.
+    _fp8w_ampere_kv = effective_kv == "fp8_e4m3" and (
+        str(effective_weights or "").startswith(("fp8", "nvfp4", "bf16", "fp16"))
+        or model.family.startswith(("qwen3-next", "qwen35"))
+    )
+    unsupported_hw = [
+        hw.id for hw in hardware
+        if effective_kv not in hw.supported_kv_formats
+        and not (_fp8w_ampere_kv and hw.sm >= 8.6)
+    ]
     if unsupported_hw:
         fail("C5", f"kv_format={effective_kv} not supported by hardware: {', '.join(unsupported_hw)}")
     else:
@@ -1075,7 +1133,10 @@ def from_compose_name(
         nvlink_active=nvlink_active,
         requires_nvlink=bool(entry.get("requires_nvlink", False)),
         required_engine_features=list(entry.get("required_engine_features", [])),
-        required_sm=entry.get("required_sm"),
+        # fallback_sm (weight-only fallback floor, e.g. NVFP4→Marlin W4A16 @7.5)
+        # replaces required_sm as the HARD floor when present — the C3 gate then
+        # admits fallback-band hardware (sm_86 live-confirmed 2026-07-11).
+        required_sm=entry.get("fallback_sm") or entry.get("required_sm"),
         project_vram=project_vram,
     )
     result.compose_name = name

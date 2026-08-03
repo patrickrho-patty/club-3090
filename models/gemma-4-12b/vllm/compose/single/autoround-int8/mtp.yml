@@ -41,10 +41,20 @@ services:
       - "${BIND_HOST:-0.0.0.0}:${ESTATE_PORT:-${PORT:-8038}}:8000"
     volumes:
       - ${MODEL_DIR:-../../../../../../models-cache}:/root/.cache/huggingface
+      # Google Gemma 4 CANONICAL chat template (published 2026-07-09) — SHARED
+      # from the gemma-4-31b tree (one canonical template family-wide); the
+      # image-bundled example predates Google's fix (see the patch README).
+      - ../../../../../gemma-4-31b/vllm/patches/google-canonical-chat-template/chat_template.jinja:/etc/club3090/gemma-canonical-template.jinja:ro
       - ../../../cache/torch_compile:/root/.cache/vllm/torch_compile_cache
       - ../../../cache/triton:/root/.triton/cache
     environment:
       - NVIDIA_VISIBLE_DEVICES=${ESTATE_GPUS:-${NVIDIA_VISIBLE_DEVICES:-all}}
+      # CUDA-level GPU mask — the runtime-agnostic half of GPU selection
+      # (#610): launch.sh --gpus exports GPU UUIDs here. CDI runtimes (NixOS,
+      # nvidia-ctk cdi) IGNORE NVIDIA_VISIBLE_DEVICES, so this mask is what
+      # actually pins cards there; on the classic runtime the UUID form is
+      # renumbering-proof. Unset → absent (no masking).
+      - CUDA_VISIBLE_DEVICES
       - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
       - HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-${OFFLINE:-0}}
       - TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-${OFFLINE:-0}}
@@ -98,7 +108,7 @@ services:
       - --reasoning-parser
       - gemma4
       - --chat-template
-      - /vllm-workspace/examples/tool_chat_template_gemma4.jinja
+      - /etc/club3090/gemma-canonical-template.jinja
       - --override-generation-config
       - '{"temperature":${TEMP:-${TEMPERATURE:-1.0}},"top_p":${TOP_P:-0.95},"top_k":${TOP_K:-64},"min_p":${MIN_P:-0.0},"repetition_penalty":${REPEAT_PENALTY:-1.0}}'
       - --host

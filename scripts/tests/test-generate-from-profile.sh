@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Force Python's UTF-8 mode (PEP 540) for every python3 this script runs.
+# Repo sources are full of unicode (— × → ⚠), and without this a rig on a real
+# non-UTF-8 locale (de_DE.iso88591 and friends) decodes reads, stdout AND argv
+# with the locale codec, which crashes the launcher/emit paths (#779). Python
+# already auto-enables UTF-8 mode for the C/POSIX locale, so this covers the
+# case it does NOT: a genuine non-UTF-8, non-C locale. Exported, so child
+# processes and nested scripts inherit it. Guarded by test-locale-utf8.sh.
+export PYTHONUTF8="${PYTHONUTF8:-1}"
+
 # test-generate-from-profile.sh — v0.8.0 [E] STEP E1 (club-3090 #141 / #147).
 #
 # Contract test for the ADDITIVE derived-emission path: EInput (CONTRACT-1),
@@ -169,10 +178,13 @@ check("--trust-remote-code" not in text,
       "e1: --trust-remote-code must NOT be emitted when trc not resolved-permitted")
 
 # A clean derived case that NEEDS a dtype (fp8 row + torch_dtype) maps a
-# kv_arg-mapped --kv-cache-dtype (fp8_e5m2 -> fp8_e5m2).
+# kv_arg-mapped --kv-cache-dtype (fp8_e5m2 -> fp8_e5m2). kv_format is pinned explicitly
+# below so this fixture stays independent of the seed slug's registry default (which switched
+# to fp8_e4m3 on 2026-07-14; note kv_arg maps fp8_e4m3 -> the short "fp8" form).
 der_fp8 = mk_der(weight_format="fp8", torch_dtype="bfloat16")
 ei_fp8 = mk_einput("vllm/qwen-a3b-preview-single", der=der_fp8,
                    gpu_count=1, sel_gpus=(0,))
+ei_fp8.runtime["kv_format"] = "fp8_e5m2"  # pin a distinct KV; registry-default-independent
 ok2, _ = gc.derived_emittable(ei_fp8)
 check(ok2, "e1: fp8+torch_dtype clean single-GPU case must be emittable")
 t2, m2 = gc.generate_from_profile(root, ei_fp8)

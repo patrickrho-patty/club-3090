@@ -9,6 +9,7 @@ What this stack assumes about your hardware. True regardless of which model or e
 - **NVIDIA RTX 3090 (24 GB, Ampere SM 8.6)** — 1 or 2 cards.
 - **PCIe Gen 4 slot** — Gen 3 works but allreduce on dual-card is slower (mild impact on multi-tenant; minimal impact on single-stream).
 - **NVIDIA driver 580.x or newer** — for CUDA 13 runtime in vLLM nightly. `nvidia-smi` to check. Older drivers won't load CUDA 13 kernels.
+  - ⚠️ **The ik-llama `cu13` pin needs CUDA ≥ 13.2 specifically** (not just 580.x). Its digest is a CUDA 13.2 runtime, so a driver whose *supported* CUDA < 13.2 — e.g. 580.159 = CUDA 13.0 — forward-compat-fails on GeForce (error 804) → CPU fallback → crash loop ([#633](../../../noonghunna/club-3090/issues/633)). The launcher **auto-selects the cu12 sibling build** (same build, backward-compatible) on such drivers; override with `IK_LLAMA_IMAGE=…:cu12-server-4574` in `.env`. Check your ceiling top-right in `nvidia-smi`.
 - **Linux** (Ubuntu 22.04+ tested). vLLM is Linux + CUDA only. llama.cpp works on macOS / Windows but our recipes assume Linux paths.
 - **Docker + NVIDIA Container Toolkit** for vLLM. llama.cpp doesn't need Docker.
 
@@ -65,6 +66,63 @@ Same `MAX_MODEL_LEN` / `GPU_MEMORY_UTILIZATION` env overrides apply for any setu
 
 ---
 
+## Arch-aware launcher defaults (#246 Phase 1)
+
+The shipped composes carry **Ampere-safe defaults** (fp8_e5m2 KV etc.). Since [#246](https://github.com/noonghunna/club-3090/issues/246) Phase 1, `launch.sh` / `switch.sh` detect your GPU's compute capability and export the better flag for newer silicon so you don't hand-tune:
+
+| Detected class | What the launchers do |
+|---|---|
+| **ampere** (sm_8.6/8.7) | Nothing — compose defaults apply, byte-for-byte pre-#246 behavior |
+| **ada** (sm_8.9) / **hopper** (sm_9.x) / **blackwell** (sm_10+) | Export `KV_CACHE_DTYPE=fp8_e4m3` for the **pilot slugs** — a **better-precision** FP8 KV format. NB: it's storage-only (≡e5m2 in speed) on consumer cards; native FP8 *attention* is Hopper/datacenter-only. See [DTYPE_MATRIX](DTYPE_MATRIX.md#having-the-tensor-cores--using-them-the-two-axes-that-decide-real-behavior) |
+| unknown / heterogeneous mix / no nvidia-smi | Nothing — compose defaults apply |
+
+Mechanics and boundaries:
+
+- **Pilot slugs only**: `vllm/dual`, `vllm/minimal` — the two Qwen fp8-KV reference configs. Expansion to the rest of the catalog is gated on the cross-rig A/B in #246 (≥15% on either canonical prompt on a volunteer 4090/5090; within CV → the injection framework gets closed out instead).
+- **The injected value comes from the hardware profiles** (`scripts/lib/profiles/hardware/<card>.yml` → `kv_format_default.balanced`) — one source of truth shared with the pull gates and c3. 3090-class profiles declare `fp8_e5m2` there, which equals the compose default: the Ampere no-op is data, not a code branch.
+- **Your env wins**: an explicit `KV_CACHE_DTYPE=…` before `launch.sh`/`switch.sh` suppresses the injection entirely.
+- **Quant-specific KV slugs are never touched** — int8-PTH (compressed-tensors weights *reject* fp8 KV), TurboQuant, and bf16 configs keep their registry KV format.
+- **Direct `docker compose -f … up` bypasses all of this** and keeps the Ampere-safe compose defaults on any card.
+- The preflight banner names the detected class: `[preflight] arch: ada (sm_8.9) — arch-aware KV defaults active for pilot slugs (#246)`.
+- `VLLM_ATTENTION_BACKEND` is plumbed through the same channel but **ships no value** — vLLM's backend auto-detect is the default until someone measures a better per-arch choice.
+- **`nvfp4` KV is DATACENTER-Blackwell-only** (sm_100/sm_103). It needs vLLM's trtllm-gen FP4 FMHA, which has no consumer-Blackwell (sm_120/121) build — so it **crashes on RTX 5090s** even though they run NVFP4 *weights* fine ([vLLM #43562](https://github.com/vllm-project/vllm/issues/43562) / [TRT-LLM #10241](https://github.com/NVIDIA/TensorRT-LLM/issues/10241); confirmed on two 5090s, disc #571). On consumer Blackwell use **fp8_e4m3** KV — the launchers inject it automatically for the pilot slugs.
+
+---
+
+## Pinning specific GPUs on multi-GPU rigs (and CDI / NixOS runtimes)
+
+`bash scripts/launch.sh --gpus 1,2` pins the model to host GPUs 1+2 (leaving GPU 0 free for e.g. a desktop session or an image-gen stack). As of [#610] the launcher resolves your indices to **GPU UUIDs** (`nvidia-smi -L`) and exports them as *both* `NVIDIA_VISIBLE_DEVICES` and `CUDA_VISIBLE_DEVICES` — one mechanism that works on **both** container GPU runtimes:
+
+| Runtime | How devices reach the container | What pins the cards |
+|---|---|---|
+| classic `nvidia` runtime (default Docker + nvidia-container-toolkit) | `NVIDIA_VISIBLE_DEVICES` (the runtime hook) | the UUID exposure itself; the CUDA mask is a no-op that agrees with it |
+| **CDI** (NixOS `hardware.nvidia-container-toolkit`, `nvidia-ctk cdi`, Podman) | the compose `deploy` block's CDI `device_ids` (typically `nvidia.com/gpu=all`) — **`NVIDIA_VISIBLE_DEVICES` is IGNORED** | the in-container `CUDA_VISIBLE_DEVICES` UUID mask |
+
+Why UUIDs and not indices: the classic runtime **renumbers** the exposed set inside the container (host GPUs 1,2 become 0,1), so an index-based inner mask would point at the wrong or a nonexistent card. UUIDs are stable under any exposure order.
+
+**CDI rigs (NixOS etc.)** — swap the compose's `deploy` device block for the CDI form and let the CUDA mask do the selection:
+
+```yaml
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: cdi
+              device_ids:
+                - nvidia.com/gpu=all
+```
+
+then `bash scripts/launch.sh --gpus 1,2` as normal (the composes pass `CUDA_VISIBLE_DEVICES` through). Manual/no-launcher equivalent: `CUDA_VISIBLE_DEVICES=GPU-xxxx,GPU-yyyy docker compose -f … up -d` with the UUIDs from `nvidia-smi -L` (indices also work under CDI-with-all-exposed, but UUIDs are unambiguous).
+
+**Gotchas:**
+- *In-container renumbering is expected, not a bug*: with 2 of 3 cards pinned, `nvidia-smi` **inside** the container shows them as GPU 0/1 (classic runtime) or shows *all* cards while CUDA uses only the masked pair (CDI). Verify placement with **host** `nvidia-smi` — the utilization lands on the cards you picked.
+- The single-card GGUF composes (beellama / llama.cpp / ik-llama) select via `device_ids: ["${ESTATE_GPUS:-${CUDA_VISIBLE_DEVICES:-0}}"]` interpolated on the **host** side — they honor the same launcher export on the classic runtime; on CDI, apply the device-block swap above.
+- Estate (multi-instance) GPU pinning is UUID-pinned the same way (#610 Phase A): each instance's `gpus: [..]` stays index-based in the estate file, and the boot path resolves them to UUIDs — so estates land on the cards they claimed on CDI rigs too. After boot, a **placement assertion** (`docker exec … nvidia-smi --query-compute-apps=gpu_uuid`) confirms the model actually ran on the requested GPUs and prints a loud ⚠ on mismatch — no more silent wrong-card serving.
+
+**Multiple models on one host (pods).** Running several models at once, each pinned to its own GPU set + port, is a **pod** workload — managed with `scripts/pod.sh` (CLI) or the c3 cockpit's Operate tab, both over one estate file with the UUID pinning + placement verification described above. Full guide: **[PODS.md](PODS.md)**.
+
+[#610]: https://github.com/noonghunna/club-3090/issues/610
+
 ## NVLink
 
 **Not required.** Dual-card composes auto-detect NVLink and configure themselves accordingly.
@@ -74,12 +132,13 @@ Same `MAX_MODEL_LEN` / `GPU_MEMORY_UTILIZATION` env overrides apply for any setu
 - **Override**: set `NVLINK_MODE=force_on|force_off` in your `.env` to bypass auto-detection.
 - Without NVLink (PCIe), `--disable-custom-all-reduce` is passed to vLLM and `NCCL_P2P_DISABLE=1` is set. With NVLink, custom all-reduce is enabled and NCCL uses the NVLink path.
 - **If you have NVLink installed and working**, single-stream TPS on dual-card will be ~1.6-1.8× single-card (vs ~1.05× without). Measured NVLink lift is ~10-15% over PCIe on the same rig. See [BENCHMARKS.md](../BENCHMARKS.md) for cross-rig data.
+- **No NVLink?** You can still enable GPU↔GPU P2P over the PCIe bus on a patched driver for a workload-dependent gain — and learn why `nvidia-smi topo -m` reports `PHB` instead of `PIX` — in [PCIE_P2P.md](PCIE_P2P.md).
 
 ---
 
 ## Power
 
-Production target: **290W (air-cooled) / 330W (water-cooled) per card** is the sweet spot — peak TPS/W efficiency and only ~5-7% TPS loss vs unrestricted stock.
+Single-card production target: **290W (air-cooled) / 330W (water-cooled)** is the sweet spot — peak TPS/W efficiency and only ~5-7% TPS loss vs unrestricted stock.
 
 Power lever:
 ```bash
@@ -93,9 +152,9 @@ Past the sweet spot: diminishing returns (SM clocks saturate near 1.9 GHz on 309
 
 **The "230W is the sweet spot" lore is wrong** — it traces back to early thermal-constrained recommendations and 3-cap-resolution data. Dense 10W sweeps show 230W costs ~16% efficiency vs 290W (decode) and ~4% vs 250W (prefill) on this rig. 230W is a *low-power / quiet* cap, not an efficient one. Use it only if your goal is thermal/acoustic, not perf-per-watt.
 
-**Sweet spot varies by workload class** — same card, same engine, same model:
+**Single-card sweet spot varies by workload class** — same card, same engine, same model:
 
-| Workload | Air-cooled 3090 sweet spot | Notes |
+| Single-card workload | Air-cooled 3090 sweet spot | Notes |
 |---|---:|---|
 | Decode-single (chat / IDE agent) | **290W** (0.111 TPS/W) | -7% TPS vs 370W stock for -22% wattage |
 | Decode-concurrent (multi-stream) | **290W** (0.110 TPS/W) | Same knee as decode-single — concurrency doesn't move it |
@@ -107,7 +166,7 @@ Mixed workloads: pick 290W (the prefill cost at 290W is only -5% vs prefill's ow
 
 **Cooling caveat**: the 388W stock numbers above are from a water-cooled rig (Alphacool Eiswolf 2 AIO 360mm) — that's what lets the card actually sustain full board power. On **air-cooled 3090s**, thermal throttling typically kicks in at ~80°C and drops effective power to ~310-340W under sustained decode load even with no software cap, so 388W → 330W gap mostly disappears — your "stock" was likely already 330W-equivalent. The 330W cap mainly helps liquid-cooled rigs by keeping the card cooler + quieter at near-zero perf cost; on air-cooled it's a soft no-op that just makes the throttling explicit.
 
-For dual-card: combined power at 330W cap each = ~660W under heavy load — verify your PSU has at least 850W single rail. 230W cap each = ~460W combined for thermally-constrained builds.
+For dual-card: combined power at 330W cap each = ~660W under heavy load — verify your PSU has at least 850W single rail. Do not assume the single-card knee carries over: the TP=2 anchor below is already flat from 220–330W/card on `dual-fast`.
 
 ### Cross-rig power-cap data (anchor points)
 
@@ -149,10 +208,13 @@ For full workload-class characterization on **your** rig: **run two modes** (~14
 
 **Plateau detection** (since 2026-05-07): the script now auto-detects boost-clock plateaus (3+ adjacent caps with identical draw + TPS within ±1%) and emits a `[plateau detected]` line plus a "Detected boost-clock plateau(s)" section in the summary file. If your rig shows a plateau, the caps inside it are functionally equivalent — pick the **lowest** cap in the plateau range to save power for free TPS.
 
-How `decode-single` is timed (the new default since 2026-05-07):
-- **Time-bounded streaming bench**: 10s narrative + 10s code per cap (configurable via `--target-cap-seconds`). Per-cap wall is constant ~23s regardless of cap or card class.
-- **Cross-card portable**: a 3090 sweep (190-390W, 21 caps) takes ~8 min; a 5090 sweep (300-600W, 31 caps) ~12 min; a 4090 sweep (230-600W, 38 caps) ~15 min — runtime scales linearly with cap count, not throttle severity.
-- **Power sampler stability**: the 23s/cap window provides 35-37 sampler readings (0.5s interval) where util>50%, well above the 10s minimum needed for stable median.
+How `decode-single` is measured (aligned with `bench.sh` since 2026-07-27):
+- **Warm before the curve**: three completed warmups per prompt run once at the highest requested cap. This removes first-cap MTP/cudagraph cold-start bias without repeating warmups at every cap.
+- **Same decode metric as `bench.sh`**: each stream requests final usage and reports `completion_tokens / (wall - TTFT)`. SSE chunks are transport fragments, not tokens, and are never used as a token count.
+- **Reduced requests, stable sampling window**: completed 500-token narrative and 400-token code requests repeat until each prompt has covered at least 10 seconds (`--target-cap-seconds`). Fast cards run more small requests; a slow request is never truncated. This keeps the power sampler useful without falling back to transport-chunk counting.
+- **Runtime remains bounded**: the 10-second minimum keeps fast-card cap points comparable; heavily throttled cards may stretch past it to finish their last request. The reduced request sizes still avoid canonical `bench.sh`'s 1000/800-token, five-run cost at every cap.
+
+Historical rows and captions explicitly marked **time-bounded** predate this correction. Their curve shapes remain useful, but their absolute TPS used streamed SSE chunk count over wall time and is not directly comparable to the corrected `decode-single` output; refresh those anchors when the rigs are next available.
 
 **Default step-size is 10W.** Don't override unless you know why:
 - `--step-size 10` (default) → 21-38 caps depending on card class. The right resolution for finding the actual knee.
@@ -193,9 +255,9 @@ How `decode-single` is timed (the new default since 2026-05-07):
 
 ⭐ = peak TPS/W efficiency on that rig.
 
-#### Efficiency curves (10W resolution)
+#### Single-card efficiency curves (10W resolution)
 
-For rigs where we have full 10W-resolution sweeps, the curves below show TPS + TPS/W efficiency across the power envelope. These are the cross-rig anchor charts; sources + raw data are linked in each caption. To add your card class, run [`scripts/power-cap-sweep.sh`](../scripts/power-cap-sweep.sh) (canonical command above) and paste the output to [disc #86](https://github.com/noonghunna/club-3090/discussions/86).
+For rigs where we have full 10W-resolution sweeps, the curves below show TPS + TPS/W efficiency across the power envelope. **Every curve in this subsection is single-card**; do not project its knee onto TP=2 or larger topologies. These are the cross-rig anchor charts; sources + raw data are linked in each caption. To add your card class, run [`scripts/power-cap-sweep.sh`](../scripts/power-cap-sweep.sh) (canonical command above) and paste the output to [disc #86](https://github.com/noonghunna/club-3090/discussions/86).
 
 ![5090 + Gemma 4 + MTP power-cap efficiency curve (apnar)](img/power-cap-5090-gemma4.png)
 
@@ -220,23 +282,30 @@ The cross-workload pattern: **both workload classes have efficiency knee at 400W
 
 ![3090 + Qwen3.6-27B + llama.cpp power-cap efficiency curve (noonghunna)](img/power-cap-3090-qwen36.png)
 
-*3090 air-cooled + Qwen3.6-27B Q3_K_XL + mainline llama.cpp, 21-cap sweep 190-390W via time-bounded streaming bench (10s/direction). **Total wall: ~8m.** Yellow callout: 290W sweet spot (0.111 TPS/W, SM 1380 MHz) at **78% of stock 370W TDP**. Orange-shaded zone 340-370W: firmware **boost-clock plateau** — directly evidenced by the new SM-clock sampling: caps 340/350/360/370W all lock SM at exactly 1560 MHz, draw 334W actual, produce 34.66 TPS. Throttle stays at 100% across the plateau, meaning the firmware *is* power-capping, but the cap it enforces is its own internal voltage/clock setpoint, not the user-set software cap. Plateau escapes at 380W cap → SM jumps to 1635 MHz → draw to 361W → TPS to 35.56. So the "ceiling" at 334W isn't a hardware limit, it's a firmware boost-state lock that releases only at the next cap step. GPU temp peaked at 74°C at 390W cap. Source script: [`img/power-cap-3090-qwen36.py`](img/power-cap-3090-qwen36.py).*
+*Single-card 3090, air-cooled + Qwen3.6-27B Q3_K_XL + mainline llama.cpp, 21-cap sweep 190-390W via time-bounded streaming bench (10s/direction). **Total wall: ~8m.** Yellow callout: 290W sweet spot (0.111 TPS/W, SM 1380 MHz) at **78% of stock 370W TDP**. Orange-shaded zone 340-370W: firmware **boost-clock plateau** — directly evidenced by the new SM-clock sampling: caps 340/350/360/370W all lock SM at exactly 1560 MHz, draw 334W actual, produce 34.66 TPS. Throttle stays at 100% across the plateau, meaning the firmware *is* power-capping, but the cap it enforces is its own internal voltage/clock setpoint, not the user-set software cap. Plateau escapes at 380W cap → SM jumps to 1635 MHz → draw to 361W → TPS to 35.56. So the "ceiling" at 334W isn't a hardware limit, it's a firmware boost-state lock that releases only at the next cap step. GPU temp peaked at 74°C at 390W cap. Source script: [`img/power-cap-3090-qwen36.py`](img/power-cap-3090-qwen36.py).*
 
 ![3090 + Qwen3.6 + llama.cpp prefill-heavy power-cap efficiency curve (noonghunna)](img/power-cap-3090-prefill.png)
 
-*3090 air-cooled + Qwen3.6-27B Q3_K_XL + mainline llama.cpp, 21-cap **prefill-heavy** sweep 190-390W via adaptive prompt calibration (probe TPS at 390W → size prompt for 10s prefill at high cap → 11K-token prompt used across all caps). **Total wall: ~6m.** Yellow callout: **250W sweet spot (3.633 prefill TPS/W, SM 1350 MHz)** at **68% of stock TDP** — different sweet spot than decode-single's 290W on the same rig because prefill is more compute-bound and reaches diminishing returns earlier. Boost-clock plateau visible at 330-370W: SM clock locks at 1605-1620 MHz across all five caps with identical 327W draw + 1050 prefill TPS. Plateau escapes at 380W → SM 1665 MHz, draw 355W, TPS 1080. Companion to the decode chart above; together they show **same card has different power-knee for different workload class** — and both workloads share the same firmware boost-clock plateau pattern, just with slightly different clock setpoints.*
+*Single-card 3090, air-cooled + Qwen3.6-27B Q3_K_XL + mainline llama.cpp, 21-cap **prefill-heavy** sweep 190-390W via adaptive prompt calibration (probe TPS at 390W → size prompt for 10s prefill at high cap → 11K-token prompt used across all caps). **Total wall: ~6m.** Yellow callout: **250W sweet spot (3.633 prefill TPS/W, SM 1350 MHz)** at **68% of stock TDP** — different sweet spot than decode-single's 290W on the same rig because prefill is more compute-bound and reaches diminishing returns earlier. Boost-clock plateau visible at 330-370W: SM clock locks at 1605-1620 MHz across all five caps with identical 327W draw + 1050 prefill TPS. Plateau escapes at 380W → SM 1665 MHz, draw 355W, TPS 1080. Companion to the decode chart above; together they show **same card has different power-knee for different workload class** — and both workloads share the same firmware boost-clock plateau pattern, just with slightly different clock setpoints.*
 
-#### Same hardware, MoE workload — sweet spot shifts 80W lower for decode
+
+#### Dual-card TP=2 anchor — no decode knee above 220W/card
+
+[@alesha-pro's 4× 3090 rig](https://github.com/noonghunna/club-3090/discussions/773) swept the two cards serving `dual-fast` TP=2 from **220 to 330W/card**. Decode TPS stayed flat within noise while combined draw rose **44%**, SM clock rose **24%**, and memory clock remained pinned at **9501 MHz**. That is a bandwidth-bound decode workload: extra core clock cannot buy token throughput. For this topology/workload, the measured knee is therefore **at or below 220W/card**; it does not contradict the 290W single-card anchor above.
+
+The missing cell is `--load-mode decode-concurrent` on the same TP=2 service. That sweep would show whether batching creates enough compute pressure to move the dual-card knee upward.
+
+#### Same single-card hardware, MoE workload — sweet spot shifts 80W lower for decode
 
 Running the same sweep on **Qwen3.6-35B-A3B (MoE, 3B active params per token)** on the same 3090 GPU 0 reveals that **model architecture moves the sweet spot meaningfully**:
 
 ![3090 + Qwen3.6-35B-A3B (MoE) + llama.cpp decode-single power-cap curve (noonghunna)](img/power-cap-3090-a3b-decode.png)
 
-*3090 air-cooled + Qwen3.6-35B-A3B Q4_K_XL + mainline llama.cpp, 21-cap decode-single sweep, time-bounded bench. **Total wall: ~8m.** Yellow callout: **210W sweet spot (0.546 TPS/W, SM 1290 MHz)** at **57% of stock 370W TDP** — that's **80W lower than the dense Qwen3.6-27B sweet spot at 290W** on the same hardware. Purple-shaded zone 340-370W: **NO boost-clock plateau** — SM clock climbs smoothly 1875→1890→1890→1905 across that cap range (vs the dense Qwen which locks at exactly 1560 MHz). Plateau auto-detection correctly flagged dense Qwen but did NOT flag A3B. Source script: [`img/power-cap-3090-a3b-decode.py`](img/power-cap-3090-a3b-decode.py).*
+*Single-card 3090, air-cooled + Qwen3.6-35B-A3B Q4_K_XL + mainline llama.cpp, 21-cap decode-single sweep, time-bounded bench. **Total wall: ~8m.** Yellow callout: **210W sweet spot (0.546 TPS/W, SM 1290 MHz)** at **57% of stock 370W TDP** — that's **80W lower than the dense Qwen3.6-27B sweet spot at 290W** on the same hardware. Purple-shaded zone 340-370W: **NO boost-clock plateau** — SM clock climbs smoothly 1875→1890→1890→1905 across that cap range (vs the dense Qwen which locks at exactly 1560 MHz). Plateau auto-detection correctly flagged dense Qwen but did NOT flag A3B. Source script: [`img/power-cap-3090-a3b-decode.py`](img/power-cap-3090-a3b-decode.py).*
 
 ![3090 + Qwen3.6-35B-A3B (MoE) + llama.cpp prefill-heavy power-cap curve (noonghunna)](img/power-cap-3090-a3b-prefill.png)
 
-*3090 air-cooled + A3B Q4_K_XL + mainline llama.cpp at -c 65536, 21-cap **prefill-heavy** sweep with adaptive prompt calibration (~31K-token prompt sized for 10s prefill at 390W cap). **Total wall: ~6m.** Yellow callout: **250W sweet spot (9.865 prefill TPS/W, SM 1380 MHz)** — **same cap as dense Qwen3.6-27B prefill** (also 250W). Boost-clock plateau auto-detected at 340-370W: SM 1680-1710 MHz, 334W draw, 2802 TPS. So both dense and MoE share the prefill plateau pattern, just at different SM clock setpoints. Source script: [`img/power-cap-3090-a3b-prefill.py`](img/power-cap-3090-a3b-prefill.py).*
+*Single-card 3090, air-cooled + A3B Q4_K_XL + mainline llama.cpp at -c 65536, 21-cap **prefill-heavy** sweep with adaptive prompt calibration (~31K-token prompt sized for 10s prefill at 390W cap). **Total wall: ~6m.** Yellow callout: **250W sweet spot (9.865 prefill TPS/W, SM 1380 MHz)** — **same cap as dense Qwen3.6-27B prefill** (also 250W). Boost-clock plateau auto-detected at 340-370W: SM 1680-1710 MHz, 334W draw, 2802 TPS. So both dense and MoE share the prefill plateau pattern, just at different SM clock setpoints. Source script: [`img/power-cap-3090-a3b-prefill.py`](img/power-cap-3090-a3b-prefill.py).*
 
 **Two findings from this comparison** (same hardware, same engine, same Q4-class quant, only model changes):
 

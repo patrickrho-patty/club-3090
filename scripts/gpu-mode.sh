@@ -5,15 +5,32 @@
 
 set -e
 
-# club-3090 is the canonical repo (qwen36-dual-3090 + /opt/ai/compose/<svc>
-# both deprecated 2026-05-10 — supporting services moved into services/).
-CLUB3090_DIR="/opt/ai/github/club-3090"
+# Force Python's UTF-8 mode (PEP 540) for every python3 this script runs.
+# Repo sources are full of unicode (— × → ⚠), and without this a rig on a real
+# non-UTF-8 locale (de_DE.iso88591 and friends) decodes reads, stdout AND argv
+# with the locale codec, which crashes the launcher/emit paths (#779). Python
+# already auto-enables UTF-8 mode for the C/POSIX locale, so this covers the
+# case it does NOT: a genuine non-UTF-8, non-C locale. Exported, so child
+# processes and nested scripts inherit it. Guarded by test-locale-utf8.sh.
+export PYTHONUTF8="${PYTHONUTF8:-1}"
+
+# Repo root: auto-detected from this script's real location (resolving the
+# /usr/local/bin/gpu-mode symlink on the reference rig), so the script is portable to
+# any clone. Override with CLUB3090_DIR=... if needed.
+CLUB3090_DIR="${CLUB3090_DIR:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
 COMPOSE_BASE="$CLUB3090_DIR/services"
+# ComfyUI/studio paths derive from MODEL_DIR (see services/comfyui/comfyui-paths.sh) so the
+# ai-studio scene's compose mounts + missing-model check match wherever the user keeps models.
+if [ -f "$COMPOSE_BASE/comfyui/comfyui-paths.sh" ]; then
+    # shellcheck disable=SC1091
+    . "$COMPOSE_BASE/comfyui/comfyui-paths.sh"
+fi
 # Post-PR-A (<quant>/ layer): dual composes live under <topology>/<quant>/.
 # Point each var at the quant dir so `compose_at` cd's into it — mount-safe,
 # the same invocation switch.sh uses (project dir = compose-file dir).
 DUAL_27B_DIR="$CLUB3090_DIR/models/qwen3.6-27b/vllm/compose/dual/autoround-int4"
 GEMMA_DUAL_DIR="$CLUB3090_DIR/models/gemma-4-31b/vllm/compose/dual/autoround-int4"
+GEMMA_31B_DUAL_DIR="$CLUB3090_DIR/models/gemma-4-31b/vllm/compose/dual/qat-awq-int4"   # current dual default (vllm/gemma-31b-dual); autoround-int4/int8.yml deprecated 07-02
 # Gemma 4 12B (gemma4_unified arch) — AutoRound INT8 weights + bf16 KV, single-card vLLM on
 # the EPHEMERAL vllm/vllm-openai:gemma4-unified arch-preview image (:8038, served gemma-4-12b-int8).
 GEMMA_12B_DIR="$CLUB3090_DIR/models/gemma-4-12b/vllm/compose/single/autoround-int8"
@@ -41,10 +58,16 @@ RED='\033[0;31m'
 CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
+# LAN IP for the URLs printed by the mode banners below — via the shared c3_lan_ip helper
+# (prefers LAN over docker bridges; LANIP=-overridable), so it can't drift from setup-ai-
+# studio.sh. Falls back to 'localhost' so a fresh clone never prints the rig's IP (#504).
+LANIP="${LANIP:-$(c3_lan_ip 2>/dev/null || true)}"
+LANIP="${LANIP:-localhost}"
+
 # Standard supporting services living under $CLUB3090_DIR/services.
 # Ollama removed 2026-06-22 (dropped from serving 2026-05-10 — Qwen/Gemma route
 # through LiteLLM directly; the unused services/ollama/ compose dir was deleted).
-SERVICES=(openwebui litellm qdrant searxng)
+SERVICES=(openwebui litellm qdrant searxng spark-dashboard)
 
 # Run a docker compose command in any directory, with optional -f override.
 # Args: <dir> <action> [compose_file]
@@ -68,6 +91,15 @@ compose_at() {
         (cd "$dir" && sudo docker compose "${env_args[@]}" -f "$file" $action)
     fi
 }
+
+# #715 gap 4 — start-failure tracking. start_* helpers used to swallow a failed
+# `compose up` ('… || echo "failed"' returns 0), so every mode printed "failed"
+# per-service yet exited 0 and the caller declared the scene ready (#686). Each
+# start site now RECORDS its failure; the dispatch tail prints a summary and
+# exits 1 when any service failed. Failures don't abort mid-scene (a partial
+# scene beats an aborted one) — they just can't masquerade as success anymore.
+FAILED_SERVICES=()
+c3_mark_start_failure() { FAILED_SERVICES+=("$1"); }
 
 # Like compose_at, but injects per-invocation env assignments that survive `sudo`.
 # `sudo docker compose` sanitizes the caller's environment, so vars set in the shell
@@ -93,7 +125,7 @@ compose_cmd() {
 
 start_service() {
     printf "  ${GREEN}▲${NC} Starting %-12s" "$1..."
-    compose_cmd "$1" "up -d" && echo "done" || echo "failed"
+    compose_cmd "$1" "up -d" && echo "done" || { echo "failed"; c3_mark_start_failure "$1"; }
 }
 
 stop_service() {
@@ -104,7 +136,7 @@ stop_service() {
 # Project-specific helpers
 start_27b_dual_mtp() {
     printf "  ${GREEN}▲${NC} Starting 27b-dual-mtp..."
-    compose_at "$DUAL_27B_DIR" "up -d" fp8-mtp.yml && echo "done" || echo "failed"
+    compose_at "$DUAL_27B_DIR" "up -d" fp8-mtp.yml && echo "done" || { echo "failed"; c3_mark_start_failure "27b-dual-mtp"; }
 }
 stop_27b_dual_mtp() {
     printf "  ${RED}▼${NC} Stopping 27b-dual-mtp..."
@@ -113,7 +145,7 @@ stop_27b_dual_mtp() {
 
 start_27b_dual_dflash() {
     printf "  ${GREEN}▲${NC} Starting 27b-dual-dflash..."
-    compose_at "$DUAL_27B_DIR" "up -d" dflash.yml && echo "done" || echo "failed"
+    compose_at "$DUAL_27B_DIR" "up -d" dflash.yml && echo "done" || { echo "failed"; c3_mark_start_failure "27b-dual-dflash"; }
 }
 stop_27b_dual_dflash() {
     printf "  ${RED}▼${NC} Stopping 27b-dual-dflash..."
@@ -122,7 +154,7 @@ stop_27b_dual_dflash() {
 
 start_27b_dual_dflash_noviz() {
     printf "  ${GREEN}▲${NC} Starting 27b-dflash-noviz..."
-    compose_at "$DUAL_27B_DIR" "up -d" dflash-noviz.yml && echo "done" || echo "failed"
+    compose_at "$DUAL_27B_DIR" "up -d" dflash-noviz.yml && echo "done" || { echo "failed"; c3_mark_start_failure "27b-dual-dflash-noviz"; }
 }
 stop_27b_dual_dflash_noviz() {
     printf "  ${RED}▼${NC} Stopping 27b-dflash-noviz..."
@@ -131,7 +163,7 @@ stop_27b_dual_dflash_noviz() {
 
 start_27b_dual_turbo() {
     printf "  ${GREEN}▲${NC} Starting 27b-dual-turbo..."
-    compose_at "$DUAL_27B_DIR" "up -d" turbo.yml && echo "done" || echo "failed"
+    compose_at "$DUAL_27B_DIR" "up -d" turbo.yml && echo "done" || { echo "failed"; c3_mark_start_failure "27b-dual-turbo"; }
 }
 stop_27b_dual_turbo() {
     printf "  ${RED}▼${NC} Stopping 27b-dual-turbo..."
@@ -150,7 +182,7 @@ stop_all_27b() {
 # vllm/qwen-35b-a3b-dual (AutoRound INT4 + fp8 KV + 262K + vision, :8051).
 start_35b_a3b_dual() {
     printf "  ${GREEN}▲${NC} Starting 35b-a3b-dual..."
-    compose_at "$A3B_DUAL_DIR" "up -d" fp8.yml && echo "done" || echo "failed"
+    compose_at "$A3B_DUAL_DIR" "up -d" fp8.yml && echo "done" || { echo "failed"; c3_mark_start_failure "35b-a3b-dual"; }
 }
 stop_35b_a3b_dual() {
     printf "  ${RED}▼${NC} Stopping 35b-a3b-dual..."
@@ -160,7 +192,7 @@ stop_35b_a3b_dual() {
 # Gemma 4 12B single-card vLLM (gemma4_unified arch-preview image, AutoRound INT8 + MTP n=2).
 start_gemma_12b() {
     printf "  ${GREEN}▲${NC} Starting gemma-12b..."
-    compose_at "$GEMMA_12B_DIR" "up -d" mtp.yml && echo "done" || echo "failed"
+    compose_at "$GEMMA_12B_DIR" "up -d" mtp.yml && echo "done" || { echo "failed"; c3_mark_start_failure "gemma-12b"; }
 }
 stop_gemma_12b() {
     printf "  ${RED}▼${NC} Stopping gemma-12b..."
@@ -171,7 +203,15 @@ stop_gemma_12b() {
 # GPU-bound — mutex with all vLLM / SGLang / llama-server LLM serving.
 start_comfyui() {
     printf "  ${GREEN}▲${NC} Starting comfyui..."
-    compose_at "$COMPOSE_BASE/comfyui" "up -d" && echo "done" || echo "failed"
+    # Pin COMFYUI_ROOT into repo-root .env so the compose's `--env-file` mounts the SAME tree the
+    # downloads went into (not the /mnt default) on any rig whose MODEL_DIR isn't /mnt — #510/#530.
+    type c3_persist_comfy_root >/dev/null 2>&1 && c3_persist_comfy_root || true
+    # Pre-create the bind-mount sources USER-OWNED before sudo docker can root-own
+    # them (#715 gap 1); a damaged (root-owned) tree fails loud with the chown fix.
+    if type c3_precreate_comfy_mounts >/dev/null 2>&1 && ! c3_precreate_comfy_mounts; then
+        echo "failed"; c3_mark_start_failure "comfyui"; return 0
+    fi
+    compose_at "$COMPOSE_BASE/comfyui" "up -d" && echo "done" || { echo "failed"; c3_mark_start_failure "comfyui"; }
 }
 stop_comfyui() {
     printf "  ${RED}▼${NC} Stopping comfyui..."
@@ -182,7 +222,7 @@ stop_comfyui() {
 # "director" LLM (:8090, GPU0). See services/studio/ + docs/ai-studio/video.md.
 start_studio_gallery() {
     printf "  ${GREEN}▲${NC} Starting studio-gallery (:8189)..."
-    compose_at "$COMPOSE_BASE/studio/gallery" "up -d" && echo "done" || echo "failed"
+    compose_at "$COMPOSE_BASE/studio/gallery" "up -d" && echo "done" || { echo "failed"; c3_mark_start_failure "studio-gallery"; }
 }
 # Director placement lever — STUDIO_DIRECTOR_DEVICE (gpu0|gpu1|cpu) from the rig .env, set by
 # c3's Settings "Director placement" field (default gpu0). gpu0 = ~4.6 GB on GPU0 (fast craft,
@@ -214,7 +254,7 @@ start_studio_director() {
     printf "  ${GREEN}▲${NC} Starting studio-director ($label)..."
     compose_at_env "$COMPOSE_BASE/studio/enhancer" "up -d" docker-compose.yml \
         "DIRECTOR_NGL=$ngl" "STUDIO_DIRECTOR_CUDA=$cvd" "STUDIO_DIRECTOR_GPU=$gpu" "DIRECTOR_THINK_ARGS=$think_args" \
-        && echo "done" || echo "failed"
+        && echo "done" || { echo "failed"; c3_mark_start_failure "studio-director"; }
 }
 stop_studio_director() {
     printf "  ${RED}▼${NC} Stopping studio-director..."
@@ -225,22 +265,43 @@ stop_studio_director() {
 _director_evict_if_gpu() {
     [ "$(_director_device)" != "cpu" ] && stop_studio_director
 }
+# `docker compose down` returns before CUDA actually releases the GPU memory, so the
+# next model scene can boot into not-yet-freed VRAM and hit vLLM's free-memory check
+# (club-3090 #535: ai-studio → gemma). Poll until total used-VRAM stops falling (or a
+# timeout) so the incoming model sees the freed memory.
+wait_gpu_vram_settle() {
+    command -v nvidia-smi >/dev/null 2>&1 || return 0
+    local timeout="${1:-20}" prev="" cur stable=0 waited=0 noted=0
+    while [ "$waited" -lt "$timeout" ]; do
+        cur=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | awk '{s+=$1} END{print s+0}')
+        [ -z "$cur" ] && return 0
+        if [ -n "$prev" ] && [ "$cur" -ge "$prev" ]; then
+            stable=$((stable+1)); [ "$stable" -ge 2 ] && { [ "$noted" = 1 ] && echo "done"; return 0; }
+        else
+            if [ "$noted" = 0 ] && [ -n "$prev" ]; then printf "  ${YELLOW}◔${NC} waiting for the previous scene's GPU VRAM to release..."; noted=1; fi
+            stable=0
+        fi
+        prev="$cur"; sleep 1; waited=$((waited+1))
+    done
+    [ "$noted" = 1 ] && echo "timeout"
+    return 0
+}
 start_studio_orchestrator() {
     printf "  ${GREEN}▲${NC} Starting studio-orchestrator (:8190, long-clip chaining)..."
-    compose_at "$COMPOSE_BASE/studio/orchestrator" "up -d --build" && echo "done" || echo "failed"
+    compose_at "$COMPOSE_BASE/studio/orchestrator" "up -d --build" && echo "done" || { echo "failed"; c3_mark_start_failure "studio-orchestrator"; }
 }
 # Native-button image shim (:8191): ComfyUI reverse-proxy that crafts Ideogram-4 JSON
 # captions (via the director) so OWUI's native 🖼️ image button renders instead of hitting
 # the "blocked by safety filter" placeholder. Needs the director (:8090) up.
 start_studio_image_shim() {
     printf "  ${GREEN}▲${NC} Starting studio-image-shim (:8191, native-button Ideogram captions)..."
-    compose_at "$COMPOSE_BASE/studio/image-shim" "up -d --build" && echo "done" || echo "failed"
+    compose_at "$COMPOSE_BASE/studio/image-shim" "up -d --build" && echo "done" || { echo "failed"; c3_mark_start_failure "studio-image-shim"; }
 }
 # Integrated-voices TTS + audio mixdown (:8192, Kokoro on CPU). The pipe POSTs /narrate after a
 # video render to mix a voiceover over the clip's native audio (ducked + normalized). No GPU.
 start_studio_tts() {
     printf "  ${GREEN}▲${NC} Starting studio-tts (:8192, Kokoro voices + mixdown, CPU)..."
-    compose_at "$COMPOSE_BASE/studio/tts" "up -d --build" && echo "done" || echo "failed"
+    compose_at "$COMPOSE_BASE/studio/tts" "up -d --build" && echo "done" || { echo "failed"; c3_mark_start_failure "studio-tts"; }
 }
 # Premium voice (:8193, Step-Audio-EditX, GPU1, isolated transformers 4.53.3). LAZY: the container
 # comes up cheap (~0 GB) so the OWUI voice lane appears as soon as ai-studio starts it; the ~14 GB
@@ -249,7 +310,7 @@ start_studio_tts() {
 # `--build` picks up server.py edits (layer-cached → fast when unchanged).
 start_step_voice() {
     printf "  ${GREEN}▲${NC} Starting step-voice (:8193, lazy — model loads on first use, GPU1)..."
-    compose_at "$COMPOSE_BASE/studio/step-voice" "up -d --build" && echo "done" || echo "failed"
+    compose_at "$COMPOSE_BASE/studio/step-voice" "up -d --build" && echo "done" || { echo "failed"; c3_mark_start_failure "step-voice"; }
 }
 stop_step_voice() {
     printf "  ${RED}▼${NC} Stopping step-voice..."
@@ -269,12 +330,19 @@ stop_gemma_mtp() {
 }
 
 start_gemma_int8() {
-    printf "  ${GREEN}▲${NC} Starting gemma-int8..."
-    compose_at "$GEMMA_DUAL_DIR" "up -d" int8.yml && echo "done" || echo "failed"
+    # REPOINTED 2026-07-18: boots the CURRENT dual default vllm/gemma-31b-dual
+    # (qat-awq-int4 bf16 @224K, stock v0.24.0+, MTP-off). The old target
+    # autoround-int4/int8.yml = the slug DEPRECATED 2026-07-02 (int8-PTH
+    # silently craters recall past ~32K without #40391) — this direct
+    # compose_at path bypassed switch.sh's status gate. Function name kept
+    # (every mode's stop-list references it).
+    printf "  ${GREEN}▲${NC} Starting gemma-31b..."
+    compose_at "$GEMMA_31B_DUAL_DIR" "up -d" base.yml && echo "done" || { echo "failed"; c3_mark_start_failure "gemma-31b"; }
 }
 stop_gemma_int8() {
-    printf "  ${RED}▼${NC} Stopping gemma-int8..."
-    compose_at "$GEMMA_DUAL_DIR" "down" int8.yml && echo "done" || echo "skipped"
+    printf "  ${RED}▼${NC} Stopping gemma-31b..."
+    compose_at "$GEMMA_31B_DUAL_DIR" "down" base.yml >/dev/null 2>&1 || true
+    compose_at "$GEMMA_DUAL_DIR" "down" int8.yml && echo "done" || echo "skipped"   # legacy int8 residue too
 }
 
 # Stop every Gemma serving variant before starting a new one
@@ -286,7 +354,7 @@ stop_all_gemma() {
 
 start_deckard() {
     printf "  ${GREEN}▲${NC} Starting deckard-40b..."
-    compose_at "$DECKARD_DIR" "up -d" mtp.yml && echo "done" || echo "failed"
+    compose_at "$DECKARD_DIR" "up -d" mtp.yml && echo "done" || { echo "failed"; c3_mark_start_failure "deckard"; }
 }
 stop_deckard() {
     printf "  ${RED}▼${NC} Stopping deckard-40b..."
@@ -307,28 +375,41 @@ show_status() {
     sudo docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" 2>/dev/null
     echo ""
     echo -e "${CYAN}═══ Active Model(s) ═══${NC}"
+    # Single source of truth for "is anything serving?" (#865). Each probe
+    # below sets this on success; the closing guard reads it instead of
+    # keeping a SECOND hardcoded port list. The two lists had drifted:
+    # :8020 / :8051 / :8090 could print a live scene line AND
+    # "(no inference endpoint responding)" in the same breath. A list cannot
+    # disagree with itself. Also drops up to 9 redundant 2s-timeout curls on
+    # a rig where nothing is serving (the guard used to re-probe everything).
+    local _endpoint_up=0
     # Check ports in priority order: 8010, 8012, 8020, 11434, 4000
     if curl -sf -m 2 http://localhost:8010/v1/models >/dev/null 2>&1; then
+        _endpoint_up=1
         local m
         m=$(curl -sf -m 2 http://localhost:8010/v1/models | python3 -c "import sys,json;d=json.load(sys.stdin);print(', '.join(x['id'] for x in d.get('data',[])))" 2>/dev/null)
         echo -e "  ${GREEN}▶${NC} 27b-dual-mtp @ :8010    → ${m:-unknown} (MTP n=3 + fp8 + 262K + vision)"
     fi
     if curl -sf -m 2 http://localhost:8051/v1/models >/dev/null 2>&1; then
+        _endpoint_up=1
         local m
         m=$(curl -sf -m 2 http://localhost:8051/v1/models | python3 -c "import sys,json;d=json.load(sys.stdin);print(', '.join(x['id'] for x in d.get('data',[])))" 2>/dev/null)
         echo -e "  ${GREEN}▶${NC} 35b-a3b-dual @ :8051    → ${m:-unknown} (MoE 3B/35B + fp8 + 262K + vision)"
     fi
     if curl -sf -m 2 http://localhost:8012/v1/models >/dev/null 2>&1; then
+        _endpoint_up=1
         local m
         m=$(curl -sf -m 2 http://localhost:8012/v1/models | python3 -c "import sys,json;d=json.load(sys.stdin);print(', '.join(x['id'] for x in d.get('data',[])))" 2>/dev/null)
         echo -e "  ${GREEN}▶${NC} 27b-dflash @ :8012      → ${m:-unknown} (DFlash N=5 + 185K + vision)"
     fi
     if curl -sf -m 2 http://localhost:8013/v1/models >/dev/null 2>&1; then
+        _endpoint_up=1
         local m
         m=$(curl -sf -m 2 http://localhost:8013/v1/models | python3 -c "import sys,json;d=json.load(sys.stdin);print(', '.join(x['id'] for x in d.get('data',[])))" 2>/dev/null)
         echo -e "  ${GREEN}▶${NC} 27b-dflash-noviz @ :8013 → ${m:-unknown} (DFlash N=5 + 200K, no vision)"
     fi
     if curl -sf -m 2 http://localhost:8011/v1/models >/dev/null 2>&1; then
+        _endpoint_up=1
         local m
         m=$(curl -sf -m 2 http://localhost:8011/v1/models | python3 -c "import sys,json;d=json.load(sys.stdin);print(', '.join(x['id'] for x in d.get('data',[])))" 2>/dev/null)
         echo -e "  ${GREEN}▶${NC} 27b-turbo @ :8011       → ${m:-unknown} (TurboQuant_3bit_nc + MTP n=3 + v7.14, 4-stream concurrency)"
@@ -338,11 +419,13 @@ show_status() {
     # llamacpp/mtp-vision now defaults to llama-cpp-qwen36-27b-vision (#169).
     # All still match the llama-cpp-* prefix used for detection below.
     if curl -sf -m 2 http://localhost:8020/v1/models >/dev/null 2>&1; then
+        _endpoint_up=1
         local m
         m=$(curl -sf -m 2 http://localhost:8020/v1/models | python3 -c "import sys,json;d=json.load(sys.stdin);print(', '.join(x['id'] for x in d.get('data',[])))" 2>/dev/null)
         echo -e "  ${GREEN}▶${NC} llamacpp/single @ :8020 → ${m:-unknown} (llama.cpp single-card)"
     fi
     if curl -sf -m 2 http://localhost:8030/v1/models >/dev/null 2>&1; then
+        _endpoint_up=1
         local m container engine_tag
         m=$(curl -sf -m 2 http://localhost:8030/v1/models | python3 -c "import sys,json;d=json.load(sys.stdin);print(', '.join(x['id'] for x in d.get('data',[])))" 2>/dev/null)
         # Detect engine via container name on the port (was hardcoded to "gemma-mtp"
@@ -356,36 +439,52 @@ show_status() {
         echo -e "  ${GREEN}▶${NC} $engine_tag"
     fi
     if curl -sf -m 2 http://localhost:8032/v1/models >/dev/null 2>&1; then
+        _endpoint_up=1
         local m
         m=$(curl -sf -m 2 http://localhost:8032/v1/models | python3 -c "import sys,json;d=json.load(sys.stdin);print(', '.join(x['id'] for x in d.get('data',[])))" 2>/dev/null)
         echo -e "  ${GREEN}▶${NC} gemma-int8 @ :8032        → ${m:-unknown} (INT8 PTH KV)"
     fi
     if curl -sf -m 2 http://localhost:8038/v1/models >/dev/null 2>&1; then
+        _endpoint_up=1
         local m
         m=$(curl -sf -m 2 http://localhost:8038/v1/models | python3 -c "import sys,json;d=json.load(sys.stdin);print(', '.join(x['id'] for x in d.get('data',[])))" 2>/dev/null)
         echo -e "  ${GREEN}▶${NC} gemma-12b @ :8038        → ${m:-unknown} (gemma4_unified, INT8 + bf16 KV + MTP, single card)"
     fi
+    if curl -sf -m 2 http://localhost:8033/v1/models >/dev/null 2>&1; then
+        _endpoint_up=1
+        local m
+        m=$(curl -sf -m 2 http://localhost:8033/v1/models | python3 -c "import sys,json;d=json.load(sys.stdin);print(', '.join(x['id'] for x in d.get('data',[])))" 2>/dev/null)
+        echo -e "  ${GREEN}▶${NC} gemma-qat @ :8033        → ${m:-unknown} (QAT W4A16 + INT8 PTH KV)"
+    fi
+    if curl -sf -m 2 http://localhost:8099/v1/models >/dev/null 2>&1; then
+        _endpoint_up=1
+        local m
+        m=$(curl -sf -m 2 http://localhost:8099/v1/models | python3 -c "import sys,json;d=json.load(sys.stdin);print(', '.join(x['id'] for x in d.get('data',[])))" 2>/dev/null)
+        echo -e "  ${GREEN}▶${NC} thinkingcap @ :8099      → ${m:-unknown} (AutoRound W4A16 served W4A8 + built-in MTP + 262K)"
+    fi
+    if curl -sf -m 2 http://localhost:8199/v1/models >/dev/null 2>&1; then
+        _endpoint_up=1
+        local m
+        m=$(curl -sf -m 2 http://localhost:8199/v1/models | python3 -c "import sys,json;d=json.load(sys.stdin);print(', '.join(x['id'] for x in d.get('data',[])))" 2>/dev/null)
+        echo -e "  ${GREEN}▶${NC} deckard @ :8199          → ${m:-unknown} (llama.cpp Q6_K + MTP, dual)"
+    fi
     if curl -sf -m 2 http://localhost:8090/v1/models >/dev/null 2>&1; then
+        _endpoint_up=1
         echo -e "  ${GREEN}▶${NC} studio director @ :8090  → qwen3.5-4b-uncensored (prompt crafter, GPU0, llama.cpp)"
     fi
     if curl -sf -m 2 http://localhost:8188/ >/dev/null 2>&1; then
+        # NOT an inference endpoint — ComfyUI is image/video gen and must not
+        # suppress the "no inference endpoint" warning on an LLM-idle rig.
         echo -e "  ${GREEN}▶${NC} ComfyUI @ :8188          → image/video generation (GPU-bound, mutex with LLM)"
     fi
     if curl -sf -m 2 -H "Authorization: Bearer sk-litellm-master-key" http://localhost:4000/v1/models >/dev/null 2>&1; then
+        _endpoint_up=1
         local m
         m=$(curl -sf -m 2 -H "Authorization: Bearer sk-litellm-master-key" http://localhost:4000/v1/models | python3 -c "import sys,json;d=json.load(sys.stdin);print(', '.join(x['id'] for x in d.get('data',[])))" 2>/dev/null)
         echo -e "  ${GREEN}▶${NC} LiteLLM @ :4000         → ${m:-unknown}"
     fi
-    if ! curl -sf -m 2 http://localhost:8010/v1/models >/dev/null 2>&1 \
-      && ! curl -sf -m 2 http://localhost:8011/v1/models >/dev/null 2>&1 \
-      && ! curl -sf -m 2 http://localhost:8012/v1/models >/dev/null 2>&1 \
-      && ! curl -sf -m 2 http://localhost:8013/v1/models >/dev/null 2>&1 \
-      && ! curl -sf -m 2 http://localhost:8030/v1/models >/dev/null 2>&1 \
-      && ! curl -sf -m 2 http://localhost:8032/v1/models >/dev/null 2>&1 \
-      && ! curl -sf -m 2 http://localhost:8033/v1/models >/dev/null 2>&1 \
-      && ! curl -sf -m 2 http://localhost:8038/v1/models >/dev/null 2>&1 \
-      && ! curl -sf -m 2 http://localhost:11434/api/tags >/dev/null 2>&1; then
-        echo -e "  ${YELLOW}(no inference endpoint responding)${NC}"
+    if [ "$_endpoint_up" -eq 0 ]; then
+        echo -e "  ${YELLOW}(none of gpu-mode's known lanes responding — this legacy view probes a fixed subset; for the full registry-derived estate use c3: tools/serve-cockpit)${NC}"
     fi
     echo ""
     echo -e "${CYAN}═══ GPU Status ═══${NC}"
@@ -470,11 +569,12 @@ mode_chat() {
     stop_step_voice
     start_service openwebui
     start_service litellm
+    start_service spark-dashboard
     start_service qdrant
     start_service searxng
     start_studio_director
     echo ""
-    echo -e "${GREEN}Chat mode active.${NC} Open WebUI: http://192.168.86.33:8080"
+    echo -e "${GREEN}Chat mode active.${NC} Open WebUI: http://$LANIP:8080"
     echo -e "${YELLOW}Director placement: $(_director_device) (change in c3 Settings · Director placement).${NC}"
     echo -e "${YELLOW}Plug in catalog models: bash scripts/switch.sh --owui <variant>  (registers it into OWUI here).${NC}"
 }
@@ -494,13 +594,15 @@ mode_27b() {
     stop_27b_dual_dflash
     stop_27b_dual_dflash_noviz
     stop_27b_dual_turbo
+    wait_gpu_vram_settle     # let the torn-down scene's VRAM release before TP=2 boots (#535 follow-up)
     start_27b_dual_mtp
     start_service litellm
+    start_service spark-dashboard
     start_service qdrant
     start_service openwebui
     start_service searxng
     echo ""
-    echo -e "${GREEN}27B dual-card MTP mode active.${NC} API: http://192.168.86.33:8010"
+    echo -e "${GREEN}27B dual-card MTP mode active.${NC} API: http://$LANIP:8010"
     echo -e "${YELLOW}Per-stream: 68 narr / 89 code TPS short, 36 TPS @ 100K, 28 TPS @ 200K warm.${NC}"
     echo -e "${YELLOW}2 concurrent streams. KV pool 168K, max concurrency 2.36× at full 262K.${NC}"
     echo -e "${YELLOW}Vision + tools + thinking + 262K ctx all working. Boot ~3-4 min.${NC}"
@@ -520,13 +622,15 @@ mode_35b_a3b() {
     stop_step_voice
     _director_evict_if_gpu
     stop_diffusiongemma
+    wait_gpu_vram_settle     # let the torn-down scene's VRAM release before TP=2 boots (#535 follow-up)
     start_35b_a3b_dual
     start_service litellm
+    start_service spark-dashboard
     start_service qdrant
     start_service openwebui
     start_service searxng
     echo ""
-    echo -e "${GREEN}35B-A3B dual-card mode active.${NC} API: http://192.168.86.33:8051"
+    echo -e "${GREEN}35B-A3B dual-card mode active.${NC} API: http://$LANIP:8051"
     echo -e "${YELLOW}MoE: 3B active / 35B total — ~178/174 TPS, 262K ctx, vision. Boot ~3-4 min.${NC}"
     echo -e "${YELLOW}Tail: sudo docker logs -f vllm-qwen36-35b-a3b-dual${NC}"
 }
@@ -545,13 +649,15 @@ mode_gemma_12b() {
     stop_step_voice
     _director_evict_if_gpu
     stop_diffusiongemma
+    wait_gpu_vram_settle     # single-card boot can still land in another scene's residue (#535 follow-up)
     start_gemma_12b
     start_service litellm
+    start_service spark-dashboard
     start_service qdrant
     start_service openwebui
     start_service searxng
     echo ""
-    echo -e "${GREEN}Gemma 4 12B mode active.${NC} API: http://192.168.86.33:8038"
+    echo -e "${GREEN}Gemma 4 12B mode active.${NC} API: http://$LANIP:8038"
     echo -e "${YELLOW}gemma4_unified arch-preview image (EPHEMERAL tag — pin a digest before prod). Single card; the other GPU is free.${NC}"
     echo -e "${YELLOW}Tail: sudo docker logs -f vllm-gemma-4-12b-int8-mtp${NC}"
 }
@@ -561,8 +667,8 @@ mode_gemma_12b() {
 #  via its catalog slug if needed.)
 
 mode_gemma_int8() {
-    echo -e "${CYAN}═══ Switching to Gemma 4 31B INT8-PTH mode (dual default, long ctx) ═══${NC}"
-    echo "Starting: Gemma 4 31B + INT8 PTH KV + 262K ctx (TP=2, :8032)"
+    echo -e "${CYAN}═══ Switching to Gemma 4 31B mode (dual default) ═══${NC}"
+    echo "Starting: Gemma 4 31B QAT-AWQ-INT4 + bf16 KV + 224K ctx (TP=2, :8032, MTP-off; canonical template)"
     echo ""
     stop_all_27b
     stop_deckard
@@ -573,13 +679,15 @@ mode_gemma_int8() {
     stop_step_voice
     _director_evict_if_gpu
     stop_gemma_int8          # clean re-switch; the dflash/awq gemma scenes were pruned
+    wait_gpu_vram_settle     # let the torn-down scene's VRAM release before TP=2 gemma boots (#535)
     start_gemma_int8
     start_service litellm
+    start_service spark-dashboard
     start_service qdrant
     start_service openwebui
     start_service searxng
     echo ""
-    echo -e "${GREEN}Gemma 4 31B INT8 PTH mode active.${NC} API: http://192.168.86.33:8032"
+    echo -e "${GREEN}Gemma 4 31B INT8 PTH mode active.${NC} API: http://$LANIP:8032"
     echo -e "${YELLOW}Tail: sudo docker logs -f vllm-gemma-4-31b-mtp-int8${NC}"
 }
 mode_deckard() {
@@ -593,8 +701,10 @@ mode_deckard() {
     stop_comfyui
     stop_step_voice
     _director_evict_if_gpu
+    wait_gpu_vram_settle     # 31 GB GGUF layer-splits both cards — don't boot into residue (#535 follow-up)
     start_deckard
     start_service litellm
+    start_service spark-dashboard
     start_service qdrant
     start_service openwebui
     start_service searxng
@@ -605,7 +715,7 @@ mode_deckard() {
         bash "$CLUB3090_DIR/scripts/lib/owui-register.sh" 8199 || true
     fi
     echo ""
-    echo -e "${GREEN}Deckard-40B mode active.${NC} API: http://192.168.86.33:8199  (model: deckard-40b)"
+    echo -e "${GREEN}Deckard-40B mode active.${NC} API: http://$LANIP:8199  (model: deckard-40b)"
     echo -e "${YELLOW}MTP n=2: ~36 narr / 46 code TPS · 128K ctx @ q8_0 KV · uncensored, text-only.${NC}"
     echo -e "${YELLOW}First boot ~1-2 min (31 GB GGUF load + 128K KV alloc across both cards).${NC}"
     echo -e "${YELLOW}Tail: sudo docker logs -f llama-cpp-deckard-40b${NC}"
@@ -675,6 +785,7 @@ mode_ai_studio() {
     stop_35b_a3b_dual
     stop_all_gemma
     stop_diffusiongemma
+    wait_gpu_vram_settle     # ComfyUI checkpoints load into the just-freed cards (#535 follow-up)
     start_comfyui
     start_studio_director
     start_studio_gallery
@@ -684,13 +795,14 @@ mode_ai_studio() {
     start_step_voice
     start_service openwebui
     start_service litellm
+    start_service spark-dashboard
     start_service qdrant
     start_service searxng
     echo ""
     echo -e "${GREEN}AI-studio mode active.${NC} — one scene; pick the lane in Open WebUI."
-    echo -e "  Open WebUI:  http://192.168.86.33:8080   (image · video · music · SFX · voice lanes)"
-    echo -e "  Gallery:     http://192.168.86.33:8189   (all generated media; survives ComfyUI down)"
-    echo -e "  ComfyUI:     http://192.168.86.33:8188   (full node graph / control)"
+    echo -e "  Open WebUI:  http://$LANIP:${OWUI_PORT:-8080}   (image · video · music · SFX · voice lanes)"
+    echo -e "  Gallery:     http://$LANIP:8189   (all generated media; survives ComfyUI down)"
+    echo -e "  ComfyUI:     http://$LANIP:8188   (full node graph / control)"
     echo -e "${YELLOW}First ComfyUI boot can take a few min (clones + node deps). Video DiT splits across both 3090s (DisTorch); image/audio lanes run on GPU0 beside the director.${NC}"
     echo -e "${YELLOW}GPU-mutex with the dual-card LLMs. Premium voice (step-audio-editx) is on-demand on GPU1 — mutually exclusive with an active video render.${NC}"
     echo -e "${YELLOW}Tail: sudo docker logs -f comfyui${NC}"
@@ -723,21 +835,21 @@ stop_estate() {
 }
 
 # --- GPU power-cap controls -------------------------------------------------
-# The rig normally runs both 3090s capped at 230W (quieter / cooler — see the
+# The rig normally runs both 3090s capped at 250W (quieter / cooler — see the
 # systemd unit below). The cap suppresses benchmark TPS, so maintainers need a
 # quick way to uncap to the hardware default for a true-TPS bench, then re-cap.
 #
-# `nvidia-power-cap.service` is the single source of truth for the 230W value
+# `nvidia-power-cap.service` is the single source of truth for the 250W value
 # AND re-applies it on every boot (Type=oneshot, RemainAfterExit=yes, enabled).
 # So `power-cap on` *restarts* that unit — `restart` (not `start`) is required:
 # the unit is already `active` from boot, and `systemctl start` on an
 # already-active RemainAfterExit oneshot is a no-op (it won't re-run ExecStart,
 # so the cap wouldn't actually re-apply after a `power-cap off`). `restart`
-# stops it (clearing RemainAfterExit) then re-runs both `-pl 230` ExecStart
+# stops it (clearing RemainAfterExit) then re-runs both `-pl 250` ExecStart
 # lines. `power-cap off` reads each card's Default Power Limit from nvidia-smi
 # (370W on GPU 0, 420W on GPU 1 here — they differ, so we never hardcode) and
 # applies it. `off` is session-scoped: a reboot OR a driver reload re-applies
-# 230W via the service. We never disable the service.
+# 250W via the service. We never disable the service.
 POWER_CAP_SERVICE="nvidia-power-cap.service"
 
 # Print per-GPU enforced / default / min / max power limits (one row per card).
@@ -772,7 +884,7 @@ mode_powercap() {
     # A numeric action = an explicit CUSTOM wattage applied to both cards (the
     # serve-cockpit power-cap menu's "custom" option).  Validated against each
     # card's [min,max] range; session-scoped like `off` (the boot service still
-    # re-applies 230W on reboot/reload).
+    # re-applies 250W on reboot/reload).
     if [[ "$action" =~ ^[0-9]+$ ]]; then
         echo -e "${CYAN}═══ Setting custom GPU power cap (${action}W) ═══${NC}"
         local cidx cmin cmax crc=0 capplied=0
@@ -798,24 +910,24 @@ mode_powercap() {
             exit 1
         fi
         echo -e "${GREEN}Custom cap ${action}W applied.${NC} ${YELLOW}Session-scoped — a reboot or driver"
-        echo -e "reload re-applies 230W via ${POWER_CAP_SERVICE}.${NC}"
+        echo -e "reload re-applies 250W via ${POWER_CAP_SERVICE}.${NC}"
         powercap_echo_enforced
         [ "$crc" -eq 0 ] || exit 1
         return
     fi
     case "$action" in
         on)
-            echo -e "${CYAN}═══ Re-applying GPU power cap (230W) ═══${NC}"
-            echo "Restarting ${POWER_CAP_SERVICE} (the boot-time 230W enforcer)."
+            echo -e "${CYAN}═══ Re-applying GPU power cap (250W) ═══${NC}"
+            echo "Restarting ${POWER_CAP_SERVICE} (the boot-time 250W enforcer)."
             # restart, not start — the unit is already active from boot, so
             # `start` is a no-op on a RemainAfterExit oneshot (won't re-run -pl).
             if sudo systemctl restart "$POWER_CAP_SERVICE" 2>/dev/null; then
                 echo -e "${GREEN}Power cap re-applied via systemd.${NC}"
             else
-                # Fallback: service missing/disabled — apply 230W directly.
-                echo -e "${YELLOW}systemctl restart failed; falling back to direct nvidia-smi -pl 230.${NC}" >&2
-                if ! { sudo nvidia-smi -i 0 -pl 230 && sudo nvidia-smi -i 1 -pl 230; }; then
-                    echo -e "${RED}✗ Failed to set 230W cap.${NC} Check sudo + driver state with: nvidia-smi -q -d POWER" >&2
+                # Fallback: service missing/disabled — apply 250W directly.
+                echo -e "${YELLOW}systemctl restart failed; falling back to direct nvidia-smi -pl 250.${NC}" >&2
+                if ! { sudo nvidia-smi -i 0 -pl 250 && sudo nvidia-smi -i 1 -pl 250; }; then
+                    echo -e "${RED}✗ Failed to set 250W cap.${NC} Check sudo + driver state with: nvidia-smi -q -d POWER" >&2
                     exit 1
                 fi
             fi
@@ -844,7 +956,7 @@ mode_powercap() {
                 exit 1
             fi
             echo -e "${GREEN}Uncapped to default.${NC} ${YELLOW}Session-scoped — a reboot or driver"
-            echo -e "reload re-applies 230W via ${POWER_CAP_SERVICE}. Run 'gpu-mode power-cap on' to re-cap now.${NC}"
+            echo -e "reload re-applies 250W via ${POWER_CAP_SERVICE}. Run 'gpu-mode power-cap on' to re-cap now.${NC}"
             powercap_echo_enforced
             [ "$rc" -eq 0 ] || exit 1
             ;;
@@ -870,6 +982,18 @@ mode_off() {
     stop_step_voice
     stop_studio_director     # full off stops even a CPU/always-on director
     stop_estate
+    # CATCH-ALL: the enumerated stop_* lists above cover the gpu-mode SCENES,
+    # but a catalog-launched engine (switch.sh <slug>, e.g. vllm/minimal) isn't
+    # in any of them — and 'off' promises "ALL services".  Stop every remaining
+    # engine-prefixed container so the next scene never boots into held VRAM
+    # (#535 class; caught live 2026-07-04 when off left vllm-qwen36-27b-minimal
+    # serving and the 27b TP=2 scene booted into its residue).
+    _stragglers=$(docker ps --format '{{.Names}}' 2>/dev/null \
+        | grep -E '^(vllm-|llama-cpp-|ik-llama-|sglang-|beellama-)' || true)
+    if [ -n "$_stragglers" ]; then
+        echo -e "  ${YELLOW}▼${NC} Stopping catalog-launched engine(s): $(echo "$_stragglers" | tr '\n' ' ')"
+        echo "$_stragglers" | xargs -r docker stop >/dev/null 2>&1 || true
+    fi
     for svc in "${SERVICES[@]}"; do
         stop_service "$svc"
     done
@@ -901,15 +1025,15 @@ mode_off() {
 list_modes_data() {
     # name<TAB>group<TAB>description<TAB>services<TAB>ports<TAB>gpus
     cat <<'TSV'
-chat	ops	Open WebUI + LiteLLM + Qdrant + SearXNG + uncensored director — supporting-infra home for catalog models	openwebui,litellm,qdrant,searxng,studio-director	8080,4000,8090	none
-qwen27b	models	Qwen3.6-27B MTP n=3 + fp8 KV + 262K + vision (TP=2) — default	vllm-qwen36-27b-dual,litellm,qdrant,openwebui,searxng	8010,8080,4000	both
-qwen35b-a3b	models	Qwen3.6-35B-A3B MoE (3B active / 35B total) AutoRound INT4 + fp8 KV + 262K + vision (TP=2)	vllm-qwen36-35b-a3b-dual,litellm,qdrant,openwebui,searxng	8051,8080,4000	both
-gemma-31b	models	Gemma 4 31B INT8 PTH KV + 262K + vision (TP=2) — dual default	vllm-gemma-4-31b-mtp-int8,litellm,qdrant,openwebui,searxng	8032,8080,4000	both
-gemma12b	models	Gemma 4 12B AutoRound INT8 + bf16 KV + MTP n=2 (gemma4_unified arch-preview, single-card)	vllm-gemma-4-12b-int8-mtp,litellm,qdrant,openwebui,searxng	8038,8080,4000	1
-deckard	models	Qwen3.6-40B-Deckard Q6_K + MTP n=2 + q8_0 KV + 128K (llama.cpp, dual)	llama-cpp-deckard-40b,litellm,qdrant,openwebui,searxng	8199,8080,4000	both
-ai-studio	studio	image · video · audio · voice — ComfyUI both GPUs + qwen director + sidecars + Open WebUI (pick the lane in OWUI)	comfyui,studio-director,studio-gallery,studio-orchestrator,studio-image-shim,studio-tts,studio-step-voice,openwebui,litellm,qdrant,searxng	8188,8090,8189,8190,8191,8192,8193,8080,4000,6333	both
+chat	ops	Open WebUI + LiteLLM + Qdrant + SearXNG + uncensored director — supporting-infra home for catalog models	openwebui,litellm,qdrant,searxng,studio-director,spark-dashboard	8080,4000,8090,3010	none
+qwen27b	models	Qwen3.6-27B MTP n=3 + fp8 KV + 262K + vision (TP=2) — default	vllm-qwen36-27b-dual,litellm,qdrant,openwebui,searxng,spark-dashboard	8010,8080,4000,3010	both
+qwen35b-a3b	models	Qwen3.6-35B-A3B MoE (3B active / 35B total) AutoRound INT4 + fp8 KV + 262K + vision (TP=2)	vllm-qwen36-35b-a3b-dual,litellm,qdrant,openwebui,searxng,spark-dashboard	8051,8080,4000,3010	both
+gemma-31b	models	Gemma 4 31B QAT-AWQ-INT4 bf16 KV @224K (TP=2, MTP-off, canonical template) — dual default	vllm-gemma-4-31b-qat-awq-int4,litellm,qdrant,openwebui,searxng,spark-dashboard	8032,8080,4000,3010	both
+gemma12b	models	Gemma 4 12B AutoRound INT8 + bf16 KV + MTP n=2 (gemma4_unified arch-preview, single-card)	vllm-gemma-4-12b-int8-mtp,litellm,qdrant,openwebui,searxng,spark-dashboard	8038,8080,4000,3010	1
+deckard	models	Qwen3.6-40B-Deckard Q6_K + MTP n=2 + q8_0 KV + 128K (llama.cpp, dual)	llama-cpp-deckard-40b,litellm,qdrant,openwebui,searxng,spark-dashboard	8199,8080,4000,3010	both
+ai-studio	studio	image · video · audio · voice — ComfyUI both GPUs + qwen director + sidecars + Open WebUI (pick the lane in OWUI)	comfyui,studio-director,studio-gallery,studio-orchestrator,studio-image-shim,studio-tts,studio-step-voice,openwebui,litellm,qdrant,searxng,spark-dashboard	8188,8090,8189,8190,8191,8192,8193,8080,4000,6333,3010	both
 off	ops	Stop all services	all-stopped		none
-power-cap	ops	GPU power-cap controls (on/off/status; both 3090s, 230W default cap)			both
+power-cap	ops	GPU power-cap controls (on/off/status; both 3090s, 250W default cap)			both
 prune	ops	docker image prune -a (safe — only unreferenced images)			none
 prune-all	ops	+ build cache (keep 5 GB) + dangling networks (volumes safe)			none
 TSV
@@ -990,10 +1114,10 @@ usage() {
     echo "  off                Stop all services"
     echo "  status             Show running services, GPU, RAM, disk, Docker disk"
     echo ""
-    echo "  GPU power cap (both 3090s; normally capped at 230W for quiet/cool operation):"
-    echo "  power-cap on       Re-apply the 230W cap (via nvidia-power-cap.service)"
+    echo "  GPU power cap (both 3090s; normally capped at 250W for quiet/cool operation):"
+    echo "  power-cap on       Re-apply the 250W cap (via nvidia-power-cap.service)"
     echo "  power-cap off      Uncap to hardware default for a true-TPS bench"
-    echo "                     (session-scoped — a reboot / driver reload re-caps at 230W)"
+    echo "                     (session-scoped — a reboot / driver reload re-caps at 250W)"
     echo "  power-cap <WATTS>  Apply a custom cap to both cards (e.g. 'power-cap 280';"
     echo "                     validated against each card's [min,max]; session-scoped)"
     echo "  power-cap status   Show per-GPU enforced / default / min / max power limits"
@@ -1021,3 +1145,12 @@ case "${1:-}" in
     --list-modes)       list_modes "${2:-}" ;;
     *)                  usage ;;
 esac
+
+# #715 gap 4 — propagate start failures to the exit code (see FAILED_SERVICES).
+if [ "${#FAILED_SERVICES[@]}" -gt 0 ]; then
+    echo "" >&2
+    echo -e "${RED}✗ ${#FAILED_SERVICES[@]} service(s) FAILED to start: ${FAILED_SERVICES[*]}${NC}" >&2
+    echo "  Inspect: sudo docker compose logs <service>   (in its compose dir)" >&2
+    echo "  Then re-run this mode — starts are idempotent." >&2
+    exit 1
+fi

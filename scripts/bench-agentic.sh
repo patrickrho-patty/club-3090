@@ -62,8 +62,32 @@
 #   SESSIONS     Sessions to run (for per-turn TTFT statistics). Default: 2
 #   TURNS        Turns per session (1-15). Default: 12
 #   QUIET        Set to 1 to suppress per-request status lines. Default: 0
+#   DECODE_GRANULARITY
+#                How this model emits tokens, which decides whether decode_TPS
+#                means anything at all (#809 — same contract as bench.sh).
+#                  auto   (default) classify from the measured turns
+#                  token  autoregressive — decode_TPS is a decode rate
+#                  canvas block diffusion (dLLM): the model denoises a whole
+#                         canvas in parallel and the endpoint emits ~one chunk
+#                         per canvas, so TTFT == wall on any response that fits
+#                         in one block and the decode window is zero-width.
+#                         decode_TPS is NOT a decode rate for this class.
+#   BENCH_DEGEN_WINDOW_FRAC
+#                A turn whose decode window is below this fraction of its own
+#                wall time has no measurable decode rate and prints n/a rather
+#                than a number. Default: 0.05 — an AR decode window is ~the
+#                whole wall, so this sits ~20x from any AR turn.
 
 set -euo pipefail
+
+# Force Python's UTF-8 mode (PEP 540) for every python3 this script runs.
+# Repo sources are full of unicode (— × → ⚠), and without this a rig on a real
+# non-UTF-8 locale (de_DE.iso88591 and friends) decodes reads, stdout AND argv
+# with the locale codec, which crashes the launcher/emit paths (#779). Python
+# already auto-enables UTF-8 mode for the C/POSIX locale, so this covers the
+# case it does NOT: a genuine non-UTF-8, non-C locale. Exported, so child
+# processes and nested scripts inherit it. Guarded by test-locale-utf8.sh.
+export PYTHONUTF8="${PYTHONUTF8:-1}"
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 if [[ -f "${ROOT_DIR}/scripts/preflight.sh" ]]; then
@@ -106,11 +130,32 @@ if [[ -z "$MODEL" ]]; then
 fi
 
 python3 - "$URL" "$MODEL" "$SESSIONS" "$TURNS" "$QUIET" "$FIXTURE" << 'PYEOF'
-import json, sys, time, urllib.request, statistics as s, pathlib
+import json, os, sys, time, urllib.request, statistics as s, pathlib
 sys.stdout.reconfigure(line_buffering=True)  # flush after every \n
 
 URL, MODEL, SESSIONS, TURNS, QUIET, FIXTURE_PATH = sys.argv[1:7]
 SESSIONS = int(SESSIONS); TURNS = int(TURNS); QUIET = int(QUIET) == 1
+
+# --- decode-granularity knobs (#809; same contract as bench.sh) -------------
+try:
+    DEGEN_WINDOW_FRAC = float(os.environ.get("BENCH_DEGEN_WINDOW_FRAC", "0.05"))
+except ValueError:
+    DEGEN_WINDOW_FRAC = 0.05
+GRANULARITY = (os.environ.get("DECODE_GRANULARITY", "auto") or "auto").strip().lower()
+if GRANULARITY not in ("auto", "token", "canvas"):
+    GRANULARITY = "auto"
+
+
+def classify_granularity(n_turns, degen_turns):
+    """(granularity, why). A declared value wins; else classify from the turns."""
+    if GRANULARITY in ("token", "canvas"):
+        return GRANULARITY, f"declared: DECODE_GRANULARITY={GRANULARITY}"
+    # One degenerate turn can be a fluke (an EOS on the first chunk). A MAJORITY
+    # of them across the ramp is a property of the model.
+    if n_turns >= 2 and degen_turns * 2 >= n_turns:
+        return "canvas", (f"auto-detected: {degen_turns}/{n_turns} turns emitted their whole "
+                          f"completion inside one block, TTFT == wall")
+    return "token", ""
 
 # Load real-session fixtures (tool results from an actual Claude Code session)
 FIXTURE = json.loads(pathlib.Path(FIXTURE_PATH).read_text())
@@ -171,7 +216,11 @@ def run_turn(messages, fixture_turn, session_id, turn_idx):
         "messages": messages,
         "tools": TOOLS,
         "tool_choice": "required",  # guarantee a tool call every turn
-        "max_tokens": 150,
+        # #665: max_tokens=150 truncated the tool-call JSON on reasoning models
+        # (Tess) mid-object → unterminated `arguments` that poisoned every later
+        # turn (HTTP 500 on replay). 600 lets the call complete; the _safe_args
+        # guard below backstops any residual clip.
+        "max_tokens": 600,
         "temperature": 0.3,
         "stream": True,
         "stream_options": {"include_usage": True},
@@ -226,10 +275,22 @@ def run_turn(messages, fixture_turn, session_id, turn_idx):
 
     # Reconstruct assistant message from real tool calls.
     # tool_choice=required guarantees at least one; treat empty as a server bug.
+    # #665 guard: a reasoning model can burn max_tokens mid-object → truncated,
+    # unterminated `arguments` JSON. Replaying that assistant turn poisons EVERY
+    # subsequent turn — llama-server throws HTTP 500 in func_args_not_string() when
+    # it re-parses the client-supplied history. Substitute "{}" for any args that
+    # don't parse, so a single clip can't kill the whole ramp.
+    def _safe_args(a):
+        a = a or "{}"
+        try:
+            json.loads(a)
+            return a
+        except (json.JSONDecodeError, ValueError):
+            return "{}"
     tool_calls_response = [
         {"id": s["id"] or f"call_t{turn_idx}_s{session_id}_{i}",
          "type": "function",
-         "function": {"name": s["name"], "arguments": s["args"] or "{}"}}
+         "function": {"name": s["name"], "arguments": _safe_args(s["args"])}}
         for i, s in sorted(tool_calls_acc.items()) if s["name"]
     ]
     # #255: decouple the context ramp from tool-call success. A turn that fails
@@ -262,7 +323,7 @@ def run_turn(messages, fixture_turn, session_id, turn_idx):
     # The model may have called a different tool than the original session;
     # that's intentional — fixed results make TTFT measurements reproducible
     # across runs and engines. Only the first call gets the full result; any
-    # additional calls (rare with max_tokens=150) get a placeholder so the
+    # additional calls (rare even at max_tokens=600) get a placeholder so the
     # context size matches the single-tool-call case.
     messages.append({
         "role": "tool",
@@ -272,13 +333,36 @@ def run_turn(messages, fixture_turn, session_id, turn_idx):
     for tc in tool_calls_response[1:]:
         messages.append({"role": "tool", "tool_call_id": tc["id"], "content": "(done)"})
 
-    decode_s = max(wall - ttft, 1e-6)
-    decode_tps = completion_tokens / decode_s if completion_tokens > 0 else 0
+    # --- decode-window guard (#809, mirroring bench.sh's #854 fix) ----------
+    # `decode_TPS = toks / (wall - TTFT)` assumes token-by-token AR streaming.
+    # A canvas-granularity (block-diffusion) model denoises a whole canvas in
+    # parallel and the SSE endpoint emits ~ONE chunk per completed canvas: a
+    # response that fits in a single canvas arrives as one chunk, TTFT == wall,
+    # and the decode window is zero-width. The old `max(wall - ttft, 1e-6)`
+    # divided by an epsilon and printed eleven turns at 409,726 -> 1,808,323 TPS
+    # while only turn 12 read plausibly (#809, real output).
+    #
+    # The guard is a RATIO, not an absolute threshold, and that is what makes it
+    # safe for AR models: a real AR decode window IS essentially the whole wall,
+    # so 5% sits ~20x away from any autoregressive turn and cannot fire on one.
+    # None means UNMEASURABLE — not slow, not zero.
+    decode_s = wall - ttft
+    degenerate = wall <= 0 or decode_s <= 0 or decode_s < DEGEN_WINDOW_FRAC * wall
+    if completion_tokens <= 0:
+        # The genuine silent-empty turn. It has always reported 0 and that
+        # discriminator must not regress into an "unmeasurable" n/a.
+        decode_tps = 0.0
+    elif degenerate:
+        decode_tps = None
+    else:
+        decode_tps = completion_tokens / decode_s
 
     return {
         "ttft_ms": ttft * 1000,
         "wall_ms": wall * 1000,
         "decode_tps": decode_tps,
+        "wall_tps": (completion_tokens / wall) if wall > 0 else 0.0,
+        "decode_degenerate": bool(degenerate and completion_tokens > 0),
         "completion_tokens": completion_tokens,
         "prompt_tokens": prompt_tokens,
         "tool_calls": len(tool_calls_response),
@@ -311,8 +395,16 @@ for session in range(1, SESSIONS + 1):
                 tool_call_misses += 1
             if not QUIET:
                 miss = "  ⚠ tool-call miss (synthetic result injected)" if m.get("tool_call_missed") else ""
+                # Never a number for an unmeasurable window — that divide is the
+                # defect (#809). wall_TPS is the honest figure for such a turn.
+                if m["decode_tps"] is None:
+                    dcol = f"{'n/a':>11}"
+                    miss = (f"  (decode window 0 — single-block emission; "
+                            f"wall {m['wall_tps']:.1f} tok/s){miss}")
+                else:
+                    dcol = f"{m['decode_tps']:>11.1f}"
                 print(f"  {turn_idx+1:<5} {m['prompt_tokens']:>10,} {m['ttft_ms']:>9.0f} "
-                      f"{m['decode_tps']:>11.1f} {m['result_chars']:>13,}{miss}", flush=True)
+                      f"{dcol} {m['result_chars']:>13,}{miss}", flush=True)
         except Exception as e:
             print(f"  turn {turn_idx+1}: FAIL — {e}", flush=True)
             break
@@ -350,14 +442,25 @@ baseline_ttft = (s.mean([m["ttft_ms"] for m in per_turn_metrics[baseline_idx]])
                  if baseline_idx is not None else None)
 cold_idx = contiguous[0] if (contiguous and anchor_pos > 0) else None
 
+# #809: how many turns had NO measurable decode window, across the whole ramp.
+# A degenerate turn contributes no decode value at all — averaging in a
+# divide-by-epsilon is how eleven turns read 409,726 -> 1,808,323 TPS.
+degen_total = sum(1 for ti in contiguous for m in per_turn_metrics[ti]
+                  if m.get("decode_degenerate"))
+turns_total = sum(len(per_turn_metrics[ti]) for ti in contiguous)
+gran, gran_why = classify_granularity(turns_total, degen_total)
+
 for turn_idx in contiguous:
     ms_list = per_turn_metrics[turn_idx]
     ttfts = [m["ttft_ms"] for m in ms_list]
-    tpss  = [m["decode_tps"] for m in ms_list if m["decode_tps"] > 0]
+    # Exclude BOTH the unmeasurable turns (None) and the silent-empty ones (0).
+    tpss  = [m["decode_tps"] for m in ms_list
+             if m["decode_tps"] is not None and m["decode_tps"] > 0]
+    degen = sum(1 for m in ms_list if m.get("decode_degenerate"))
     ptoks = [m["prompt_tokens"] for m in ms_list]
     mean_ttft = s.mean(ttfts)
     std_ttft  = s.stdev(ttfts) if len(ttfts) > 1 else 0
-    mean_tps  = s.mean(tpss) if tpss else 0
+    mean_tps  = s.mean(tpss) if tpss else None
     mean_ptok = s.mean(ptoks)
 
     note = ""
@@ -374,7 +477,33 @@ for turn_idx in contiguous:
         elif ratio > 1.4:
             note = f"~  TTFT {ratio:.1f}× warm-baseline"
 
-    print(f"  {turn_idx+1:<5} {mean_ptok:>10,.0f} {mean_ttft:>9.0f} {std_ttft:>6.0f} {mean_tps:>11.1f}  {note}")
+    if mean_tps is None:
+        tcol = f"{'n/a':>11}"
+        # State the exclusion — a sample that vanishes silently is its own defect.
+        note = (f"decode window unmeasurable on {degen}/{len(ms_list)} run(s) of this turn"
+                + (f" · {note}" if note else ""))
+    else:
+        tcol = f"{mean_tps:>11.1f}"
+        if degen:
+            note = (f"decode_TPS over {len(tpss)}/{len(ms_list)} run(s) "
+                    f"({degen} unmeasurable)" + (f" · {note}" if note else ""))
+    print(f"  {turn_idx+1:<5} {mean_ptok:>10,.0f} {mean_ttft:>9.0f} {std_ttft:>6.0f} {tcol}  {note}")
+
+# --- decode-granularity verdict (#809) --------------------------------------
+# Stated once, after the table, so a reader who scrolls to the numbers cannot
+# take a `n/a` column for a broken run or a low figure for a slow model.
+if degen_total:
+    print(f"\n  decode-window  unmeasurable on {degen_total}/{turns_total} turn(s) "
+          f"(decode window < {DEGEN_WINDOW_FRAC:.0%} of wall).")
+    print("                 Those turns are EXCLUDED from every decode_TPS above; their honest")
+    print("                 throughput figure is wall TPS, which INCLUDES prefill.")
+if gran == "canvas":
+    print(f"\n  ⚠ CANVAS GRANULARITY ({gran_why})")
+    print("    dLLM: block emission, decode window undefined. decode_TPS is NOT a decode rate")
+    print("    for this model class — the HEADLINE number is wall TPS (#809). The TTFT curve")
+    print("    below is unaffected: TTFT is measured, not derived.")
+    if GRANULARITY == "auto":
+        print("    Set DECODE_GRANULARITY=token if this model really is autoregressive.")
 
 # TTFT growth analysis — anchored to the first warm turn (cold-start excluded)
 if baseline_idx is not None and contiguous[-1] != baseline_idx:

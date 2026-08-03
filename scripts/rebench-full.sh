@@ -14,6 +14,8 @@
 # Order matches docs/QUALITY_TEST.md "test pipeline":
 #   0. verify-full.sh          — functional preflight, FAIL-FAST (~2 min)
 #   1. bench.sh                — TPS narrative + code (~5 min)
+#   1b. bench-agentic.sh       — multi-turn prefill curve (~8 min) [#805 parity]
+#   1c. concurrency-probe.sh   — N=1 control + N=2/4 rungs (~5 min) [#805 parity]
 #   2. verify-stress.sh        — long-context + boundary (~10-15 min)
 #   3. 8-pack quality          — OPT-IN, skipped by default (#338). Enable with
 #      --with-8pack-thinking[=off|on|both]:
@@ -93,6 +95,15 @@
 #                       (finish_reason=length before the final answer).
 #
 
+# Force Python's UTF-8 mode (PEP 540) for every python3 this script runs.
+# Repo sources are full of unicode (— × → ⚠), and without this a rig on a real
+# non-UTF-8 locale (de_DE.iso88591 and friends) decodes reads, stdout AND argv
+# with the locale codec, which crashes the launcher/emit paths (#779). Python
+# already auto-enables UTF-8 mode for the C/POSIX locale, so this covers the
+# case it does NOT: a genuine non-UTF-8, non-C locale. Exported, so child
+# processes and nested scripts inherit it. Guarded by test-locale-utf8.sh.
+export PYTHONUTF8="${PYTHONUTF8:-1}"
+
 set -euo pipefail
 
 # --- canonical cwd ----------------------------------------------------------
@@ -102,6 +113,68 @@ set -euo pipefail
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
+# --- usage / help -----------------------------------------------------------
+# Self-contained heredoc (NOT `sed "$0"`, which breaks after the cd above when
+# invoked via a relative path from another cwd, and truncated the env section).
+usage() {
+  cat <<'EOF'
+rebench-full.sh — canonical full-eval orchestrator for the running model.
+
+Fail-fast verify-full preflight + measured steps in docs/QUALITY_TEST.md pipeline
+order, with the recurring manual-run mistakes guarded (cwd, MODEL= 404, hermes
+localhost env, port, --resume idempotency). Artifacts land in results/rebench/<tag>/.
+
+PIPELINE
+  0. verify-full     functional preflight, FAIL-FAST                      (~2 min)
+  1. bench           narrative + code TPS                                 (~5 min)
+  1b. bench-agentic  multi-turn prefill curve (agent workload)            (~8 min)
+  1c. concurrency    N=1 control + N=2/4 rungs, capped at served slots    (~5 min)
+  2. verify-stress   long-context NIAH ladder + boundary                  (~10-15 min)
+  3. 8-pack quality  OPT-IN via --with-8pack-thinking (needs benchlocal)  (~45-90 min/pass)
+  4. soak            multi-turn VRAM stability                            (~15-20 min)
+  -> REPORT.md + REPORT-discuss.md synthesized at the end.
+
+USAGE
+  bash scripts/rebench-full.sh [OPTIONS]
+
+OPTIONS
+  --with-8pack-thinking[=off|on|both]
+                  Add the behavioral 8-pack (/150). off=reasoning-OFF,
+                  on=reasoning-ON, both=both passes (production-promotion gate).
+                  Omit to run structural gates only (~35-45 min). Requires
+                  benchlocal-cli + sandbox images (see docs/QUALITY_TEST.md).
+  --with-concurrency-deep
+                  Add the mixed-regime rung to the concurrency step: N=4 x 10K
+                  prompts. Off by default (slow) — but it is the rung that
+                  caught the 60.2-vs-16.3 regime split, so run it before
+                  publishing a concurrency claim.
+  --tag NAME      Output-dir basename (default: <model>-YYYYMMDD-HHMM).
+  --skip CSV      Skip phases (comma-sep): verify-full,bench,bench-agentic,
+                  concurrency,verify-stress,soak.
+  --resume        Skip steps that already have artifacts (idempotent).
+  --url URL       Target any OpenAI-compatible endpoint; skips container
+                  autodetect and runs host-only (CONTAINER=none).
+  --model NAME    Served-model-name (default: GET /v1/models).
+  --engine KIND   vllm|llama-cpp|sglang|other (use with --url).
+  -h, --help      Show this help and exit.
+
+ENV OVERRIDES (rarely needed — preflight autodetects our composes)
+  URL MODEL TAG OUT_DIR · SOAK_SESSIONS (10) · SOAK_TURNS (5)
+  MAX_TOKENS (both 8-pack passes) · THINKING_MAX_TOKENS (reasoning-ON pass)
+  SAMPLING_FROM_SERVER (inherit serving sampling; tags runs non-canonical)
+  AGENTIC_SESSIONS (1) · AGENTIC_TURNS (12)
+  CONCURRENCY_RUNGS ("1 2 4", auto-capped at the served slot count) ·
+  CONCURRENCY_PROMPT_TOKENS (256) · CONCURRENCY_GEN_TOKENS (256) ·
+  CONCURRENCY_ROUNDS (3)
+
+EXAMPLES
+  bash scripts/rebench-full.sh                             # structural gates only
+  bash scripts/rebench-full.sh --with-8pack-thinking=both  # + full 8-pack off+on
+  bash scripts/rebench-full.sh --url http://localhost:8020 --model tess-4-27b --engine llama-cpp
+  bash scripts/rebench-full.sh --resume                    # continue an interrupted run
+EOF
+}
+
 # --- args -------------------------------------------------------------------
 SKIP_CSV=""
 RESUME=0
@@ -110,9 +183,11 @@ URL_FLAG=""
 MODEL_FLAG=""
 ENGINE_FLAG=""
 WITH_8PACK=""   # #338: 8-pack quality opt-in — "" (omit)=skip | off | on | both
+WITH_CONCURRENCY_DEEP=0   # #805: the slow N=4 x 10K mixed-regime rung
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --skip)     SKIP_CSV="$2"; shift 2 ;;
+    --with-concurrency-deep) WITH_CONCURRENCY_DEEP=1; shift ;;
     --tag)      TAG_OVERRIDE="$2"; shift 2 ;;
     --resume)   RESUME=1; shift ;;
     --url)      URL_FLAG="$2"; shift 2 ;;
@@ -121,7 +196,7 @@ while [[ $# -gt 0 ]]; do
     --with-8pack-thinking)    WITH_8PACK="off"; shift ;;
     --with-8pack-thinking=*)  WITH_8PACK="${1#*=}"; shift ;;
     -h|--help)
-      sed -n '2,55p' "$0"
+      usage
       exit 0
       ;;
     *)
@@ -220,6 +295,8 @@ echo "  out dir:     $OUT_DIR"
 echo "  resume:      $RESUME"
 echo "  skips:       ${SKIP_CSV:-(none)}"
 echo "  8-pack:      ${WITH_8PACK:-(skipped — opt-in via --with-8pack-thinking=off|on|both)}"
+echo "  agentic:     bench-agentic.sh (sessions=${AGENTIC_SESSIONS:-1}, turns=${AGENTIC_TURNS:-12})"
+echo "  concurrency: rungs ${CONCURRENCY_RUNGS:-1 2 4 (capped at served slots)}$([[ "$WITH_CONCURRENCY_DEEP" == "1" ]] && echo " + deep N=4×10K" || echo " (deep rung off — --with-concurrency-deep)")"
 echo "  hermes env:  BENCHLOCAL_HERMES_RESOLVE_LOCALHOST=${BENCHLOCAL_HERMES_RESOLVE_LOCALHOST:-0}"
 echo "  thinking:    ${ENABLE_THINKING:-0}${THINKING_MAX_TOKENS:+ (max_tokens=$THINKING_MAX_TOKENS)}"
 echo "==============================================================="
@@ -323,10 +400,95 @@ if ! URL="$URL" MODEL="$MODEL" \
 fi
 
 # --- step 1: bench ----------------------------------------------------------
-URL="$URL" MODEL="$MODEL" RUNS="${RUNS:-3}" WARMUPS="${WARMUPS:-1}" \
+# Defaults match bench.sh's protocol (5 measured / 3 warm). The old
+# RUNS:-3 / WARMUPS:-1 overrides here silently under-ran the protocol on
+# every orchestrated gate (the A1 "n=3 env leak" was actually this line).
+URL="$URL" MODEL="$MODEL" RUNS="${RUNS:-5}" WARMUPS="${WARMUPS:-3}" \
   ENABLE_THINKING="${ENABLE_THINKING:-0}" \
   run_step bench "$OUT_DIR/bench.log" \
     bash "$ROOT_DIR/scripts/bench.sh" || true
+
+# --- step 1b: bench-agentic (multi-turn prefill curve) ----------------------
+# #805 parity: report.sh --agentic/--full has always run this; rebench — the
+# CANONICAL eval pipeline — did not, so the pipeline that produces BENCHMARKS
+# rows captured strictly less than the paste-bundle did, and the docs had to
+# tell people to run report.sh --agentic afterwards to fill the gap.
+# Curve-shape producer, not a TPS number: single-prompt bench.sh cannot see the
+# incremental-prefill cost that dominates every agent turn past ~5.
+URL="$URL" MODEL="$MODEL" \
+  SESSIONS="${AGENTIC_SESSIONS:-1}" TURNS="${AGENTIC_TURNS:-12}" \
+  run_step bench-agentic "$OUT_DIR/bench-agentic.log" \
+    bash "$ROOT_DIR/scripts/bench-agentic.sh" || true
+
+# --- step 1c: concurrency probe ---------------------------------------------
+# #805 (scope addition): the rung that catches a regime split — a config can
+# look fine at N=1 and collapse at N=4 (the 60.2-vs-16.3 case). ENGINE-AWARE and
+# reboot-free: the server's own slot count is the ceiling, we probe what is
+# served rather than re-launching it. Rungs above the served slot count would
+# measure QUEUE WAIT and report it as concurrency (the #818 mislabeling), so
+# they are dropped with the reason stated.
+concurrency_rungs() {
+  local slots="" src="" cmd="" rungs=(1) n
+  if [[ "${CONTAINER:-}" != "none" ]] && command -v docker >/dev/null 2>&1 \
+     && [[ -n "${CONTAINER_NAME:-}" ]]; then
+    cmd="$(docker inspect "$CONTAINER_NAME" --format '{{join .Config.Cmd " "}}' 2>/dev/null || true)"
+    slots="$(command grep -oE 'max-num-seqs [0-9]+' <<<"$cmd" | command grep -oE '[0-9]+' | head -1 || true)"
+    [[ -n "$slots" ]] && src="container max-num-seqs"
+    if [[ -z "$slots" ]]; then
+      slots="$(command grep -oE '\-np +[0-9]+' <<<"$cmd" | command grep -oE '[0-9]+' | head -1 || true)"
+      [[ -n "$slots" ]] && src="container -np"
+    fi
+  fi
+  if [[ -z "$slots" ]]; then
+    slots="$(curl -s -m 3 "${URL}/props" 2>/dev/null \
+      | python3 -c 'import json,sys; v=json.load(sys.stdin).get("total_slots",""); print(v if isinstance(v,int) else "")' 2>/dev/null || true)"
+    [[ -n "$slots" ]] && src="server /props total_slots"
+  fi
+
+  if [[ -z "$slots" ]]; then
+    # Not fatal here (unlike concurrency-probe.sh's own detection, which gates a
+    # validation verdict) — but we will not INVENT rungs the server may not have.
+    echo "[concurrency] served slot count undetected (no container cmd, no /props total_slots)."
+    echo "[concurrency] running the N=1 control only — pass CONCURRENCY_RUNGS='1 2 4' to override."
+    slots=1; src="undetected"
+  else
+    echo "[concurrency] served slots: ${slots} (detected: ${src})"
+  fi
+
+  for n in 2 4; do
+    if [[ "$n" -le "${slots:-1}" ]]; then rungs+=("$n"); else
+      echo "[concurrency] rung N=${n} dropped — above the served slot count (${slots}); it would measure queue wait, not concurrency."
+    fi
+  done
+  # Explicit override wins over detection, for a server whose slots we can't read.
+  if [[ -n "${CONCURRENCY_RUNGS:-}" ]]; then
+    read -ra rungs <<<"$CONCURRENCY_RUNGS"
+    echo "[concurrency] rungs overridden: ${rungs[*]}"
+  fi
+
+  local rc=0
+  for n in "${rungs[@]}"; do
+    echo
+    echo "───────────────── concurrency rung N=${n} ─────────────────"
+    URL="$URL" MODEL="$MODEL" CONCURRENCY="$n" \
+      PROMPT_TOKENS="${CONCURRENCY_PROMPT_TOKENS:-256}" \
+      GEN_TOKENS="${CONCURRENCY_GEN_TOKENS:-256}" \
+      ROUNDS="${CONCURRENCY_ROUNDS:-3}" \
+      bash "$ROOT_DIR/scripts/concurrency-probe.sh" || rc=$?
+  done
+  # The mixed-regime rung: N=4 x 10K prompts. OFF by default — it is slow, and
+  # it is the one that caught the 60.2-vs-16.3 split, so it is worth the opt-in.
+  if [[ "$WITH_CONCURRENCY_DEEP" == "1" ]]; then
+    echo
+    echo "───────────────── concurrency DEEP rung (N=4 × 10K prompts) ─────────────────"
+    URL="$URL" MODEL="$MODEL" CONCURRENCY=4 \
+      PROMPT_TOKENS=10000 GEN_TOKENS="${CONCURRENCY_GEN_TOKENS:-256}" \
+      ROUNDS="${CONCURRENCY_ROUNDS:-3}" \
+      bash "$ROOT_DIR/scripts/concurrency-probe.sh" || rc=$?
+  fi
+  return 0   # a rung that misses a gate is DATA, not a pipeline failure
+}
+run_step concurrency "$OUT_DIR/concurrency.log" concurrency_rungs || true
 
 # --- step 2: verify-stress --------------------------------------------------
 URL="$URL" MODEL="$MODEL" \
@@ -412,3 +574,134 @@ echo "  soak:          grep -E 'verdict|silent_empty|p50_decode' $OUT_DIR/soak.l
 echo
 echo "To submit your numbers (review then PR):"
 echo "  bash scripts/submit-bench.sh --tag $TAG"
+
+# --- measurement record + baseline-induction prompt (catalog-baselines slice 2) ---
+# Auto-emit the #249 measurement record into the per-rig corpus when the served
+# container EXACT-matches a registry slug (identity semantics — a port/substring
+# match is a shape guess and must not stamp another slug's record; see the c3
+# detect layer). BYO/swap serves have no registry identity → skipped with a note.
+if [[ -f "$OUT_DIR/bench.log" ]] && command -v python3 >/dev/null 2>&1; then
+  OUT_DIR="$OUT_DIR" TAG="$TAG" python3 - <<'PY_RECORD' || true
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+root = Path(__file__).resolve().parent if "__file__" in dir() else Path.cwd()
+sys.path.insert(0, str(Path.cwd()))
+try:
+    from scripts.lib.profiles.compose_registry import COMPOSE_REGISTRY
+    from scripts.lib.profiles.measurement_record import (
+        build_record, parse_bench_output, write_record,
+    )
+except Exception as exc:  # pragma: no cover - env without the profiles tree
+    print(f"  record:      skipped (profiles unavailable: {exc})")
+    raise SystemExit(0)
+
+out_dir = Path(os.environ["OUT_DIR"])
+tag = os.environ["TAG"]
+
+# EXACT container -> slug (never port/substring).
+slug = None
+try:
+    names = subprocess.run(
+        ["docker", "ps", "--format", "{{.Names}}"],
+        capture_output=True, text=True, timeout=10,
+    ).stdout.split()
+    norm = {n.replace("_", "-") for n in names}
+    for s, e in COMPOSE_REGISTRY.items():
+        # container name = the compose's container_name default
+        try:
+            txt = Path(e["compose_path"]).read_text(errors="replace")
+        except OSError:
+            continue
+        m = re.search(r'container_name:\s*"?(?:\$\{[^:}]*:-)?([A-Za-z0-9._-]+)\}?"?', txt)
+        if m and m.group(1).replace("_", "-") in norm:
+            slug = s
+            break
+except Exception:
+    pass
+
+if not slug:
+    print("  record:      skipped — no running container exact-matches a registry slug")
+    raise SystemExit(0)
+
+
+def _quality(path: Path):
+    try:
+        q = json.loads(path.read_text())
+        p = sum(int(x.get("passed") or 0) for x in q.get("packs") or [])
+        t = sum(int(x.get("total") or 0) for x in q.get("packs") or [])
+        return f"{p}/{t}" if t else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+# Fingerprint enrichment — the cohort keys the corpus joins/staleness rely on.
+engine_pin = None
+try:
+    from scripts.lib.profiles.compat import load_profiles
+    from scripts.lib.profiles.launch_compat import ProfileError, resolve_variant_pin
+
+    exports = resolve_variant_pin(load_profiles(), slug)
+    if "VLLM_NIGHTLY_SHA" not in exports:
+        engine_pin = next(iter(exports.values()))
+except Exception:
+    pass
+if not engine_pin:
+    try:
+        txt = Path(COMPOSE_REGISTRY[slug]["compose_path"]).read_text(errors="replace")
+        m = re.search(r'^\s*image:\s*["\x27]?(?:\$\{[A-Z_0-9]+:-)?([^\s}"\x27]+)\}?', txt, re.M)
+        engine_pin = m.group(1) if m else None
+    except OSError:
+        pass
+
+hardware = None
+power_cap = None
+try:
+    rows = subprocess.run(
+        ["nvidia-smi", "--query-gpu=name,power.limit", "--format=csv,noheader,nounits"],
+        capture_output=True, text=True, timeout=10,
+    ).stdout.strip().splitlines()
+    if rows:
+        name = rows[0].split(",")[0].strip()
+        m = re.search(r"RTX\s*(\d{4})", name)
+        hardware = f"rtx-{m.group(1)}" if m else None
+        power_cap = round(float(rows[0].split(",")[1]))
+except Exception:
+    pass
+
+try:
+    metrics = parse_bench_output((out_dir / "bench.log").read_text(errors="replace"))
+    soak = "not-run"
+    soak_log = out_dir / "soak.log"
+    if soak_log.is_file():
+        soak = "pass" if re.search(r"verdict\s+PASS", soak_log.read_text(errors="replace")) else "fail"
+    rec = build_record(
+        tag=slug, bench_metrics=metrics,
+        hardware=hardware, engine_pin=engine_pin, power_cap_w=power_cap,
+        smoke_status="pass",   # rebench aborts at step 0 unless verify-full passed
+        soak_status=soak,
+    )
+    q_off = _quality(out_dir / "quality-full.json")
+    q_on = _quality(out_dir / "quality-full-thinking.json")
+    if q_off:
+        rec["measured_extensions"]["quality_8pk"] = q_off
+    if q_on:
+        rec["measured_extensions"]["quality_8pk_think_on"] = q_on
+    rec["_rebench_tag"] = tag
+    from datetime import datetime, timezone
+    rec["_recorded_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    path = write_record(rec)
+    print(f"  record:      corpus record appended -> {path}  (slug {slug})")
+except Exception as exc:
+    print(f"  record:      skipped ({exc})")
+    raise SystemExit(0)
+
+print()
+print("To induct these numbers as the slug's SHIPPED baseline (review then PR):")
+print(f"  bash scripts/catalog-baseline.sh {slug} --from-tag {tag}")
+PY_RECORD
+fi

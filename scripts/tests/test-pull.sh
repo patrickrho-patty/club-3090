@@ -23,6 +23,15 @@
 # goldens and an injected d_runner for the dry-run-refusal golden.
 set -euo pipefail
 
+# Force Python's UTF-8 mode (PEP 540) for every python3 this script runs.
+# Repo sources are full of unicode (— × → ⚠), and without this a rig on a real
+# non-UTF-8 locale (de_DE.iso88591 and friends) decodes reads, stdout AND argv
+# with the locale codec, which crashes the launcher/emit paths (#779). Python
+# already auto-enables UTF-8 mode for the C/POSIX locale, so this covers the
+# case it does NOT: a genuine non-UTF-8, non-C locale. Exported, so child
+# processes and nested scripts inherit it. Guarded by test-locale-utf8.sh.
+export PYTHONUTF8="${PYTHONUTF8:-1}"
+
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 export PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}"
@@ -350,6 +359,13 @@ check(r.stratum is P.Stratum.DERIVER
       and r.abort_reason == "unsupported-format" and not r.ok,
       f"g12: no safetensors -> stratum-1 unsupported-format "
       f"(got {r.stratum.name}/{r.abort_reason})")
+
+# g12a-hint: the CLI prints an actionable GGUF hint on this abort (the
+# 2026-07-27 triage class — bare pull.sh on a *-GGUF repo read as broken).
+h = "\n".join(P._unsupported_format_hint(s))
+check("route-G" in h and f"hf download {s}" in h
+      and "Run a local GGUF without the catalog" in h,
+      "g12a-hint: unsupported-format hint carries route-G + hf download + doc pointer")
 
 # g12b: multiple top-level safetensors, no index -> ambiguous-weight-set.
 s = "fixtures/ambiguous"

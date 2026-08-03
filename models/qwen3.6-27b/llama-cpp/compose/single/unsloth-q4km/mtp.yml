@@ -30,7 +30,7 @@
 # If you don't need image input, this is the better MTP profile.
 #
 # Template: native (GGUF-embedded) + `--reasoning off` + `--reasoning-format
-# deepseek` — the stack-wide thinking-off lever. We A/B'd froggeric v19 here
+# deepseek` — the stack-wide thinking-off lever. We A/B'd froggeric (pinned) here
 # (it loads + honours --reasoning off fine on b9246 — the old "froggeric
 # suppresses --reasoning off" lore is stale), but it REGRESSED the 8-pack
 # 102 → 95 on mainline llama.cpp. froggeric helps the vLLM/Qwen3-Next path,
@@ -83,11 +83,11 @@ services:
     # regressed at b9282 (broken lib packaging: `libllama-common.so.0: cannot
     # open shared object file` → crash loop) — see #187. Bump via env when a
     # newer build is validated:  LLAMACPP_IMAGE=ghcr.io/ggml-org/llama.cpp:server-cuda-bXXXX
-    image: ${LLAMACPP_IMAGE:-ghcr.io/ggml-org/llama.cpp:server-cuda-b9246}
+    image: ${LLAMACPP_IMAGE:-ghcr.io/ggml-org/llama.cpp:server-cuda-b9967}
     container_name: "${ESTATE_CONTAINER:-llama-cpp-qwen36-27b}"
     restart: unless-stopped
     ports:
-      - "${ESTATE_PORT:-${PORT:-8020}}:8080"
+      - "${BIND_HOST:-0.0.0.0}:${ESTATE_PORT:-${PORT:-8020}}:8080"
     volumes:
       - "${MODEL_DIR:-../../../../../../models-cache}:/models:ro"
     # ⚠ -np 1 is intentional on a single 24 GB card — do NOT raise it to

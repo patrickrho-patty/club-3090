@@ -26,11 +26,12 @@
 #
 # Usage:
 #   CONTAINER=<your-container> bash scripts/verify-full.sh
+#   MTP_ACCEPT_MIN=1.8 bash scripts/verify-full.sh  # profile-specific measured floor
 #
 # Env (optional):
 #   URL          Default: http://localhost:8020
 #   MODEL        Default: auto-detected from the endpoint's /v1/models, else
-#                qwen3.6-27b-autoround
+#                qwen3.6-27b
 #   CONTAINER    Default: vllm-qwen36-27b
 #   SKIP_TOOLS   Set to 1 to skip the tool-call test entirely (useful when
 #                running against the default config which is known to fail
@@ -42,6 +43,15 @@
 #                TTFT mean+std+CV. Adds ~1-2 minutes.
 
 set -euo pipefail
+
+# Force Python's UTF-8 mode (PEP 540) for every python3 this script runs.
+# Repo sources are full of unicode (— × → ⚠), and without this a rig on a real
+# non-UTF-8 locale (de_DE.iso88591 and friends) decodes reads, stdout AND argv
+# with the locale codec, which crashes the launcher/emit paths (#779). Python
+# already auto-enables UTF-8 mode for the C/POSIX locale, so this covers the
+# case it does NOT: a genuine non-UTF-8, non-C locale. Exported, so child
+# processes and nested scripts inherit it. Guarded by test-locale-utf8.sh.
+export PYTHONUTF8="${PYTHONUTF8:-1}"
 
 RUN_BENCH=0
 for arg in "$@"; do
@@ -62,7 +72,7 @@ URL="${URL:-http://localhost:8020}"
 # Resolve the served model from /v1/models when MODEL is unset (#372). The qwen
 # literal below is only a last resort if detection no-ops (endpoint unreachable).
 declare -F preflight_autodetect_model >/dev/null && preflight_autodetect_model
-MODEL="${MODEL:-qwen3.6-27b-autoround}"
+MODEL="${MODEL:-qwen3.6-27b}"
 CONTAINER="${CONTAINER:-vllm-qwen36-27b}"
 
 pass() { printf "  \033[32m✓\033[0m %s\n" "$1"; }
@@ -500,9 +510,10 @@ except Exception as e:
 run_check "output_quality" check_output_quality
 
 # --------------------------------------------------------------------
-# 10. MTP acceptance length — assert spec-decode is contributing speedup.
-#     Mean AL >= 2.0 means each step accepts >=1 drafted token on average
-#     (target_only baseline = 1.0). Production sees AL 3.4-3.8 with n=3.
+# 10. MTP acceptance length — assert spec-decode is contributing.
+#     The default floor is 2.0 (target_only baseline = 1.0); production Qwen
+#     profiles see AL 3.4-3.8 with n=3. MTP_ACCEPT_MIN permits a profile-specific
+#     measured floor when a shallower drafter is independently throughput-positive.
 # --------------------------------------------------------------------
 check_mtp_acceptance() {
   echo "[9/9] MTP acceptance length threshold ..."
@@ -557,11 +568,21 @@ check_mtp_acceptance() {
     return 0
   fi
 
-  if python3 -c "import sys; sys.exit(0 if float('$al') >= 2.0 else 1)" 2>/dev/null; then
-    pass "MTP acceptance length = ${al} (>=2.0 — spec-decode contributing)"
+  local accept_min="${MTP_ACCEPT_MIN:-}"
+  if [[ -z "$accept_min" && "$CONTAINER" != "none" ]] && command -v docker >/dev/null 2>&1; then
+    accept_min="$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$CONTAINER" 2>/dev/null \
+      | awk -F= '$1 == "MTP_ACCEPT_MIN" {print $2; exit}')"
+  fi
+  accept_min="${accept_min:-2.0}"
+  if ! [[ "$accept_min" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    fail "invalid MTP_ACCEPT_MIN=${accept_min}" "Set a non-negative numeric threshold."
+    return 1
+  fi
+  if python3 -c "import sys; sys.exit(0 if float('$al') >= float('$accept_min') else 1)" 2>/dev/null; then
+    pass "MTP acceptance length = ${al} (>=${accept_min} — spec-decode contributing)"
   else
-    fail "MTP acceptance length = ${al} (<2.0 — spec-decode degraded or off)" \
-         "Either MTP routing broken (P65 not active?) or accept rate collapsed. Check spec_decode kernel + Genesis env vars."
+    fail "MTP acceptance length = ${al} (<${accept_min} — below this profile's floor)" \
+         "Check MTP routing and the profile's measured acceptance/throughput evidence."
   fi
 }
 run_check "mtp" check_mtp_acceptance

@@ -2,7 +2,7 @@
 
 You have **3 or more GPUs** and want to know if club-3090 applies. Short
 answer: yes. We ship a community-validated 4×3090 fp8/MTP baseline (now the
-`vllm/qwen-27b-multi-fast` slug) plus a matching FP8 + int8-PTH "max accuracy"
+`vllm/qwen-27b-multi-fast` slug) plus a matching FP8 + fp8/e4m3 "max accuracy"
 variant (`vllm/qwen-27b-multi-max`), and keep other 3+ GPU configs as derivation
 recipes until someone measures them. This page explains what scales (and what
 doesn't) when going beyond TP=2, the constraints to know, and how to derive your
@@ -39,10 +39,129 @@ own compose when the shipped `multi4` composes aren't your topology.
 1. **More cards = much more headroom**, especially for long-context
    single-prompt workloads. On TP=4 the 24 GB-per-card pressure that
    drives Cliff 2 disappears entirely — weights and KV pool both split.
-2. **Per-stream TPS doesn't scale** without NVLink. PCIe NCCL all-reduce
-   overhead grows with TP count; per-stream decode at TP=4 may be
-   *lower* than TP=2. Aggregate concurrent throughput still scales, but
-   you don't get faster single-stream answers from more PCIe cards.
+2. **Per-stream TPS doesn't scale *on our recipes*** — but read the scoping
+   below before treating that as a law of PCIe.
+
+> [!IMPORTANT]
+> **⚠️ Scoped 2026-07-26.** This bullet used to read *"Per-stream TPS doesn't
+> scale without NVLink. PCIe NCCL all-reduce overhead grows with TP count;
+> per-stream decode at TP=4 may be lower than TP=2."* That states a **topology
+> law**, and it isn't one — it's a property of the **recipe** we measure on.
+>
+> Every shipped config in the table above runs **MTP K=3 speculative decoding**.
+> [@alesha-pro](https://github.com/noonghunna/club-3090/discussions/773) ran the
+> same TP sweep on 4× 3090 with **no spec decoding at all** and got the opposite
+> result. Decode tok/s, Qwen3.6-27B fp8, single stream:
+>
+> | | TP=2 | TP=4 | scaling |
+> |---|--:|--:|--:|
+> | **no spec** (@alesha-pro, 220 W, patched P2P) | 38.07 | 61.60 | **+62%** |
+> | **MTP n=3** (our shipped configs) | 70.7 <sup>a</sup> | 74.76 <sup>b</sup> | **+5.7%** |
+>
+> <sup>a</sup> `vllm/qwen-27b-dual-fast`, v0.24.0 · <sup>b</sup> `vllm/qwen-27b-multi-fast`, @ryanmpelletier 4× 3090 all-x16, v0.24.0
+>
+> **Both are correct.** vLLM TP scaling is real; our TP=2 baseline just already
+> has ~1.85× of drafter folded into it, so there's nothing left for cards 3 and 4
+> to recover. The decisive number: **his TP=4 (61.60) lands 13% *below* our TP=2
+> (70.7).**
+>
+> So the *practical* advice survives — **on a PCIe rig you buy single-stream speed
+> with a drafter, not with more cards** — but the stated *mechanism* (all-reduce
+> overhead growing with TP) is not what either dataset shows. Ours shows TP=4 ≈
+> TP=2, not TP=4 < TP=2.
+>
+> **Confirmed by measurement 2026-07-27 — the matched-recipe pair.** The clean
+> test this section was waiting for: same rig, same sitting, same 220 W on every
+> card, same weights and image (v0.25.1), **MTP n=3 on *both* arms**,
+> `switch.sh` + `bench.sh`, ~20 minutes apart
+> ([@alesha-pro again](https://github.com/noonghunna/club-3090/discussions/773)):
+>
+> | | TP=2 `dual-fast` | TP=4 `multi-fast` | Δ |
+> |---|--:|--:|--:|
+> | narrative decode TPS | 79.26 (CV 4.1%) | 82.44 (CV 3.2%) | **+4.0%** |
+> | code decode TPS | 106.50 (CV 6.2%) | 103.73 (CV 1.7%) | **−2.6%** |
+> | prefill @10K tok/s | 1556 (CV 0.1%) | 2407 (CV 0.1%) | **+54.6%** |
+> | prefill @90K tok/s | 1202 (CV 0.6%) | 1948 (CV 0.5%) | **+62.0%** |
+> | TTFT @90K | 73.1 s | 45.6 s | **−37.6%** |
+>
+> Decode is flat — reproducing the cross-rig +5.7%/−2.9% above within ~2 points,
+> from one rig in one sitting. Recipe-not-topology is now *measured*, not
+> inferred. **And the number that changes the guidance: cards 3 and 4 buy
+> prefill and TTFT, not decode.** A 90K-token prompt starts answering 27 seconds
+> sooner on four cards; the tokens then stream no faster. (Same shape as the
+> NVLink A/B in [#698](https://github.com/noonghunna/club-3090/issues/698) —
+> decode +3–5%, prefill +35–49% — with a larger prefill term.) Two caveats
+> carried from the report: the TP=2 arm runs vLLM's custom all-reduce and the
+> TP=4 arm cannot (engine-gated at >2 PCIe GPUs —
+> [#786](https://github.com/noonghunna/club-3090/issues/786); every
+> dual-vs-multi4 comparison shares this asymmetry, recorded as Rig-cell field 4
+> in BENCHMARKS), and the cross-*version* question is **resolved (2026-07-27)**:
+> our first-party v0.25.1 re-run reproduces the v0.24.0 numbers (decode
+> 68.5/92.1 vs 70.7/93.5, at 230 W vs stock caps — flat within power+CV
+> noise), so the +11–16% by which the #773 rig's dual arm beats ours is
+> **rig-side, not the engine** — their TP=2 runs custom all-reduce +
+> transfer-verified P2P; ours runs neither. That difference matching the ~15%
+> they measured for custom-AR alone is the strongest hint yet of what the
+> interconnect stack is worth at TP=2.
+>
+> One engine caveat from the same report: this is a **vLLM** property. On the
+> llama.cpp leg (tensor-split, not TP) the same box gained only 3–13% going 2→4,
+> with a repeat spread wide enough to swamp it (Q8_0 gave 52.9 and 71.8 on
+> identical settings). If you're on a GGUF engine, "more cards ≠ faster per
+> stream" holds much more strongly.
+
+   Aggregate concurrent throughput still scales — see **Replication vs
+   tensor-parallel** below, which is usually the bigger lever.
+
+---
+
+## Replication vs tensor-parallel — the fork this page used to ignore
+
+Everything else on this page reasons in the **TP dimension**: how do I split one
+model across N cards? For **aggregate** throughput that is frequently the wrong
+question. If the model fits on one card, running **N independent instances**
+beats splitting it N ways — by a lot.
+
+Measured by [@alesha-pro](https://github.com/noonghunna/club-3090/discussions/773)
+on 4× 3090 PCIe, all arms matched at 220 W, peak aggregate tok/s
+(`--max-num-seqs 256 --enable-chunked-prefill`):
+
+| Model | TP=4, 1 instance | replicated | gain |
+|---|--:|--:|--:|
+| gemma-4-12B AWQ | 1,007 | **3,425** (TP=1 × 4) | **3.40×** |
+| Qwen3.6-27B INT8-W8A8 | 358 | **741** (TP=2 × 2) | 2.07× |
+| Qwen3.6-27B INT4 | 307 | **737** (TP=2 × 2) | 2.40× |
+
+**The rule of thumb: latency wants max TP, throughput wants max instances.**
+(@alesha-pro's phrasing.) Same cards, same weights, opposite answer depending on
+which you're optimizing.
+
+The trap is that **the same run flips winner** depending on which number you
+read. AutoRound INT4 on that rig, one sitting, one power cap:
+
+| | TP=2 | TP=4 |
+|---|--:|--:|
+| single stream (wall) | 53.80 | **69.26** |
+| aggregate peak @ c=64 | **473.1** | 294.8 |
+
+TP=4 is **29% faster for one user and 38% slower for a full queue.** So "which
+TP should I run" has no answer without "for what workload".
+
+**This agrees with what we measured from the concurrency side.** Our own sweep
+(2026-07-10, 2× 3090, agent-shaped 16K prompts) found the dense 27B's batching
+knee at **N=2** — decode-aggregate *halves* by N=8, because per-stream falls
+faster than N grows. Meanwhile the 35B-A3B MoE holds ~250–270 flat to N=16.
+Same lesson from the other direction: past a low N, stop feeding one big engine
+and start adding engines. See the concurrency sweep in
+[BENCHMARKS.md](../BENCHMARKS.md) and the FAQ entry on serving multiple coding
+agents.
+
+**Caveats before you replicate.** Each instance needs its own full weight copy
+(so the model must fit on one card *with* a useful KV pool), its own port, and
+its own KV pool — you lose the pooled-KV benefit that is the main reason to run
+TP=4 for long-context single-prompt work. Replication is the answer for **many
+short-to-medium requests**; TP is the answer for **one very long one**. We don't
+ship a replication compose today — [PODS.md](PODS.md) is the closest thing.
 
 ---
 
@@ -66,6 +185,8 @@ for a subset.
 | `vram_matched_compute_mismatched` | Same VRAM, different compute tier | RTX 3090 + RTX 4090 | TP=N works correctly, but faster cards wait at NCCL allreduce. Estate planner is better for multi-model workloads. |
 | `vram_mismatched` | Different VRAM sizes | RTX 3060 12 GB + RTX 3090 24 GB | Prefer llama.cpp `--tensor-split`, manual PP=N experiments, or estate planner. Avoid TP=N across the full mismatched set. |
 | `heterogeneous_mixed` | Multiple VRAM and compute tiers | RTX 3060 + RTX 3090 + RTX 4090 | Manual selection. Run one model on the largest matched subset or use estate planner for separate endpoints. |
+
+> **Running several models at once** (the "estate planner / separate endpoints" rows above) is a **pod** workload — one model per GPU subset, managed with `pod.sh` or the c3 Operate tab. See **[PODS.md](PODS.md)**.
 
 ### Why TP=N is poor on VRAM-mismatched cards
 
@@ -194,18 +315,24 @@ since renamed `fp8-mtp.yml` → `mtp.yml`; config unchanged):
 
 (Validation thread: [discussion #26](https://github.com/noonghunna/club-3090/discussions/26), 2026-05-03.)
 
-### `vllm/qwen-27b-multi-max` — FP8 weights + int8-PTH KV (highest fidelity)
+### `vllm/qwen-27b-multi-max` — FP8 weights + fp8/e4m3 KV (highest fidelity)
 
 ```bash
 bash scripts/switch.sh vllm/qwen-27b-multi-max
 ```
 
 `multi4/fp8/mtp.yml` mirrors the 2-card `vllm/qwen-27b-dual-max`: official **FP8**
-weights (Marlin W8A16 on Ampere — memory win, no FP8 compute speedup) + **int8-PTH**
-KV (8-bit, higher fidelity than fast's fp8_e5m2) + MTP n=3 @ 262K. Validated via the
-dual-max proxy at TP=2 (KV pool **295K tok / 1.13×** @262K, MTP active) — the tight
-2-card KV pool is exactly what TP=4 relieves. **No 4-card bench on this layout yet**,
-and the quality A/B vs the fast tier is pending.
+weights (Marlin W8A16 on Ampere — memory win, no FP8 compute speedup) + **fp8/e4m3**
+KV (1 byte/token, FlashInfer backend, scale=1.0 on this checkpoint) + MTP n=3 @ 262K.
+**✅ Production** (2026-07-07) — validated on a clean v0.24.0 4-card rig:
+[#584](https://github.com/noonghunna/club-3090/issues/584) (@ryanmpelletier, 4× 3090
+x16) passed verify-full 9/9, verify-stress to 240K, soak-continuous, and the full 8-pack
+at **111/150** (ties the dual-max proxy 109 → quality is TP-invariant), corroborated by a
+2nd independent rig [#625](https://github.com/noonghunna/club-3090/issues/625) (@MoppelMat,
+mixed x4/x8 lanes). The 4 cards relieve the dual-max proxy's tight **295K-tok / 1.13×** KV
+pool → **6.77×** at TP=4; single-stream decode is ~flat vs the 2-card tier.
+
+> **KV decode-at-depth applies here too ([#594](https://github.com/noonghunna/club-3090/pull/594), [#595](https://github.com/noonghunna/club-3090/pull/595)).** `multi-max` now mirrors `dual-max` exactly: FP8 weights + `KV_CACHE_DTYPE=fp8` (e4m3 → FlashInfer). The prior int8-PTH KV was `TRITON_ATTN`-only and cratered at depth on the dual proxy (130.8→50.7 TPS @ 35K); fp8/e4m3 stayed flat (~115 @ 35K), recalled NIAH to 240K, tied the 8-pack (109 vs 107), and passed soak. `multi-max` inherited that one-line KV flip in #595, and it was confirmed at TP=4 on [#584](https://github.com/noonghunna/club-3090/issues/584) (verify-full 9/9, stress to 240K, soak, 8-pack 111/150) + corroborated on [#625](https://github.com/noonghunna/club-3090/issues/625) — hence its promotion to ✅ Production.
 
 > **DFlash on TP=4 was removed.** The former `vllm/dual4-dflash`
 > (`multi4/autoround-int4/dflash.yml`) is gone — DFlash on Qwen3-Next vLLM is blocked
@@ -334,7 +461,7 @@ Specifically interested in:
 ## Why we ship only a fast/max pair of pre-baked 4-card configs
 
 We ship two TP=4 composes — `vllm/qwen-27b-multi-fast` (fp8/MTP) and
-`vllm/qwen-27b-multi-max` (FP8 + int8-PTH) — mirroring the 2-card fast/max tiers.
+`vllm/qwen-27b-multi-max` (FP8 + fp8/e4m3) — mirroring the 2-card fast/max tiers.
 The `multi-fast` config is here because a community rig validated that exact
 4× RTX 3090 PCIe topology with `verify-full.sh`, `verify-stress.sh`, and
 `bench.sh`; `multi-max` is its higher-fidelity sibling (validated via the

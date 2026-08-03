@@ -45,6 +45,7 @@ Usage:
 """
 
 import argparse
+import math
 import json
 import logging
 import os
@@ -98,8 +99,8 @@ def _load_model_specs_from_yaml(profiles):
     g_fields = ("hidden_size", "intermediate_size", "num_hidden_layers", "num_full_attn_layers", "num_sliding_attn_layers", "num_attn_heads", "num_kv_heads", "head_dim_sliding", "global_head_dim", "sliding_window", "max_ctx_supported", "attention_k_eq_v")
     gm_fields = (*g_fields, "num_global_kv_heads", "num_experts", "num_experts_per_tok", "moe_intermediate_size", "active_params_b", "mtp_num_hidden_layers")
     qm_fields = (*q_fields, "num_experts", "num_experts_per_tok", "moe_intermediate_size", "shared_expert_intermediate_size", "active_params_b", "mtp_num_hidden_layers")
-    qspec = {"model_id": qwen.id, "model_family": qwen.family, **{k: getattr(qwen, k) for k in q_fields}, "valid_tp": list(qwen.valid_tp), "weights_total_gb": _weight_size(qwen, qwen.default_weight_variant), "mamba_state_bytes": 4, "chunk_size": 256, "mtp_n_default": profiles.drafters["qwen-mtp-builtin"].n_default}
-    qmspec = {"model_id": qwen_moe.id, "model_family": qwen_moe.family, **{k: getattr(qwen_moe, k) for k in qm_fields}, "valid_tp": list(qwen_moe.valid_tp), "weights_total_gb": _weight_size(qwen_moe, qwen_moe.default_weight_variant), "weights_gptq_gb": _weight_size(qwen_moe, "gptq_int4"), "mamba_state_bytes": 4, "chunk_size": 256, "mtp_n_default": profiles.drafters["qwen-mtp-builtin"].n_default}
+    qspec = {"model_id": qwen.id, "model_family": qwen.family, **{k: getattr(qwen, k) for k in q_fields}, "valid_tp": list(qwen.valid_tp), "weights_total_gb": _weight_size(qwen, qwen.default_weight_variant), "weights_nvfp4_gb": _weight_size(qwen, "nvfp4"), "mamba_state_bytes": 4, "chunk_size": 256, "mtp_n_default": profiles.drafters["qwen-mtp-builtin"].n_default}
+    qmspec = {"model_id": qwen_moe.id, "model_family": qwen_moe.family, **{k: getattr(qwen_moe, k) for k in qm_fields}, "valid_tp": list(qwen_moe.valid_tp), "weights_total_gb": _weight_size(qwen_moe, qwen_moe.default_weight_variant), "weights_gptq_gb": _weight_size(qwen_moe, "gptq_int4"), "weights_nvfp4_gb": _weight_size(qwen_moe, "nvfp4"), "mamba_state_bytes": 4, "chunk_size": 256, "mtp_n_default": profiles.drafters["qwen-mtp-builtin"].n_default}
     gspec = {"model_id": gemma.id, "model_family": gemma.family, **{k: getattr(gemma, k) for k in g_fields}, "valid_tp": list(gemma.valid_tp), "weights_int4_gb": _weight_size(gemma, "autoround-int4"), "weights_awq_gb": _weight_size(gemma, "awq"), "weights_bf16_gb": _weight_size(gemma, "bf16"), "drafter_mtp_gb": float(profiles.drafters["gemma-it-assistant"].vram_footprint_gb), "drafter_dflash_gb": float(profiles.drafters["gemma-dflash"].vram_footprint_gb), "mtp_n_default": profiles.drafters["gemma-it-assistant"].n_default}
     gmspec = {"model_id": gemma_moe.id, "model_family": gemma_moe.family, **{k: getattr(gemma_moe, k) for k in gm_fields}, "valid_tp": list(gemma_moe.valid_tp), "weights_int4_gb": _weight_size(gemma_moe, "autoround-int4-mixed"), "weights_awq_gb": _weight_size(gemma_moe, "awq"), "drafter_mtp_gb": float(profiles.drafters["gemma-26b-it-assistant"].vram_footprint_gb), "mtp_n_default": profiles.drafters["gemma-26b-it-assistant"].n_default}
     # Gemma-4-12B (gemma4_unified arch). Its TEXT backbone is gemma4-swa-dense
@@ -125,9 +126,17 @@ def _load_model_specs_from_yaml(profiles):
     g12_int8 = _weight_size(gemma12, "autoround-int8")
     g12_int4 = _weight_size(gemma12, "qat-w4a16")
     g12spec = {"model_id": gemma12.id, "model_family": "gemma4-swa-dense", **{k: getattr(gemma12, k) for k in g_fields}, "valid_tp": list(gemma12.valid_tp), "weights_int4_gb": g12_int4, "weights_awq_gb": g12_int4, "weights_bf16_gb": g12_bf16, "weights_int8_gb": g12_int8, "drafter_mtp_gb": float(profiles.drafters["gemma-12b-it-assistant"].vram_footprint_gb), "measured_kv_growing_bpt_tp1": 45632, "mtp_n_default": profiles.drafters["gemma-12b-it-assistant"].n_default}
+    # Agents-A1 (InternScience 35B agentic MoE): geometry verified byte-identical
+    # to qwen3.6-35b-a3b (same Qwen3-Next MoE arch class) — rides the SAME
+    # qwen3-next-moe KV math. Own weights footprint (FP8-dynamic 36 GB, Marlin
+    # weight-only on Ampere). No MTP head in the checkpoint (safetensors header
+    # scan 2026-07-03: 0 mtp tensors) — mtp_n_default is inert (drafter=None).
+    a1 = profiles.models["agents-a1"]
+    a1spec = {"model_id": a1.id, "model_family": a1.family, **{k: getattr(a1, k) for k in qm_fields}, "valid_tp": list(a1.valid_tp), "weights_total_gb": _weight_size(a1, a1.default_weight_variant), "mamba_state_bytes": 4, "chunk_size": 256, "mtp_n_default": profiles.drafters["qwen-mtp-builtin"].n_default}
     return {
         "qwen3.6-27b": qspec,
         "qwen3.6-35b-a3b": qmspec,
+        "agents-a1": a1spec,
         "gemma-4-31b": gspec,
         "gemma-4-26b-a4b": gmspec,
         "gemma-4-12b": g12spec,
@@ -159,6 +168,9 @@ KV_FORMAT_BYTES = {
     "q4_0":                  0.5 + 0.0625, # 4-bit + per-group scale
     "k8v4":                  0.75,         # avg of K=int8 V=int4
     "turboquant_3bit_nc":    0.375 + 0.05, # 3 bits + small QJL overhead
+    "nvfp4":                 0.5 + 0.0625, # 4-bit elements + fp8 block scale per 16
+                                           # (PROJECTED — Blackwell-only, no measured
+                                           # boot on this stack yet; #246 A/B arm 3)
 }
 
 INDEXER_FORMAT_BYTES = {
@@ -189,6 +201,7 @@ QWEN_GDN_ACTIVATION_COEF = {
     "q4_0":               155,
     "k8v4":               155,
     "turboquant_3bit_nc": 165,
+    "nvfp4":              130,  # PROJECTED — mirror fp8 until a Blackwell boot calibrates it (#246)
 }
 
 # ---- Qwen MoE activation + built-in MTP workspace ----
@@ -209,9 +222,62 @@ QWEN_MOE_ACTIVATION_COEF = {
     "q4_0":               130,
     "k8v4":               130,
     "turboquant_3bit_nc": 140,
+    "nvfp4":              105,  # PROJECTED — mirror fp8 until a Blackwell boot calibrates it (#246)
 }
 QWEN_MOE_EXPERT_DISPATCH_GB = 0.20
 QWEN_MOE_BUILTIN_MTP_WORKSPACE_GB = 0.10
+
+# ---- GDN chunked-prefill scratch (DERIVED, not calibrated) ----------------
+# The coefficients above scale with max_ctx. That is the Cliff-2 shape, and it
+# leaves a real term completely invisible: the FLA chunked-prefill scratch
+# scales with `--max-num-batched-tokens`, NOT with max_ctx. With chunked
+# prefill on (every compose we ship), a 262K prompt is processed in batched
+# chunks, so these buffers are bounded by the BATCH, and doubling the batch
+# doubles them while the calibrated ctx term does not move at all.
+#
+# Unlike everything else in this section these numbers are DERIVED from the
+# kernel source, not fitted — `fla/ops/chunk_delta_h.py`:
+#
+#     h = k.new_empty(B, NT, H, V, K)      # NT = batched / FLA_CHUNK_SIZE
+#     v_new = torch.empty_like(u)          # in chunk_delta_h
+#     o     = torch.empty_like(v)          # in chunk_o
+#
+# with H = linear_num_v_heads / TP, V/K = the linear head dims, dtype = k.dtype
+# (bf16 = 2 B; note `final_state` IS fp32 but that is the per-sequence
+# recurrent state, modelled separately in _recurrent_state_per_card_bytes).
+#
+# Sanity anchor: Qwen3.6-27B at TP=2 gives h = batched × 12 KiB, so batched=8192
+# is exactly 100,663,296 B = 96.00 MiB — the allocation that failed in
+# club-3090 #838 on a 2× 5090, to the decimal.
+FLA_CHUNK_SIZE = 64          # fla/ops/utils.py FLA_CHUNK_SIZE (NOT spec["chunk_size"]=256, a different buffer)
+GDN_SCRATCH_DTYPE_BYTES = 2  # h/v_new/o inherit k.dtype; every GDN compose we ship runs --dtype bfloat16
+
+# Every calibration anchor in CALIBRATION was booted at this batch size, so the
+# empirical ctx coefficients ALREADY absorb the scratch at this value. The
+# scratch is therefore applied as a signed DELTA against this baseline: at the
+# default the prediction is byte-identical to before (calibration stays green
+# by construction), and it only moves when a config departs from it.
+GDN_SCRATCH_CALIBRATION_BATCHED_TOKENS = 8192
+
+
+def gdn_prefill_scratch_per_card_bytes(spec, tp, batched_tokens):
+    """Per-card FLA chunked-prefill scratch for one GDN layer's forward.
+
+    h + v_new + o, live simultaneously inside chunk_gated_delta_rule_fwd.
+    Linear in `batched_tokens` (i.e. --max-num-batched-tokens), NOT in max_ctx.
+    Returns 0 for non-GDN families.
+    """
+    heads = spec.get("linear_num_v_heads")
+    v_dim = spec.get("linear_v_head_dim")
+    k_dim = spec.get("linear_k_head_dim")
+    if not (heads and v_dim and k_dim):
+        return 0.0
+    heads_per_rank = heads / tp
+    nt = math.ceil(batched_tokens / FLA_CHUNK_SIZE)
+    h = nt * heads_per_rank * v_dim * k_dim * GDN_SCRATCH_DTYPE_BYTES
+    # v_new and o are both shaped like v: (batched, heads/rank, v_dim)
+    v_like = batched_tokens * heads_per_rank * v_dim * GDN_SCRATCH_DTYPE_BYTES
+    return h + 2 * v_like
 
 # ---- Gemma activation peak (mostly constant in ctx) ----
 # Unlike Qwen GDN, Gemma's activation peak comes from dense MLP forward +
@@ -253,8 +319,9 @@ GENERIC_DENSE_ACTIVATION_FLOOR_GB = 1.5         # ≥ Gemma dense constant activ
 # Compose presets (per-model)
 # =============================================================================
 COMPOSE_ALIAS_TEXT = {
-    "qwen3.6-27b": "minimal=vllm/minimal dual=vllm/dual",
-    "qwen3.6-35b-a3b": "qwen-a3b-preview-single=vllm/qwen-a3b-preview-single qwen-35b-a3b-dual=vllm/qwen-35b-a3b-dual",
+    "qwen3.6-27b": "minimal=vllm/minimal dual=vllm/dual nvfp4-single=vllm/qwen-27b-single-nvfp4 nvfp4-dual=vllm/qwen-27b-dual-nvfp4",
+    "qwen3.6-35b-a3b": "qwen-a3b-preview-single=vllm/qwen-a3b-preview-single qwen-35b-a3b-dual=vllm/qwen-35b-a3b-dual nvfp4-single=vllm/qwen-35b-a3b-single-nvfp4 nvfp4-dual=vllm/qwen-35b-a3b-dual-nvfp4",
+    "agents-a1": "agents-a1-dual=vllm/agents-a1-dual",
     "gemma-4-31b": "gemma-dual=vllm/gemma-bf16-mtp gemma-dual-int8=vllm/gemma-int8-mtp gemma-single=vllm/gemma-mtp-tp1",
     # gemma-4-12b legacy alias namespace is keyed by model id, so reusing the
     # bare `gemma-dual` string here is harmless — compat + the CLI always pass
@@ -298,7 +365,9 @@ def _compose_cfg_from_registry(profiles, model_id, legacy_name, registry_name):
         if drafter is not None:
             cfg["drafter_gb"] = float(drafter.vram_footprint_gb)
     if model_id == "qwen3.6-35b-a3b":
-        cfg["weights_variant"] = "gptq" if entry["weights_variant"] == "gptq_int4" else "default"
+        cfg["weights_variant"] = {"gptq_int4": "gptq", "nvfp4": "nvfp4"}.get(entry["weights_variant"], "default")
+    if model_id == "qwen3.6-27b":
+        cfg["weights_variant"] = "nvfp4" if entry["weights_variant"] == "nvfp4" else "default"
     cfg.update(COMPOSE_COMPAT_OVERRIDES.get((model_id, legacy_name), {}))
     return cfg
 
@@ -363,6 +432,10 @@ class CacheBreakdown:
 def _weights_per_card_gb(spec, tp, weights_variant="default"):
     """Return per-card weights footprint in GB after TP split."""
     if spec["model_family"] == "qwen3-next-hybrid":
+        # nvfp4 (nvidia modelopt, 21.9 GB) vs the default AutoRound INT4 —
+        # the community Hopper/Blackwell slugs (vllm/qwen-27b-*-nvfp4).
+        if weights_variant == "nvfp4":
+            return spec["weights_nvfp4_gb"] / tp
         return spec["weights_total_gb"] / tp
     elif spec["model_family"] == "qwen3-next-moe":
         # vLLM shards attention + MoE expert weights across TP ranks, so
@@ -374,6 +447,8 @@ def _weights_per_card_gb(spec, tp, weights_variant="default"):
         # (e.g. 262K dual, which fits) into a false FAIL.
         if weights_variant == "gptq":
             return spec["weights_gptq_gb"] / tp
+        if weights_variant == "nvfp4":
+            return spec["weights_nvfp4_gb"] / tp
         return spec["weights_total_gb"] / tp
     elif spec["model_family"] == "gemma4-swa-dense":
         if weights_variant == "awq":
@@ -728,7 +803,24 @@ def architecture_cache_breakdown(
     )
 
 
-def activation_peak_per_card_bytes(spec, kv_format, max_ctx, tp):
+def _gdn_scratch_delta(spec, tp, batched_tokens):
+    """Signed correction for a non-default --max-num-batched-tokens.
+
+    The calibrated ctx coefficients already absorb the scratch at
+    GDN_SCRATCH_CALIBRATION_BATCHED_TOKENS (every anchor was booted there), so
+    only the DELTA from that baseline is new information. batched_tokens=None
+    => 0.0, i.e. byte-identical to the pre-#838 model.
+    """
+    if batched_tokens is None:
+        return 0.0
+    here = gdn_prefill_scratch_per_card_bytes(spec, tp, batched_tokens)
+    base = gdn_prefill_scratch_per_card_bytes(
+        spec, tp, GDN_SCRATCH_CALIBRATION_BATCHED_TOKENS
+    )
+    return here - base
+
+
+def activation_peak_per_card_bytes(spec, kv_format, max_ctx, tp, batched_tokens=None):
     """Per-card peak activation during prefill forward.
 
     For Qwen 3.6 (DeltaNet GDN): linear in seq_len, KV-format-dependent
@@ -741,11 +833,13 @@ def activation_peak_per_card_bytes(spec, kv_format, max_ctx, tp):
     """
     if spec["model_family"] == "qwen3-next-hybrid":
         coef = QWEN_GDN_ACTIVATION_COEF[kv_format]
-        return (coef * spec["num_gdn_layers"] * max_ctx) / tp
+        base = (coef * spec["num_gdn_layers"] * max_ctx) / tp
+        return base + _gdn_scratch_delta(spec, tp, batched_tokens)
 
     elif spec["model_family"] == "qwen3-next-moe":
         coef = QWEN_MOE_ACTIVATION_COEF[kv_format]
-        return (coef * spec["num_gdn_layers"] * max_ctx) / tp + QWEN_MOE_EXPERT_DISPATCH_GB * 1e9
+        base = (coef * spec["num_gdn_layers"] * max_ctx) / tp + QWEN_MOE_EXPERT_DISPATCH_GB * 1e9
+        return base + _gdn_scratch_delta(spec, tp, batched_tokens)
 
     elif spec["model_family"] == "gemma4-swa-dense":
         const_bytes = GEMMA_ACTIVATION_CONST_GB * 1e9
@@ -807,6 +901,7 @@ def predict(
     drafter_gb=0.0,
     mtp=False,
     weights_variant="default",
+    max_num_batched_tokens=None,
 ) -> Prediction:
     """Predict per-card VRAM usage.
 
@@ -830,7 +925,9 @@ def predict(
     kv_pool_requested_gb = growing_b / 1e9
     kv_pool_sliding_fixed_gb = sliding_b / 1e9
 
-    activation_gb = activation_peak_per_card_bytes(spec, kv_format, max_ctx, tp) / 1e9
+    activation_gb = activation_peak_per_card_bytes(
+        spec, kv_format, max_ctx, tp, batched_tokens=max_num_batched_tokens
+    ) / 1e9
     overhead_gb = cudagraph_overhead_gb(mem_util, tp)
 
     # Drafter: prefer drafter_gb; fall back to legacy dflash_draft_gb.
@@ -1253,6 +1350,7 @@ def run_calibration():
 # =============================================================================
 
 def solve_max_ctx(spec, kv_format, max_num_seqs, tp, mem_util, vram_gb,
+                  max_num_batched_tokens=None,
                   drafter_gb=0.0, dflash_draft_gb=0.0, mtp=False, weights_variant="default"):
     """Binary search for the largest max_ctx that keeps the verdict at PASS or TIGHT."""
     lo, hi = 1024, spec.get("max_ctx_supported", 262144)
@@ -1267,6 +1365,7 @@ def solve_max_ctx(spec, kv_format, max_num_seqs, tp, mem_util, vram_gb,
             tp=tp, mem_util=mem_util, vram_gb=vram_gb,
             drafter_gb=drafter_gb, dflash_draft_gb=dflash_draft_gb,
             mtp=mtp, weights_variant=weights_variant,
+            max_num_batched_tokens=max_num_batched_tokens,
         )
         if p.verdict in ("PASS", "TIGHT"):
             best = mid
@@ -1325,6 +1424,29 @@ CARD_VRAM_GB = {
 # run_calibration() + the solver epilogue). Surfaced verbatim so consumers
 # can compare vram_est to budget with the same tolerance the gate uses.
 FIT_BAND_GB = 1.5
+
+# Per-card SM (compute capability) for the required_sm gate — derived from the
+# hardware profiles (the SAME source compat.py's C3 floor uses), keyed like
+# CARD_VRAM_GB (canonical hyphenated id + dehyphenated alias). A bare-number
+# --card describes VRAM only, so it has no SM → the gate is skipped
+# (permissive by design: an uncatalogued card is not assumed incompatible).
+CARD_SM = {}
+for _hid, _h in PROFILES.hardware.items():
+    CARD_SM[_hid] = float(_h.sm)
+    CARD_SM[_hid.replace("-", "")] = float(_h.sm)
+
+
+def _resolve_card_sm(card: Optional[str]) -> Optional[float]:
+    if card is None:
+        return None
+    raw = str(card).strip()
+    try:
+        float(raw)
+        return None  # bare VRAM number — carries no arch info
+    except ValueError:
+        pass
+    key = raw.lower().replace(" ", "").replace("_", "").replace("/", "-")
+    return CARD_SM.get(key) or CARD_SM.get(key.replace("-", ""))
 
 
 def _resolve_card_vram_gb(card: Optional[str]) -> Optional[float]:
@@ -1415,6 +1537,38 @@ def fit_verdict(target: str, card: Optional[str], vram_default: float) -> dict:
     if err is not None:
         return {"verdict": "unknown", "error": err}
 
+    # required_sm gate (compat C3's arch floor, surfaced in the FIT verdict so
+    # the cockpit can hide/warn hardware-incompatible slugs — e.g. NVFP4 on
+    # Ampere: the VRAM would "fit" but the NATIVE kernels don't exist below
+    # sm 9.0). Since v0.24 some formats have a weight-only FALLBACK kernel
+    # below required_sm (registry `fallback_sm` — NVFP4 -> Marlin W4A16,
+    # floor sm 7.5; live-confirmed on 2x3090 2026-07-11). In the band
+    # [fallback_sm, required_sm) we PRICE the fit normally and attach an
+    # `hw_fallback` annotation instead of hiding — the cockpit badges it.
+    _entry_reg = COMPOSE_REGISTRY[slug]
+    _req_sm = _entry_reg.get("required_sm")
+    _fb_sm = _entry_reg.get("fallback_sm")
+    _card_sm = _resolve_card_sm(card)
+    _hw_fallback = None
+    if _req_sm is not None and _card_sm is not None and _card_sm < float(_req_sm):
+        if _fb_sm is not None and _card_sm >= float(_fb_sm):
+            _hw_fallback = {
+                "required_sm": float(_req_sm),
+                "card_sm": _card_sm,
+                "note": (
+                    f"no native kernels below sm {float(_req_sm):g} — runs via "
+                    f"weight-only fallback (Marlin); works, no speed edge vs "
+                    f"native 4-bit quants on this card"
+                ),
+            }
+        else:
+            return {
+                "verdict": "incompatible-hw",
+                "required_sm": float(_req_sm),
+                "card_sm": _card_sm,
+                "error": f"requires sm >= {float(_req_sm):g} (this card is sm_{_card_sm:g})",
+            }
+
     try:
         spec = MODEL_SPECS[model_id]
         cfg = _compose_cfg_from_registry(PROFILES, model_id, "__fit__", slug)
@@ -1437,12 +1591,15 @@ def fit_verdict(target: str, card: Optional[str], vram_default: float) -> dict:
     except Exception as exc:  # any pricing-path failure → honest unknown
         return {"verdict": "unknown", "error": f"pricing {slug!r} failed: {exc}"}
 
-    return {
+    res = {
         "verdict": _RAW_VERDICT_MAP[pred.verdict],
         "vram_est_gb": round(pred.total_gb, 4),
         "band_gb": FIT_BAND_GB,
         "max_ctx": int(max_ctx_fit),
     }
+    if _hw_fallback is not None:
+        res["hw_fallback"] = _hw_fallback
+    return res
 
 
 def fit_all_verdicts(card: Optional[str], vram_default: float) -> dict:
@@ -1468,7 +1625,27 @@ def fit_all_verdicts(card: Optional[str], vram_default: float) -> dict:
         vram = float(vram_default)
 
     variants: dict = {}
+    _card_sm = _resolve_card_sm(card)
     for slug, entry in COMPOSE_REGISTRY.items():
+        # required_sm gate first — applies to SKIP (non-vLLM) slugs too, and
+        # short-circuits the pricing for slugs whose kernels can't exist here.
+        # Slugs with a `fallback_sm` at/below this card fall THROUGH to normal
+        # pricing (fit_verdict re-checks and attaches the hw_fallback note).
+        _req_sm = entry.get("required_sm")
+        _fb_sm = entry.get("fallback_sm")
+        if (
+            _req_sm is not None
+            and _card_sm is not None
+            and _card_sm < float(_req_sm)
+            and not (_fb_sm is not None and _card_sm >= float(_fb_sm))
+        ):
+            variants[slug] = {
+                "verdict": "incompatible-hw",
+                "required_sm": float(_req_sm),
+                "card_sm": _card_sm,
+                "error": f"requires sm >= {float(_req_sm):g} (this card is sm_{_card_sm:g})",
+            }
+            continue
         if entry.get("kvcalc_key") in (None, "SKIP"):
             variants[slug] = {"verdict": "skip"}
             continue
@@ -1522,7 +1699,12 @@ def main():
                    help="Drafter model size in GB (MTP / DFlash). 0 if not using a drafter.")
     p.add_argument("--dflash-draft-gb", type=float, default=None,
                    help="(deprecated alias for --drafter-gb)")
-    p.add_argument("--weights-variant", choices=["default", "int4", "awq", "bf16", "int8"], default=None,
+    p.add_argument("--max-num-batched-tokens", type=int, default=None,
+                   help=("Chunked-prefill batch size. GDN models only: the FLA prefill scratch "
+                         f"(h + v_new + o) is linear in THIS, not in max_ctx. Omit to assume the "
+                         f"{GDN_SCRATCH_CALIBRATION_BATCHED_TOKENS} the calibration anchors were "
+                         "booted at (prediction then matches the calibrated model exactly)."))
+    p.add_argument("--weights-variant", choices=["default", "int4", "awq", "bf16", "int8", "nvfp4"], default=None,
                    help="Gemma 4 only: which weight quant variant. Default: from --compose, or int4.")
     p.add_argument("--calibration", action="store_true", help="Print predicted vs measured for all calibrated models.")
     p.add_argument("--fit", metavar="SLUG|MODEL",
@@ -1642,6 +1824,7 @@ def main():
             tp=tp, mem_util=mem_util, vram_gb=args.vram,
             drafter_gb=drafter_gb, dflash_draft_gb=dflash_gb, mtp=mtp,
             weights_variant=weights_variant,
+            max_num_batched_tokens=args.max_num_batched_tokens,
         )
         if best > 0:
             pred_at_best = predict(
@@ -1649,6 +1832,7 @@ def main():
                 tp=tp, mem_util=mem_util, vram_gb=args.vram,
                 drafter_gb=drafter_gb, dflash_draft_gb=dflash_gb, mtp=mtp,
                 weights_variant=weights_variant,
+                max_num_batched_tokens=args.max_num_batched_tokens,
             )
             if args.json:
                 out = pred_at_best.__dict__.copy()
@@ -1673,6 +1857,7 @@ def main():
         tp=tp, mem_util=mem_util, vram_gb=args.vram,
         drafter_gb=drafter_gb, dflash_draft_gb=dflash_gb, mtp=mtp,
         weights_variant=weights_variant,
+        max_num_batched_tokens=args.max_num_batched_tokens,
     )
 
     breakdown = None

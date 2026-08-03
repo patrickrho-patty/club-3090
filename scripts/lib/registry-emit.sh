@@ -4,16 +4,47 @@
 # Source this file, declare the destination arrays in the caller, then call
 # derive_switch_variant_tables or derive_launch_variant_tables with ROOT_DIR.
 
+# Force Python's UTF-8 mode (PEP 540) for every python3 this script runs.
+# Repo sources are full of unicode (— × → ⚠), and without this a rig on a real
+# non-UTF-8 locale (de_DE.iso88591 and friends) decodes reads, stdout AND argv
+# with the locale codec, which crashes the launcher/emit paths (#779). Python
+# already auto-enables UTF-8 mode for the C/POSIX locale, so this covers the
+# case it does NOT: a genuine non-UTF-8, non-C locale. Exported, so child
+# processes and nested scripts inherit it. Guarded by test-locale-utf8.sh.
+export PYTHONUTF8="${PYTHONUTF8:-1}"
+
 registry_variant_rows() {
   local root="$1"
   python3 - "$root" <<'PY_EMIT'
 from __future__ import annotations
 
+import os
 import re
 import sys
 from pathlib import Path
 
-import yaml
+# PyYAML is OPTIONAL on this path (the switch.sh/launch.sh table derivation):
+# community rigs run minimal VMs without python3-yaml (#584 — ryan's Proxmox
+# box), and the ONLY thing this block used yaml for is pulling container_name
+# out of each compose — which the regex fallback below handles for our own
+# compose files. The `--json` contract path (c3 cockpit / baselines join)
+# still requires PyYAML. CLUB3090_EMIT_NO_YAML=1 forces the fallback so the
+# no-yaml guard test can exercise it on rigs where yaml IS installed.
+try:
+    import yaml
+except Exception:
+    yaml = None
+if os.environ.get("CLUB3090_EMIT_NO_YAML") == "1":
+    yaml = None
+
+# Non-UTF-8 locales (LC_ALL=C VMs, #599/#584) also break the WRITE side: a
+# piped stdout defaults to the locale codec → UnicodeEncodeError printing the
+# unicode in status notes. Reads were fixed in #599; pin the output too.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 root = Path(sys.argv[1])
 sys.path.insert(0, str(root))
@@ -35,10 +66,29 @@ def switch_engine(key: str) -> str:
     return "llamacpp" if prefix == "llamacpp" else prefix
 
 
+# First non-comment `container_name:` line — the regex fallback for rigs
+# without PyYAML. Our compose files are single-service (or first-service-wins,
+# matching the yaml path's dict-order iteration), so this is equivalent for
+# every checked-in compose; test-registry-emit-no-yaml asserts that parity.
+_CONTAINER_RX = re.compile(r"""^\s*container_name:\s*(['"]?)(.+?)\1\s*$""", re.M)
+
+
+def _unwrap_env_default(raw: str) -> str:
+    match = re.fullmatch(r"\$\{[^}:]+:-(.+)\}", raw)
+    return match.group(1) if match else raw
+
+
 def container_name(compose_path: str) -> str:
     path = root / compose_path
+    if yaml is None:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except Exception as exc:
+            raise RuntimeError(f"could not read compose yaml: {exc}") from exc
+        m = _CONTAINER_RX.search(text)
+        return _unwrap_env_default(m.group(2).strip()) if m else ""
     try:
-        data = yaml.safe_load(path.read_text()) or {}
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     except Exception as exc:
         raise RuntimeError(f"could not parse compose yaml: {exc}") from exc
     services = data.get("services") or {}
@@ -46,9 +96,7 @@ def container_name(compose_path: str) -> str:
         raw = service.get("container_name")
         if not raw:
             continue
-        raw = str(raw)
-        match = re.fullmatch(r"\$\{[^}:]+:-(.+)\}", raw)
-        return match.group(1) if match else raw
+        return _unwrap_env_default(str(raw))
     return ""
 
 
@@ -59,7 +107,7 @@ _CTX_FLAG = re.compile(r"(?:--max-model-len|--ctx-size|--n-ctx|(?<!\w)-c)\s*\n?\
 def compose_default_ctx(compose_path: str):
     """The ctx the compose serves by DEFAULT (its ${VAR:-N} fallback or flag literal)."""
     try:
-        txt = (root / compose_path).read_text()
+        txt = (root / compose_path).read_text(encoding="utf-8")
     except Exception:
         return None
     m = _CTX_ENV.search(txt) or _CTX_FLAG.search(txt)
@@ -132,10 +180,14 @@ derive_switch_variant_tables() {
   # proper assoc arrays without each having to declare them. VARIANT_CONTAINER
   # (slug -> container name) drives switch.sh's registry-derived orphan teardown.
   declare -gA VARIANT_CTX VARIANT_CONTAINER
-  if ! emit="$(registry_variant_rows "$root" 2>/dev/null)"; then
+  local _emit_err; _emit_err="$(mktemp)"
+  if ! emit="$(registry_variant_rows "$root" 2>"$_emit_err")"; then
     echo "[switch] ERROR: could not derive variant tables from compose_registry.py" >&2
+    [[ -s "$_emit_err" ]] && sed 's/^/[switch]   /' "$_emit_err" >&2
+    rm -f "$_emit_err"
     exit 2
   fi
+  rm -f "$_emit_err"
   while IFS=$'\t' read -r kind key switch_engine _launch_engine cdir cfile port _model _profile_engine _kvcalc container _compose_path status max_ctx status_note; do
     [[ -n "${kind:-}" ]] || continue
     case "$kind" in
@@ -161,10 +213,14 @@ derive_switch_variant_tables() {
 
 derive_launch_variant_tables() {
   local root="$1" emit key _switch_engine launch_engine cdir cfile port model profile_engine kvcalc container _compose_path status _max_ctx status_note
-  if ! emit="$(registry_variant_rows "$root" 2>/dev/null)"; then
+  local _emit_err; _emit_err="$(mktemp)"
+  if ! emit="$(registry_variant_rows "$root" 2>"$_emit_err")"; then
     echo "[launch] ERROR: could not derive variant tables from compose_registry.py" >&2
+    [[ -s "$_emit_err" ]] && sed 's/^/[launch]   /' "$_emit_err" >&2
+    rm -f "$_emit_err"
     exit 2
   fi
+  rm -f "$_emit_err"
   while IFS=$'\t' read -r kind key _switch_engine launch_engine cdir cfile port model profile_engine kvcalc container _compose_path status _max_ctx status_note; do
     [[ -n "${kind:-}" ]] || continue
     case "$kind" in
@@ -227,7 +283,60 @@ PY_DEFAULT
 
 # --- PR-B: model-default resolver (the single injection point) ---------------
 #
-# model_default_target ROOT MODEL TOPOLOGY  →  resolved slug on stdout.
+# primary_sm_from_gpu_spec GPU_SPEC  →  first GPU's compute-cap ("8.6") on stdout.
+# GPU_SPEC is the switch/launch "idx|name|mem|sm;idx|name|mem|sm" form. Empty
+# output when the spec is empty/malformed → callers fail-open (no arch gating).
+primary_sm_from_gpu_spec() {
+  local spec="${1:-}" first
+  first="${spec%%;*}"            # first GPU entry
+  [[ "$first" == *"|"* ]] || { printf ''; return 0; }
+  printf '%s' "${first##*|}"     # last |-field = sm
+}
+
+# warn_if_default_arch_gated ROOT SLUG DETECTED_SM  →  loud stderr warning when
+# SLUG is validated as a default only on other arches than DETECTED_SM (its
+# default_arch_allow). No-op otherwise. Covers explicit selection + user pins of
+# an off-arch slug (the curated default already steers away). #693.
+warn_if_default_arch_gated() {
+  local root="$1" slug="$2" sm="$3"
+  [[ -n "$slug" && -n "$sm" ]] || return 0
+  python3 - "$root" "$slug" "$sm" <<'PY_ARCH_WARN'
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+sys.path.insert(0, str(root))
+from scripts.lib.profiles.compose_registry import (  # noqa: E402
+    COMPOSE_REGISTRY,
+    curated_default_target,
+    default_arch_gated,
+    model_of_slug,
+    slug_topology,
+)
+
+slug, sm = sys.argv[2], sys.argv[3]
+if not default_arch_gated(slug, sm):
+    raise SystemExit(0)
+entry = COMPOSE_REGISTRY.get(slug, {})
+allow = ", ".join("sm_" + a for a in entry.get("default_arch_allow", []))
+model = model_of_slug(slug)
+alt = curated_default_target(model, slug_topology(slug) or "single", sm) if model else None
+rec = (
+    f"Recommended on your card: {alt} (pin it: scripts/switch.sh --set-default {alt})."
+    if alt
+    else "No validated single-card default exists for your arch — run a dual "
+    "config or pick a slug explicitly."
+)
+print(
+    f"[arch-gate] WARNING: {slug} is validated as a default only on {allow} "
+    f"(RTX 3090); your GPU is sm_{sm}. beellama's DFlash path returns gibberish "
+    f"on Ada/sm_8.9 and is unvalidated on other arches (club-3090 #693). {rec}",
+    file=sys.stderr,
+)
+PY_ARCH_WARN
+}
+
+# model_default_target ROOT MODEL TOPOLOGY [DETECTED_SM]  →  resolved slug on stdout.
 #
 # Resolution precedence ladder (design §3); `--variant X` (caller-explicit) is
 # handled by the callers BEFORE they reach here, so this implements:
@@ -241,7 +350,7 @@ PY_DEFAULT
 # only the resolved slug goes to stdout. Returns non-zero with a clear message
 # when no functional default exists at any topology (never crashes).
 model_default_target() {
-  local root="$1" model="$2" topology="$3"
+  local root="$1" model="$2" topology="$3" detected_sm="${4:-}"
   # Compute the .env pin key for this model, then read its value from the
   # environment (the caller has already loaded .env into the env).
   local pin_key pin_value
@@ -255,7 +364,7 @@ PY_PINKEY
 )"
   pin_value="${!pin_key:-}"
 
-  python3 - "$root" "$model" "$topology" "$pin_value" "$pin_key" <<'PY_MODEL_DEFAULT'
+  python3 - "$root" "$model" "$topology" "$pin_value" "$pin_key" "$detected_sm" <<'PY_MODEL_DEFAULT'
 from __future__ import annotations
 
 import sys
@@ -274,7 +383,8 @@ from scripts.lib.profiles.compose_registry import (  # noqa: E402
     _topology_family,
 )
 
-model, topology, pin_value, pin_key = sys.argv[2:6]
+model, topology, pin_value, pin_key, detected_sm = sys.argv[2:7]
+_sm = detected_sm or None
 
 
 def warn(msg: str) -> None:
@@ -321,8 +431,8 @@ if community:
     print(community)
     raise SystemExit(0)
 
-# 3) Curated fallback (§4) at the detected topology.
-slug = curated_default_target(model, topology)
+# 3) Curated fallback (§4) at the detected topology (arch-gated for the GPU).
+slug = curated_default_target(model, topology, _sm)
 if slug:
     print(slug)
     raise SystemExit(0)
@@ -330,7 +440,7 @@ if slug:
 # 4) Degradation (§6): notice + nearest-lower topology, then a clear message.
 fallback_topology = _nearest_lower_topology(topology)
 while fallback_topology:
-    slug = curated_default_target(model, fallback_topology)
+    slug = curated_default_target(model, fallback_topology, _sm)
     if slug:
         warn(
             f"no functional default for {model!r} on the detected "
@@ -370,9 +480,14 @@ registry_variant_rows_json() {
     echo "[registry-emit] ERROR: registry_variant_rows failed" >&2
     return 2
   fi
-  # Pass the tab rows via the environment (not stdin) so the heredoc below can
-  # still serve as the python script's stdin.
-  REGISTRY_TAB="$rows" python3 - "$root" <<'PY_JSON'
+  # Pass the tab rows via a TEMP FILE (not stdin — the heredoc below owns the
+  # python script's stdin; not env — a single env value is capped at
+  # MAX_ARG_STRLEN ~128 KB on Linux and the emit sits just under it at 63
+  # entries, 2026-07-11).
+  local _tab_file _py_rc
+  _tab_file="$(mktemp)"
+  printf '%s' "$rows" > "$_tab_file"
+  REGISTRY_TAB_FILE="$_tab_file" python3 - "$root" <<'PY_JSON'
 from __future__ import annotations
 
 import dataclasses
@@ -381,6 +496,28 @@ import json
 import os
 import sys
 from pathlib import Path
+
+# PyYAML is REQUIRED on the --json contract path (profiles + baselines join —
+# load_profiles() below imports it too, so check FIRST and fail with the fix,
+# not a bare ModuleNotFoundError traceback). The switch.sh/launch.sh table
+# path runs stdlib-only (regex container_name fallback, #584) — only
+# c3-cockpit consumers need PyYAML.
+try:
+    import yaml  # noqa: E402,F401
+except Exception:
+    print(
+        "registry-emit --json requires PyYAML (profiles/baselines join).\n"
+        "Fix: sudo apt install python3-yaml   (or: pip install pyyaml)",
+        file=sys.stderr,
+    )
+    raise SystemExit(3)
+
+# Pin output to UTF-8 regardless of locale (see the table-path note, #599/#584).
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 root = Path(sys.argv[1])
 sys.path.insert(0, str(root))
@@ -397,8 +534,114 @@ _spec.loader.exec_module(_tui_registry)
 
 from scripts.lib.profiles.compat import load_profiles  # noqa: E402
 from scripts.lib.profiles.compose_registry import COMPOSE_REGISTRY, DEFAULTS  # noqa: E402
+from scripts.lib.profiles.launch_compat import ProfileError, resolve_variant_pin  # noqa: E402
 
-tab = os.environ.get("REGISTRY_TAB", "")
+_tab_path = os.environ.get("REGISTRY_TAB_FILE", "")
+tab = Path(_tab_path).read_text(encoding="utf-8") if _tab_path and Path(_tab_path).exists() else ""
+
+# --- profiles: sourced via the EXISTING loaders (never re-derived).  Loaded
+#     HERE (not after the variants block) because the baselines join below
+#     resolves per-slug current pins through the engine profiles. ---
+profiles = load_profiles()
+
+# --- baselines join (catalog-baselines slice 1): the shipped bar rows from
+#     scripts/lib/profiles/baselines.yml, joined per-slug with a computed
+#     staleness verdict.  THIS is the single point where measured display
+#     numbers enter the contract — consumers never read baselines.yml (or
+#     BENCHMARKS.md) directly. ---
+import re as _re  # noqa: E402
+
+_yaml = yaml  # required-import guard at the top of this block (#584)
+
+_bl_path = root / "scripts" / "lib" / "profiles" / "baselines.yml"
+_baselines = {}
+if _bl_path.exists():
+    _baselines = (_yaml.safe_load(_bl_path.read_text(encoding="utf-8")) or {}).get("baselines") or {}
+
+# First `image:` default in the compose (handles both a bare literal and the
+# ${ENGINE_IMAGE:-literal} env-fallback form) — the pin truth for engines with
+# no docker-image install.spec (ik / llama.cpp pin per-compose or roll by policy).
+_IMG_RE = _re.compile(r"^\s*image:\s*[\"']?(?:\$\{[A-Z_0-9]+:-)?([^\s}\"']+)\}?", _re.M)
+
+
+def _compose_image_default(compose_path: str):
+    try:
+        txt = (root / compose_path).read_text(encoding="utf-8")
+    except OSError:
+        return None
+    m = _IMG_RE.search(txt)
+    return m.group(1) if m else None
+
+
+def _current_pin(slug: str, compose_path: str):
+    """The pin a launcher-started serve actually runs TODAY: the engine
+    profile's docker-image spec when it has one (launchers inject it), else
+    the compose's image default."""
+    try:
+        exports = resolve_variant_pin(profiles, slug)
+        # Nightly pins export a bare SHA (VLLM_NIGHTLY_SHA) — not comparable to
+        # an image string; fall through to the compose default for those.
+        if "VLLM_NIGHTLY_SHA" not in exports:
+            return next(iter(exports.values()))
+    except ProfileError:
+        pass
+    return _compose_image_default(compose_path)
+
+
+def _baseline_for(slug: str, compose_path: str):
+    row = _baselines.get(slug)
+    if not row:
+        return None
+    out = dict(row)
+    cur = _current_pin(slug, compose_path)
+    measured = row.get("engine_pin")
+    # stale: true/false when both pins are known; null = undeterminable
+    # (unpinned engine or unreadable compose) — badge only on TRUE.
+    out["stale"] = (cur != measured) if (cur and measured) else None
+    out["current_pin"] = cur
+    # slice 3: cross-rig submissions ride the join with the SAME per-row
+    # staleness verdict (an image pin is rig-independent, so the comparison
+    # holds for foreign rigs).  A submission-only entry (no primary row) has
+    # out["stale"] = None and carries only this map.
+    subs = row.get("submissions")
+    if isinstance(subs, dict):
+        out["submissions"] = {
+            rc: {
+                **s,
+                "stale": (cur != s.get("engine_pin"))
+                if (cur and s.get("engine_pin")) else None,
+            }
+            for rc, s in subs.items()
+        }
+    return out
+
+# --- weights-format join: models/<id>.yml weights[<variant>].format ----------
+# The honest quant FORMAT (autoround / awq / compressed-tensors / fp8 / bf16 /
+# gguf) behind a weights_variant token — the catalog Weights column falls back
+# to it when the token itself carries no recognisable quant segment (fine-tune
+# artifact slugs like mudler-apex-compact).  Built once from ALL model YAMLs,
+# keyed (model_id, variant); encoding= is load-bearing (#599).
+_WFMT = None
+def _weights_meta(model: str, variant: str):
+    """(quant_label, format) for a weights entry — quant_label is the optional
+    explicit display quant for custom-named artifacts (mixed-quant packs like
+    PRISM-PRO-DQ whose token carries no quant segment; value read from the GGUF
+    header's general.file_type and baked into the model YAML)."""
+    global _WFMT
+    if _WFMT is None:
+        _WFMT = {}
+        for _p in sorted((root / "scripts/lib/profiles/models").glob("*.yml")):
+            # NOTE: _yaml (this block's alias), NOT yaml — a bare `yaml` here is
+            # a NameError that a blanket except would silently eat to an empty
+            # map (the exact swallowed-failure class #599 warned about).
+            _data = _yaml.safe_load(_p.read_text(encoding="utf-8")) or {}
+            _mid = _data.get("id") or _p.stem
+            for _wk, _wv in (_data.get("weights") or {}).items():
+                _WFMT[(_mid, _wk)] = (
+                    (_wv or {}).get("quant_label"),
+                    (_wv or {}).get("format"),
+                )
+    return _WFMT.get((model, variant)) or (None, None)
 
 # --- variants: exactly the fields parse_variant_rows produces from the tab form,
 #     trimmed to the contract's variant schema (+ 'source' default "curated"). ---
@@ -426,6 +669,29 @@ for vr in _tui_registry.parse_variant_rows(tab):
             # probed running ctx against the slug's CONFIGURED ctx as an exact int,
             # never round-tripping through the colloquial ÷1000 label.
             "configured_ctx": (COMPOSE_REGISTRY.get(d["slug"], {}) or {}).get("max_ctx"),
+            # KV-cache format from the registry (for the catalog KV column) —
+            # int8_per_token_head / fp8_e4m3 / fp8_e5m2 / turboquant_3bit_nc / bf16 / q*.
+            "kv_format": (COMPOSE_REGISTRY.get(d["slug"], {}) or {}).get("kv_format"),
+            # Activation compute format (for the catalog act column, #723) —
+            # "16bit" default (fp16/bf16 per compose --dtype) / "int8" / "fp8".
+            "act_format": (COMPOSE_REGISTRY.get(d["slug"], {}) or {}).get("act_format"),
+            "chat_template": (COMPOSE_REGISTRY.get(d["slug"], {}) or {}).get("chat_template"),
+            # W4A8-int8-activation capability (c3 serve-confirm checkbox, #609) —
+            # True when the compose is wired + weights are positive-sym int4.
+            "act8_capable": bool((COMPOSE_REGISTRY.get(d["slug"], {}) or {}).get("act8_capable")),
+            # Weight-offload backend (catalog "offload" column) — None = resident
+            # (default) / "uva" / "n-cpu-moe" / "prefetch". Laguna 118B-MoE slugs.
+            "offload": (COMPOSE_REGISTRY.get(d["slug"], {}) or {}).get("offload"),
+            # Weights quant_label + FORMAT from the model profile (catalog
+            # Weights column fallbacks) — see _weights_meta() above.
+            "weights_quant_label": _weights_meta(
+                (COMPOSE_REGISTRY.get(d["slug"], {}) or {}).get("model") or "",
+                (COMPOSE_REGISTRY.get(d["slug"], {}) or {}).get("weights_variant") or "",
+            )[0],
+            "weights_format": _weights_meta(
+                (COMPOSE_REGISTRY.get(d["slug"], {}) or {}).get("model") or "",
+                (COMPOSE_REGISTRY.get(d["slug"], {}) or {}).get("weights_variant") or "",
+            )[1],
             # Per-slug download artifacts BEYOND the core weights_variant — the
             # extra weight-variant keys (a DFlash draft / an mmproj vision
             # projector) the slug's compose mounts from a separate subdir.  The
@@ -444,6 +710,10 @@ for vr in _tui_registry.parse_variant_rows(tab):
             ),
             "status_note": d["status_note"],
             "source": "curated",
+            # The shipped baseline row ("the bar") + computed staleness — the
+            # ONLY measured-display source for consumers (replaces the c3-side
+            # BENCHMARKS.md scrape).  None when the slug has no accepted row.
+            "baseline": _baseline_for(d["slug"], d["compose_path"]),
         }
     )
 
@@ -459,8 +729,7 @@ defaults = [
     for (model, engine, topology), slug in DEFAULTS.items()
 ]
 
-# --- profiles: sourced via the EXISTING loaders (never re-derived). ---
-profiles = load_profiles()
+# (profiles loaded above, before the variants block — the baselines join needs it.)
 
 
 def _engine(e):
@@ -515,12 +784,16 @@ payload = {
     },
 }
 
-json.dump(payload, sys.stdout, sort_keys=True)
+# default=str: baseline rows carry YAML-parsed datetime.date values.
+json.dump(payload, sys.stdout, sort_keys=True, default=str)
 sys.stdout.write("\n")
 PY_JSON
+  _py_rc=$?
+  rm -f "$_tab_file"
+  return "$_py_rc"
 }
 
-# x_default_dispatch ROOT TOKEN TOPOLOGY MODEL  →  resolved slug on stdout.
+# x_default_dispatch ROOT TOKEN TOPOLOGY MODEL [DETECTED_SM]  →  slug on stdout.
 #
 # Parses an `X/default` token (design §13.1): if X is an engine name →
 # engine-recommendation (registry_default_target on the given MODEL); else if X
@@ -528,7 +801,7 @@ PY_JSON
 # sets come from the registry and are disjoint. The caller passes the model to
 # use for the engine-recommendation branch (its PRIMARY_MODEL / chosen model).
 x_default_dispatch() {
-  local root="$1" token="$2" topology="$3" model="$4" x
+  local root="$1" token="$2" topology="$3" model="$4" detected_sm="${5:-}" x
   x="${token%/default}"
   local kind
   kind="$(python3 - "$root" "$x" <<'PY_DISPATCH'
@@ -550,7 +823,7 @@ PY_DISPATCH
       registry_default_target "$root" "$model" "$x" "$topology"
       ;;
     model)
-      model_default_target "$root" "$x" "$topology"
+      model_default_target "$root" "$x" "$topology" "$detected_sm"
       ;;
     *)
       echo "[default] ERROR: '${token}': '${x}' is neither a known engine nor a known model." >&2

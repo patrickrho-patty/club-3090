@@ -32,6 +32,35 @@
 #
 # Opts: --yes  --force-download  --experimental-arch  --trust-remote-code
 #       --hf-home DIR  --out FILE (Path A)  --hardware SM (override nvidia-smi)
+#       --allow-xet  --verify-in-place   (download behaviour — see below)
+#
+# Download behaviour flags (club-3090 #804 / #812)
+# -------------------------------------------------------------------------
+#   --allow-xet         Permit rung 2 of the download ladder. The classic LFS
+#                       path (rung 1) is always tried first; if huggingface_hub
+#                       CLIENT-SIDE refuses it ("The file is too large to be
+#                       downloaded using the regular download method" — a hard
+#                       policy wall for files over 50 GB, not flakiness), this
+#                       flag lets the retry run with Xet enabled, but ONLY if
+#                       `hf_xet` is already importable. Nothing here ever
+#                       installs it. Xet has a stall / restart-from-zero history
+#                       on this stack, so it never engages without this flag,
+#                       and an independent sha256 gate runs afterwards either
+#                       way. Without the flag the ladder falls straight to
+#                       rung 3 (single-stream resumable curl against the
+#                       resolve endpoint) — slower, but universal.
+#                       Env equivalent: ALLOW_XET=1.
+#
+#   --verify-in-place   When a target file is ALREADY at the destination with no
+#                       HF download metadata beside it (hand-placed weights),
+#                       sha256 it against the hub instead of re-downloading, and
+#                       adopt it on a match (0 bytes over the wire). Off by
+#                       default because hashing a 40 GB file costs a full read.
+#                       The *announcement* of what was found and why a download
+#                       is (or isn't) starting is UNCONDITIONAL — this flag only
+#                       controls whether the hash is computed. A size match
+#                       alone is never treated as, or reported as, verification.
+#                       Env equivalent: VERIFY_IN_PLACE=1.
 #
 # All decision logic lives in scripts/lib/profiles/pull.py (this is a thin
 # argv pass-through, matching the generate-compose.sh / diagnose-profile.sh
@@ -65,20 +94,123 @@
 # `--dry-run` contract surface.
 set -euo pipefail
 
+# Force Python's UTF-8 mode (PEP 540) for every python3 this script runs.
+# Repo sources are full of unicode (— × → ⚠), and without this a rig on a real
+# non-UTF-8 locale (de_DE.iso88591 and friends) decodes reads, stdout AND argv
+# with the locale codec, which crashes the launcher/emit paths (#779). Python
+# already auto-enables UTF-8 mode for the C/POSIX locale, so this covers the
+# case it does NOT: a genuine non-UTF-8, non-C locale. Exported, so child
+# processes and nested scripts inherit it. Guarded by test-locale-utf8.sh.
+export PYTHONUTF8="${PYTHONUTF8:-1}"
+
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Download-behaviour flags (#804 / #812). Stripped HERE and turned into env, so
+# every downstream path — the gate, --json, --apply-swap — sees an argv it
+# already understands and `pull.py`'s parser is untouched. The bare ALLOW_XET /
+# VERIFY_IN_PLACE env vars from the issues keep working on their own; the flags
+# just set them for one invocation. Both default OFF: Xet is opt-in because of
+# its stall history here, and in-place hashing is opt-in because it costs a full
+# read of a multi-GB file.
+_pull_dlargs=()
+for _a in "$@"; do
+    case "$_a" in
+        --allow-xet)        export CLUB3090_ALLOW_XET=1 ;;
+        --verify-in-place)  export CLUB3090_VERIFY_IN_PLACE=1 ;;
+        *)                  _pull_dlargs+=("$_a") ;;
+    esac
+done
+set -- "${_pull_dlargs[@]+"${_pull_dlargs[@]}"}"
 
 # Intercept --json (strictly additive). Absent -> the original exec path,
 # byte-identical. Present -> strip it and hand the remaining argv to the
 # structured-emit helper (which forces the evaluate-only gate).
 _pull_json=0
+_pull_apply_swap=0
+_pull_emit_only=0
 _pull_args=()
 for _a in "$@"; do
     if [ "$_a" = "--json" ]; then
         _pull_json=1
+    elif [ "$_a" = "--apply-swap" ]; then
+        _pull_apply_swap=1
+    elif [ "$_a" = "--emit-only" ]; then
+        _pull_emit_only=1
     else
         _pull_args+=("$_a")
     fi
 done
+
+# --apply-swap: the BYO Route-C weight-swap ACTION (strictly additive, like
+# --json). It NEVER runs the locked 6-stratum gate — a curated-arch fine-tune
+# hard-stops there at stratum-5 `no-fit-model`, which is correct (nothing to
+# price). Instead it downloads the brought weights SHA-verified and emits a
+# serve-locally compose that CLONES the --profile-like sibling with --model
+# re-pointed at those weights. The c3 [D] press on a Route-C fit-check is the
+# explicit opt-in; without --apply-swap this script's behaviour is unchanged.
+#
+# --emit-only (with --apply-swap): skip the SHA-verified download and JUST emit
+# the serve-locally compose (do_download=False). For when the weights are
+# already on disk — c3's ② Serve uses this so a present-weights serve needs no
+# [D] download step (the mount points at the existing pull dir).
+if [ "$_pull_apply_swap" -eq 1 ]; then
+    export _PULL_EMIT_ONLY="$_pull_emit_only"
+    exec python3 - "${ROOT_DIR}" "${_pull_args[@]+"${_pull_args[@]}"}" <<'PY'
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+if str(root) not in sys.path:
+    sys.path.insert(0, str(root))
+
+from scripts.lib.profiles import swap_apply as SA   # the apply-swap action
+
+ap = argparse.ArgumentParser(prog="pull.sh --apply-swap", add_help=False)
+ap.add_argument("slug")
+ap.add_argument("--profile-like", required=True, dest="profile_like")
+ap.add_argument("--hf-home", default=None)
+# tolerate (ignore) the flags a caller may carry over from the fit-check line
+for _f in ("--dry-run", "--yes", "--force-download", "--experimental-arch",
+           "--trust-remote-code", "--recommend"):
+    ap.add_argument(_f, action="store_true")
+ap.add_argument("--hardware", default=None)
+ap.add_argument("--hardware-gpus", default=None)
+ap.add_argument("--out", default=None)
+args, _unknown = ap.parse_known_args(sys.argv[2:])
+
+_emit_only = os.environ.get("_PULL_EMIT_ONLY") == "1"
+print(f"[apply-swap] resolving Route-C swap for {args.slug} "
+      f"(profile-like={args.profile_like})"
+      + (" [emit-only — weights on disk, no download]" if _emit_only else ""),
+      flush=True)
+res = SA.apply_swap(root, args.slug, args.profile_like, hf_home=args.hf_home,
+                    do_download=not _emit_only)
+if not res.get("ok"):
+    # rc=3 = "already downloading" (distinct from rc=1 failure): a concurrent
+    # download of this slug holds the pull-dir lock; do NOT start a duplicate
+    # (club-3090 #617). Callers (c3) treat rc=3 as "reflect the live download".
+    if res.get("in_progress"):
+        print(f"[apply-swap] already in progress ({res.get('detail','')}) "
+              "— not starting a duplicate", flush=True)
+        sys.exit(3)
+    print(f"[apply-swap] ERROR: {res.get('error')}", file=sys.stderr, flush=True)
+    if res.get("detail"):
+        print(f"[apply-swap]   detail: {res['detail']}", file=sys.stderr, flush=True)
+    sys.exit(1)
+
+mtp = "MTP kept" if res.get("has_mtp_head") else "MTP dropped (no head)"
+print(f"[apply-swap] sibling={res['sibling_slug']}  served-as={res['served_model_name']}"
+      f"  ({mtp})", flush=True)
+print(f"[apply-swap] weights: {res['weights_dir']}", flush=True)
+# The final, machine-parseable line the c3 lane greps for → serve this compose.
+print(f"[apply-swap] compose: {res['compose_path']}", flush=True)
+print("[apply-swap] ok", flush=True)
+PY
+fi
 
 if [ "$_pull_json" -eq 0 ]; then
     exec python3 "${ROOT_DIR}/scripts/lib/profiles/pull.py" "$@"
@@ -197,12 +329,15 @@ def _swap_path(slug, der, eligible):
                 quant_match = meta.get("format") or first_slug
         except Exception:
             quant_match = None
+        # Keep --speculative-config IFF the brought checkpoint actually carries
+        # an MTP head (deriver.detect_mtp_head: config declares MTP layers + a
+        # dedicated mtp weights file). The old blanket drop served head-
+        # preserving fine-tunes (e.g. ThinkingCap AutoRound) MTP-off; a plain
+        # re-quant without the head still drops.
+        has_mtp = bool((der.profile or {}).get("has_mtp_head"))
         return {"route": "C", "sibling_slug": sibling,
                 "quant_match": quant_match,
-                # The curated configs use a built-in MTP head; a generic repo
-                # carries no MTP head, so drop --speculative-config unless an
-                # -MTP variant is brought (mirrors the human NOTE + docs).
-                "drop_spec_config": True}
+                "drop_spec_config": not has_mtp}
     # No curated sibling -> the self-contained GGUF fallback (route B).
     return {"route": "B", "sibling_slug": None,
             "quant_match": "gguf", "drop_spec_config": False}

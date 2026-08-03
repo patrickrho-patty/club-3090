@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Force Python's UTF-8 mode (PEP 540) for every python3 this script runs.
+# Repo sources are full of unicode (— × → ⚠), and without this a rig on a real
+# non-UTF-8 locale (de_DE.iso88591 and friends) decodes reads, stdout AND argv
+# with the locale codec, which crashes the launcher/emit paths (#779). Python
+# already auto-enables UTF-8 mode for the C/POSIX locale, so this covers the
+# case it does NOT: a genuine non-UTF-8, non-C locale. Exported, so child
+# processes and nested scripts inherit it. Guarded by test-locale-utf8.sh.
+export PYTHONUTF8="${PYTHONUTF8:-1}"
+
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
@@ -73,6 +82,13 @@ assert_json_keys "$out" "d['active_estate']['instance_count']" "2"
 assert_json_keys "$out" "d['active_estate']['instances'][0]['name']" "qwen-left"
 assert_json_keys "$out" "d['active_estate']['instances'][0]['compose']" "llamacpp/default"
 assert_json_keys "$out" "d['active_estate']['instances'][0]['gpus']==[0]" "True"
+# F7 — per-instance LIVENESS: estate.yml is a plan; report-state probes docker
+# per instance. The test instances are never booted → running is False (probed,
+# down) or None (docker unavailable in this env) — NEVER True. Consumers treat
+# only running==False as "not a claim" (fail closed on None/missing).
+assert_json_keys "$out" "d['active_estate']['instances'][0]['running'] in (False, None)" "True"
+assert_json_keys "$out" "d['active_estate']['instances'][0]['container']" "club3090-qwen-left"
+assert_json_keys "$out" "d['active_estate']['running_count']" "0"
 assert_json_keys "$out" "sorted(d['profile_counts'].keys())==['drafters','engines','hardware','models','workloads']" "True"
 
 # report-state --json with a missing estate file

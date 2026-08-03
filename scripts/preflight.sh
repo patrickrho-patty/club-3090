@@ -18,6 +18,15 @@
 # Hard failures get a one-line ERROR + a "Fix:" hint.
 
 # Avoid double-sourcing.
+
+# Force Python's UTF-8 mode (PEP 540) for every python3 this script runs.
+# Repo sources are full of unicode (— × → ⚠), and without this a rig on a real
+# non-UTF-8 locale (de_DE.iso88591 and friends) decodes reads, stdout AND argv
+# with the locale codec, which crashes the launcher/emit paths (#779). Python
+# already auto-enables UTF-8 mode for the C/POSIX locale, so this covers the
+# case it does NOT: a genuine non-UTF-8, non-C locale. Exported, so child
+# processes and nested scripts inherit it. Guarded by test-locale-utf8.sh.
+export PYTHONUTF8="${PYTHONUTF8:-1}"
 [[ -n "${_PREFLIGHT_LOADED:-}" ]] && return 0
 _PREFLIGHT_LOADED=1
 _PREFLIGHT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -70,6 +79,43 @@ preflight_gpu() {
   fi
   echo "[preflight] gpu:     ${gpu_count}× detected"
   echo "$gpu_lines" | sed 's/^/[preflight]            /'
+  # GPU arch class (display-only, #246). The launchers inject arch-aware env
+  # (KV dtype) from the hardware profiles; this banner just names the class.
+  local _cap _arch_class
+  _cap="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d '[:space:]')"
+  if [[ -n "$_cap" ]]; then
+    case "$_cap" in
+      8.6|8.7)      _arch_class="ampere" ;;
+      8.9)          _arch_class="ada" ;;
+      9.*)          _arch_class="hopper" ;;
+      1[0-9].*)     _arch_class="blackwell" ;;
+      *)            _arch_class="unknown" ;;
+    esac
+    if [[ "$_arch_class" == "ampere" || "$_arch_class" == "unknown" ]]; then
+      echo "[preflight] arch:    ${_arch_class} (sm_${_cap}) — compose defaults apply (no arch-aware override)"
+    else
+      echo "[preflight] arch:    ${_arch_class} (sm_${_cap}) — arch-aware KV defaults active for pilot slugs (#246)"
+    fi
+  fi
+  # Interconnect capability (display-only; the engagement VERDICT lives in
+  # report.sh — pre-boot there is no container to audit). Silent on
+  # single-GPU / stock-PCIe rigs so the line is always signal.
+  if [[ "$gpu_count" -ge 2 ]]; then
+    local _p2p_cap=""
+    # shellcheck source=lib/p2p-state.sh
+    source "$(dirname "${BASH_SOURCE[0]}")/lib/p2p-state.sh" 2>/dev/null && \
+      _p2p_cap="$(p2p_host_capability "$gpu_count")"
+    case "$_p2p_cap" in
+      nvlink)
+        if [[ "${NVLINK_MODE:-auto}" == "force_off" ]]; then
+          echo "[preflight] p2p:     NVLink bridge detected but NVLINK_MODE=force_off — the bridge will sit idle this boot (~15% decode, BENCHMARKS #77)"
+        else
+          echo "[preflight] p2p:     NVLink bridge detected — launcher auto-engages it (NVLINK_MODE=${NVLINK_MODE:-auto})"
+        fi ;;
+      pcie_p2p)
+        echo "[preflight] p2p:     driver reports PCIe P2P available — launcher auto-engages it (patched-driver path, NVLINK_MODE=${NVLINK_MODE:-auto}; docs/PCIE_P2P.md)" ;;
+    esac
+  fi
   # Cross-rig friendliness: surface a hint when 4090 / 5090 cards are
   # detected. Composes run cross-rig but per-class gotchas (ctx derate,
   # VRAM envelope, SM-gated kernels) live in the FAQ — easier to catch
@@ -102,14 +148,39 @@ _preflight_csv_token() {
   printf '%s' "$value"
 }
 
+# UUID→index normalization (#610): launch.sh --gpus exports GPU UUIDs (the
+# runtime-agnostic form — CDI ignores NVIDIA_VISIBLE_DEVICES, and indices
+# renumber inside classic-runtime containers). Preflight's checks are all
+# host-index-based, so translate any GPU-xxxx token back to its host index
+# here — ONE choke point for every selector consumer. Unknown tokens pass
+# through untouched (they fail the match downstream with the existing error).
+_preflight_selector_normalize() {
+  local selector="$1" token out="" idx
+  [[ "$selector" != *GPU-* ]] && { printf '%s' "$selector"; return 0; }
+  local uuid_map
+  uuid_map="$(nvidia-smi --query-gpu=index,uuid --format=csv,noheader,nounits 2>/dev/null || true)"
+  IFS=',' read -ra _pf_norm_tokens <<< "$selector"
+  for token in "${_pf_norm_tokens[@]}"; do
+    token="$(_preflight_trim "$token")"
+    if [[ "$token" == GPU-* && -n "$uuid_map" ]]; then
+      idx="$(awk -F', *' -v u="$token" '$2 == u {print $1; exit}' <<< "$uuid_map")"
+      [[ -n "$idx" ]] && token="$idx"
+    fi
+    out="${out:+${out},}${token}"
+  done
+  printf '%s' "$out"
+}
+
 _preflight_selector() {
+  local raw=""
   if [[ -n "${CLUB3090_GPU:-}" ]]; then
-    printf '%s' "${CLUB3090_GPU}"
+    raw="${CLUB3090_GPU}"
   elif [[ -n "${NVIDIA_VISIBLE_DEVICES:-}" && "${NVIDIA_VISIBLE_DEVICES}" != "all" && "${NVIDIA_VISIBLE_DEVICES}" != "void" ]]; then
-    printf '%s' "${NVIDIA_VISIBLE_DEVICES}"
+    raw="${NVIDIA_VISIBLE_DEVICES}"
   elif [[ -n "${CUDA_VISIBLE_DEVICES:-}" && "${CUDA_VISIBLE_DEVICES}" != "all" && "${CUDA_VISIBLE_DEVICES}" != "void" ]]; then
-    printf '%s' "${CUDA_VISIBLE_DEVICES}"
+    raw="${CUDA_VISIBLE_DEVICES}"
   fi
+  [[ -n "$raw" ]] && _preflight_selector_normalize "$raw"
 }
 
 _preflight_selector_is_specific() {
@@ -191,8 +262,8 @@ _preflight_hardware_suggestions() {
   echo "[preflight]   - Pick a compose that matches the detected GPU VRAM/topology." >&2
   if [[ "$variant" == vllm/gemma-mtp-tp1 ]]; then
     echo "[preflight]   - vllm/gemma-mtp-tp1 is DEPRECATED (no fp8 KV path for Gemma 4 on Ampere sm_86)." >&2
-    echo "[preflight]   - Single 24 GB card, use:  bash scripts/switch.sh beellama/gemma-dflash" >&2
-    echo "[preflight]   - On 2x 24 GB cards, use:  bash scripts/switch.sh vllm/gemma-bf16-mtp" >&2
+    echo "[preflight]   - Single 24 GB card: no functional Gemma-4-31B single config (beellama retired 2026-07-27) — nearest: bash scripts/switch.sh vllm/gemma-12b-single-int8-mtp (12B), or run the 31B dual" >&2
+    echo "[preflight]   - On 2x 24 GB cards, use:  bash scripts/switch.sh vllm/gemma-31b-dual" >&2
   fi
   echo "[preflight]   - On a single 24 GB card, start with:  bash scripts/switch.sh beellama/dflash  (single-card default)" >&2
   echo "[preflight]   - For maximum compatibility, use:  bash scripts/switch.sh llamacpp/default" >&2
@@ -239,6 +310,12 @@ preflight_compose_hardware() {
   min_gpu_count="$(compose_meta_get "$compose_file" requires-min-gpu-count || true)"
   tp="$(compose_meta_get "$compose_file" tensor-parallel || true)"
   requires_sm="$(compose_meta_get "$compose_file" requires-sm || true)"
+  # Requires-homogeneous-arch: true -> this compose has an ARCH-GATED path
+  # (e.g. NVFP4/MXFP8 activation kernels) that torch.compile emits per rank.
+  # A weight-only fallback can be valid per card and still be invalid across
+  # ranks, so mixed compute capabilities must be REFUSED, not warned. (#762)
+  local requires_homog_arch
+  requires_homog_arch="$(compose_meta_get "$compose_file" requires-homogeneous-arch || true)"
 
   if [[ -z "$min_vram_gb" || -z "$min_gpu_count" || -z "$tp" ]]; then
     echo "[preflight] WARN:  compose has no hardware metadata; allowing boot: $compose_file" >&2
@@ -261,6 +338,10 @@ preflight_compose_hardware() {
 
   local total_count=0 selected_count=0 eligible_count=0 selected_below_vram=0 selected_below_sm=0
   local best_idx="" best_name="" best_mib=0 best_sm=""
+  # Architecture heterogeneity across the SELECTED cards (#762). The
+  # pre-existing HET check in launch.sh keys on VRAM only, so a 3090+4090
+  # pair (equal 24 GB, sm_86 vs sm_89) carried no architecture signal.
+  local sel_sm_list=""
   local first_idx="" first_name="" first_mib=0 first_sm=""
   local idx name mem_mib sm rest vram_gb sm_int
 
@@ -283,6 +364,10 @@ preflight_compose_hardware() {
 
     vram_gb="$(_preflight_vram_gb "$mem_mib")"
     sm_int="$(_preflight_sm_to_int "$sm")"
+    case " ${sel_sm_list} " in
+      *" ${sm} "*) : ;;
+      *) sel_sm_list="${sel_sm_list}${sm} " ;;
+    esac
 
     if (( vram_gb < min_vram_gb )); then
       selected_below_vram=1
@@ -381,6 +466,54 @@ preflight_compose_hardware() {
     echo "[preflight] WARN:  ${variant:-compose} requires >=${min_vram_gb} GB per visible GPU for TP=${tp}, but at least one selected GPU is smaller." >&2
     echo "[preflight]        Continuing because TP>=2 sub-24 GB rigs may use tuned gpu-memory-utilization/KV settings." >&2
   fi
+
+  # --- Mixed-architecture TP guard (#762, @paulp83) -------------------------
+  # Reported: NVFP4 + MXFP8 activations on a 5090 (sm_120) + 3090 Ti (sm_86)
+  # pair. Weight loading succeeded via the Marlin W4A16 weight-only fallback,
+  # then torch.compile AOT emitted `tl.float8e4nv` activation kernels the
+  # Ampere rank cannot compile:
+  #     ValueError("type fp8e4nv not supported in this architecture")
+  # Worker_TP1 died; Worker_TP0 hung on the shared-memory broadcast.
+  #
+  # Why the SM floor did not catch it: fallback_sm replaces required_sm as the
+  # hard floor (compat.py), so both cards individually cleared 7.5. But a
+  # weight-only fallback is a property of the TP GROUP, not of one card -- on a
+  # homogeneous sub-sm_90 pair the fallback is the only path taken and works
+  # (live-validated 2x3090 sm_86, 2026-07-11); on a MIXED pair the faster rank
+  # takes the native activation path and the slower one cannot follow.
+  local sel_sm_count
+  sel_sm_count="$(printf '%s\n' ${sel_sm_list} | grep -c . || true)"
+  if (( tp > 1 && sel_sm_count > 1 )); then
+    if [[ "${requires_homog_arch,,}" == "true" || "${requires_homog_arch,,}" == "yes" ]]; then
+      echo "[preflight] ERROR: ${variant:-compose} requires a HOMOGENEOUS GPU architecture for TP=${tp}." >&2
+      echo "[preflight]        Selected cards span compute capabilities: ${sel_sm_list% }" >&2
+      while IFS=',' read -r idx name mem_mib sm rest; do
+        idx="$(_preflight_csv_token "$idx")"
+        name="$(_preflight_csv_token "$name")"
+        mem_mib="$(_preflight_csv_token "$mem_mib")"
+        sm="$(_preflight_csv_token "$sm")"
+        [[ -z "$idx" ]] && continue
+        _preflight_selector_allows_index "$selector" "$idx" || continue
+        echo "[preflight]          GPU ${idx}: ${name}, $(_preflight_vram_gb "$mem_mib") GB, sm_${sm}" >&2
+      done <<< "$gpu_query"
+      echo "[preflight]        This compose has an arch-gated activation path (e.g. NVFP4/MXFP8)." >&2
+      echo "[preflight]        A weight-only fallback can be valid per card and still be invalid" >&2
+      echo "[preflight]        across ranks: torch.compile emits activation kernels per rank, and" >&2
+      echo "[preflight]        the lower-capability rank cannot compile them (club-3090 #762)." >&2
+      echo "[preflight]        Options:" >&2
+      echo "[preflight]          - run on a HOMOGENEOUS pair (all same sm_), or" >&2
+      echo "[preflight]          - use the single-card slug on the higher-capability GPU, or" >&2
+      echo "[preflight]          - try VLLM_ENFORCE_EAGER=1 to skip torch.compile AOT (~20-30% TPS), or" >&2
+      echo "[preflight]          - for genuinely heterogeneous serving see https://github.com/efschu/shvllm" >&2
+      _preflight_hardware_suggestions "$variant"
+      return 1
+    fi
+    echo "[preflight] WARN:  mixed GPU architectures selected for TP=${tp} (sm: ${sel_sm_list% })." >&2
+    echo "[preflight]        Mixed-arch tensor parallelism is NOT validated on this stack: ranks do" >&2
+    echo "[preflight]        not compute identically, and arch-gated kernels can fail on the lower" >&2
+    echo "[preflight]        card mid-compile. Prefer a homogeneous pair (club-3090 #762)." >&2
+  fi
+  # -------------------------------------------------------------------------
 
   echo "[preflight] hardware: ${variant:-compose} TP=${tp} requires ${min_gpu_count} GPU(s), >=${min_vram_gb} GB each${sm_label}; ${selected_count} visible GPU(s) detected"
   return 0
@@ -504,6 +637,66 @@ preflight_gpu_idle() {
     echo "[preflight]        Boot may OOM. Free VRAM with 'nvidia-smi' / 'docker stop ...' first." >&2
   fi
   return 0
+}
+
+# preflight_compose_gpu_fit <compose_file> <force>
+#   HARD-fail (unless force=1) when the GPUs lack enough FREE VRAM for the compose's
+#   gpu_memory_utilization. vLLM aborts at boot if `free < util × total`; with
+#   restart:unless-stopped it then restart-loops, so `switch.sh` waits the full
+#   READY_TIMEOUT (600s) for an endpoint that never comes. This converts that silent
+#   timeout into an instant, actionable error — the failure @stage-chuk hit switching
+#   ai-studio → gemma on a desktop rig (club-3090 #535): GNOME on the GPUs (~1.3 GiB/card)
+#   leaves < the 0.95 budget free. We mirror vLLM's own check (util × total × 0.98 ≈ its
+#   mem_get_info total, i.e. nvidia-smi total minus ~2% driver-reserved) and briefly retry,
+#   because `docker compose down` returns before CUDA actually releases a torn-down scene.
+preflight_compose_gpu_fit() {
+  local compose="$1" force="${2:-0}"
+  command -v nvidia-smi >/dev/null 2>&1 || return 0
+  [[ -f "$compose" ]] || return 0
+
+  # Effective util: an env GPU_MEMORY_UTILIZATION override wins over the compose default
+  # (`${GPU_MEMORY_UTILIZATION:-<X>}`), so the gate matches what vLLM will actually use.
+  local util_default util
+  util_default=$(grep -oE 'GPU_MEMORY_UTILIZATION:-[0-9.]+' "$compose" | head -1 | sed 's/.*-//')
+  util="${GPU_MEMORY_UTILIZATION:-$util_default}"
+  case "$util" in ''|*[!0-9.]*) return 0 ;; esac   # unknown / non-numeric → can't gate
+
+  # Cards this compose uses (TP / min-gpu-count header; default 1).
+  local need_cards
+  need_cards=$(grep -oiE '#[[:space:]]*(Tensor-parallel|Requires-min-gpu-count):[[:space:]]*[0-9]+' "$compose" \
+               | grep -oE '[0-9]+' | sort -rn | head -1)
+  [[ -z "$need_cards" ]] && need_cards=1
+
+  # Settle window (~10s): a just-`down`ed scene's VRAM lags docker's return.
+  local attempt result idx fg ng fits
+  for attempt in 1 2 3 4 5; do
+    result=$(nvidia-smi --query-gpu=index,memory.total,memory.free --format=csv,noheader,nounits 2>/dev/null \
+      | awk -F, -v util="$util" -v n="$need_cards" '
+          { gi[NR]=$1+0; f[NR]=$3+0; d[NR]=util*$2*0.98 }
+          END {
+            if (NR==0) { print "-1 0 0 1"; exit }          # no cards visible → skip
+            for (i=1;i<=NR;i++) ord[i]=i                    # sort card rows by free desc
+            for (i=1;i<=NR;i++) for (j=i+1;j<=NR;j++) if (f[ord[j]]>f[ord[i]]) { t=ord[i]; ord[i]=ord[j]; ord[j]=t }
+            k=(n<NR ? n : NR); fits=1; wf=1e18; wn=0; wi=-1  # check the k best cards; report the worst
+            for (i=1;i<=k;i++){ c=ord[i]; if (f[c]<d[c]) fits=0; if (f[c]<wf){ wf=f[c]; wn=d[c]; wi=gi[c] } }
+            printf "%d %.1f %.1f %d", wi, wf/1024, wn/1024, fits
+          }')
+    read -r idx fg ng fits <<< "$result"
+    [[ "$fits" == "1" ]] && return 0
+    [[ "$attempt" -lt 5 ]] && sleep 2
+  done
+
+  echo "[preflight] ERROR: GPU ${idx} has ${fg} GiB free, but this config needs ~${ng} GiB/card" >&2
+  echo "[preflight]        (gpu_memory_utilization=${util}, ${need_cards} card(s) for TP). Something else is holding VRAM —" >&2
+  echo "[preflight]        a desktop on the GPU, another model, or a scene that isn't fully stopped (check: docker ps / nvidia-smi)." >&2
+  echo "[preflight]        Fix: free that VRAM, or lower the ceiling —" >&2
+  echo "[preflight]             GPU_MEMORY_UTILIZATION=0.90 bash scripts/switch.sh <variant>" >&2
+  echo "[preflight]        — then retry.  (Bypass this check with --force.)" >&2
+  if [[ "$force" == "1" ]]; then
+    echo "[preflight] WARN:  --force set — launching anyway; vLLM may still abort at the free-memory check." >&2
+    return 0
+  fi
+  return 1
 }
 
 preflight_running() {
@@ -1190,7 +1383,7 @@ preflight_autodetect_endpoint() {
 # Why this exists (#372): report.sh autodetects container + URL + engine but NOT
 # the served model, so the verify/bench scripts fell back to MODEL=qwen3.6-27b-
 # autoround. Against a non-qwen vLLM endpoint (e.g. gemma-4-26b-a4b-awq) every
-# request 404'd ("The model `qwen3.6-27b-autoround` does not exist"). llama.cpp
+# request 404'd ("The model `qwen3.6-27b` does not exist"). llama.cpp
 # ignores the request's model field, so the same wrong default silently "worked"
 # there (#371) — which is exactly what masked the bug.
 #
@@ -1219,4 +1412,86 @@ except Exception:
     echo "[autodetect] served model='${MODEL}' (from ${url%/}/v1/models; set MODEL= to override)" >&2
   fi
   return 0
+}
+
+# ── #633 — ik-llama cu13/cu12 driver-aware image selection ────────────────────
+# The pinned cu13 ik-llama image has a CUDA 13.2 runtime; on a driver whose
+# supported CUDA < 13.2 the forward-compat path fails on GeForce (CUDA error
+# 804) → silent CPU fallback → segfault crash-loop, with no actionable hint
+# (launch just times out after 600 s). Auto-pick the cu12 sibling build (same
+# build 4574, CUDA 12.6, backward-compatible with the 13.0 driver — validated on
+# a 580.159 rig, #633) unless the user pinned IK_LLAMA_IMAGE. ik-llama only.
+IK_LLAMA_CU13_MIN_CUDA="13.2"
+IK_LLAMA_CU12_FALLBACK="${IK_LLAMA_CU12_FALLBACK:-ghcr.io/ikawrakow/ik-llama-cpp:cu12-server-4574}"
+
+# _cuda_ge A B → 0 (true) iff major.minor A >= B
+_cuda_ge() {
+  local a1="${1%%.*}" b1="${2%%.*}" a2 b2
+  a2="${1#*.}"; [[ "$a2" == "$1" ]] && a2=0
+  b2="${2#*.}"; [[ "$b2" == "$2" ]] && b2=0
+  (( 10#${a1:-0} > 10#${b1:-0} )) && return 0
+  (( 10#${a1:-0} < 10#${b1:-0} )) && return 1
+  (( 10#${a2:-0} >= 10#${b2:-0} ))
+}
+
+# Driver's max supported CUDA (major.minor), or "" if undetectable.
+_driver_cuda_version() {
+  local v
+  v="$(nvidia-smi --query 2>/dev/null | grep -m1 -oE 'CUDA Version[[:space:]]*:[[:space:]]*[0-9]+\.[0-9]+' | grep -oE '[0-9]+\.[0-9]+' || true)"
+  [[ -z "$v" ]] && v="$(nvidia-smi 2>/dev/null | grep -m1 -oE 'CUDA Version:?[[:space:]]*[0-9]+\.[0-9]+' | grep -oE '[0-9]+\.[0-9]+' || true)"
+  printf '%s' "$v"
+}
+
+# preflight_single_card_util <compose_file> [variant]
+# Advisory WARN (never blocks; runs even under --force) when the user raises
+# GPU_MEMORY_UTILIZATION above the compose's validated default on a SINGLE-CARD
+# (TP<=1) config. On one GPU a higher util shrinks the free VRAM a large
+# tool-response prefill needs for its activation peak, so vLLM OOMs mid-prefill
+# even though boot succeeds (verify-stress step 2/8). Two 5090 testers hit this
+# by setting util=0.92 on the nvfp4 slug whose validated default is 0.85 (#617).
+# No-op unless the user overrode the env AND the compose ships a
+# `GPU_MEMORY_UTILIZATION:-<default>` (so it never fires for non-vLLM engines,
+# dual/multi-card, or a plain default run).
+preflight_single_card_util() {
+  local compose_file="$1" variant="${2:-}"
+  [[ -f "$compose_file" ]] || return 0
+  local user_util="${GPU_MEMORY_UTILIZATION:-}"
+  [[ -n "$user_util" ]] || return 0                 # only when explicitly overridden
+
+  local tp=""
+  if declare -F compose_meta_get >/dev/null 2>&1; then
+    tp="$(compose_meta_get "$compose_file" tensor-parallel 2>/dev/null || true)"
+  fi
+  [[ "$tp" =~ ^[0-9]+$ ]] || return 0               # unknown topology → stay quiet
+  (( tp <= 1 )) || return 0                          # single-card only
+
+  local default_util
+  default_util="$(command grep -oE 'GPU_MEMORY_UTILIZATION:-[0-9.]+' "$compose_file" | head -1 | sed -E 's/.*:-//')"
+  [[ -n "$default_util" ]] || return 0               # compose ships no util default
+
+  if awk -v u="$user_util" -v d="$default_util" 'BEGIN{exit !((u+0) > (d+0))}'; then
+    echo "[preflight] WARN:  GPU_MEMORY_UTILIZATION=${user_util} exceeds ${variant:-this config}'s validated single-card default of ${default_util}." >&2
+    echo "[preflight]        On one GPU a higher util steals the headroom a large tool-response prefill needs for its" >&2
+    echo "[preflight]        activation peak — vLLM can OOM mid-prefill (verify-stress step 2/8) even though boot succeeds." >&2
+    echo "[preflight]        Fix: grow context via MAX_MODEL_LEN and keep GPU_MEMORY_UTILIZATION <= ${default_util}. (#617)" >&2
+  fi
+  return 0
+}
+
+preflight_ik_llama_image() {
+  local variant="${1:-}"
+  [[ "$variant" == ik-llama/* ]] || return 0
+  if [[ -n "${IK_LLAMA_IMAGE:-}" ]]; then
+    echo "[preflight] ik-llama image pinned (.env/shell): ${IK_LLAMA_IMAGE}"
+    return 0
+  fi
+  local drv; drv="$(_driver_cuda_version)"
+  [[ -z "$drv" ]] && return 0                    # undetectable → leave compose default (cu13)
+  _cuda_ge "$drv" "$IK_LLAMA_CU13_MIN_CUDA" && return 0   # >=13.2 → cu13 runtime OK
+  export IK_LLAMA_IMAGE="$IK_LLAMA_CU12_FALLBACK"
+  echo "[preflight] ⚠ driver CUDA ${drv} < ${IK_LLAMA_CU13_MIN_CUDA} (the cu13 ik-llama pin's runtime)." >&2
+  echo "[preflight]   cu13 would forward-compat-fail on GeForce (error 804) → CPU fallback → crash loop (#633)." >&2
+  echo "[preflight]   Auto-selected the cu12 sibling build (same build, CUDA 12.6, backward-compatible):" >&2
+  echo "[preflight]     IK_LLAMA_IMAGE=${IK_LLAMA_CU12_FALLBACK}" >&2
+  echo "[preflight]   Pin IK_LLAMA_IMAGE in .env to override." >&2
 }

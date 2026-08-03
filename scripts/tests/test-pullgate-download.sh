@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Force Python's UTF-8 mode (PEP 540) for every python3 this script runs.
+# Repo sources are full of unicode (— × → ⚠), and without this a rig on a real
+# non-UTF-8 locale (de_DE.iso88591 and friends) decodes reads, stdout AND argv
+# with the locale codec, which crashes the launcher/emit paths (#779). Python
+# already auto-enables UTF-8 mode for the C/POSIX locale, so this covers the
+# case it does NOT: a genuine non-UTF-8, non-C locale. Exported, so child
+# processes and nested scripts inherit it. Guarded by test-locale-utf8.sh.
+export PYTHONUTF8="${PYTHONUTF8:-1}"
+
 # test-pullgate-download.sh — v0.8.0 [E] STEP E2 (club-3090 #141 / #147).
 #
 # Contract test for CONTRACT-3: the HF download stage. The test IS the spec;
@@ -131,6 +140,22 @@ check("README.md" not in ds, "download_set excludes unrelated repo files")
 check("chat_template.jinja" in ds and "vocab.json" in ds
       and "merges.txt" in ds,
       "download_set reconciles BOTH v2's *.jinja AND legacy vocab/merges")
+
+# 1b. A dedicated MTP/nextn head (e.g. `mtp_grafted.safetensors`) is a real
+# weight the model needs with MTP enabled, but it's neither a `model-*` nor
+# `-of-` shard — the shard filter used to DROP it, silently omitting
+# Tess-4-27B-FP8's MTP head → broken MTP serving (club-3090 #617). It must now
+# be unioned into the weight set.
+MTP_API = {"siblings": [{"rfilename": n} for n in (
+    "model-00001-of-00007.safetensors", "model-00007-of-00007.safetensors",
+    "model.safetensors.index.json", "mtp_grafted.safetensors",
+    "config.json", "tokenizer.json",
+)]}
+mtp_ds = D.download_set(MTP_API)
+check("mtp_grafted.safetensors" in mtp_ds,
+      f"download_set unions a dedicated MTP head (mtp_grafted.safetensors); got={sorted(mtp_ds)}")
+check("model-00001-of-00007.safetensors" in mtp_ds,
+      "download_set still includes the main shards alongside the MTP head")
 
 # ---------------------------------------------------------------------------
 # 2. sized_download_gb sizes EXACTLY download_set; gates.c2a_disk consumes
@@ -641,10 +666,12 @@ with tempfile.TemporaryDirectory() as td:
           f"'hf-cli-missing') (got ok={getattr(r,'ok',None)} "
           f"fail={getattr(r,'failure',None)})")
     check(r is not None and "hf download" not in (r.detail or "")
-          and "huggingface-cli" in (r.detail or "")
-          and "uv tool install" in (r.detail or ""),
-          f"missing-CLI carries the canonical actionable detail "
-          f"(setup.sh:418-421 install hint); detail={getattr(r,'detail',None)!r}")
+          and "pipx" in (r.detail or "")
+          and "uv tool install" in (r.detail or "")
+          and "break-system-packages" in (r.detail or ""),
+          f"missing-CLI carries the canonical PEP-668-aware install hint "
+          f"(pipx / uv / --break-system-packages; in sync with setup.sh "
+          f"ensure_hf_cli); detail={getattr(r,'detail',None)!r}")
     final = DL.pull_dir(Path(td), "Org/NoCli")
     check(not (final / ".incomplete").exists(),
           "missing-CLI: .incomplete tree deleted (no residue)")

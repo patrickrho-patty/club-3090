@@ -9,20 +9,19 @@
 #   Vision:    yes
 #   Max ctx:   262K (text_config max_position_embeddings; head_dim 256 uniform → int8-PTH native)
 #   Genesis:   none — intentionally Genesis-free
-#   Status:    🧪 Experimental
+#   Status:    🗑️ Deprecated
+#   Caveats:   DEPRECATED 2026-07-16 (maintainer decision, tier-space review). Dominated by the
+#                fast tier on every measured axis (decode ~67 vs ~89 code TPS · KV pool 370K/1.41×
+#                vs fast's 622K/2.37× · 8-pack tie 105 vs 109), and its ONLY reason-to-exist —
+#                the int8-PTH KV fidelity bet (#470) — was invalidated by #594/#595: int8-PTH KV
+#                routes to TRITON_ATTN and CRATERS decode at depth vs fp8/e4m3→FlashInfer (the
+#                same finding that flipped dual-max OFF int8-PTH). The pending NIAH A/B is moot —
+#                the instrument arrived and answered AGAINST the bet. Use vllm/dual (fast); for
+#                higher weight fidelity use vllm/qwen-27b-dual-max (fp8 + fp8/e4m3 KV).
 #   Quality:   105/150 (det 64/75 · sandbox 41/75) (--full, same harness 2026-06-07). 8-pack A/B
 #                same day: fast 109 · balanced 105 · max 110 — a TIE (det 64/64/65; within ±5-7
 #                noise; balanced nominally lowest). The short-ctx 8-pack can't separate the quants.
-#   ⚠️ Honest standing: balanced is DOMINATED by the fast tier (vllm/dual) — slower (~67 vs ~89
-#                code TPS), SMALLER KV pool (370K/1.41× vs fast's measured 622K/2.37× @262K: the
-#                heavier 27 GB AWQ weights leave less KV room than fast's 17.5 GB autoround), AND
-#                tied/below on the 8-pack. Its ONLY possible edge is int8-PTH KV fidelity > fast's
-#                fp8_e5m2 — UNPROVEN (the short-ctx 8-pack is blind to it). Note int8-PTH and fp8
-#                are the SAME size, so this is a fidelity bet, not a memory one. Survives only if
-#                the long-ctx NIAH A/B (#470) shows int8-PTH materially better high-ctx recall;
-#                otherwise deprecate — fast wins on speed AND pool.
-#   Best for:  EXPERIMENTAL int8-PTH-KV-fidelity bet, pending the long-ctx NIAH A/B (#470). NOT a
-#                recommended tier today — fast (vllm/dual) dominates it on speed + KV pool.
+#   Best for:  nothing — deprecated; kept for historical reference (see Caveats).
 # ---------------------------------------------------------------------------
 # Dual RTX 3090 — Qwen3.6-27B "balanced" tier (vllm/qwen-27b-dual-balanced).
 # cyankiwi AWQ-BF16-INT4 weights + MTP n=3 + int8-PTH KV + vision. 4-bit weights (Marlin
@@ -40,7 +39,7 @@
 # Dependencies:
 #   - 2× RTX 3090 (Ampere SM 8.6), PCIe-only (no NVLink — works fine; NVLink
 #     auto-detected at boot via NVLINK_MODE if present)
-#   - vLLM STABLE v0.22.0 image (Docker Hub, immutable) — no source overlays.
+#   - vLLM STABLE image (v0.24.0, from the `vllm-stable` engine profile — version in install.spec, #254) — no source overlays.
 #     AWQ pack-quantized loads via the compressed-tensors path (Marlin int4 on Ampere);
 #     int8_per_token_head KV is native on stock v0.22.0 for this uniform-head-dim model.
 #
@@ -60,7 +59,7 @@ services:
     # means no patch overlays are anchored here, so we ride stable releases.
     # Bump the tag to a newer stable after a verify-stress + soak gate.
     # Override with VLLM_IMAGE=... if you need a specific build.
-    image: ${VLLM_IMAGE:-vllm/vllm-openai:v0.22.0}
+    image: ${VLLM_IMAGE:-vllm/vllm-openai:v0.25.1}
     container_name: "${ESTATE_CONTAINER:-vllm-qwen36-27b-dual-balanced}"
     restart: ${CLUB3090_RESTART:-unless-stopped}
     ports:
@@ -85,8 +84,17 @@ services:
       - ../../../patches/froggeric-chat-template/chat_template.jinja:/etc/qwen-froggeric-chat-template.jinja:ro
       # NVLink auto-detection — runs inside container at boot.
       - ../../../../../../scripts/detect_nvlink.sh:/etc/club3090/detect_nvlink.sh:ro
+      # Vendored vllm#48375 (MambaManager drop_eagle_block) — inert under the
+      # prefix-off default; protects PREFIX_CACHE_ARG users. See patches.yml.
+      - ../../../patches/vllm-pr48375-mamba-drop-eagle-block:/etc/club3090/pr48375:ro
     environment:
       - NVIDIA_VISIBLE_DEVICES=${ESTATE_GPUS:-${NVIDIA_VISIBLE_DEVICES:-all}}
+      # CUDA-level GPU mask — the runtime-agnostic half of GPU selection
+      # (#610): launch.sh --gpus exports GPU UUIDs here. CDI runtimes (NixOS,
+      # nvidia-ctk cdi) IGNORE NVIDIA_VISIBLE_DEVICES, so this mask is what
+      # actually pins cards there; on the classic runtime the UUID form is
+      # renumbering-proof. Unset → absent (no masking).
+      - CUDA_VISIBLE_DEVICES
       - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
       - HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-${OFFLINE:-0}}
       - TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-${OFFLINE:-0}}
@@ -95,7 +103,13 @@ services:
       - NCCL_CUMEM_ENABLE=0
       - NCCL_P2P_DISABLE=1
       - VLLM_NO_USAGE_STATS=1
-      - VLLM_USE_FLASHINFER_SAMPLER=1
+      # FlashInfer sampler OFF: measured -3.0% narrative / -1.7% code decode on the
+      # 2x3090 flagship (bench.sh, 5 measured runs/arm, symmetric boots, single
+      # variable). With MTP spec-decode active, sampling routes through the
+      # rejection-sampler path where the FlashInfer kernel adds overhead without a
+      # win. Also trims sampler workspace, which is load-bearing on 24 GB (same
+      # reasoning as nemotron dual/w4a16/turbo.yml). Reported by @Aduer in #671.
+      - VLLM_USE_FLASHINFER_SAMPLER=0
       - OMP_NUM_THREADS=1
       # expandable_segments:True crashes boot on some setups (likely cuMemMap path).
       # Known: JusefPol on NVLink (PR #31), WSL2 single-card 3090 Ti.
@@ -120,6 +134,7 @@ services:
         # stability. See docs/HARDWARE.md "Note for WSL2 / Windows users".
         # NVLink auto-detection (sets NCCL env vars, _NVLINK_ENABLED).
         source /etc/club3090/detect_nvlink.sh
+        bash /etc/club3090/pr48375/install.sh || exit 1
         if [ "$${_NVLINK_ENABLED:-0}" = "1" ]; then
           exec vllm serve $${VLLM_ENFORCE_EAGER:+--enforce-eager} "$$@"
         else
@@ -130,7 +145,8 @@ services:
       - --model
       - /root/.cache/huggingface/qwen3.6-27b-awq-bf16-int4
       - --served-model-name
-      - qwen3.6-27b-awq-bf16-int4
+      - qwen3.6-27b
+      - qwen3.6-27b-autoround
       - --quantization
       - compressed-tensors
       - --dtype
@@ -146,7 +162,7 @@ services:
       - --max-num-seqs
       - "2"
       - --max-num-batched-tokens
-      - "8192"
+      - "${MAX_NUM_BATCHED_TOKENS:-8192}"
       - --kv-cache-dtype
       - "${KV_CACHE_DTYPE:-int8_per_token_head}"
       - --trust-remote-code
@@ -160,7 +176,11 @@ services:
       - --enable-auto-tool-choice
       - --tool-call-parser
       - qwen3_coder
-      - --enable-prefix-caching
+      # Prefix-caching ON by default (flipped 2026-07-17, #710/#736): the
+      # vllm#43559 fix (vllm#48375) is VENDORED on this compose and applied at
+      # boot, plus 7-day production + 6-arm probe evidence of the pair clean on
+      # v0.25.x. Opt out: PREFIX_CACHE_ARG=--no-enable-prefix-caching
+      - "${PREFIX_CACHE_ARG:---enable-prefix-caching}"
       - --enable-chunked-prefill
       - --speculative-config
       - '{"method":"mtp","num_speculative_tokens":3}'

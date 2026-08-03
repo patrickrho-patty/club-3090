@@ -12,8 +12,11 @@
 #   - clones Sandermage/genesis-vllm-patches into models/<model>/vllm/patches/genesis
 #     (vLLM-only; skip with SKIP_GENESIS=1 if you only need llama.cpp / SGLang;
 #     Gemma 4 doesn't fetch Genesis at all yet)
-#   - downloads model weights into $MODEL_DIR with SHA256 verification
-#     against HF x-linked-etag
+#   - downloads model weights into $MODEL_DIR with SHA256 verification against
+#     the hub's published x-linked-etag (no-redirect resolve HEAD via
+#     scripts/lib/profiles/hf_fetch.py). A file the hub publishes no hash for is
+#     reported UNVERIFIED and EXCLUDED from the verified count — "verified"
+#     never attaches to a size-only check (#857)
 #   - downloads the always-required drafter (Gemma 4: MTP "assistant"; Qwen3.6:
 #     no always-required drafter — DFlash is optional via WITH_DFLASH_DRAFT=1)
 #
@@ -40,6 +43,15 @@
 # Idempotent: safe to re-run — skips steps already done.
 
 set -euo pipefail
+
+# Force Python's UTF-8 mode (PEP 540) for every python3 this script runs.
+# Repo sources are full of unicode (— × → ⚠), and without this a rig on a real
+# non-UTF-8 locale (de_DE.iso88591 and friends) decodes reads, stdout AND argv
+# with the locale codec, which crashes the launcher/emit paths (#779). Python
+# already auto-enables UTF-8 mode for the C/POSIX locale, so this covers the
+# case it does NOT: a genuine non-UTF-8, non-C locale. Exported, so child
+# processes and nested scripts inherit it. Guarded by test-locale-utf8.sh.
+export PYTHONUTF8="${PYTHONUTF8:-1}"
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 WEIGHTS_READER="${ROOT_DIR}/scripts/lib/profiles/weights.py"
@@ -152,7 +164,7 @@ esac
 if [[ $# -gt 1 ]]; then
   echo "ERROR: setup.sh takes a single model name; got extra argument(s): ${*:2}" >&2
   echo "       setup.sh only DOWNLOADS WEIGHTS for a model — e.g. bash scripts/setup.sh ${1}" >&2
-  echo "       To LAUNCH a serving config (a slug such as 'vllm/gemma-int8-mtp'), use:" >&2
+  echo "       To LAUNCH a serving config (a slug such as 'vllm/gemma-31b-dual'), use:" >&2
   echo "         bash scripts/launch.sh --variant <slug>      # or: bash scripts/switch.sh <slug>" >&2
   echo "       See the slugs available for a model:  bash scripts/switch.sh --list" >&2
   exit 64
@@ -547,6 +559,72 @@ if [[ "${SKIP_MODEL:-0}" == "1" ]]; then
   exit 0
 fi
 
+# Ensure an HF download CLI ('hf', or legacy 'huggingface-cli') is available.
+# If neither is present, offer a CONSENT-GATED, ISOLATED install (uv tool / pipx
+# — lands on PATH, no changes to system Python). We deliberately NEVER run
+# `pip --break-system-packages` or `sudo apt` on the user's behalf; those stay
+# copy-paste the user owns. Returns 0 when a CLI is available (already or after
+# an accepted install); prints the working manual options + returns 1 otherwise.
+# Honors CLUB3090_ASSUME_YES=1 for non-interactive opt-in. Fixes the PEP 668
+# `externally-managed-environment` wall on Ubuntu 24.04 / WSL, where the old
+# bare `pip install` hint could not run.
+ensure_hf_cli() {
+  command -v hf >/dev/null 2>&1 && return 0
+  command -v huggingface-cli >/dev/null 2>&1 && return 0
+
+  # First ISOLATED installer available (never touches system Python).
+  local installer="" cmd=""
+  if command -v uv >/dev/null 2>&1; then
+    installer="uv";   cmd="uv tool install --with hf_transfer huggingface-hub"
+  elif command -v pipx >/dev/null 2>&1; then
+    installer="pipx"; cmd="pipx install 'huggingface-hub[hf_transfer]'"
+  fi
+
+  if [[ -n "$installer" ]]; then
+    local go=""
+    if [[ "${CLUB3090_ASSUME_YES:-0}" == "1" ]]; then
+      go=1
+      echo "[model] hf CLI missing — CLUB3090_ASSUME_YES=1, installing via ${installer} (isolated)." >&2
+    elif [[ -t 0 ]]; then
+      echo "[model] The Hugging Face CLI ('hf') is required to download weights, but it's not installed." >&2
+      echo "[model] I can install it for you, isolated (on your PATH, no changes to system Python):" >&2
+      echo "[model]     ${cmd}" >&2
+      local reply=""
+      read -rp "[model] Install it now? [Y/n] " reply
+      case "${reply}" in ""|[Yy]|[Yy][Ee][Ss]) go=1 ;; esac
+    fi
+    if [[ -n "$go" ]]; then
+      echo "[model] Installing: ${cmd}" >&2
+      if eval "$cmd" >&2; then
+        # Freshly-installed console scripts land in ~/.local/bin (pipx + uv's
+        # default tool bin) — make them visible to THIS run, no shell restart.
+        export PATH="${HOME}/.local/bin:${PATH}"
+        hash -r 2>/dev/null || true
+        if command -v hf >/dev/null 2>&1 || command -v huggingface-cli >/dev/null 2>&1; then
+          echo "[model] hf CLI installed and on PATH." >&2
+          return 0
+        fi
+        echo "[model] Installed, but 'hf' isn't on PATH in this shell yet — restart your terminal (or run 'pipx ensurepath' / add ~/.local/bin to PATH) and re-run setup.sh." >&2
+        return 1
+      fi
+      echo "[model] Automatic install did not complete — use a manual option below." >&2
+    fi
+  fi
+
+  # No isolated installer, declined, or install failed → the working manual set.
+  {
+    echo "ERROR: the Hugging Face CLI ('hf') is required but not installed."
+    echo "  Recommended — isolated, puts 'hf' on your PATH (works on Ubuntu 24.04 / WSL):"
+    echo "    sudo apt install -y pipx && pipx install 'huggingface-hub[hf_transfer]' && pipx ensurepath"
+    echo "    (then restart your shell and re-run this command)"
+    echo "  Or, with uv:"
+    echo "    uv tool install --with hf_transfer huggingface-hub"
+    echo "  Quick override — modifies SYSTEM Python (only on a dedicated box / WSL):"
+    echo "    pip install --break-system-packages 'huggingface-hub[hf_transfer]'"
+  } >&2
+  return 1
+}
+
 _hf_download_repo() {
   local repo="$1"
   local subdir="$2"
@@ -556,6 +634,8 @@ _hf_download_repo() {
   local rev_args=()
   [[ -n "$revision" ]] && rev_args=(--revision "$revision")
   mkdir -p "${MODEL_DIR}/${subdir}"
+  # Guarantee a download CLI (consent-gated isolated install if missing).
+  ensure_hf_cli || exit 1
   if command -v hf >/dev/null 2>&1; then
     echo "[model]   Using 'hf download' (hf_transfer if available) ..."
     # files is intentionally word-split: empty -> whole repo; non-empty -> selected files.
@@ -566,14 +646,57 @@ _hf_download_repo() {
     HF_HUB_ENABLE_HF_TRANSFER=1 HF_HUB_DISABLE_XET=1 \
       huggingface-cli download "$repo" ${files} "${rev_args[@]}" --local-dir "${MODEL_DIR}/${subdir}"
   else
-    echo "ERROR: neither 'hf' nor 'huggingface-cli' found. Install with:" >&2
-    echo "  pip install 'huggingface-hub[hf_transfer]'" >&2
-    echo "or:" >&2
-    echo "  uv tool install --with hf_transfer huggingface-hub" >&2
+    # Unreachable: ensure_hf_cli returned 0 so one of the above resolves.
+    echo "ERROR: hf CLI unexpectedly unavailable after ensure_hf_cli." >&2
     exit 1
   fi
 }
 
+# _hf_remote_meta <repo> <revision> <file> -> "<sha256> <size>" on stdout
+#
+# Delegates to scripts/lib/profiles/hf_fetch.py::resolve_head (#855) rather than
+# re-implementing the lookup here. Two reasons that are not style preferences:
+#
+#   1. The HEAD must NOT follow redirects. The old `curl -sfI` did, and on any
+#      Xet-backed repo the 302 lands on the CAS bridge, whose response carries
+#      the CAS *blob* ETag and NO `x-linked-etag` — so the canonical sha256,
+#      which lives on the FIRST hop, read as "not published" on every modern
+#      repo. The SKIP was the normal outcome, not a rare edge (#857).
+#   2. One implementation means the downloader and setup.sh cannot disagree
+#      about what "verified" means. They already did, and the weaker surface
+#      was the one printing the reassuring line.
+#
+# Prints "<sha256|-> <size|->" and returns 0 when the hub answered at all;
+# returns non-zero only when the lookup itself failed. A literal "-" in the hash
+# field means the hub published NO sha256 for this file — the caller MUST treat
+# that as UNVERIFIED, never as a pass, however good the size looks.
+_hf_remote_meta() {
+  local repo="$1" revision="$2" file="$3"
+  command -v python3 >/dev/null 2>&1 || return 1
+  [[ -f "${ROOT_DIR}/scripts/lib/profiles/hf_fetch.py" ]] || return 1
+  python3 - "$repo" "$revision" "$file" <<PY 2>/dev/null
+import sys
+sys.path.insert(0, "${ROOT_DIR}/scripts/lib/profiles")
+import hf_fetch
+m = hf_fetch.resolve_head(sys.argv[1], sys.argv[3], revision=sys.argv[2],
+                          token=hf_fetch._token())
+if m.sha256 is None and m.size is None:
+    raise SystemExit(1)          # the hub told us nothing at all
+print(f"{m.sha256 or '-'} {m.size if m.size is not None else '-'}")
+PY
+}
+
+# Verify the downloaded artifacts against the hub's published hashes.
+#
+# #857 — the word "verified" only ever attaches to a HASH check. Before this,
+# a file whose etag lookup came back empty printed `SKIP (no etag)`, was not
+# counted as a failure, and was still included in the `N file(s) SHA-verified`
+# total. Combined with the redirect-following lookup above, on a Xet-backed repo
+# that meant the reassuring line was printed for files nothing had checked —
+# the same failure shape as the historical "DONE (hash-verified)" incident.
+#
+# Now: hash-checkable files are verified; everything else is UNVERIFIED (size-
+# only at best) and is EXCLUDED from the verified count, with the split stated.
 _verify_downloaded_files() {
   local repo="$1"
   local subdir="$2"
@@ -581,20 +704,44 @@ _verify_downloaded_files() {
   # Pin the etag lookup to the same revision we downloaded (#319). Empty -> main
   # HEAD; a stale pin would otherwise etag-check against a newer HEAD and FAIL.
   local revision="${4:-main}"
-  local fail=0 count=0 f expected actual
+  local fail=0 verified=0 unverified=0 total=0
+  local f meta expected exp_size actual local_size
 
-  echo "[verify]  Checking SHA256 of every ${verify_glob} against HF x-linked-etag (rev: ${revision}) ..."
+  echo "[verify]  Checking SHA256 of every ${verify_glob} against the hub's published"
+  echo "          x-linked-etag (no-redirect resolve HEAD, rev: ${revision}) ..."
   cd "${MODEL_DIR}/${subdir}"
   for f in ${verify_glob}; do
     [[ -f "$f" ]] || continue
-    count=$((count + 1))
-    expected="$(curl -sfI "https://huggingface.co/${repo}/resolve/${revision}/$f" \
-      | grep -i '^x-linked-etag:' | tr -d '"\r' | awk '{print $NF}' || true)"
-    actual="$(sha256sum "$f" | awk '{print $1}')"
+    total=$((total + 1))
+    expected=""; exp_size=""
+    if meta="$(_hf_remote_meta "$repo" "$revision" "$f")"; then
+      read -r expected exp_size <<<"$meta"
+      [[ "$expected" == "-" ]] && expected=""
+      [[ "$exp_size" == "-" ]] && exp_size=""
+    fi
     if [[ -z "$expected" ]]; then
-      printf "  %-50s SKIP (no etag)\n" "$f"
-    elif [[ "$expected" == "$actual" ]]; then
+      # No published hash -> this file CANNOT be verified. Size is the only
+      # cross-check available and it is not a verification: a truncated-then-
+      # padded or silently-corrupted file matches on size (the exact incident
+      # this rule exists for). Say so, and keep it out of the verified count.
+      local_size="$(stat -c '%s' "$f" 2>/dev/null || echo "?")"
+      if [[ -n "$exp_size" && "$exp_size" == "$local_size" ]]; then
+        printf "  %-50s UNVERIFIED (no published hash; size matches: %s bytes — NOT a verification)\n" \
+          "$f" "$local_size"
+      elif [[ -n "$exp_size" ]]; then
+        printf "  %-50s FAIL  size mismatch  exp=%s  act=%s\n" "$f" "$exp_size" "$local_size"
+        fail=$((fail + 1))
+        continue
+      else
+        printf "  %-50s UNVERIFIED (hub published neither hash nor size)\n" "$f"
+      fi
+      unverified=$((unverified + 1))
+      continue
+    fi
+    actual="$(sha256sum "$f" | awk '{print $1}')"
+    if [[ "$expected" == "$actual" ]]; then
       printf "  %-50s OK\n" "$f"
+      verified=$((verified + 1))
     else
       printf "  %-50s FAIL  exp=%.12s  act=%.12s\n" "$f" "$expected" "$actual"
       fail=$((fail + 1))
@@ -603,15 +750,26 @@ _verify_downloaded_files() {
   cd "${ROOT_DIR}"
 
   if [[ "$fail" != "0" ]]; then
-    echo "[verify]  ${fail} file(s) failed SHA check." >&2
+    echo "[verify]  ${fail} file(s) failed their integrity check." >&2
     echo "          Delete ${MODEL_DIR}/${subdir} and re-run setup.sh." >&2
     exit 1
   fi
-  if [[ "$count" == "0" ]]; then
+  if [[ "$total" == "0" ]]; then
     echo "[verify]  No ${verify_glob} found in ${MODEL_DIR}/${subdir} — download may have failed." >&2
     exit 1
   fi
-  echo "[done]    ${count} file(s) SHA-verified in ${subdir}."
+  # The count in this line is HASH-VERIFIED FILES ONLY. Anything the hub does
+  # not publish a hash for is reported separately and loudly — a reader must
+  # never be able to read "N file(s) SHA-verified" and conclude N == total when
+  # it does not.
+  echo "[done]    ${verified}/${total} file(s) SHA-verified in ${subdir}."
+  if [[ "$unverified" != "0" ]]; then
+    echo "[verify]  ⚠ ${unverified}/${total} file(s) UNVERIFIED — the hub published no sha256 for them,"
+    echo "            so nothing checked their contents (a size match is not a verification)."
+    echo "            Re-fetch through the resilience ladder for a hash-gated pull:"
+    echo "              python3 scripts/lib/profiles/hf_fetch.py ${repo} \\"
+    echo "                --local-dir ${MODEL_DIR}/${subdir} --verify-in-place"
+  fi
 }
 
 download_weight_key() {
@@ -622,7 +780,11 @@ download_weight_key() {
   _verify_downloaded_files "$WEIGHT_REPO" "$WEIGHT_SUBDIR" "$WEIGHT_VERIFY_GLOB" "${WEIGHT_REVISION:-main}"
 }
 
-VERIFY_GLOB="${VERIFY_GLOB_OVERRIDE:-*.safetensors}"
+# #634 — honour the PRIMARY recipe's verify_glob (set by load_weight_recipe →
+# line 100, e.g. "*.gguf" for GGUF keys), NOT a re-hardcoded *.safetensors, or
+# every GGUF primary fetch (WEIGHTS=gguf/iq4ks) fails verify despite a good
+# download.  An explicit VERIFY_GLOB_OVERRIDE still wins.
+VERIFY_GLOB="${VERIFY_GLOB_OVERRIDE:-${VERIFY_GLOB}}"
 _hf_download_repo "${MODEL_REPO}" "${MODEL_SUBDIR}" "${GGUF_FILES}" "${MODEL_REVISION:-}"
 _verify_downloaded_files "${MODEL_REPO}" "${MODEL_SUBDIR}" "${VERIFY_GLOB}" "${MODEL_REVISION:-main}"
 
@@ -680,7 +842,7 @@ case "${MODEL_NAME}" in
     SAMPLE_CONTAINER="vllm-qwen36-27b"
     SAMPLE_COMPOSE_FLAGS_DUAL=" -f dual/autoround-int4/fp8-mtp.yml"
     SAMPLE_PORT="8020"
-    SAMPLE_MODEL_NAME="qwen3.6-27b-autoround"
+    SAMPLE_MODEL_NAME="qwen3.6-27b"
     NEXT_STEPS_NOTE="Or dual-card vLLM (Marlin patched files already vendored in-repo):
   cd models/${MODEL_NAME}/vllm/compose && docker compose -f dual/autoround-int4/fp8-mtp.yml up -d"
     ;;
@@ -690,10 +852,10 @@ case "${MODEL_NAME}" in
     # Use scripts/switch.sh which auto-selects the right compose by variant.
     SAMPLE_COMPOSE_FLAGS_DUAL=""
     SAMPLE_PORT="8030"
-    SAMPLE_MODEL_NAME="gemma-4-31b-autoround"
+    SAMPLE_MODEL_NAME="gemma-4-31b"
     NEXT_STEPS_NOTE="Available variants:
-  bash scripts/switch.sh vllm/gemma-bf16-mtp        # MTP drafter, TP=2, port 8030 (dual-card)
-  bash scripts/switch.sh beellama/gemma-dflash # DFlash, single-card default, port 8061"
+  bash scripts/switch.sh vllm/gemma-31b-dual        # bf16 KV, TP=2, port 8032 (dual-card, v0.24.0 overlay-free)
+  bash scripts/switch.sh vllm/gemma-31b-dual # dual (single-card 31B has no functional config since the beellama retirement)"
     ;;
   gemma-4-26b-a4b)
     SAMPLE_CONTAINER="vllm-gemma-4-26b-a4b"
@@ -728,7 +890,7 @@ echo "[setup] Next: bash scripts/launch.sh"
 echo ""
 echo "Next — single-card vLLM (default):"
 if [[ "${MODEL_NAME}" == "gemma-4-31b" ]]; then
-  echo "  bash scripts/switch.sh vllm/gemma-bf16-mtp"
+  echo "  bash scripts/switch.sh vllm/gemma-31b-dual"
   echo "  docker logs -f ${SAMPLE_CONTAINER}"
 else
   echo "  cd models/${MODEL_NAME}/vllm/compose && docker compose up -d"

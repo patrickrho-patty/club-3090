@@ -15,9 +15,26 @@
 #                (0.23.1-dev) than the stack's v0.22.0 pin; promotion to ✅ wants LMCache on our
 #                own image. (2) L2 disk tier (--l2-adapter) is wired but OFF by default
 #                (rehydrate ~5.3 s, compute-bound not disk-bound — cross-rig #423). (3) 38 GB image pulled
-#                on-demand. RAM-gated: --l1-size-gb 30 needs ~58 GB free; preflight rejects
-#                over-allocation (the l1=100→reboot lesson). Hidden from `switch.sh --list`
+#                on-demand. RAM-gated: preflight (preflight_lmcache_ram) hard-fails the launch
+#                unless AVAILABLE RAM (/proc/meminfo MemAvailable) >= L1 + 28 GB — the +28 covers
+#                the vLLM process + OS. The gate is COMPUTED from the live L1 (tracks the
+#                LMCACHE_L1_GB override), not the static 58 below: default --l1-size-gb 30 → ~58 GB;
+#                LMCACHE_L1_GB=10 → ~38 GB. Hard-fail is `--force`-proof (host-choke prevention is
+#                not optional — the l1=100→reboot lesson). Hidden from `switch.sh --list`
 #                (see --list --all); `--force` to launch.
+#              • ⚠️ MTP × hybrid-GDN wild write — vllm#50021, OPEN and LIVE IN THIS PIN.
+#                The GDN spec-decode path builds a state-block index from an UNBOUNDED
+#                accepted-token count; a zero/stale count dereferences a wild address →
+#                `CUDA error: unspecified launch failure` + Xid 13/31 and a dead worker,
+#                typically after minutes of agent-shaped traffic rather than at boot. Not
+#                quant-, topology- or depth-specific: hit on Ampere+Ada (#758) and on
+#                2× 5090 across NVFP4 AND W4A8 alike (#838). The vendored pr48375 fixes
+#                vllm#43559 (corruption) and does NOT cover this fault.
+#                MITIGATION: run the drafter off — delete the --speculative-config
+#                line below. Lower n cuts frequency, NOT exposure (#758 called
+#                n=3 stable; #838 crashed AT n=3). Clears when
+#                #50021 merges and a pin bump inherits it — v0.26.0 PREDATES it.
+#                Detail + re-test trigger: docs/UPSTREAM.md.
 #   Quality:   inherits dual-max fidelity (FP8 + int8-PTH + MTP); 8-pack not re-run (KV-cache
 #                layer, not a quant change). Decode 74 narr / 94 code TPS — ZERO penalty vs
 #                non-LMCache (controlled A/B 2026-06-17).
@@ -98,6 +115,12 @@ services:
       - ../../../../../../scripts/detect_nvlink.sh:/etc/club3090/detect_nvlink.sh:ro
     environment:
       - NVIDIA_VISIBLE_DEVICES=${ESTATE_GPUS:-${NVIDIA_VISIBLE_DEVICES:-all}}
+      # CUDA-level GPU mask — the runtime-agnostic half of GPU selection
+      # (#610): launch.sh --gpus exports GPU UUIDs here. CDI runtimes (NixOS,
+      # nvidia-ctk cdi) IGNORE NVIDIA_VISIBLE_DEVICES, so this mask is what
+      # actually pins cards there; on the classic runtime the UUID form is
+      # renumbering-proof. Unset → absent (no masking).
+      - CUDA_VISIBLE_DEVICES
       - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
       - HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-${OFFLINE:-0}}
       - TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-${OFFLINE:-0}}
@@ -106,7 +129,21 @@ services:
       - NCCL_CUMEM_ENABLE=0
       - NCCL_P2P_DISABLE=1
       - VLLM_NO_USAGE_STATS=1
-      - VLLM_USE_FLASHINFER_SAMPLER=1
+      # FlashInfer sampler OFF: measured -3.0% narrative / -1.7% code decode on the
+      # 2x3090 flagship (bench.sh, 5 measured runs/arm, symmetric boots, single
+      # variable). With MTP spec-decode active, sampling routes through the
+      # rejection-sampler path where the FlashInfer kernel adds overhead without a
+      # win. Also trims sampler workspace, which is load-bearing on 24 GB (same
+      # reasoning as nemotron dual/w4a16/turbo.yml). Reported by @Aduer in #671.
+      - VLLM_USE_FLASHINFER_SAMPLER=0
+      # DeepGEMM (vLLM's fp8-GEMM path) is built for Hopper (sm_90) + datacenter
+      # Blackwell (sm_100/103). Consumer Blackwell (5090 / PRO 6000 / GB10,
+      # sm_120/121) has no recipe and hard-fails "recipe not found" at boot
+      # (disc #571). Pass-through: switch.sh/launch.sh auto-inject
+      # VLLM_USE_DEEP_GEMM=0 on those cards; if you run raw `docker compose` on a
+      # consumer Blackwell card, set it yourself (VLLM_USE_DEEP_GEMM=0). Unset =
+      # vLLM's arch default (DeepGEMM stays on where it works).
+      - VLLM_USE_DEEP_GEMM
       - LMCACHE_DISABLE_BANNER=1
       # Forward host-tunable LMCache knobs into the in-container entrypoint.
       # Keep empty defaults here so bash's own $${VAR:-fallback} logic below
@@ -151,7 +188,8 @@ services:
       - --model
       - /root/.cache/huggingface/qwen3.6-27b-fp8
       - --served-model-name
-      - qwen3.6-27b-fp8
+      - qwen3.6-27b
+      - qwen3.6-27b-autoround
       - --quantization
       - fp8
       - --dtype

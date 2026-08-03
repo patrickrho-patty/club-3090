@@ -3,7 +3,7 @@
 #   Model:     Qwen3.6-27B (Lorbus AutoRound INT4 + BF16 mtp.fc preserved)
 #   Topology:  Single 3090 (TP=1)
 #   Drafter:   none (no spec-decode — simplest path)
-#   KV:        fp8_e5m2 (no TQ3 to avoid cudagraph cascade bugs)
+#   KV:        fp8_e4m3 (no TQ3 to avoid cudagraph cascade bugs)
 #   Vision:    no
 #   Max ctx:   65K (mem-util 0.95)
 #   Genesis:   none — bare vLLM, isolation control
@@ -33,12 +33,12 @@
 # ===========================================================================
 # Hardware metadata (parsed by scripts/preflight.sh):
 # Requires-min-vram-gb: 20
-# Engine-profile: vllm-nightly-clean
+# Engine-profile: vllm-stable
 # Requires-min-gpu-count: 1
 # Tensor-parallel: 1
 services:
   vllm-qwen36-27b-minimal:
-    image: ${VLLM_IMAGE:-vllm/vllm-openai:v0.22.0}
+    image: ${VLLM_IMAGE:-vllm/vllm-openai:v0.25.1}
     container_name: "${ESTATE_CONTAINER:-vllm-qwen36-27b-minimal}"
     restart: ${CLUB3090_RESTART:-unless-stopped}
     ports:
@@ -60,10 +60,20 @@ services:
       # See docs/UPSTREAM.md "Community templates / model assets" + the row at
       # https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates
       - ../../../patches/froggeric-chat-template/chat_template.jinja:/etc/qwen-froggeric-chat-template.jinja:ro
+      # W4A8 int8-activation enablement (#609) — NO-OP until VLLM_MARLIN_INPUT_DTYPE=int8
+      # is set (see the patch README). Applied by the entrypoint before vllm serve.
+      - ../../../patches/w4a8-int8-act:/etc/club3090/w4a8:ro
     environment:
       - NVIDIA_VISIBLE_DEVICES=${ESTATE_GPUS:-${NVIDIA_VISIBLE_DEVICES:-all}}
-      # Uncomment the next line to pin to a specific GPU (e.g. GPU 0):
-      # - CUDA_VISIBLE_DEVICES=0
+      # CUDA-level GPU mask — the runtime-agnostic half of GPU selection
+      # (#610): launch.sh --gpus exports GPU UUIDs here. CDI runtimes (NixOS,
+      # nvidia-ctk cdi) IGNORE NVIDIA_VISIBLE_DEVICES, so this mask is what
+      # actually pins cards there; on the classic runtime the UUID form is
+      # renumbering-proof. Unset → absent (no masking).
+      - CUDA_VISIBLE_DEVICES
+      # W4A8 knob (#609): VLLM_MARLIN_INPUT_DTYPE=int8 → int8 activations (see the
+      # w4a8 patch mount). Bare passthrough — unset → absent → stock W4A16.
+      - VLLM_MARLIN_INPUT_DTYPE
       - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
       - HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-${OFFLINE:-0}}
       - TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-${OFFLINE:-0}}
@@ -89,6 +99,8 @@ services:
       - /bin/bash
       - -c
       - |
+        # W4A8 patches (#609) — no-op unless VLLM_MARLIN_INPUT_DTYPE=int8 (see mount).
+        bash /etc/club3090/w4a8/install.sh || exit 1
         # VLLM_ENFORCE_EAGER=1 in .env disables CUDA graphs — use on
         # hardware where graph capture causes OOM or instability (e.g. WSL2).
         exec vllm serve ${VLLM_ENFORCE_EAGER:+--enforce-eager} "$@"
@@ -97,6 +109,7 @@ services:
       - --model
       - /root/.cache/huggingface/qwen3.6-27b-autoround-int4
       - --served-model-name
+      - qwen3.6-27b
       - qwen3.6-27b-autoround
       - --quantization
       - auto_round
@@ -111,9 +124,9 @@ services:
       - --gpu-memory-utilization
       - "${GPU_MEMORY_UTILIZATION:-0.92}"
       - --max-num-seqs
-      - "1"
+      - "${MAX_NUM_SEQS:-1}"
       - --kv-cache-dtype
-      - "${KV_CACHE_DTYPE:-fp8_e5m2}"
+      - "${KV_CACHE_DTYPE:-fp8_e4m3}"
       - --trust-remote-code
       # froggeric chat-template override (see volumes block + docs/UPSTREAM.md)
       - --chat-template
@@ -125,7 +138,11 @@ services:
       - --enable-auto-tool-choice
       - --tool-call-parser
       - qwen3_coder
-      - --enable-prefix-caching
+      # Prefix-caching ON by default (flipped 2026-07-17, #710/#736): this
+      # compose ships NO MTP arg, so the vllm#43559 corruption pair cannot
+      # form here — the #720 off-default was pure TTFT cost (measured 7.4x on
+      # long prefixes). Opt out: PREFIX_CACHE_ARG=--no-enable-prefix-caching
+      - "${PREFIX_CACHE_ARG:---enable-prefix-caching}"
       - --enable-chunked-prefill
       # No --speculative-config (this is the minimal variant — no spec-decode)
       - --override-generation-config

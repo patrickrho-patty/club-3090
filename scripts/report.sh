@@ -14,10 +14,21 @@
 #   bash scripts/report.sh --bench           # adds bench.sh output (~3 min)
 #   bash scripts/report.sh --agentic         # adds bench-agentic.sh curve-shape output (~8 min estimate)
 #   bash scripts/report.sh --full            # ALL five: verify + stress + soak + bench + agentic (~43 min estimate, the canonical "everything" pass for cross-rig contributions)
+#   bash scripts/report.sh --studio          # adds AI Studio container log tails (ComfyUI + director + …) — for image/video/audio generation bugs (~2 sec)
 #   bash scripts/report.sh --no-redact       # disable path/host/user redaction
 #   bash scripts/report.sh --container NAME  # override container auto-detection
 #   bash scripts/report.sh --full-calibration  # kv-calc matrix for ALL models (default: only the running model; skipped on llama.cpp/ik_llama)
 #   bash scripts/report.sh > my-rig.md       # capture for paste
+#
+# Exit codes (#813, committed to on #619):
+#   0  every stage that ran passed — or no stage was requested
+#   2  ADVISORY-only: a check flagged headroom/risk rather than incorrectness
+#      (today: verify-stress's agent-safety VRAM margin at the context ceiling —
+#      recall is correct there, the margin for sustained agent load is not)
+#   1  hard failure: a stage failed a correctness check, could not run, or the
+#      engine died mid-run and the remaining stages were skipped
+# The "Check summary" section names the failing check, so it is identifiable
+# from the exit path without reading every inner block.
 #
 # Why --soak is its own flag:
 #   verify-full + verify-stress + bench all PASS on configs that FAIL the
@@ -30,11 +41,21 @@
 
 set -uo pipefail
 
+# Force Python's UTF-8 mode (PEP 540) for every python3 this script runs.
+# Repo sources are full of unicode (— × → ⚠), and without this a rig on a real
+# non-UTF-8 locale (de_DE.iso88591 and friends) decodes reads, stdout AND argv
+# with the locale codec, which crashes the launcher/emit paths (#779). Python
+# already auto-enables UTF-8 mode for the C/POSIX locale, so this covers the
+# case it does NOT: a genuine non-UTF-8, non-C locale. Exported, so child
+# processes and nested scripts inherit it. Guarded by test-locale-utf8.sh.
+export PYTHONUTF8="${PYTHONUTF8:-1}"
+
 DO_VERIFY=0
 DO_STRESS=0
 DO_SOAK=0
 DO_BENCH=0
 DO_AGENTIC=0
+DO_STUDIO=0
 REDACT=1
 CONTAINER=""
 # KV-calc calibration is scoped to the running model by default (#168). Set to 1
@@ -52,6 +73,7 @@ while [[ $# -gt 0 ]]; do
     --soak) DO_SOAK=1; shift ;;
     --bench) DO_BENCH=1; shift ;;
     --agentic) DO_AGENTIC=1; shift ;;
+    --studio) DO_STUDIO=1; shift ;;
     --full) DO_VERIFY=1; DO_STRESS=1; DO_SOAK=1; DO_BENCH=1; DO_AGENTIC=1; shift ;;
     --no-redact) REDACT=0; shift ;;
     --container) CONTAINER="${2:-}"; shift 2 ;;
@@ -70,6 +92,8 @@ cd "$REPO_ROOT"
 
 # KV-calc calibration helpers (engine/model detection + per-model filter, #168).
 source "$REPO_ROOT/scripts/lib/report_calib.sh"
+# shellcheck source=lib/p2p-state.sh
+source "$REPO_ROOT/scripts/lib/p2p-state.sh"
 
 # Pick up a saved MODEL_DIR (and other config) from the repo .env — same as
 # launch.sh / switch.sh, and what setup.sh writes there. An explicit exported
@@ -144,6 +168,30 @@ section "System"
   fi
   echo "- **OS:** $os_name"
   echo "- **Kernel:** $(uname -r)"
+
+  # Motherboard / BIOS — from sysfs DMI (readable WITHOUT root; serials/UUIDs
+  # are root-only in sysfs so they are never exposed here). #690.
+  _dmi() {
+    local v; v="$(cat "/sys/class/dmi/id/$1" 2>/dev/null)"
+    v="${v//$'\n'/ }"; v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
+    # drop common OEM placeholder junk so it degrades to "(not exposed)"
+    case "$v" in
+      "To Be Filled By O.E.M."|"To be filled by O.E.M."|"Default string"|      "System manufacturer"|"System Product Name"|"System Version"|      "Not Applicable"|"None"|"N/A"|"Unknown"|"0.0.0"|"") v="" ;;
+    esac
+    printf '%s' "$v"
+  }
+  _mb_vendor="$(_dmi board_vendor)"; _mb_name="$(_dmi board_name)"
+  _mb_product="$(_dmi product_name)"; _mb_bios="$(_dmi bios_version)"; _mb_biosdate="$(_dmi bios_date)"
+  _mb="$_mb_vendor${_mb_vendor:+${_mb_name:+ }}$_mb_name"
+  if [[ -n "$_mb" ]]; then
+    [[ -n "$_mb_product" && "$_mb_product" != "$_mb" ]] && _mb="$_mb  (system: $_mb_product)"
+    echo "- **Motherboard:** $_mb"
+  elif [[ -n "$_mb_product" ]]; then
+    echo "- **Motherboard:** (board DMI not exposed; system: $_mb_product)"
+  else
+    echo "- **Motherboard:** (not exposed)"
+  fi
+  [[ -n "$_mb_bios" ]] && echo "- **BIOS:** ${_mb_bios}${_mb_biosdate:+ ($_mb_biosdate)}"
 
   # Environment detection
   env_kind="bare metal"
@@ -551,6 +599,83 @@ if have python3 && [[ -f tools/kv-calc.py ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Quality tooling (benchlocal-cli + sandboxes)
+# ---------------------------------------------------------------------------
+# Triage for "my quality run skipped packs / scored weird": is benchlocal-cli
+# installed, how fresh, are the sandbox images built, and do they PREDATE the
+# CLI (the rebuilt-CLI-stale-sandboxes incident class)? All best-effort — a
+# rig without any of this still produces a report.
+
+section "Quality tooling (benchlocal-cli + sandboxes)"
+{
+  bl_bin=$(command -v benchlocal-cli 2>/dev/null || true)
+  if [[ -z "$bl_bin" ]]; then
+    echo "- **benchlocal-cli:** not installed (quality-test.sh needs it — \`pip install git+https://github.com/noonghunna/benchlocal-cli.git\`)"
+  else
+    bl_mtime=$(stat -c %Y "$bl_bin" 2>/dev/null || echo 0)
+    bl_when=$([[ "$bl_mtime" -gt 0 ]] && date -d "@${bl_mtime}" +%F 2>/dev/null || echo "unknown")
+    # Version via the CLI's own interpreter (works for pip-from-git AND
+    # editable-checkout installs; console-script shebang points at the env).
+    bl_py=$(head -1 "$bl_bin" 2>/dev/null | sed 's/^#!//')
+    bl_ver=$([[ -x "$bl_py" ]] && "$bl_py" -c 'import importlib.metadata as m; print(m.version("benchlocal-cli"))' 2>/dev/null || true)
+    # PRECISE source — the metadata version is frozen at install time and
+    # fixes are pushed without bumping it, so it alone can't identify the
+    # code. pip records the truth in direct_url.json: a git install carries
+    # the exact commit; an editable install carries the checkout dir → git
+    # describe (path itself withheld from the public report).
+    bl_src=$([[ -x "$bl_py" ]] && "$bl_py" - <<'PYEOF' 2>/dev/null
+import importlib.metadata as m, json, subprocess
+try:
+    raw = m.distribution("benchlocal-cli").read_text("direct_url.json") or ""
+    d = json.loads(raw)
+except Exception:
+    d = {}
+vcs = (d.get("vcs_info") or {}).get("commit_id")
+if vcs:
+    print(f"git@{vcs[:9]}")
+elif (d.get("dir_info") or {}).get("editable") and str(d.get("url", "")).startswith("file://"):
+    path = d["url"][7:]
+    try:
+        desc = subprocess.run(["git", "-C", path, "describe", "--tags", "--always", "--dirty"],
+                              capture_output=True, text=True, timeout=5).stdout.strip()
+        print(f"{desc} (editable checkout)" if desc else "editable checkout")
+    except Exception:
+        print("editable checkout")
+PYEOF
+    )
+    echo "- **benchlocal-cli:** \`${bl_bin}\` (version: \`${bl_ver:-unknown}\`${bl_src:+, source: \`${bl_src}\`}, installed/updated: ${bl_when})"
+    if have docker && docker info >/dev/null 2>&1; then
+      stale_any=0
+      echo "- **Sandbox images** (needed by the --full sandboxed packs):"
+      for img in benchlocal-sandbox-bugfind benchlocal-sandbox-cli benchlocal-sandbox-hermes benchlocal-sandbox-aider-polyglot; do
+        created=$(docker image inspect "${img}:latest" --format '{{.Created}}' 2>/dev/null || true)
+        if [[ -z "$created" ]]; then
+          echo "  - \`${img}\`: ✗ not built"
+          continue
+        fi
+        cdate=$(date -d "$created" +%F 2>/dev/null || echo "$created")
+        cepoch=$(date -d "$created" +%s 2>/dev/null || echo 0)
+        mark=""
+        if [[ "$cepoch" -gt 0 && "$bl_mtime" -gt 0 && "$cepoch" -lt "$bl_mtime" ]]; then
+          mark="  ⚠ OLDER than the installed CLI — rebuild if the update touched sandbox sources"
+          stale_any=1
+        fi
+        echo "  - \`${img}\`: built ${cdate}${mark}"
+      done
+      [[ "$stale_any" == "1" ]] && echo "- **Rebuild:** \`bash <benchlocal-cli-checkout>/tools/build-sandboxes.sh\` (heuristic — an unrelated reinstall also trips it)"
+    else
+      echo "- **Sandbox images:** docker unavailable — cannot inspect (sandboxed packs need Docker)"
+    fi
+  fi
+  latest_q=$(ls -t results/quality/quality-*.json 2>/dev/null | head -1)
+  if [[ -n "$latest_q" ]]; then
+    echo "- **Latest quality result:** \`${latest_q}\` ($(date -d "@$(stat -c %Y "$latest_q")" +%F 2>/dev/null || echo '?'))"
+  else
+    echo "- **Latest quality result:** none found under results/quality/"
+  fi
+} | redact
+
+# ---------------------------------------------------------------------------
 # Active container
 # ---------------------------------------------------------------------------
 
@@ -694,6 +819,68 @@ else
 
   subsection "Boot log highlights"
   {
+    # Interconnect / P2P ENGAGEMENT — the runtime truth. The GPU "Topology" /
+    # "PCIe / P2P detail" sections above report P2P *capability* (can it?); this
+    # reports whether P2P is actually ON for the running serving container.
+    # detect_nvlink.sh emits an [nvlink] decision trail at boot stating the
+    # resolved NCCL_P2P_LEVEL + custom-all-reduce state. Grep the WHOLE log (not
+    # head -200) so a late line on a 3-4 GPU boot isn't missed, and fall back to
+    # the live container env. ALWAYS prints something so a reviewer never has to
+    # guess whether P2P was engaged (the gap that forced asks on #446 / #488).
+    nvlink_boot=$(docker logs "$CONTAINER" 2>&1 | grep -E '\[nvlink\]' | head -8)
+    p2p_env=$(docker exec "$CONTAINER" env 2>/dev/null | grep -E '^(NCCL_P2P|NVLINK_MODE|NCCL_CUMEM)=' | sort)
+    # vLLM's runtime custom-AR veto (world>2 without NVLink — its gate never
+    # consults peer access). Fed to the classifier so the verdict can't claim
+    # "custom all-reduce ON" that vLLM already vetoed (#786).
+    vllm_ar_gate=$(docker logs "$CONTAINER" 2>&1 | grep -m1 'Custom allreduce is disabled' || true)
+    echo "**Interconnect / P2P engagement:**"
+    if [[ -n "$nvlink_boot" || -n "$p2p_env" || -n "$vllm_ar_gate" ]]; then
+      echo '```'
+      [[ -n "$nvlink_boot" ]] && echo "$nvlink_boot"
+      [[ -n "$vllm_ar_gate" ]] && { echo "# vLLM runtime:"; echo "$vllm_ar_gate"; }
+      [[ -n "$p2p_env" ]] && { echo "# resolved container env:"; echo "$p2p_env"; }
+      echo '```'
+    else
+      echo "_No \`[nvlink]\` boot line or NCCL_P2P/NVLINK_MODE env found — P2P engagement undetermined (single-GPU, a non-NCCL engine like llama.cpp, or an entrypoint predating detect_nvlink.sh)._"
+    fi
+    # Cross-referenced VERDICT (capability x engagement — the #488/#158 matrix).
+    # Silent on single-GPU / no-capability rigs so the OK/WARN/INFO line is
+    # always signal, never boilerplate.
+    _p2p_verdict_line="$(p2p_verdict "$(p2p_gpu_count)" "$(p2p_host_capability)" \
+      "$(printf '%s\n%s\n%s' "$nvlink_boot" "$vllm_ar_gate" "$p2p_env" | p2p_classify_engagement)")"
+    [[ -n "$_p2p_verdict_line" ]] && { echo; echo "**Interconnect verdict:** ${_p2p_verdict_line}"; }
+    # Kernel-module flavor — the WHY behind a P2P result on GeForce cards. A
+    # proprietary (closed) module refuses P2P; the open modules can grant it, with
+    # `topo -p2p rw` above the functional proof. Only meaningful multi-GPU.
+    # We report open-vs-proprietary (detectable); we do NOT claim to fingerprint
+    # the aikitoria patch — it's metadata-identical to stock nvidia-open.
+    if [[ "$(p2p_gpu_count)" -ge 2 ]]; then
+      case "$(p2p_driver_flavor)" in
+        proprietary) echo; echo "**NVIDIA kernel module:** proprietary (closed) — refuses P2P on GeForce; the open kernel modules (\`nvidia-open\`, or a patched fork) are what enable it. A \`CNS\` in \`topo -p2p rw\` above is this. See docs/PCIE_P2P.md." ;;
+        open)        echo; echo "**NVIDIA kernel module:** open (\`Dual MIT/GPL\`) — P2P-capable on GeForce; whether it's granted is the \`topo -p2p rw\` result above (\`OK\` = engaged, \`CNS\` = board/layout still refusing). Metadata can't tell stock \`nvidia-open\` from a patched fork — the topo result is the proof." ;;
+      esac
+      # Transfer-verified P2P (#786, read-only tier folded from #787): report
+      # vLLM's functional-check cache when a boot ever ran with
+      # VLLM_SKIP_P2P_CHECK=0 — host first, then the serving container.
+      # Absence is normal (the check is off by default upstream); when present
+      # it upgrades the verdict above from driver-asserted to measured.
+      _tc_json=""; _tc_src=""
+      _tc_f="$(p2p_transfer_cache_file)"
+      if [[ -n "$_tc_f" ]]; then
+        _tc_json="$(cat "$_tc_f" 2>/dev/null)"; _tc_src="${_tc_f/#$HOME/\~}"
+      fi
+      if [[ -z "$_tc_json" ]]; then
+        _tc_f="$(docker exec "$CONTAINER" sh -c 'ls -t /root/.cache/vllm/gpu_p2p_access_cache_for_*.json 2>/dev/null | head -1' 2>/dev/null || true)"
+        [[ -n "$_tc_f" ]] && { _tc_json="$(docker exec "$CONTAINER" cat "$_tc_f" 2>/dev/null)"; _tc_src="container:${_tc_f}"; }
+      fi
+      if [[ -n "$_tc_json" ]]; then
+        read -r _tc_ok _tc_total <<<"$(printf '%s' "$_tc_json" | p2p_transfer_cache_parse)" || true
+        _tc_line="$(p2p_transfer_verdict "${_tc_ok:-0}" "${_tc_total:-0}" "$_tc_src")"
+        [[ -n "$_tc_line" ]] && { echo; echo "**Transfer check:** ${_tc_line}"; }
+      fi
+    fi
+    echo
+
     genesis_results=$(docker logs "$CONTAINER" 2>&1 | grep -E '\[INFO:genesis\.apply_all\] (Genesis|✅) Results' | tail -1)
     if [[ -n "$genesis_results" ]]; then
       echo "**Genesis patches applied:**"
@@ -814,15 +1001,201 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Stage gating + engine liveness (#830)
+# ---------------------------------------------------------------------------
+# Every stage used to run unconditionally, so a mid-run engine death produced N
+# more identical `<details>` blocks, each reading like its own fault:
+#
+#   ## bench.sh output
+#   ERROR: service not reachable at http://localhost:8099/v1/models
+#     Start with: cd compose && docker compose up -d
+#   ## bench-agentic.sh output
+#   ERROR: service not reachable at http://localhost:8099/v1/models
+#     Start with: bash scripts/launch.sh
+#
+# That is one dead engine wearing two faults, and the "just start it" hints are
+# actively wrong — the service WAS started, it crashed (#827). So we probe the
+# endpoint between stages and, once it stops answering, skip the rest with the
+# causal order stated instead of running each one into the same wall.
+#
+# Deliberately NOT done: aborting on a stage's own failure. A thin-VRAM-margin
+# advisory is no reason to skip soak, and the point of --full is a complete
+# artifact for cross-rig comparison. Bailing early would have made #827's report
+# LESS useful — the soak crash is the finding. Only loss of the endpoint gates.
+
+STAGE_ENDPOINT=""
+ENGINE_PROBE=0        # 1 = we have an endpoint we can meaningfully probe
+ENGINE_DEAD=0
+ENGINE_DEAD_AFTER=""
+ENGINE_UP_AT_START=0
+LAST_STAGE_RUN=""
+
+# ---------------------------------------------------------------------------
+# Stage verdict accounting (#813) — inner verdicts must reach the outer exit.
+# ---------------------------------------------------------------------------
+# Committed to on #619: `report.sh --full` exited 0 while verify-stress printed
+# "1 stress check(s) failed" inside. A --full chain whose exit code doesn't
+# reflect inner verdicts is unsafe to automate against, which is the entire
+# point of --full. @seanyourhighness caught it only by reading inner verdicts,
+# which most reporters reasonably won't.
+#
+# Exit contract:
+#   0  every stage that ran passed (or no stage was requested)
+#   2  ADVISORY-only failure — a check fired that flags headroom or risk rather
+#      than incorrectness. Today that is verify-stress's agent-safety VRAM
+#      margin: recall is CORRECT at the ceiling, what fails is the margin for
+#      sustained agent load. Distinguishable so a caller can gate on hard
+#      failures alone.
+#   1  hard failure — a stage failed a correctness check, could not run, or the
+#      engine died mid-run.
+#
+# The advisory classifier reads the stage's own output rather than its exit
+# code, because verify-stress exits with the COUNT of failed checks and does not
+# distinguish the classes. `✗` is emitted only by fail(); the margin advisory
+# prints `⚠ VRAM margin thin at ceiling`. So: nonzero exit + no `✗` + a margin
+# line == advisory-only. Read from the RAW output, before redaction.
+STAGE_ROWS=()
+STAGE_WORST=0         # 0 clean · 2 advisory · 1 hard
+STAGE_RAW_DIR="$(mktemp -d)"
+trap 'rm -rf "$STAGE_RAW_DIR"' EXIT
+
+# Escalate to the worst verdict seen. Hard (1) outranks advisory (2).
+stage_escalate() {
+  case "$1" in
+    1) STAGE_WORST=1 ;;
+    2) [[ $STAGE_WORST -eq 1 ]] || STAGE_WORST=2 ;;
+  esac
+}
+
+# stage_record <flag-key> <exit-code> <raw-output-file|"">
+stage_record() {
+  local key="$1" rc="$2" raw="${3:-}" verdict detail advisory=0 hard=0
+  if [[ "$rc" -eq 0 ]]; then
+    verdict="PASS"; detail="—"
+  else
+    if [[ -n "$raw" && -f "$raw" ]]; then
+      hard="$(command grep -c '✗' "$raw" 2>/dev/null || true)"
+      advisory="$(command grep -c 'VRAM margin thin at ceiling' "$raw" 2>/dev/null || true)"
+    fi
+    if [[ "${hard:-0}" -eq 0 && "${advisory:-0}" -gt 0 ]]; then
+      verdict="ADVISORY"
+      detail="agent-safety VRAM margin thin at ceiling (recall correct; headroom is not)"
+      stage_escalate 2
+    else
+      verdict="FAIL"
+      if [[ -n "$raw" && -f "$raw" && "${hard:-0}" -gt 0 ]]; then
+        # Name the failing checks so they're identifiable from the exit path.
+        detail="$(sed -E 's/\x1b\[[0-9;]*[mK]//g' "$raw" | command grep '✗' \
+          | sed -E 's/^[[:space:]]*✗[[:space:]]*//' | head -3 | paste -sd';' - \
+          | sed -E 's/;/ · /g')"
+        [[ -n "$detail" ]] || detail="see the block above"
+      else
+        detail="see the block above"
+      fi
+      stage_escalate 1
+    fi
+  fi
+  # `|` is the row separator AND the markdown cell separator — a check message
+  # carrying one would split the row in both places.
+  detail="${detail//|/ / }"
+  STAGE_ROWS+=("$(stage_label "$key")|${rc}|${verdict}|${detail}")
+}
+
+# stage_skipped <flag-key> <reason>
+stage_skipped() {
+  STAGE_ROWS+=("$(stage_label "$1")|-|SKIPPED|$2")
+  stage_escalate 1
+}
+
+# Flag key -> the script the stage runs, for human-readable causal statements.
+stage_label() {
+  case "$1" in
+    verify)  echo "verify-full.sh" ;;
+    stress)  echo "verify-stress.sh" ;;
+    soak)    echo "soak-test.sh" ;;
+    bench)   echo "bench.sh" ;;
+    agentic) echo "bench-agentic.sh" ;;
+    *)       echo "$1" ;;
+  esac
+}
+
+# Resolve the engine endpoint the same way preflight.sh / soak-test.sh do: by
+# the container's ENGINE-INTERNAL port mapping (vLLM 8000 / llama.cpp 8080 /
+# sglang 30000), never a model-name allowlist. Mirrors, rather than sources,
+# preflight.sh — that file executes checks at source time.
+resolve_stage_endpoint() {
+  if [[ -n "${URL:-}" ]]; then printf '%s\n' "${URL%/}"; return 0; fi
+  if [[ -n "${ENDPOINT:-}" ]]; then printf '%s\n' "${ENDPOINT%/}"; return 0; fi
+  have docker || return 0
+  [[ -n "$CONTAINER" ]] || return 0
+  local internal mapped port
+  for internal in 8000 8080 30000; do
+    mapped="$(docker port "$CONTAINER" "${internal}/tcp" 2>/dev/null | head -1 || true)"
+    if [[ -n "$mapped" ]]; then
+      port="${mapped##*:}"
+      [[ "$port" =~ ^[0-9]+$ ]] && { printf 'http://localhost:%s\n' "$port"; return 0; }
+    fi
+  done
+  return 0
+}
+
+engine_alive() {
+  [[ $ENGINE_PROBE -eq 1 ]] || return 0   # can't probe → never claim it's dead
+  curl -sf -m 5 "${STAGE_ENDPOINT}/v1/models" >/dev/null 2>&1
+}
+
+# Called BEFORE each stage. Returns 1 when the stage must be skipped.
+stage_guard() {
+  local stage="$1"
+  if [[ $ENGINE_DEAD -eq 1 ]]; then
+    printf '_SKIPPED — endpoint unreachable since **%s** (the engine appears to have crashed there). ' "$ENGINE_DEAD_AFTER"
+    printf 'This stage was not run, so it contributes no evidence: it would only have reproduced the same '
+    printf 'connection failure. Container logs are above. Re-run `bash scripts/report.sh --%s` once the service is back._\n' "$stage"
+    stage_skipped "$stage" "endpoint unreachable since ${ENGINE_DEAD_AFTER}"
+    return 1
+  fi
+  if [[ $ENGINE_PROBE -eq 1 ]] && ! engine_alive; then
+    ENGINE_DEAD=1
+    ENGINE_DEAD_AFTER="$(stage_label "${LAST_STAGE_RUN:-an earlier stage}")"
+    printf '_SKIPPED — the endpoint stopped answering after **%s**. ' "$ENGINE_DEAD_AFTER"
+    printf 'The engine did not survive that stage; every remaining stage is skipped rather than run into the '
+    printf 'same wall. Container logs are above. Re-run `bash scripts/report.sh --%s` once the service is back._\n' "$stage"
+    stage_skipped "$stage" "endpoint died during ${ENGINE_DEAD_AFTER}"
+    return 1
+  fi
+  LAST_STAGE_RUN="$stage"
+  return 0
+}
+
+if [[ $DO_VERIFY -eq 1 || $DO_STRESS -eq 1 || $DO_SOAK -eq 1 || $DO_BENCH -eq 1 || $DO_AGENTIC -eq 1 ]]; then
+  STAGE_ENDPOINT="$(resolve_stage_endpoint)"
+  if [[ -n "$STAGE_ENDPOINT" ]] && have curl; then
+    ENGINE_PROBE=1
+    if engine_alive; then
+      ENGINE_UP_AT_START=1
+    else
+      # Never up. This IS the "just start it" case, and saying so once beats
+      # saying it once per stage.
+      ENGINE_DEAD=1
+      ENGINE_DEAD_AFTER="before any stage ran (the endpoint was never reachable)"
+    fi
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 # Optional: verify-full
 # ---------------------------------------------------------------------------
 
 if [[ $DO_VERIFY -eq 1 ]]; then
   section "verify-full.sh output"
-  if [[ -f scripts/verify-full.sh ]]; then
-    bash scripts/verify-full.sh 2>&1 | redact | details "verify-full output"
-  else
+  if [[ ! -f scripts/verify-full.sh ]]; then
     echo "_scripts/verify-full.sh not found_"
+  elif stage_guard verify; then
+    # tee the RAW output aside so stage_record can classify + name the failing
+    # checks; redaction would keep the markers but the tee is where the exit
+    # path gets its evidence. PIPESTATUS[0] is the stage's own code.
+    bash scripts/verify-full.sh 2>&1 | tee "${STAGE_RAW_DIR}/verify" | redact | details "verify-full output"
+    stage_record verify "${PIPESTATUS[0]}" "${STAGE_RAW_DIR}/verify"
   fi
 fi
 
@@ -832,10 +1205,11 @@ fi
 
 if [[ $DO_STRESS -eq 1 ]]; then
   section "verify-stress.sh output"
-  if [[ -f scripts/verify-stress.sh ]]; then
-    bash scripts/verify-stress.sh 2>&1 | redact | details "verify-stress output (7 boundary checks incl. Cliff 2 needle recall)"
-  else
+  if [[ ! -f scripts/verify-stress.sh ]]; then
     echo "_scripts/verify-stress.sh not found_"
+  elif stage_guard stress; then
+    bash scripts/verify-stress.sh 2>&1 | tee "${STAGE_RAW_DIR}/stress" | redact | details "verify-stress output (7 boundary checks incl. Cliff 2 needle recall)"
+    stage_record stress "${PIPESTATUS[0]}" "${STAGE_RAW_DIR}/stress"
   fi
 fi
 
@@ -845,11 +1219,14 @@ fi
 
 if [[ $DO_SOAK -eq 1 ]]; then
   section "soak-test.sh (SOAK_MODE=continuous) output"
-  if [[ -f scripts/soak-test.sh ]]; then
+  if [[ ! -f scripts/soak-test.sh ]]; then
+    echo "_scripts/soak-test.sh not found_"
+  elif stage_guard soak; then
     soak_run_dir="results/report-soak-$(date +%Y%m%d-%H%M%S)"
     SOAK_MODE=continuous SOAK_SESSIONS=5 SOAK_TURNS=5 SOAK_OUTPUT="$soak_run_dir" \
       SOAK_TIMEOUT_S="${SOAK_TIMEOUT_S:-1800}" \
-      bash scripts/soak-test.sh 2>&1 | redact | details "soak-test stdout (5-session × 5-turn ramping conversation, ~25 min)"
+      bash scripts/soak-test.sh 2>&1 | tee "${STAGE_RAW_DIR}/soak" | redact | details "soak-test stdout (5-session × 5-turn ramping conversation, ~25 min)"
+    stage_record soak "${PIPESTATUS[0]}" "${STAGE_RAW_DIR}/soak"
     if [[ -f "$soak_run_dir/summary.md" ]]; then
       echo
       echo "**Soak summary** (\`$soak_run_dir/summary.md\`):"
@@ -858,8 +1235,6 @@ if [[ $DO_SOAK -eq 1 ]]; then
     else
       echo "_soak summary.md not produced — check stdout above_"
     fi
-  else
-    echo "_scripts/soak-test.sh not found_"
   fi
 fi
 
@@ -869,10 +1244,11 @@ fi
 
 if [[ $DO_BENCH -eq 1 ]]; then
   section "bench.sh output"
-  if [[ -f scripts/bench.sh ]]; then
-    bash scripts/bench.sh 2>&1 | redact | details "bench output (3 warmups + 5 measured per prompt)"
-  else
+  if [[ ! -f scripts/bench.sh ]]; then
     echo "_scripts/bench.sh not found_"
+  elif stage_guard bench; then
+    bash scripts/bench.sh 2>&1 | tee "${STAGE_RAW_DIR}/bench" | redact | details "bench output (3 warmups + 5 measured per prompt)"
+    stage_record bench "${PIPESTATUS[0]}" "${STAGE_RAW_DIR}/bench"
   fi
 fi
 
@@ -903,11 +1279,95 @@ fi
 
 if [[ $DO_AGENTIC -eq 1 ]]; then
   section "bench-agentic.sh output"
-  if [[ -f scripts/bench-agentic.sh ]]; then
-    SESSIONS=1 bash scripts/bench-agentic.sh 2>&1 | redact | details "bench-agentic output (1 session x 12 default turns, curve-shape estimate; ~8 min estimate)"
-  else
+  if [[ ! -f scripts/bench-agentic.sh ]]; then
     echo "_scripts/bench-agentic.sh not found_"
+  elif stage_guard agentic; then
+    SESSIONS=1 bash scripts/bench-agentic.sh 2>&1 | tee "${STAGE_RAW_DIR}/agentic" | redact | details "bench-agentic output (1 session x 12 default turns, curve-shape estimate; ~8 min estimate)"
+    stage_record agentic "${PIPESTATUS[0]}" "${STAGE_RAW_DIR}/agentic"
   fi
+fi
+
+# ---------------------------------------------------------------------------
+# AI Studio container logs (--studio) — opt-in: the ComfyUI / director / orchestrator
+# log tails that diagnose an image/video/audio GENERATION failure (e.g. a "ComfyUI
+# generation error" in a lane). Off by default — verbose + only relevant for studio bugs.
+# ---------------------------------------------------------------------------
+if [[ $DO_STUDIO -eq 1 ]]; then
+  section "AI Studio logs (--studio)"
+  echo "_Container log tails for image/video/audio generation bugs. ComfyUI carries the workflow"
+  echo "execution trace (the actual generation error). Redacted; pass \`--no-redact\` for full paths._"
+  _studio_found=0
+  # ComfyUI first (the generation engine — longest tail), then the studio sidecars.
+  for c in comfyui studio-director studio-orchestrator studio-image-shim studio-tts studio-step-voice studio-gallery; do
+    if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$c"; then
+      _studio_found=1
+      _tail=200; [[ "$c" == comfyui ]] && _tail=400
+      _running=$(docker ps --filter "name=^${c}$" --format '{{.Status}}' 2>/dev/null | head -1)
+      # strip ANSI colour codes (ComfyUI logs are coloured) so the pasted block reads cleanly
+      docker logs --tail "$_tail" "$c" 2>&1 | sed -E 's/\x1b\[[0-9;]*[mK]//g' | redact \
+        | details "$c — ${_running:-not running} (last $_tail lines)"
+    fi
+  done
+  [[ $_studio_found -eq 0 ]] && echo "_No AI Studio containers found. Bring the studio up (\`gpu-mode ai-studio\` or \`bash scripts/setup-ai-studio.sh\`), reproduce the failure, then re-run with \`--studio\`._"
+fi
+
+# ---------------------------------------------------------------------------
+# Engine liveness verdict (#830) — ONE verdict, not one per skipped stage.
+# ---------------------------------------------------------------------------
+
+if [[ $ENGINE_DEAD -eq 1 ]]; then
+  section "Engine liveness"
+  if [[ $ENGINE_UP_AT_START -eq 0 ]]; then
+    cat <<EOF
+> ❌ **The endpoint was never reachable — no stage ran.**
+>
+> \`${STAGE_ENDPOINT}/v1/models\` did not answer before the first stage, so the
+> stages were skipped rather than each reporting the same connection failure.
+>
+> Start the service and re-run:
+>
+> \`\`\`bash
+> bash scripts/launch.sh          # or: bash scripts/switch.sh <variant>
+> \`\`\`
+EOF
+  else
+    cat <<EOF
+> ❌ **The engine died during this run — remaining stages were skipped.**
+>
+> The endpoint answered at the start and stopped answering after **${ENGINE_DEAD_AFTER}**.
+> That is ONE fault, not one per stage: the later stages were skipped instead of
+> each reproducing the same unreachable-endpoint error, which reads like
+> additional independent failures and sends triage the wrong way.
+>
+> **The service was running and crashed — do not "just start it" without reading
+> why.** The container log sections above carry the actual cause. Common ones on
+> this stack: an MTP drafter emitting out-of-range draft token IDs under
+> sustained multi-turn load (\`SPEC_N=3\` is the known-good workaround, see #758),
+> or an OOM at high accumulated context.
+>
+> Re-run the skipped stages individually once the service is back.
+EOF
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# Check summary (#813) — the failing check must be nameable from the exit path.
+# ---------------------------------------------------------------------------
+
+if [[ ${#STAGE_ROWS[@]} -gt 0 ]]; then
+  section "Check summary"
+  echo "| Stage | Exit | Verdict | Detail |"
+  echo "|---|---:|---|---|"
+  for row in "${STAGE_ROWS[@]}"; do
+    IFS='|' read -r _s _rc _v _d <<< "$row"
+    printf '| %s | %s | %s | %s |\n' "$_s" "$_rc" "$_v" "$_d"
+  done | redact
+  echo
+  case "$STAGE_WORST" in
+    0) echo "**Overall: PASS** — every stage that ran passed. \`report.sh\` exits 0." ;;
+    2) echo "**Overall: ADVISORY** — no correctness check failed, but an advisory fired (headroom / risk, not incorrectness). \`report.sh\` exits **2**, so a caller can gate on hard failures alone." ;;
+    *) echo "**Overall: FAIL** — at least one stage failed a check, could not run, or was skipped. \`report.sh\` exits **1**." ;;
+  esac
 fi
 
 # ---------------------------------------------------------------------------
@@ -918,5 +1378,7 @@ cat <<'EOF'
 
 ---
 
-_Generated by `bash scripts/report.sh`. Flags: `--verify` (verify-full), `--stress` (verify-stress 7/7 incl. Cliff 2 needles), `--soak` (SOAK_MODE=continuous, catches Cliff 2b), `--bench` (canonical TPS), `--agentic` (multi-turn TTFT/decode curve-shape, ~8 min estimate), `--full` (all five, ~43 min estimate). Use `--no-redact` to disable redaction (internal sharing only)._
+_Generated by `bash scripts/report.sh`. Flags: `--verify` (verify-full), `--stress` (verify-stress 7/7 incl. Cliff 2 needles), `--soak` (SOAK_MODE=continuous, catches Cliff 2b), `--bench` (canonical TPS), `--agentic` (multi-turn TTFT/decode curve-shape, ~8 min estimate), `--studio` (AI Studio / ComfyUI container log tails — for generation bugs), `--full` (all five, ~43 min estimate). Use `--no-redact` to disable redaction (internal sharing only). Exit code: 0 all-clear · 2 advisory-only · 1 hard failure._
 EOF
+
+exit "$STAGE_WORST"

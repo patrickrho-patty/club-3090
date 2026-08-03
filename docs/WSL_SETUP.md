@@ -105,6 +105,16 @@ In VS Code, set the file's EOL to **LF** (bottom-right status bar) and enable `"
 
 ## 7. Download weights — `WEIGHTS` + `MODEL_DIR`
 
+**Prerequisite — the `hf` CLI.** `setup.sh` fetches weights with Hugging Face's `hf` CLI. On a fresh Ubuntu 24.04 / WSL, the usual `pip install huggingface-hub` is blocked (`error: externally-managed-environment` — that's [PEP 668](https://peps.python.org/pep-0668/), not a bug on your end). If the CLI is missing, `setup.sh` will **offer to install it for you** — isolated, via `pipx`/`uv`, no changes to system Python — just answer **Y**. To install it yourself first:
+
+```bash
+sudo apt install -y pipx
+pipx install 'huggingface-hub[hf_transfer]'
+pipx ensurepath      # then restart the terminal so `hf` lands on PATH
+```
+
+> ⚠️ **Don't use a raw `python -m venv` for this.** Activating a venv rewrites your `PATH` and can hide `docker` and your model paths (a common WSL trip-up). `pipx` installs the `hf` CLI *isolated* but on your PATH — no `activate`, nothing shadowed.
+
 For the **robust single-card path on a 24 GB card** (recommended on WSL2 — see step 10), fetch the **GGUF** weights for llama.cpp / ik_llama:
 
 ```bash
@@ -166,7 +176,7 @@ Sanity-check the endpoint (the launcher prints this curl too):
 ```bash
 curl -sf http://localhost:8020/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"qwen3.6-27b-autoround","messages":[{"role":"user","content":"Capital of France?"}],"max_tokens":200}'
+  -d '{"model":"qwen3.6-27b","messages":[{"role":"user","content":"Capital of France?"}],"max_tokens":200}'
 ```
 
 ---
@@ -212,7 +222,7 @@ You still do steps **1–3** (WSL + driver/passthrough + `.wslconfig` RAM) and *
    git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
    cmake -B build -DGGML_CUDA=ON && cmake --build build --config Release -j
    ```
-   …or grab a prebuilt CUDA binary. To match the MTP / spec-decode support the Docker image ships, track a recent build — the composes pin `ghcr.io/ggml-org/llama.cpp:server-cuda-b9246` (or newer).
+   …or grab a prebuilt CUDA binary. To match the MTP / spec-decode support the Docker image ships, track a recent build — the composes pin `ghcr.io/ggml-org/llama.cpp:server-cuda-b9967` (or newer).
 
 2. **Run `llama-server` with the flags the compose uses.** The compose is the source of truth — lift them from [`models/qwen3.6-27b/llama-cpp/compose/single/unsloth-q4km/mtp.yml`](../models/qwen3.6-27b/llama-cpp/compose/single/unsloth-q4km/mtp.yml). The equivalent native invocation:
    ```bash

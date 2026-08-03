@@ -53,7 +53,7 @@ bash scripts/launch.sh
 # 4. Sanity test (launcher already printed this curl)
 curl -sf http://localhost:8020/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"qwen3.6-27b-autoround","messages":[{"role":"user","content":"Capital of France?"}],"max_tokens":200}'
+  -d '{"model":"qwen3.6-27b","messages":[{"role":"user","content":"Capital of France?"}],"max_tokens":200}'
 
 # 5. Run the canonical benchmark
 bash scripts/bench.sh
@@ -68,7 +68,19 @@ bash scripts/update.sh
 
 `launch.sh` calls `switch.sh` (down old, up new) and then `verify-full.sh` so you know it's serving cleanly before you point a client at it. See [`scripts/`](scripts/) for all helpers.
 
-> 🖥️ **Prefer a TUI?** The **serve cockpit (`c3`)** wraps the same flow — discover → serve → operate → validate — in one lazydocker-style screen (catalog, live GPU/scenes/containers, Doctor health, and the add-a-model pipeline). Install: `uv pip install -e tools/serve-cockpit` then run `c3`. See [`tools/serve-cockpit/`](tools/serve-cockpit/).
+### Prefer a screen to the CLI? — the serve cockpit (`c3`)
+
+**`c3`** is a lazydocker-style terminal UI that wraps the same flow — **discover → serve → operate → validate** — in one keyboard-driven cockpit: browse the catalog and serve a variant with `⏎`, watch live GPU / scenes / containers, run Doctor health checks, and (producer lane) walk the add-a-model pipeline.
+
+```bash
+# Install from the checkout (the cockpit + its in-repo core package):
+uv pip install -e tools/serve-cockpit          # with uv (recommended — one command)
+#   …or plain pip:  pip install -e tools/tui-core && pip install -e tools/serve-cockpit
+
+c3                                              # launch  (also: python -m club3090_cockpit)
+```
+
+**First run:** press **`S`** → set your **Model Dir** (where weights download) + **HuggingFace token** → **`Ctrl+S`** to save; then **`r`** to browse the catalog and serve one. **`c3 --lean`** (or **`[C]`** in-app) hides the producer lane for a consumer-only view. After a `git pull`, re-run the install to pick up new deps + UI changes. Full keybindings + details → [`tools/serve-cockpit/`](tools/serve-cockpit/).
 
 > ⚠️ **Single-card long-context note:** Cliff 2 (GDN prefill OOM at >~50K single-prompt) is **open** on 24 GB single-card vLLM. Genesis v7.72.2 PN59 was intended as the fix but doesn't engage on chunked-prefill. **Workarounds:** [`vllm/dual`](docs/DUAL_CARD.md) (TP=2 escapes it) or [`llamacpp/default`](docs/SINGLE_CARD.md#bulletproof-no-cliffs) (different engine, no cliff). Full diagnosis at [`docs/CLIFFS.md`](docs/CLIFFS.md).
 
@@ -113,7 +125,7 @@ Each hardware page lists every supported model with the working composes for tha
 | Model | Status | Card counts | Engines | Highlights |
 |---|---|---|---|---|
 | **[Qwen3.6-27B](models/qwen3.6-27b/)** | Production-ready ⭐ | 1× / 2× 3090 | vLLM ✅ · llama.cpp ✅ · ik_llama ✅ | Vision · tools · MTP n=3 · up to 262K ctx · vLLM dual = 89/127 TPS · llama.cpp single = 200K max-safe, no prefill cliffs · ik_llama IQ4_KS = ~60/69 TPS (fastest single-card) |
-| **[Gemma 4 31B](models/gemma-4-31b/)** | Production-ready | 1× ¹ / 2× 3090 | vLLM ✅ (dual) · llama.cpp ⚠️ (community fork; mainline blocked on FA hdim=512) | Vision · tools · MTP n=3 (Google official drafter) **OR** DFlash n=7 (z-lab drafter) · up to 262K ctx via INT8 PTH KV (PR [#40391](https://github.com/vllm-project/vllm/pull/40391) vendored) · MTP dual = 106/141 TPS at 32K, 95/126 at 262K · DFlash dual = 105/177 TPS at 32K (code-optimal) · **beellama.cpp = single-card default** ⭐ 47/88 TPS, 131–200K ctx, 109–114/150 8-pack ([discussion #239](https://github.com/noonghunna/club-3090/discussions/239)) |
+| **[Gemma 4 31B](models/gemma-4-31b/)** | Production-ready | 1× ¹ / 2× 3090 | vLLM ✅ (dual) · llama.cpp ⚠️ (community fork; mainline blocked on FA hdim=512) | Vision · tools · MTP n=3 (Google official drafter) **OR** DFlash n=7 (z-lab drafter) · up to 262K ctx via INT8 PTH KV (PR [#40391](https://github.com/vllm-project/vllm/pull/40391) vendored) · MTP dual = 106/141 TPS at 32K, 95/126 at 262K · DFlash dual = 105/177 TPS at 32K (code-optimal) · single-card: no functional config since the beellama retirement (2026-07-27 — engine deprecated; historical: 47/88 TPS via beellama DFlash, [discussion #239](https://github.com/noonghunna/club-3090/discussions/239)) |
 | **[Qwen3.6 35B-A3B](models/qwen3.6-35b-a3b/)** | Production-ready (ik-llama single-card · vLLM dual) | 1× / 2× 3090 | vLLM ✅ · ik_llama ✅ · llama.cpp ✅ (mainline runs it — see `docs/HARDWARE.md`; ik_llama is the shipped single-card path) | **MoE (256 experts × 8 active, ~3 B active params)** · vision · tools · **ik_llama `fit-mtp.yml` single-card (Mudler APEX I-Compact)** = 103/149 TPS at 196K, hermes 11/20 + aider 12/30 + cli 12/40 ([PR #243](https://github.com/noonghunna/club-3090/pull/243)) · ik_llama `byteshape-iq4xs` single-card = 113/129 TPS at full 262K, 110/150 8-pack ([PR #293](https://github.com/noonghunna/club-3090/pull/293)) · vLLM dual = 178/174 TPS at 262K + vision (v0.22.0 stable; MTP net-negative on this MoE at TP=2) |
 | **[Gemma 4 26B-A4B](models/gemma-4-26b-a4b/)** | Production via AWQ (Intel AutoRound INT4 blocked on Ampere) | 2× 3090 ² | vLLM ✅ (AWQ overlay) · llama.cpp ❌ | **MoE (128 experts × 8 active, ~4 B active params)** · vision · tools · AWQ dual = **139/139 TPS at 32K**, CV 0.2% / 0.0% |
 
@@ -280,6 +292,7 @@ club-3090/
 │   ├── verify-stress.sh                   boundary-case stress test (longctx ladder + tool prefill OOM, ~5-10 min)
 │   ├── soak-test.sh                       runtime VRAM accretion / multi-turn agent traffic (~10-30 min, opt-in)
 │   ├── bench.sh                           canonical TPS bench
+│   ├── offload-matrix.sh                  CPU-offloaded MoE config sweep (llama.cpp forks)
 │   └── report.sh                          paste-ready triage report (run before filing a bug or sharing bench numbers)
 └── tools/
     └── charts/                            re-generate docs/img/* SVGs and PNG exports (matplotlib)
@@ -326,7 +339,7 @@ This separation keeps the stack maintainable as it grows. We don't want a model-
 
 ## Community
 
-- 💬 **[Discord](https://discord.gg/3t6UKFGhKw)** — casual chat, hardware questions, share what you're running. Use for synchronous Q&A.
+- 💬 **[Discord](https://discord.gg/gzdfjhj5yN)** — casual chat, hardware questions, share what you're running. Use for synchronous Q&A.
 - 📋 **[GitHub Discussions](https://github.com/noonghunna/club-3090/discussions)** — async, searchable. Best for cross-rig benchmark drops, "should I tune X" type threads, and anything you want others to find via search.
 - 🐛 **[GitHub Issues](https://github.com/noonghunna/club-3090/issues)** — bug reports, regression repros, concrete asks. Triage ladder in [FAQ](docs/FAQ.md#before-symptom-matching--boot-the-simplest-stack-first) before filing.
 
