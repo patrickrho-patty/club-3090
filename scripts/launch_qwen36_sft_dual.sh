@@ -33,6 +33,9 @@
 # values for enable_thinking=true general tasks) + --default-chat-template-kwargs
 # enable_thinking=true so thinking is on by default. Clients can still override
 # per-request; pass extra_body.chat_template_kwargs.enable_thinking=false to mute.
+# --reasoning-parser qwen3: splits <think>...</think> into reasoning_content
+# (template opens <think>, model closes </think>) so content is the clean answer
+# and thinking is a separate parseable field — LiteLLM forwards reasoning_content.
 #
 # GPU layout: 0 + 1 (TP=2). GPU2 is reserved for the search-stack-quant
 # (reranker/embedding/router/mineru) and is NEVER touched by this script.
@@ -113,6 +116,7 @@ start() {
       --enable-chunked-prefill \
       --override-generation-config '{"temperature":1.0,"top_p":0.95,"top_k":20,"min_p":0.0,"presence_penalty":1.5,"repetition_penalty":1.0}' \
       --default-chat-template-kwargs '{"enable_thinking": true}' \
+      --reasoning-parser qwen3 \
       $([ "$LONG_PREFILL_TOKEN_THRESHOLD" != "0" ] && echo --long-prefill-token-threshold "$LONG_PREFILL_TOKEN_THRESHOLD") \
       && echo "Container started. Waiting for health (TP=2 + cudagraph compile takes ~3-4 min on first boot)..."
 
