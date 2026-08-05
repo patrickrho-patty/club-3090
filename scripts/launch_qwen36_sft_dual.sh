@@ -53,6 +53,9 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TEMPLATE="${TEMPLATE:-$SCRIPT_DIR/../models/qwen3.6-35b-a3b/vllm/chat-templates/qwen3_5_serve.jinja}"
+
 CONTAINER_NAME="${CONTAINER_NAME:-ssq-llm-sft}"
 PORT="${PORT:-8033}"
 BIND_HOST="${BIND_HOST:-10.200.82.233}"
@@ -95,6 +98,7 @@ start() {
       --ipc=host \
       --shm-size=16g \
       -v "$MODEL_PATH:/model:ro" \
+      -v "$TEMPLATE:/templates/qwen3_5.jinja:ro" \
       -p "$BIND_HOST:$PORT:8000" \
       "$IMAGE" \
       --host 0.0.0.0 --port 8000 \
@@ -114,6 +118,7 @@ start() {
       --trust-remote-code \
       --enable-prefix-caching \
       --enable-chunked-prefill \
+      --chat-template /templates/qwen3_5.jinja \
       --override-generation-config '{"temperature":1.0,"top_p":0.95,"top_k":20,"min_p":0.0,"presence_penalty":1.5,"repetition_penalty":1.0}' \
       --default-chat-template-kwargs '{"enable_thinking": true}' \
       --reasoning-parser qwen3 \
