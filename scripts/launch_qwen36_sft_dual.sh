@@ -28,6 +28,11 @@
 #     QoS flags; not trained into this SFT and may break its format)
 # Performance recipe applied unchanged: TP=2, 262K, fp8_e4m3 KV, eager OFF,
 # chunked prefill, prefix caching, --disable-custom-all-reduce (PCIe, no NVLink).
+# Qwen3.6 thinking-mode defaults baked in via --override-generation-config
+# (temp 1.0 / top_p 0.95 / top_k 20 / presence_penalty 1.5 — official model-card
+# values for enable_thinking=true general tasks) + --default-chat-template-kwargs
+# enable_thinking=true so thinking is on by default. Clients can still override
+# per-request; pass extra_body.chat_template_kwargs.enable_thinking=false to mute.
 #
 # GPU layout: 0 + 1 (TP=2). GPU2 is reserved for the search-stack-quant
 # (reranker/embedding/router/mineru) and is NEVER touched by this script.
@@ -106,6 +111,8 @@ start() {
       --trust-remote-code \
       --enable-prefix-caching \
       --enable-chunked-prefill \
+      --override-generation-config '{"temperature":1.0,"top_p":0.95,"top_k":20,"min_p":0.0,"presence_penalty":1.5,"repetition_penalty":1.0}' \
+      --default-chat-template-kwargs '{"enable_thinking": true}' \
       $([ "$LONG_PREFILL_TOKEN_THRESHOLD" != "0" ] && echo --long-prefill-token-threshold "$LONG_PREFILL_TOKEN_THRESHOLD") \
       && echo "Container started. Waiting for health (TP=2 + cudagraph compile takes ~3-4 min on first boot)..."
 
