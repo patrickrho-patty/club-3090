@@ -26,6 +26,9 @@ def _stub_registry(tmp_path: Path, slug: str, compose_rel: str, **entry_extra):
     profiles = ModuleType("scripts.lib.profiles")
     cr = ModuleType("scripts.lib.profiles.compose_registry")
     cr.COMPOSE_REGISTRY = fake_reg
+    # C4-rev: runtime consumers import the merged accessor — the stub exposes
+    # it as an identity over the stub registry.
+    cr.get_registry = lambda *a, **k: fake_reg
     sys.modules["scripts"] = scripts
     sys.modules["scripts.lib"] = lib
     sys.modules["scripts.lib.profiles"] = profiles
@@ -427,3 +430,235 @@ class TestEmbeddedMtp:
         out = data._rewrite_gguf_command(
             ["-m", "/old.gguf"], model_mount="/models/b.gguf", embedded_mtp=False)
         assert "--spec-type" not in out and "--spec-draft-model" not in out
+
+
+class TestGgufHeaderFactsThreading:
+    """P3 / ModelSpec M3 — the GGUF header spec: route-G ⑤ Promote stops
+    dead-ending pure-template. Synthetic in-test GGUF bytes only; NO live
+    network. ``gguf_header_facts`` returns a TYPED ModelSpec whose Facts carry
+    ``provenance="derived-estimate"`` and ``source="gguf-header:<arch>.<kv>``."""
+
+    @staticmethod
+    def _gguf_bytes() -> bytes:
+        import struct as _s
+
+        def st(x: str) -> bytes:
+            b = x.encode()
+            return _s.pack("<Q", len(b)) + b
+
+        kv = [
+            ("general.architecture", 8, None, "llama"),
+            ("general.name", 8, None, "Synth-7B"),
+            ("general.file_type", 4, 15, None),
+            ("llama.block_count", 4, 32, None),
+            ("llama.embedding_length", 10, 4096, None),
+            ("llama.attention.head_count", 10, 32, None),
+            ("llama.attention.head_count_kv", 10, 8, None),
+            ("llama.context_length", 10, 131072, None),
+        ]
+        out = b"GGUF" + _s.pack("<I", 3) + _s.pack("<Q", 291) + _s.pack("<Q", len(kv))
+        for key, vt, num, sval in kv:
+            out += st(key) + _s.pack("<I", vt)
+            out += (
+                st(sval) if vt == 8 else _s.pack(
+                    "<I" if vt == 4 else "<Q", num)
+            )
+        return out
+
+    @staticmethod
+    def _model_spec_cls():
+        """Import the REAL model_spec (evicting any fake `scripts.*` stubs
+        other tests leaked into sys.modules), like reads_local_pull_dir."""
+        import sys as _sys
+
+        root = str(Path(__file__).resolve().parents[3])
+        if root not in _sys.path:
+            _sys.path.insert(0, root)
+        for m in [k for k in list(_sys.modules) if k == "scripts" or k.startswith("scripts.")]:
+            _sys.modules.pop(m, None)
+        from scripts.lib.profiles.model_spec import ModelSpec
+
+        return ModelSpec
+
+    @classmethod
+    def _gguf_spec(cls):
+        """The typed header spec for the synthetic Synth-7B fixture dims."""
+        return cls._model_spec_cls().from_gguf_facts({
+            "model_id": "org/Synth-7B-GGUF",
+            "arch": "llama",
+            "hidden_size": 4096,
+            "num_hidden_layers": 32,
+            "num_attn_heads": 32,
+            "num_kv_heads": 8,
+            "head_dim_attn": 128,
+            "max_ctx_supported": 131072,
+            "weights_total_gb": 4.2,
+            "valid_tp": [1, 2],
+            "confidence": "estimated-lower-bound",
+            "facts_provenance": "gguf-header",
+        })
+
+    def test_byo_check_gguf_threads_header_spec(self, tmp_path: Path):
+        data = CockpitData(tmp_path)
+        res = data.byo_check_gguf(
+            "org/Synth-7B-GGUF", "llama-cpp/q4km",
+            quant="Q4_K_M", size_gb=4.2, card_vram_gb=24.0,
+            spec=self._gguf_spec(),
+        )
+        assert res.facts.num_hidden_layers.value == 32
+        assert res.facts.num_kv_heads.value == 8
+        # Provenance survives the threading: every mapped dim is a labeled Fact.
+        assert res.facts.num_hidden_layers.provenance == "derived-estimate"
+        assert res.facts.num_hidden_layers.source == "gguf-header:llama.block_count"
+
+    def test_byo_check_gguf_keeps_absent_dims_placeholder_eligible(self, tmp_path: Path):
+        data = CockpitData(tmp_path)
+        ms = self._model_spec_cls().from_gguf_facts(
+            {"hidden_size": None, "arch": "llama"})
+        res = data.byo_check_gguf(
+            "org/M", "llama-cpp/q4km", quant="Q4_K_M", size_gb=1.0,
+            spec=ms,
+        )
+        assert res.facts.hidden_size is None       # absent ⇒ placeholder
+        assert res.facts.arch == "llama"
+
+    def test_byo_check_gguf_without_facts_stays_none(self, tmp_path: Path):
+        data = CockpitData(tmp_path)
+        res = data.byo_check_gguf(
+            "org/M", "llama-cpp/q4km", quant="Q4_K_M", size_gb=1.0)
+        assert res.facts is None
+
+    def test_gguf_header_facts_reads_local_pull_dir(self, tmp_path, monkeypatch):
+        import asyncio
+
+        # _stub_registry (other tests in this file) leaks fake `scripts.*`
+        # modules into sys.modules — evict them so the REAL deriver imports.
+        import sys
+
+        for m in [k for k in sys.modules if k == "scripts" or k.startswith("scripts.")]:
+            sys.modules.pop(m, None)
+        # The deriver import resolves against the REAL repo root (CockpitData
+        # gets tmp_path here); the pull dir itself comes from $HF_HOME.
+        monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[3]))
+        monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+        pull = tmp_path / "hf" / "club3090" / "pulls" / "org-synth-7b-gguf"
+        pull.mkdir(parents=True)
+        (pull / "Synth-7B-Q4_K_M.gguf").write_bytes(self._gguf_bytes())
+        data = CockpitData(tmp_path)
+        mspec = asyncio.run(data.gguf_header_facts(
+            "org/Synth-7B-GGUF", ["Synth-7B-Q4_K_M.gguf"], size_gb=4.2))
+        assert mspec is not None
+        assert mspec.num_hidden_layers.value == 32
+        assert mspec.hidden_size.value == 4096
+        assert mspec.num_kv_heads.value == 8
+        assert mspec.max_ctx_supported.value == 131072
+        assert mspec.weights_total_gb.value == 4.2
+        assert mspec.confidence == "estimated-lower-bound"
+        # Provenance: every dim sourced from the GGUF header KVs.
+        for dim, kv in (("hidden_size", "embedding_length"),
+                        ("num_hidden_layers", "block_count"),
+                        ("num_kv_heads", "attention.head_count_kv"),
+                        ("max_ctx_supported", "context_length")):
+            f = getattr(mspec, dim)
+            assert f.provenance == "derived-estimate"
+            assert f.source == f"gguf-header:llama.{kv}", dim
+
+    def test_gguf_header_facts_empty_when_nothing_probeable(
+        self, tmp_path, monkeypatch,
+    ):
+        """No local file AND no listed repo files → None (never raises, never
+        fabricates); the scaffold keeps its placeholders."""
+        import asyncio
+
+        monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
+        (tmp_path / "hf" / "club3090" / "pulls" / "org-x-gguf").mkdir(parents=True)
+        data = CockpitData(tmp_path)
+        assert asyncio.run(data.gguf_header_facts("org/X-GGUF", [])) is None
+
+    def test_scaffold_autofills_arch_dims_from_gguf_facts(self):
+        from club3090_cockpit.data import ByoResult, compute_promote_scaffold
+
+        byo = ByoResult(
+            repo="org/Synth-7B-GGUF", profile_like="llama-cpp/q4km",
+            arch="gguf", eligible=True, fit_verdict="fits-clean",
+            route="G", sibling_slug="llama-cpp/q4km", quant_match="Q4_K_M",
+            facts=self._gguf_spec(),
+        )
+        sc = compute_promote_scaffold(byo=byo, measurement=None)
+        assert not sc.error
+        # Auto-filled — NOT <int> placeholders (the pre-P3 dead-end).
+        for key, val in (("hidden_size", 4096), ("num_hidden_layers", 32),
+                         ("num_attn_heads", 32), ("num_kv_heads", 8),
+                         ("head_dim_attn", 128), ("max_ctx_supported", 131072)):
+            assert f"{key}: {val}" in sc.profile_yaml, key
+        assert "<int>" not in sc.profile_yaml
+        # Round-trip: every field the scaffold consumes carries provenance.
+        for key in ("hidden_size", "num_hidden_layers", "num_attn_heads",
+                    "num_kv_heads", "head_dim_attn", "max_ctx_supported"):
+            f = getattr(byo.facts, key)
+            assert f.source and f.provenance, key
+        assert sc.spec["arch"]["valid_tp"] == [1, 2]
+        # Human-required fields stay placeholders — never fabricated.
+        assert "family: <family-tag>" in sc.profile_yaml
+
+    def test_scaffold_renders_experts_line_for_moe_facts(self):
+        """ModelSpec M5: a MoE spec renders an explicit auto-filled experts
+        block (summary comment + canonical ModelProfile keys) instead of the
+        generic hand-fill placeholder."""
+        from club3090_cockpit.data import ByoResult, compute_promote_scaffold
+
+        facts = self._model_spec_cls().from_gguf_facts({
+            "model_id": "org/Synth-MoE-GGUF",
+            "arch": "qwen3moe",
+            "hidden_size": 4096,
+            "num_hidden_layers": 48,
+            "num_attn_heads": 32,
+            "num_kv_heads": 8,
+            "head_dim_attn": 128,
+            "max_ctx_supported": 131072,
+            "weights_total_gb": 4.2,
+            "valid_tp": [1, 2],
+            "confidence": "estimated-lower-bound",
+            "facts_provenance": "gguf-header",
+            # M5: the GGUF expert KVs gguf_spec_facts maps (llama.cpp naming).
+            "num_experts": 128,
+            "experts_per_tok": 8,
+        })
+        from scripts.lib.profiles.model_spec import Fact
+        assert facts.moe.num_experts == Fact(
+            128, "derived-estimate", "gguf-header:qwen3moe.expert_count"
+        )
+        byo = ByoResult(
+            repo="org/Synth-MoE-GGUF", profile_like="llama-cpp/q4km",
+            arch="gguf", eligible=True, fit_verdict="fits-clean",
+            route="G", sibling_slug="llama-cpp/q4km", quant_match="Q4_K_M",
+            facts=facts,
+        )
+        sc = compute_promote_scaffold(byo=byo, measurement=None)
+        assert not sc.error
+        assert (
+            "# experts (auto-filled from gguf-header:qwen3moe.expert_count): "
+            "128 routed / 8 active"
+        ) in sc.profile_yaml
+        assert "num_experts: 128" in sc.profile_yaml
+        assert "num_experts_per_tok: 8" in sc.profile_yaml
+        # The keys ride the spec skeleton too — additive for promote.py's
+        # renderer (arch_spec extras are ignored by the fixed key list).
+        assert sc.spec["arch"]["num_experts"] == 128
+        assert sc.spec["arch"]["num_experts_per_tok"] == 8
+
+    def test_scaffold_without_moe_facts_has_no_experts_line(self):
+        """Dense specs are byte-for-byte unchanged — no experts line, no
+        expert keys anywhere in the preview or the spec skeleton."""
+        from club3090_cockpit.data import ByoResult, compute_promote_scaffold
+
+        byo = ByoResult(
+            repo="org/Synth-7B-GGUF", profile_like="llama-cpp/q4km",
+            arch="gguf", eligible=True, fit_verdict="fits-clean",
+            route="G", sibling_slug="llama-cpp/q4km", quant_match="Q4_K_M",
+            facts=self._gguf_spec(),
+        )
+        sc = compute_promote_scaffold(byo=byo, measurement=None)
+        assert not sc.error
+        assert "experts" not in sc.profile_yaml
+        assert "num_experts" not in sc.spec["arch"]

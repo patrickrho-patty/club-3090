@@ -68,6 +68,7 @@ from .data import (
     GATE_STEPS,
     GpuCompApp,
     GpuConflict,
+    KvOption,
     LocalMeasured,
     Measurement,
     MeasuredNumbers,
@@ -97,6 +98,7 @@ from .data import (
     bench_row_from_corpus_record,
     bench_rows_from_benchmarks_md,
     compute_promote_scaffold,
+    rebase_spec_to_core,
     measured_from_internal_json,
     measured_from_report_md,
     parse_compute_apps,
@@ -225,6 +227,28 @@ class Runner(Protocol):
     ) -> RunResult: ...
 
 
+async def _reap(proc: Any) -> None:
+    """Kill and await a subprocess so its transport is closed while the loop lives.
+
+    Idempotent and never raises: called from exception paths, where a second
+    failure would mask the original one. A process that already exited raises
+    ProcessLookupError from kill() -- that is the success case, not an error.
+    """
+    if proc is None:
+        return
+    try:
+        if proc.returncode is None:
+            proc.kill()
+    except (ProcessLookupError, AttributeError):
+        pass
+    except Exception:
+        pass
+    try:
+        await proc.wait()
+    except Exception:
+        pass
+
+
 class RealRunner:
     """Production runner — actually shells out (READ contracts only)."""
 
@@ -249,10 +273,20 @@ class RealRunner:
                 stderr=err.decode("utf-8", errors="replace"),
             )
         except asyncio.TimeoutError:
+            # `wait_for` cancels communicate() but does NOT touch the CHILD. Without
+            # reaping it here the process keeps running and its transport stays
+            # alive; when `proc` is later GC'd -- at interpreter shutdown, AFTER the
+            # loop is closed -- BaseSubprocessTransport.__del__ calls loop.call_soon
+            # and raises "RuntimeError: Event loop is closed" as an ignored exception
+            # on quit. One orphan per timed-out probe, across 26 call sites.
+            await _reap(proc)
             result = RunResult(returncode=-1, stdout="", stderr="timeout", timed_out=True)
         except FileNotFoundError as exc:
             result = RunResult(returncode=127, stdout="", stderr=str(exc))
         except Exception as exc:  # pragma: no cover - defensive
+            # Same reasoning as the timeout arm: if the failure happened after the
+            # child was spawned, it must still be reaped.
+            await _reap(locals().get("proc"))
             result = RunResult(returncode=-1, stdout="", stderr=str(exc))
         if log is not None:
             log.complete_result(result)
@@ -260,7 +294,12 @@ class RealRunner:
 
 
 # Detect seam: async callables matching the core signatures.
-DetectEndpointFn = Callable[[], Awaitable[ServingTarget]]
+# Takes an optional ``variants=`` registry-rows kwarg (#1219: detection is
+# registry-first), so an injected double MUST accept it — swallowing a TypeError
+# here to retry without it would mask a genuine detect failure, and this callable
+# feeds the fail-closed dual-writer gate where "I could not detect" must mean
+# UNSAFE, never "nothing running".
+DetectEndpointFn = Callable[..., Awaitable[ServingTarget]]
 GetGpuInfoFn = Callable[[], Awaitable[list[GpuInfo]]]
 # A7: probe the live engine for its ACTUAL running config (ctx + image).  Takes
 # the detected ServingTarget (for url / container) and returns a ServedProbe.
@@ -430,7 +469,16 @@ class CockpitData:
         # 'scripts'" (and fit-check's topology detection silently degrades).
         # 2026-07-09 dogfood — previously only one call site guarded this.
         import sys as _sys
-        if str(self.repo_root) not in _sys.path:
+        # ⚠️ Only insert roots that actually provide the module tree:
+        # scripts/lib/profiles is a REGULAR package (__init__.py), so the first
+        # sys.path entry containing it pins resolution exclusively. Inserting a
+        # tmp fixture root shadows the real tree and every later
+        # `scripts.lib.profiles.*` import dies with ModuleNotFoundError
+        # (surfaced by Wave-3 tests constructing CockpitData(tmp_path) early).
+        if (
+            str(self.repo_root) not in _sys.path
+            and (self.repo_root / "scripts" / "lib" / "profiles" / "__init__.py").exists()
+        ):
             _sys.path.insert(0, str(self.repo_root))
         self.card = card
         # FIX 2 — the registry's top-level ``defaults`` array (curated
@@ -440,6 +488,11 @@ class CockpitData:
         # registry-recommended representative per (family, topology).  Refreshed
         # on each ``load_catalog_rows``; empty on the raw-tab fallback path.
         self.catalog_defaults: list[dict] = []
+        # Model-level metadata from the --json ``profiles.models`` section
+        # (display_name / family / active_params_b / vision_capable / hf_repo),
+        # keyed by model id — the model-info popup's local-data source.  Empty
+        # on the raw-tab fallback path (degraded catalog).
+        self.catalog_models: dict[str, dict] = {}
         self._runner: Runner = runner or RealRunner()
         self._logging_enabled = False
         self._detect_endpoint: DetectEndpointFn = detect_endpoint_fn or core_detect_endpoint
@@ -601,9 +654,16 @@ class CockpitData:
             # emitter has no `defaults` array, so the profile-template picker
             # degrades to the status floor (still functional-only).
             self.catalog_defaults = []
+            self.catalog_models = {}
             rows, ferr = await self._load_catalog_rows_fallback()
             if ferr:
                 return [], err
+            # The fallback saved the paint but LOST the --json-only facets
+            # (defaults, model metadata).  Surface WHY instead of silently
+            # degrading: the caller shows this note as a yellow banner while
+            # the reduced-column rows still render.
+            note = f"registry JSON emit failed, showing reduced columns: {err}"
+            return [CatalogEntry(row=r) for r in rows], note[:300]
         else:
             data = data or {}
             rows = [_variant_row_from_dict(d) for d in data.get("variants", [])]
@@ -611,7 +671,10 @@ class CockpitData:
             # the registry's own recommendation per (family, topology).
             d = data.get("defaults")
             self.catalog_defaults = list(d) if isinstance(d, list) else []
-
+            models = (data.get("profiles") or {}).get("models")
+            self.catalog_models = {
+                mid: m for mid, m in (models or {}).items() if isinstance(m, dict)
+            }
         return [CatalogEntry(row=r) for r in rows], None
 
     async def _load_catalog_rows_fallback(self) -> tuple[list[VariantRow], Optional[str]]:
@@ -1156,7 +1219,13 @@ class CockpitData:
             return {}
         import datetime as _dt
 
-        best: dict[str, tuple[float, LocalMeasured]] = {}
+        # Per-field NEWEST merge (slice 2c). bench.sh emits a TPS-only record and
+        # quality-test.sh a quality-only record, so a slug's newest TPS and newest
+        # 8pk can live in DIFFERENT records. Show the latest of EACH: running bench
+        # 3× → the 3rd run's TPS wins (older ones stay in the append-only corpus);
+        # a later quality-test run adds its 8pk without clobbering the TPS.
+        tps_best: dict[str, tuple[float, dict]] = {}
+        q_best: dict[str, tuple[float, dict]] = {}
         for f in sorted(base.glob("*.jsonl")):
             try:
                 mtime = f.stat().st_mtime
@@ -1179,17 +1248,47 @@ class CockpitData:
                 ext = r.get("measured_extensions") or {}
                 by_ctx = ext.get("decode_tps_by_ctx") or {}
                 decode = next(iter(by_ctx.values()), None)
-                lm = LocalMeasured(
-                    decode_tps=decode,
-                    quality_8pk=ext.get("quality_8pk"),
-                    quality_8pk_think_on=ext.get("quality_8pk_think_on"),
-                    engine_pin=r.get("engine_pin"),
-                    date=(stamp[:10] if stamp
-                          else _dt.date.fromtimestamp(mtime).isoformat()),
+                date = stamp[:10] if stamp else _dt.date.fromtimestamp(mtime).isoformat()
+                # Only a REAL user-facing bench (bench.sh / rebench-full →
+                # result_class "bench-measured") may drive the perf columns. The
+                # compose-optimizer writes `boot-fit-measured` boot-fit probes
+                # (degenerate ttft ~1ms, synthetic ~475 TPS) into the SAME dir;
+                # those are internal fit checks, not the rig's bench, and must
+                # never surface here (they were showing as the slug's TPS).
+                rc = (r.get("result_class") or "").strip().lower()
+                has_tps = (
+                    decode is not None
+                    or ext.get("narr_tps") is not None
+                    or ext.get("code_tps") is not None
                 )
-                if slug not in best or ts > best[slug][0]:
-                    best[slug] = (ts, lm)
-        return {s: lm for s, (ts, lm) in best.items()}
+                if rc == "bench-measured" and has_tps:
+                    if slug not in tps_best or ts > tps_best[slug][0]:
+                        tps_best[slug] = (ts, {
+                            "decode_tps": decode, "narr_tps": ext.get("narr_tps"),
+                            "code_tps": ext.get("code_tps"),
+                            "engine_pin": r.get("engine_pin"), "date": date,
+                        })
+                if ext.get("quality_8pk") or ext.get("quality_8pk_think_on"):
+                    if slug not in q_best or ts > q_best[slug][0]:
+                        q_best[slug] = (ts, {
+                            "quality_8pk": ext.get("quality_8pk"),
+                            "quality_8pk_think_on": ext.get("quality_8pk_think_on"),
+                            "engine_pin": r.get("engine_pin"), "date": date,
+                        })
+        out: dict[str, LocalMeasured] = {}
+        for slug in set(tps_best) | set(q_best):
+            t = tps_best.get(slug, (0.0, {}))[1]
+            q = q_best.get(slug, (0.0, {}))[1]
+            out[slug] = LocalMeasured(
+                decode_tps=t.get("decode_tps"),
+                narr_tps=t.get("narr_tps"),
+                code_tps=t.get("code_tps"),
+                quality_8pk=q.get("quality_8pk"),
+                quality_8pk_think_on=q.get("quality_8pk_think_on"),
+                engine_pin=t.get("engine_pin") or q.get("engine_pin"),
+                date=max(t.get("date", ""), q.get("date", "")),
+            )
+        return out
 
     def _read_benchmarks_md(self) -> str:
         path = self.repo_root / "BENCHMARKS.md"
@@ -1460,6 +1559,30 @@ class CockpitData:
             return ArtifactInventory(repo=repo, error=err or "no output")
         return ArtifactInventory.from_dict(data)
 
+    async def hf_search(self, query: str, limit: int = 20) -> tuple[list[dict], Optional[str]]:
+        """HF repo DISCOVERY for the ① Bring search front-end ([f] / the
+        "Search HF" button).  Same seam as ``bring_inspect``: the app never
+        does network I/O — the stdlib urllib CLI
+        ``scripts/lib/profiles/hf_search.py`` hits the hub's search API as a
+        subprocess and prints the JSON row contract.  Returns (rows, error);
+        an EMPTY list with no error is a valid "no results", NOT a failure."""
+        data, err = await self._run_json(
+            [
+                "python3",
+                "scripts/lib/profiles/hf_search.py",
+                query,
+                "--limit",
+                str(limit),
+                "--json",
+            ],
+            timeout=20.0,
+        )
+        if data is None:
+            return [], err or "no output"
+        if not isinstance(data, list):
+            return [], f"unexpected payload: expected a JSON array (got {type(data).__name__})"
+        return [r for r in data if isinstance(r, dict)], None
+
     async def byo_check(self, repo: str, profile_like: str) -> ByoResult:
         """pull.sh <repo> --profile-like <key> --dry-run --json.
 
@@ -1482,6 +1605,13 @@ class CockpitData:
         if data is None:
             return ByoResult(repo=repo, profile_like=profile_like, error=err or "no output")
         res = ByoResult.from_dict(repo, profile_like, data)
+        if not res.error and not res.facts:
+            # C4-rev / ModelSpec M2–M3: enrich with the deriver's TYPED,
+            # provenance-labeled ModelSpec so ⑤ Promote can auto-fill the arch
+            # dims.  Best-effort: any failure keeps facts None and the
+            # scaffold's <...> placeholders stay placeholders.  Read-only
+            # derive — no download, no write.
+            res.facts = await self._deriver_spec(repo)
         # The evaluate leg is safetensors-only BY DESIGN (the deriver's fit math
         # reads config.json), so a GGUF-only repo aborts `unsupported-format`
         # here even though route-G handles it first-class.  Intercept exactly
@@ -1513,6 +1643,31 @@ class CockpitData:
                 )
         return res
 
+    # C4-rev / ModelSpec M2: read-only deriver probe — emits the TYPED
+    # ModelSpec (provenance-labeled dims: config.json facts vs the 131072
+    # fallback vs GGUF-header estimates) as one JSON object on stdout via the
+    # deriver's own `--spec-json` flag.  Replaces the old hand-rolled rename
+    # table (`_DERIVER_FACTS_SRC`) AND its second config.json fetch — the
+    # vision heuristic now lives in the deriver proper.  A failure yields None
+    # (placeholders).
+    async def _deriver_spec(self, repo: str) -> Optional["ModelSpec"]:
+        """The repo's typed ModelSpec, or None on ANY failure."""
+        try:
+            data, _err = await self._run_json(
+                [
+                    "python3", "-m", "scripts.lib.profiles.deriver",
+                    "--spec-json", repo,
+                ],
+                timeout=60.0,
+            )
+            if isinstance(data, dict):
+                from scripts.lib.profiles.model_spec import ModelSpec
+
+                return ModelSpec.from_dict(data)
+        except Exception:
+            pass
+        return None
+
     # GGUF-engine slug prefixes (the registry's engine path segment) — the
     # engines whose sibling composes route-G can clone.  vllm (safetensors)
     # is deliberately absent.
@@ -1541,8 +1696,8 @@ class CockpitData:
         """Card count for a registry slug from its compose path topology segment."""
         path = ""
         try:
-            from scripts.lib.profiles.compose_registry import COMPOSE_REGISTRY
-            entry = COMPOSE_REGISTRY.get(profile_like) or {}
+            from scripts.lib.profiles.compose_registry import get_registry
+            entry = get_registry().get(profile_like) or {}
             path = str(entry.get("compose_path") or "")
         except Exception:
             path = ""
@@ -1565,6 +1720,7 @@ class CockpitData:
         card_vram_gb: Optional[float] = None,
         companion_gb: float = 0.0,
         per_card_gb: float = 24.0,
+        spec: Optional["ModelSpec"] = None,
     ) -> ByoResult:
         """Phase 4 route-G: GGUF fit without the vLLM/safetensors deriver.
 
@@ -1572,7 +1728,11 @@ class CockpitData:
         mtp draft).  Budget = ``card_vram_gb`` if given, else
         ``per_card_gb × topology_cards(profile_like)`` so dual/multi siblings
         are judged against combined VRAM (not always one 24 GB card).
-        """
+
+        ``spec`` (P3 / ModelSpec M3): the typed GGUF header ModelSpec from
+        :meth:`gguf_header_facts` — threaded onto ``ByoResult.facts`` so the
+        ⑤ Promote scaffold auto-fills arch dims instead of staying
+        pure-template. None keeps every placeholder as-is."""
         if not quant:
             return ByoResult(
                 repo=repo, profile_like=profile_like,
@@ -1620,8 +1780,80 @@ class CockpitData:
             sibling_slug=profile_like if eligible else None,
             quant_match=quant,
             drop_spec_config=False,
+            # P3 / ModelSpec M3: GGUF header dims (provenance-labeled) for
+            # the ⑤ Promote scaffold; None keeps every placeholder as-is.
+            facts=spec,
             error="",
         )
+
+    async def gguf_header_facts(
+        self,
+        repo: str,
+        files: list[str],
+        *,
+        size_gb: Optional[float] = None,
+    ) -> Optional["ModelSpec"]:
+        """P3 / ModelSpec M3: the GGUF header KV facts for a brought repo as a
+        TYPED, provenance-labeled ModelSpec (``gguf-header:<arch>.<kv>``
+        sources) — the route-G fix so ⑤ Promote stops dead-ending
+        pure-template on GGUF-only repos.
+
+        Resolution order: an on-disk ``.gguf`` in the CONTRACT-2 pull dir
+        (post-[D]: exact repo-relative match first, else any non-mmproj
+        ``*.gguf``), else a bounded HTTP range probe of the repo's first
+        listed file via the deriver (pre-[D]; header-only, never a full
+        download). Any failure → ``None`` — the scaffold keeps its ``<...>``
+        placeholders instead of fabricating."""
+        import asyncio
+        import os
+
+        from scripts.lib.profiles.model_spec import ModelSpec
+
+        def _spec(facts: Optional[dict]) -> Optional["ModelSpec"]:
+            return ModelSpec.from_gguf_facts(facts) if facts else None
+
+        try:
+            # Inside the try: an unresolvable `scripts` package must degrade
+            # to None (placeholders stay), never raise out of the fit-check.
+            from scripts.lib.profiles import deriver as _deriver
+
+            d = self.bring_pull_dir(repo)
+            # 1) exact repo-relative match (the picked quant's own files)
+            for rel in files:
+                p = d / str(rel)
+                if p.is_file():
+                    s = _spec(await asyncio.to_thread(
+                        _deriver.gguf_facts_from_file,
+                        str(p), model_id=repo, weight_gb=size_gb,
+                    ))
+                    if s:
+                        return s
+            # 2) any non-mmproj GGUF already on disk (multi-part: shard 1)
+            if d.is_dir():
+                local = sorted(
+                    p for p in d.rglob("*.gguf")
+                    if not p.name.lower().startswith("mmproj")
+                )
+                if local:
+                    s = _spec(await asyncio.to_thread(
+                        _deriver.gguf_facts_from_file,
+                        str(local[0]), model_id=repo, weight_gb=size_gb,
+                    ))
+                    if s:
+                        return s
+            # 3) remote: bounded range probe of the first listed repo file
+            if files:
+                s = _spec(await asyncio.to_thread(
+                    _deriver.gguf_facts_from_repo,
+                    repo, str(files[0]), _deriver.default_probe_fetcher(),
+                    os.environ.get("HF_TOKEN") or None,
+                    model_id=repo, weight_gb=size_gb,
+                ))
+                if s:
+                    return s
+        except Exception:
+            pass
+        return None
 
     @staticmethod
     def _normalize_compose_command(raw) -> list:
@@ -1801,10 +2033,10 @@ class CockpitData:
         from pathlib import Path as _P
 
         try:
-            from scripts.lib.profiles.compose_registry import COMPOSE_REGISTRY
+            from scripts.lib.profiles.compose_registry import get_registry
         except Exception as exc:
             return {"compose_path": "", "compose_yaml": "", "error": f"registry: {exc}"}
-        entry = COMPOSE_REGISTRY.get(profile_like)
+        entry = get_registry().get(profile_like)
         if entry is None:
             return {
                 "compose_path": "", "compose_yaml": "",
@@ -2225,6 +2457,59 @@ class CockpitData:
 
     # ── READ: container logs ──────────────────────────────────────────────────────
 
+    async def vram_breakdown(self, container: str) -> dict[str, Any]:
+        """Per-GPU VRAM component split for the serving container (#1118, READ).
+
+        Same seam as bootlog_solve: ``docker logs <container>`` through the
+        injected read runner, then ``scripts/lib/vram_breakdown.py <log>
+        --json`` (the parser bench.sh uses; the packaged TUI never imports
+        repo internals).
+
+        Reads the FULL log, both streams, and is cached by the caller (600 s
+        stride): the component lines live at the HEAD of the log (boot-time
+        load_tensors / sched_reserve), and a tail window on a long-running
+        container drops them entirely -- measured 578k lines with the boot in
+        the first ~70 on glm53-flash-dual.  Boot lines are on STDERR, and
+        ``container_logs`` only surfaces stderr when stdout is empty, so this
+        method reads the runner directly and merges both streams."""
+        if not container:
+            return {"ok": False, "container": container, "devices": [],
+                    "warnings": [], "error": "no serving container resolved"}
+        res = await self._runner.run(
+            ["docker", "logs", container],
+            cwd=str(self.repo_root), timeout=60.0,
+        )
+        if res.timed_out:
+            return {"ok": False, "container": container, "devices": [],
+                    "warnings": [],
+                    "error": f"timed out reading logs for {container}"}
+        # docker logs splits app output across stdout/stderr; llama.cpp
+        # announces the buffers on stderr while later traffic lands on
+        # stdout -- both are needed, so merge unconditionally.
+        text = f"{res.stdout or ''}\n{res.stderr or ''}"
+        lines = text.splitlines()
+        import tempfile
+
+        fd, path = tempfile.mkstemp(prefix="c3-vram-", suffix=".log")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", errors="replace") as fh:
+                fh.write("\n".join(lines))
+            data, err = await self._run_json(
+                ["python3", "scripts/lib/vram_breakdown.py", path, "--json"],
+                timeout=30.0,
+            )
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:  # pragma: no cover - defensive
+                pass
+        if err:
+            return {"ok": False, "container": container, "devices": [],
+                    "warnings": [], "error": err}
+        return {"ok": True, "container": container,
+                "devices": data.get("devices", []),
+                "warnings": data.get("warnings", []), "error": None}
+
     async def container_logs(
         self, name: str, *, tail: int = 200
     ) -> dict[str, Any]:
@@ -2253,6 +2538,76 @@ class CockpitData:
             return {"lines": [], "error": (res.stderr.strip()[:200] or f"rc={res.returncode}")}
         return {"lines": lines, "error": None}
 
+    # ── READ: boot-log KV back-solve (ADDING_MODELS.md Step 5, automated) ─────────
+
+    async def bootlog_solve(
+        self, *, slug: Optional[str] = None, container: Optional[str] = None, tail: int = 4000
+    ) -> dict[str, Any]:
+        """Back-solve the serving container's boot log against kv-calc (READ).
+
+        Two legs, both through the injected read runner (tests stay
+        subprocess-free):
+          1. ``docker logs --tail <N> <container>`` via ``container_logs`` —
+             the live boot log;
+          2. ``scripts/lib/profiles/bootlog_solve.py --slug <slug> --json`` —
+             parse + classify vs the kv-calc prediction (the same --json
+             subprocess contract as ``kv-calc --fit``; the packaged TUI never
+             imports repo internals).
+
+        Returns ``{"ok": bool, "container", "slug", "message", "report"}``.
+        Honest failures — no container, no slug, docker unavailable, solver
+        garbage — return ``ok=False`` with the reason; the report itself
+        carries ``verdict="insufficient-log"`` when the LOG lacks fields.
+        NEVER guesses."""
+        if not container:
+            return {
+                "ok": False, "container": None, "slug": slug,
+                "message": "no serving container resolved — boot-log back-solve needs a live container",
+                "report": None,
+            }
+        if not slug:
+            return {
+                "ok": False, "container": container, "slug": None,
+                "message": "no catalog slug matched — the back-solve prices curated slugs only",
+                "report": None,
+            }
+        res = await self.container_logs(container, tail=tail)
+        if res.get("error"):
+            return {
+                "ok": False, "container": container, "slug": slug,
+                "message": f"docker logs unavailable: {res['error']}",
+                "report": None,
+            }
+        lines = res.get("lines") or []
+        import tempfile
+
+        fd, path = tempfile.mkstemp(prefix="c3-bootlog-", suffix=".log")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", errors="replace") as fh:
+                fh.write("\n".join(lines))
+            report, err = await self._run_json(
+                [
+                    "python3", "scripts/lib/profiles/bootlog_solve.py",
+                    "--slug", slug, "--log-file", path, "--json",
+                ],
+                timeout=30.0,
+            )
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:  # pragma: no cover - defensive
+                pass
+        if report is None:
+            return {
+                "ok": False, "container": container, "slug": slug,
+                "message": f"boot-log back-solve failed: {err}",
+                "report": None,
+            }
+        if isinstance(report, dict):
+            report.setdefault("slug", slug)
+            report["container"] = container
+        return {"ok": True, "container": container, "slug": slug, "message": "", "report": report}
+
     async def gpu_info(self) -> "list[GpuInfo]":
         """Docker-FREE per-card GPU read (nvidia-smi only) — for the cockpit's fast GPU
         rail refresh, decoupled from the heavy docker+host estate batch (estate_state /
@@ -2271,9 +2626,15 @@ class CockpitData:
         health.sh Doctor read + gpu-mode scene catalog + estate-planner report."""
         state = EstateState()
 
-        # detect: running engine + GPUs
+        # detect: running engine + GPUs.
+        # Hand the registry rows DOWN into detection (#1219) — a local slug's
+        # container matches neither the engine-name prefix nor the curated
+        # internal-port set, so without them it is never classified as an engine
+        # and the estate reports "not reachable" over a plainly loaded model.
+        # match_target_to_registry below still enriches; this makes detection
+        # itself registry-aware instead of only the labelling after it.
         try:
-            target = await self._detect_endpoint()
+            target = await self._detect_endpoint(variants=variants)
         except Exception as exc:  # pragma: no cover - defensive
             state.error = f"detect failed: {exc}"
             target = ServingTarget()
@@ -2760,8 +3121,11 @@ class CockpitData:
         result = ReconcileResult(safe=True, action=action)
 
         # Fresh detect — never trust a cached snapshot for the gate.
+        # Registry-first (#1219): this gate decides whether the cards are free, so
+        # a container detection cannot classify reads as NO container — i.e. a
+        # registered local slug serving on GPU0 would look like an empty card.
         try:
-            target = await self._detect_endpoint()
+            target = await self._detect_endpoint(variants=variants)
         except Exception as exc:  # pragma: no cover - defensive
             result.note = f"detect failed: {exc}"
             # A failed detect is NOT safe — we can't prove the cards are free.
@@ -3011,10 +3375,13 @@ class CockpitData:
         }
         try:
             import sys as _sys
-            if str(self.repo_root) not in _sys.path:
+            if (
+                str(self.repo_root) not in _sys.path
+                and (self.repo_root / "scripts" / "lib" / "profiles" / "__init__.py").exists()
+            ):
                 _sys.path.insert(0, str(self.repo_root))   # cwd-independent import
-            from scripts.lib.profiles.compose_registry import COMPOSE_REGISTRY
-            entry = COMPOSE_REGISTRY.get(profile_like)
+            from scripts.lib.profiles.compose_registry import get_registry
+            entry = get_registry().get(profile_like)
             if entry:
                 out["ENGINE"] = str(entry.get("engine", "") or "")
                 txt = (self.repo_root / entry["compose_path"]).read_text(encoding="utf-8")
@@ -3024,10 +3391,13 @@ class CockpitData:
                         out[var] = m.group(1).strip().strip('"')
                 # Real drafter for the SPEC label ("on" is uninformative): parse the
                 # sibling's --speculative-config method + num_speculative_tokens.
-                sm = _re.search(r'"method"\s*:\s*"([a-z0-9_]+)"', txt)
+                sm = _re.search(r'\\?"method\\?"\s*:\s*\\?"([a-z0-9_]+)\\?"', txt)
                 if sm:
                     method = sm.group(1)
-                    nm = _re.search(r'"num_speculative_tokens"\s*:\s*(\d+)', txt)
+                    nm = _re.search(r'\\?"num_speculative_tokens\\?"\s*:\s*(\d+)', txt)
+                    if not nm:   # entrypoint-built configs use a $$_spec_n var; the
+                        # real default n lives in ${SPEC_N:-<n>}.
+                        nm = _re.search(r'\$\{SPEC_N:-(\d+)\}', txt)
                     out["SPEC_METHOD"] = method                    # raw, e.g. "mtp"
                     out["SPEC_N"] = nm.group(1) if nm else ""
                     out["SPEC_DRAFTER"] = (
@@ -3161,11 +3531,20 @@ class CockpitData:
         )
 
     def estate_down(self) -> ActionPlan:
+        """Stop everything.
+
+        The reconcile gate lists running instances as COLLISIONS, so on any busy
+        rig "Stop all" opened with Confirm disabled and "press f to Stop anyway"
+        — the gate treating the very thing you asked to stop as a reason not to.
+        The targeted stop (`k`) already carries force + a reason for exactly this;
+        stop-all is the same case, so it says so up front and ⏎ commits."""
         return ActionPlan(
             kind="estate_down",
             cmd=["python3", "scripts/lib/profiles/estate_cli.py", "down"],
             description="estate_cli down",
             requires_reconcile=True,
+            force=True,
+            force_reason="stopping everything is the point — running instances are the target, not a collision",
         )
 
     def container_action(self, name: str, op: str) -> ActionPlan:
@@ -4621,11 +5000,14 @@ class CockpitData:
         on_event: Optional[Callable[[Any], None]] = None,
         on_line: Optional[Callable[[str], None]] = None,
     ) -> Any:
-        """Launch c3t scoped to the SHARED ServingTarget, streamed (MOCK-ONLY).
+        """Launch c3t scoped to the SHARED ServingTarget, streamed.
 
-        ⚠️  WIRED-BUT-MOCK-ONLY.  c3t runs the post-boot evaluator against the
-        live serving model — heavy.  The write runner is NEVER executed live this
-        phase; conftest blocks the real spawn and tests inject a FakeWriteRunner.
+        ⚠️  THIS RUNS FOR REAL.  c3t is spawned through ``self._write_runner`` —
+        the production runner in a real session — and evaluates the live serving
+        model (heavy).  The previous "WIRED-BUT-MOCK-ONLY / never executed live"
+        note described only the TEST environment: conftest blocks the spawn and
+        tests inject a FakeWriteRunner, neither of which applies in production.
+        Callers must keep this behind the confirm gate.
 
         Scopes c3t to ``target`` by passing the endpoint/model/container through
         the child env (``C3T_REPO_ROOT`` + ``C3T_TARGET_*``) so the test-console
@@ -4666,92 +5048,404 @@ class CockpitData:
         measurement: Optional[Measurement] = None,
         model_id: str = "",
         sibling_compose_path: str = "",
+        compose_text: str = "",
+        layer: str = "local",
     ) -> PromoteScaffold:
         """COMPUTE + PREVIEW the catalog-promotion scaffold (design §3.5b).
 
-        For a served/validated BYO model, compute a ModelProfile YAML skeleton +
-        a ``compose_registry.py`` ``_entry(...)`` row from facts the app already
-        holds (the BYO pull-gate arch facts in ``byo`` + the Evidence
-        ``measurement`` numbers), match the REAL shapes
-        (``scripts/lib/profiles/models/*.yml`` + ``_entry(...)`` +
-        ``docs/ADDING_MODELS.md``), and attach a GATED hand-off plan.
+        C4-rev: targets the gitignored LOCAL layer by default; ``layer="core"``
+        is the maintainer-gated secondary action.  The spec carries the deriver
+        facts threaded through ``ByoResult.facts`` (auto-filled arch dims);
+        ``display_name`` / ``family`` stay REQUIRED inline edits in
+        ``PromoteScaffoldScreen``.
 
-        In THIS phase: compute + preview ONLY.  The write-into-``scripts/`` + the
-        guard-suite run is the attached ``write_plan`` (built by
-        ``promote_write_plan``), which is MOCKED / never-executed and NEVER
-        auto-fires.  This method does NOT touch the filesystem."""
+        Compute + preview ONLY — this method does NOT touch the filesystem.
+        The gated write is the attached ``write_plan`` (built by
+        ``promote_write_plan``), which NEVER auto-fires."""
         scaffold = compute_promote_scaffold(
             byo=byo,
             measurement=measurement,
             model_id=model_id,
             sibling_compose_path=sibling_compose_path,
+            compose_text=compose_text,
+            layer=layer,
         )
         if scaffold.computed:
-            scaffold.write_plan = self.promote_write_plan(scaffold)
+            scaffold.write_plan = self.promote_write_plan(scaffold, layer=layer)
         return scaffold
 
-    def promote_write_plan(self, scaffold: PromoteScaffold) -> ActionPlan:
-        """Build the GATED, MOCK-ONLY write+guard ActionPlan for a scaffold.
+    def promote_write_plan(
+        self,
+        scaffold: PromoteScaffold,
+        *,
+        layer: str = "local",
+        spec: Optional[dict] = None,
+    ) -> ActionPlan:
+        """Build the GATED write+validate ActionPlan for a scaffold (C4-rev).
 
-        ⚠️  REPO MUTATION — NEVER auto-fired / executed this phase.  This would
-        (a) write the profile YAML + registry row into ``scripts/lib/profiles/``
-        and (b) run the guard suite (``for t in scripts/tests/*.sh``).  Because it
-        mutates ``scripts/`` (a repo write) it is built but NEVER executed live —
-        ``requires_confirm=True``; tests assert it is mock-only and never reaches
-        the write runner.  It does NOT claim a GPU → ``requires_reconcile=False``.
+        ⚠️  REPO MUTATION — NEVER auto-fired.  ``requires_confirm=True`` routes
+        it through ConfirmActionScreen; it does NOT claim a GPU →
+        ``requires_reconcile=False``.
 
-        The cmd is a guard-suite invocation as a PLACEHOLDER for the gated
-        action; the actual file-write is performed by the (future) promote tool,
-        not auto-written by the cockpit (do NOT auto-write into scripts/)."""
+        cmd (per plan): promote.py (the executor) && diagnose-profile.sh <slug>
+        && preflight-add-model.sh <slug> — the P2 preflight gate runs right
+        after the write.  The machine-readable spec rides in the child env as
+        ``C3_PROMOTE_SPEC`` (merged over os.environ by execute_action), so the
+        plan stays inspectable without a giant argv.
+
+        layer: "local" (default — the gitignored community layer) or "core"
+        (maintainer-only curated catalog).  Core does NOT inject
+        C3_ALLOW_CORE_PROMOTE — that flag must exist in the USER'S environment;
+        both the screen and promote.py assert it."""
+        base_spec = spec if spec is not None else dict(scaffold.spec or {})
+        if layer == "core":
+            base_spec = rebase_spec_to_core(base_spec)
+        slug = (base_spec.get("registry_entry") or {}).get("slug", "") or scaffold.registry_slug
+        promote_cmd = (
+            "python3 scripts/lib/profiles/promote.py "
+            f"--spec-env C3_PROMOTE_SPEC --layer {layer}"
+        )
+        post_cmd = (
+            f"bash scripts/diagnose-profile.sh {slug} "
+            f"&& bash scripts/preflight-add-model.sh {slug}"
+        )
         return ActionPlan(
             kind="promote_catalog",
-            cmd=list(scaffold.guard_suite_cmd)
-            or ["bash", "-c", 'for t in scripts/tests/*.sh; do bash "$t"; done'],
+            cmd=["bash", "-c", f"{promote_cmd} && {post_cmd}"],
+            env={"C3_PROMOTE_SPEC": json.dumps(base_spec, ensure_ascii=False)},
             description=(
-                f"promote {scaffold.model_id} → catalog "
-                f"(write {scaffold.profile_path} + registry {scaffold.registry_slug}, "
-                "then guard suite)"
+                f"promote {scaffold.model_id} → {layer.upper()} layer "
+                f"(write {scaffold.profile_path} + registry {slug}, "
+                "then diagnose + preflight)"
             ),
             requires_reconcile=False,    # no GPU contention — a repo write
             requires_confirm=True,       # repo mutation — confirm, never auto
         )
 
-    # ── Hook 3: Optimize for my card — DORMANT v0.10.0 seam (design §5.2 seam 1) ────
+    def local_amend_plan(
+        self,
+        kind: str,
+        slug: str,
+        *,
+        to: str = "",
+        sets: Optional[list] = None,
+    ) -> ActionPlan:
+        """GATED plan for managing an entry in the LOCAL layer (#1153).
+
+        The layer was write-only from the UI: ⑤ Promote could create an entry and
+        nothing could list, edit or remove one, so changing anything meant
+        hand-editing registry.local.json — the exact friction the layer exists to
+        remove.
+
+        The executor is scripts/catalog.sh, so the UI and the CLI share one
+        implementation and one set of refusals: a CURATED slug is unreachable
+        from every one of these (resolved in registry.local.json first, refused
+        before anything is read), `origin` is not editable, and renaming onto a
+        curated slug is refused because it would be shadowed instantly.
+
+        ⚠️ REPO MUTATION — never auto-fired. requires_confirm=True routes it
+        through ConfirmActionScreen; no GPU is claimed → requires_reconcile=False.
+        """
+        import shlex
+
+        q = shlex.quote
+        if kind == "remove":
+            cmd = f"bash scripts/catalog.sh unregister --slug {q(slug)} -y"
+            desc = (
+                f"unregister {slug} from the LOCAL layer — removes its model "
+                f"profile, compose tree and registry entry (core is untouched)"
+            )
+        elif kind == "rename":
+            if not to:
+                raise ValueError("rename needs a target slug")
+            cmd = f"bash scripts/catalog.sh rename --slug {q(slug)} --to {q(to)}"
+            desc = (
+                f"rename {slug} → {to} in the LOCAL layer "
+                f"(moves the compose tree when the engine changes)"
+            )
+        elif kind == "update":
+            pairs = list(sets or [])
+            if not pairs:
+                raise ValueError("update needs at least one KEY=VALUE")
+            args = " ".join(f"--set {q(kv)}" for kv in pairs)
+            cmd = f"bash scripts/catalog.sh update --slug {q(slug)} {args}"
+            desc = f"update {slug} in the LOCAL layer: {', '.join(pairs)}"
+        else:
+            raise ValueError(f"unknown amend kind: {kind!r}")
+
+        return ActionPlan(
+            kind=f"local_{kind}",
+            cmd=["bash", "-c", cmd],
+            description=desc,
+            requires_reconcile=False,   # a repo write, not a GPU claim
+            requires_confirm=True,      # repo mutation — confirm, never auto
+        )
+
+    def export_pr_plan(self, spec: dict, *, out_dir: Optional[str] = None) -> ActionPlan:
+        """Build the GATED ActionPlan for ``export_pr.py`` — translate an
+        already-promoted LOCAL-layer model into the three ready-to-commit CORE
+        artifacts (models/<id>.yml · core-layout compose tree · the registry
+        ENTRY FILE ``registry-entry.yaml`` + canonical merge command), written
+        ONLY under ``out_dir`` (default /tmp).  LOCAL-layer models only: a CORE
+        model already IS core content.  The spec rides in the child env as
+        ``C3_EXPORT_SPEC`` (merged over os.environ by execute_action); the plan
+        claims no GPU and NEVER auto-fires."""
+        mid = (spec or {}).get("model_id", "?")
+        cmd = [
+            "python3", "scripts/lib/profiles/export_pr.py",
+            "--spec-env", "C3_EXPORT_SPEC",
+        ]
+        if out_dir:
+            cmd += ["--out", out_dir]
+        return ActionPlan(
+            kind="export_pr",
+            cmd=cmd,
+            env={"C3_EXPORT_SPEC": json.dumps(spec or {}, ensure_ascii=False)},
+            description=(
+                f"export PR bundle for {mid} (models/<id>.yml + compose tree "
+                "+ registry-entry.yaml), written ONLY under "
+                f"{out_dir or '/tmp'}"
+            ),
+            requires_reconcile=False,    # no GPU contention — writes under --out
+            requires_confirm=True,       # runs a script — confirm, never auto
+        )
+
+    async def run_export_pr(
+        self,
+        plan: ActionPlan,
+        *,
+        on_line: Optional[Callable[[str], None]] = None,
+    ) -> Any:
+        """Run the confirmed export through the WRITE-runner seam, streamed.
+        In tests this is the FakeWriteRunner; live it is blocked by conftest."""
+        import os as _os
+
+        env = dict(_os.environ)
+        env.update(plan.env or {})
+        return await self._start_raw_logged(
+            self._write_runner,
+            plan.cmd,
+            env=env,
+            run_type=plan.kind,
+            parser=None,
+            on_line=on_line,
+        )
+
+
+    # ── Hook 3: Optimize for my card — the kv-calc brain (design §5.2 seam 1, P4) ───
+    # kv-calc interface used (all via the read Runner seam, cwd repo root):
+    #   python3 tools/kv-calc.py --fit <slug> --card <card> --json
+    #       → {verdict, vram_est_gb, band_gb, max_ctx} at the slug's OWN config.
+    #   python3 tools/kv-calc.py --model <m> --compose <c> --kv-format <f>
+    #       --solve-max-ctx [--max-ctx <target>] --json [--vram <gb>]
+    #       → prediction at target ctx + solved_max_ctx (the fit ceiling).
+    # The (model, compose) pair is the slug's registry ``kvcalc_key``
+    # ("<model>:<compose>", e.g. "qwen3.6-27b:dual"); legality of a KV dtype =
+    # engine ``supported_kv_formats`` ∩ hardware-profile ``supported_kv_formats``.
+
+    # kv-calc raw predict() verdict → the cockpit fit vocabulary (mirrors
+    # kv-calc's own _RAW_VERDICT_MAP).
+    _KV_VERDICT_MAP = {"PASS": "fits-clean", "TIGHT": "fits-constrained", "FAIL": "wont-fit"}
+
+    def hardware_profile(self, card: str) -> dict:
+        """Stdlib parse of ``scripts/lib/profiles/hardware/<card>.yml`` → the
+        card facts the optimizer needs: ``supported_kv_formats`` (the
+        hardware-legal KV set) + ``vram_gb``.  Empty when unreadable — callers
+        then fall back to engine-declared formats and omit ``--vram``."""
+        out: dict = {"supported_kv_formats": [], "vram_gb": None}
+        if not card:
+            return out
+        p = self.repo_root / "scripts" / "lib" / "profiles" / "hardware" / f"{card}.yml"
+        try:
+            grab = False
+            for ln in p.read_text(encoding="utf-8").splitlines():
+                st = ln.strip()
+                if st.startswith("vram_gb:"):
+                    try:
+                        out["vram_gb"] = float(st.split(":", 1)[1].strip())
+                    except ValueError:
+                        pass
+                    continue
+                if st.startswith("supported_kv_formats:"):
+                    grab = True
+                    continue
+                if grab:
+                    if st.startswith("- "):
+                        out["supported_kv_formats"].append(
+                            st[2:].split("#", 1)[0].strip())
+                    elif st and not st.startswith("#"):
+                        break   # dedented → end of the list block
+        except OSError:
+            pass
+        return out
+
+    def _slug_kv_default(self, compose_path: str) -> str:
+        """The slug's own KV dtype: its compose's ``${KV_CACHE_DTYPE:-default}``
+        knob (same read serve_override_defaults does).  "" when unresolvable."""
+        if not compose_path:
+            return ""
+        try:
+            txt = (self.repo_root / compose_path).read_text(encoding="utf-8")
+        except OSError:
+            return ""
+        m = re.search(r"\$\{KV_CACHE_DTYPE:-([^}]+)\}", txt)
+        return m.group(1).strip().strip('"') if m else ""
 
     async def optimize_for_card(
-        self, *, slug: str = "", card: Optional[str] = None
+        self,
+        *,
+        slug: str = "",
+        entry: Optional[CatalogEntry] = None,
+        card: Optional[str] = None,
     ) -> OptimizerReport:
-        """The ▸ Optimize-for-my-card seam — DORMANT until v0.10.0 (design §5.2).
+        """The ▸ Optimize-for-my-card brain — kv-calc via the Runner seam.
 
-        The optimizer (``recommend --optimize`` / ``generate_compose.py
-        --optimize``) does NOT exist yet.  This detects its absence and returns an
-        ``OptimizerReport(available=False, message='optimizer not available
-        (v0.10.0)')`` — it NEVER fabricates optimizer output.  The honesty-gate
-        fields on the report (boot-fit predicted|measured · runtime
-        soak-validated · confidence tier · cliff-class --accept-runtime-risk) are
-        the reserved INTERFACE, rendered only once the engine lands.
-
-        Absence is detected via the read runner probing for the optimizer's
-        ``--optimize`` flag; any non-zero / missing result keeps the seam
-        dormant.  Until the engine exists this is, in practice, always
-        unavailable."""
-        # Probe for the optimizer flag.  When it lands it will print a JSON
-        # OptimizerReport on `recommend --optimize --json`; until then the probe
-        # returns non-zero / empty and we stay honestly dormant.
-        try:
-            res = await self._runner.run(
-                ["bash", "scripts/recommend.sh", "--optimize", "--probe"],
-                cwd=str(self.repo_root),
-                timeout=15.0,
+        One ``--fit <slug>`` verdict (recommended max-model-len + projected VRAM
+        at the slug's own KV dtype), then one ``--solve-max-ctx`` pricing per
+        hardware-legal KV dtype option.  NEVER fabricates: a failed / unparsable
+        kv-calc call → ``available=False`` with the error; a SKIP-engine slug
+        (kvcalc_key=SKIP — ik/llama composes) → an explicit unsupported
+        message; one broken option keeps its row with the error in ``note``."""
+        c = card or self.card
+        rep = OptimizerReport(slug=slug, card=c, engine=(entry.engine if entry else ""))
+        if not slug:
+            rep.message = "no catalog slug selected — open Optimize from Run · Catalog"
+            return rep
+        if entry is not None and (entry.row.kvcalc_key or "").upper() == "SKIP":
+            rep.message = (
+                f"kv-calc does not price {slug} (kvcalc_key=SKIP — this engine/"
+                f"compose has no vLLM KV model) — no recommendation available"
             )
-        except Exception:
-            return OptimizerReport(available=False)
-        if not res.ok or "optimize" not in (res.stdout or "").lower():
-            # No optimizer engine → dormant.  Do NOT fabricate a recommendation.
-            return OptimizerReport(available=False)
-        # (Reserved) — when the engine lands, parse its JSON honesty-gate output
-        # here.  Until then this branch is unreachable; keep the seam honest.
-        return OptimizerReport(available=False)
+            return rep
+
+        # 1) Base verdict at the slug's own config (--fit resolves model +
+        #    topology + KV format from the registry itself).
+        cmd = ["python3", "tools/kv-calc.py", "--fit", slug, "--json", "--card", c]
+        try:
+            fit, err = await self._run_json(cmd, timeout=30.0)
+        except Exception as exc:
+            fit, err = None, str(exc)
+        if fit is None:
+            rep.message = f"kv-calc failed for {slug}: {err}"
+            return rep
+        if fit.get("error") or str(fit.get("verdict", "")) == "unknown":
+            rep.message = (
+                f"kv-calc could not price {slug}: "
+                f"{fit.get('error') or 'unknown verdict'}"
+            )
+            return rep
+        rep.available = True
+        rep.recommended_max_ctx = int(fit["max_ctx"]) if fit.get("max_ctx") is not None else None
+        try:
+            rep.fit_vram_est_gb = float(fit.get("vram_est_gb"))
+        except (TypeError, ValueError):
+            rep.fit_vram_est_gb = None
+        try:
+            rep.band_gb = float(fit.get("band_gb"))
+        except (TypeError, ValueError):
+            rep.band_gb = None
+        rep.recommended_kv_format = self._slug_kv_default(
+            getattr(getattr(entry, "row", None), "compose_path", "") if entry else ""
+        )
+
+        # 2) Per-dtype options — only when the registry kvcalc_key decomposes to
+        #    (model, compose) so kv-calc can re-price each legal format.
+        key = (getattr(getattr(entry, "row", None), "kvcalc_key", "") or "") if entry else ""
+        model, sep, compose = key.partition(":")
+        if not (sep and model and compose):
+            return rep   # fit-only report; no fabricated per-dtype rows
+        hw = self.hardware_profile(c)
+        engine_formats = self.engine_kv_formats(rep.engine)
+        legal = [
+            f for f in engine_formats
+            if not hw["supported_kv_formats"] or f in hw["supported_kv_formats"]
+        ]
+        if not legal:
+            return rep
+        target_ctx = (
+            getattr(entry, "configured_ctx", None) if entry else None
+        ) or rep.recommended_max_ctx
+        rep.options = list(await asyncio.gather(*(
+            self._price_kv_option(model, compose, fmt, target_ctx, hw["vram_gb"])
+            for fmt in legal
+        )))
+        return rep
+
+    async def _price_kv_option(
+        self,
+        model: str,
+        compose: str,
+        kv_format: str,
+        target_ctx: Optional[int],
+        vram_gb: Optional[float],
+    ) -> KvOption:
+        """Price ONE KV dtype for a (model, compose) topology via kv-calc
+        --solve-max-ctx.  A failure returns an honest note-row, never numbers."""
+        cmd = [
+            "python3", "tools/kv-calc.py",
+            "--model", model, "--compose", compose,
+            "--kv-format", kv_format, "--solve-max-ctx", "--json",
+        ]
+        if vram_gb:
+            cmd += ["--vram", f"{vram_gb:g}"]
+        if target_ctx:
+            cmd += ["--max-ctx", str(int(target_ctx))]
+        try:
+            data, err = await self._run_json(cmd, timeout=30.0)
+        except Exception as exc:
+            data, err = None, str(exc)
+        if data is None:
+            return KvOption(kv_format=kv_format, note=f"kv-calc failed: {err}")
+        if data.get("error"):
+            return KvOption(kv_format=kv_format, note=str(data["error"]))
+        headroom: Optional[float] = None
+        total: Optional[float] = None
+        try:
+            total = float(data.get("total_gb"))
+            budget = float(data.get("budget_gb"))
+            headroom = budget - total
+        except (TypeError, ValueError):
+            pass
+        notes = "; ".join(str(n) for n in (data.get("notes") or []) if str(n).strip())
+        solved = data.get("solved_max_ctx")
+        return KvOption(
+            kv_format=kv_format,
+            solved_max_ctx=int(solved) if solved is not None else None,
+            vram_est_gb=total,
+            headroom_gb=headroom,
+            verdict=self._KV_VERDICT_MAP.get(str(data.get("verdict", "")).upper(), ""),
+            note=notes,
+        )
+
+    def optimize_apply_plan(
+        self,
+        slug: str,
+        *,
+        max_model_len: Optional[int] = None,
+        kv_dtype: Optional[str] = None,
+    ) -> ActionPlan:
+        """Stage the tuned serve for ``slug`` — the Optimize APPLY action.
+
+        The SAME gated ``switch.sh <slug>`` serve plan the Catalog uses, with
+        the kv-calc overrides riding ``plan.env`` (merged over os.environ by
+        execute_action, exactly like the ② Serve override editor's values —
+        they interpolate into the compose's ``${MAX_MODEL_LEN}`` /
+        ``${KV_CACHE_DTYPE}``).  No new write path; recommendations stay
+        ADVISORY: requires_confirm=True routes through ConfirmActionScreen."""
+        env: dict[str, str] = {}
+        if max_model_len:
+            env["MAX_MODEL_LEN"] = str(int(max_model_len))
+        if kv_dtype:
+            env["KV_CACHE_DTYPE"] = str(kv_dtype)
+        tuned = ", ".join(f"{k}={v}" for k, v in sorted(env.items())) or "no changes"
+        return ActionPlan(
+            kind="serve",
+            cmd=["bash", "scripts/switch.sh", slug],
+            description=f"switch.sh {slug} · kv-calc tuned ({tuned}) — advisory rec",
+            requires_reconcile=True,
+            requires_confirm=True,
+            env=env,
+        )
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────────
@@ -4900,6 +5594,10 @@ def _variant_row_from_dict(d: dict[str, Any]) -> VariantRow:
         comp = d.get("weights_companions") or []
         object.__setattr__(row, "weights_companions", [str(c) for c in comp])
         object.__setattr__(row, "drafter", str(d.get("drafter") or ""))
+        # Drafter-less speculation (the ngram-* runtime spec-types keep
+        # `drafter` null BY DESIGN) — without this the Spec Dec column shows
+        # "—" while speculation is running.
+        object.__setattr__(row, "spec_method", str(d.get("spec_method") or ""))
         object.__setattr__(row, "vision", bool(d.get("vision")))
         # KV-cache format from the registry (catalog KV column) — attached same
         # as the facets above; "" when the contract didn't carry it.
@@ -4910,12 +5608,22 @@ def _variant_row_from_dict(d: dict[str, Any]) -> VariantRow:
         # Weight-offload backend (catalog offload column) — same pattern;
         # "" when the contract didn't carry it (resident/older emit) → shows "—".
         object.__setattr__(row, "offload", str(d.get("offload") or ""))
+        # DYNAMIC expert-cache axis, orthogonal to `offload` (which is the
+        # residency-capability axis). The offload COLUMN renders static/dynamic
+        # from this; without it every CPU-offload slug reads "static".
+        object.__setattr__(row, "moe_cache", bool(d.get("moe_cache")))
         # Minimum host RAM for offload slugs (hard gate). Kept as int|None rather than
         # str so the column can render "—" for resident slugs without a magic string.
         object.__setattr__(row, "host_ram_gb", d.get("host_ram_gb"))
         object.__setattr__(row, "chat_template", str(d.get("chat_template") or "native"))
         # W4A8-int8-activation capability (c3 serve-confirm checkbox, #609).
         object.__setattr__(row, "act8_capable", bool(d.get("act8_capable")))
+        # Per-mode model-card sampler rows (#1014 L3 serve-confirm thinking
+        # toggle) — {"instruct": {…}, "thinking": {…}} when the emit carries
+        # them; None when absent (older emit / single-row models) → no toggle.
+        object.__setattr__(
+            row, "sampler_profiles", d.get("sampler_profiles") or None
+        )
         # Weights quant_label + FORMAT from the model profile (emit join) —
         # the catalog Weights column's fallbacks for weights_variant tokens that
         # carry no recognisable quant segment: quant_label is the explicit

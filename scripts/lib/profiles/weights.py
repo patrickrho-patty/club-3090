@@ -42,6 +42,8 @@ ALIASES = {
     "qwen3.6-27b-nvfp4": ("qwen3.6-27b", "nvfp4"),
     "Qwen3.6-27B-NVFP4": ("qwen3.6-27b", "nvfp4"),
     "qwen3.6-27b-dflash": ("qwen3.6-27b", "dflash"),
+    "qwen3.8-27b-dflash2": ("qwen3.8-27b", "dflash2"),
+    "qwen3.8-27b-mmproj-f16": ("qwen3.8-27b", "gguf_mmproj_f16"),
     "qwen3.6-27b-prism-eagle3": ("qwen3.6-27b", "prism_eagle3"),
     "qwen3.6-27b-mtp-head": ("qwen3.6-27b", "mtp_head"),
     "qwen3.6-27b-gguf-q4km": ("qwen3.6-27b", "unsloth-q4km"),
@@ -76,13 +78,32 @@ def _require_yaml() -> None:
 
 
 def _load_models() -> dict[str, dict[str, Any]]:
+    """Every model profile: the curated set, plus the LOCAL layer.
+
+    The local layer was invisible here, and this module feeds `enrich_weights`,
+    which is what fills c3's provider and GB columns — so a model a user
+    registered showed a blank provider and no size no matter what its profile
+    said. Curated wins a collision, matching compose_registry's core-wins rule
+    (a local id colliding with core is refused at load anyway, so this is
+    belt-and-braces rather than a live case). A broken/absent local layer is not
+    an error: this must never take the curated listing down.
+    """
     _require_yaml()
     out: dict[str, dict[str, Any]] = {}
-    for path in sorted((PROFILE_ROOT / "models").glob("*.yml")):
-        with path.open("r", encoding="utf-8") as fh:
-            data = yaml.safe_load(fh) or {}
-        model_id = str(data.get("id") or path.stem)
-        out[model_id] = data
+    local_dir = PROFILE_ROOT.parent / "profiles-local" / "models.d"
+    for root in (local_dir, PROFILE_ROOT / "models"):   # core LAST → core wins
+        try:
+            paths = sorted(root.glob("*.yml")) if root.is_dir() else []
+        except OSError:
+            continue
+        for path in paths:
+            try:
+                with path.open("r", encoding="utf-8") as fh:
+                    data = yaml.safe_load(fh) or {}
+            except (OSError, yaml.YAMLError):
+                continue
+            model_id = str(data.get("id") or path.stem)
+            out[model_id] = data
     return out
 
 
@@ -207,6 +228,12 @@ def main(argv: list[str] | None = None) -> int:
     # itself against its configured model dir).  Pure profile read, no FS check.
     p_list = sub.add_parser("list")
     p_list.add_argument("--json", action="store_true")
+    # `catalog --json` — the setup.sh front door's single derivation source
+    # (contract C2): per model, the resolved default weight key plus the
+    # optional `setup:` dispatch policy from the profile YAML. Pure profile
+    # read — no FS checks, no network. Same _require_yaml contract as `list`.
+    p_catalog = sub.add_parser("catalog")
+    p_catalog.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
 
     if args.cmd == "list":
@@ -233,6 +260,41 @@ def main(argv: list[str] | None = None) -> int:
                     }
                 )
         print(_json.dumps(rows))
+        return 0
+
+    if args.cmd == "catalog":
+        import json as _json
+
+        rows: list[dict[str, Any]] = []
+        for model_id, model in _load_models().items():
+            setup = model.get("setup") or {}
+            if not isinstance(setup, dict):
+                setup = {}
+            default_variant = model.get("default_weight_variant") or ""
+            primary = str(setup.get("primary") or default_variant)
+            weights = model.get("weights") or {}
+            default_meta = weights.get(default_variant)
+            rows.append(
+                {
+                    "id": model_id,
+                    "display_name": str(model.get("display_name") or model_id),
+                    "default_key": f"{model_id}:{primary}" if primary else "",
+                    "aliases": dict(setup.get("weights_aliases") or {}),
+                    "alias_extras": {
+                        k: [str(x) for x in (v or [])]
+                        for k, v in (setup.get("alias_extras") or {}).items()
+                    },
+                    "always_draft": str(setup.get("always_draft") or ""),
+                    "assistant_draft": str(setup.get("assistant_draft") or ""),
+                    "dflash": str(setup.get("dflash") or ""),
+                    "vision": str(setup.get("vision") or ""),
+                    "prism_eagle3": str(setup.get("prism_eagle3") or ""),
+                    "size_gb": (default_meta or {}).get("size_gb")
+                    if isinstance(default_meta, dict)
+                    else None,
+                }
+            )
+        print(_json.dumps({"models": rows}))
         return 0
 
     if args.cmd == "entry":

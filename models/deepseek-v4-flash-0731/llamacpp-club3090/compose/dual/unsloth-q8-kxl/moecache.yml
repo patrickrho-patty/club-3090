@@ -2,10 +2,12 @@
 # Profile (at-a-glance):
 #   Model:     DeepSeek-V4-Flash-0731 (284B MoE, unsloth UD-Q8_K_XL — MXFP4
 #              experts + BF16 attention, 151 GB across 5 shards)
-#   Engine:    llamacpp-club3090 (fork: leloch's MoE expert cache v2 + our L1/L3/E
+#   Engine:    llamacpp-club3090-v1.5 (fork: leloch's MoE expert cache v2 + our L1/L3/E
 #              ports, bypass warn-split, and multi-row top-k batching)
 #   Topology:  Dual 3090 PCIe (layer-split -ts 1,1, no NVLink)
 #   Drafter:   DSpark n=5 external, PINNED TO CPU (-devd none) — see Caveats
+#              Toggle: SPEC_N=<n> sets depth; SPEC_N=0 (or SPEC=off) disables
+#              (removes the flags — n-max=0 would leave the draft context allocated)
 #   KV:        fp16 (llama.cpp default — MLA + a 4,352-cell SWA window keep it tiny)
 #   Vision:    no
 #   Max ctx:   204800  (262144 boots on this config — see Caveats)
@@ -34,10 +36,25 @@
 #                is below that swing and measured ~11% SLOWER despite a larger
 #                pool and higher hit rate. Do not copy these values to another
 #                card count or VRAM size without re-deriving them.
-#              • `-ub/-b 2048` is a decode↔prefill trade, chosen deliberately:
-#                vs 4096 it frees ~2.2-2.7 GB/card of compute buffer which the
-#                cache converts into ~1,300 more resident experts → +10% decode
-#                for −12.5% prefill @10K. Prefer 4096 for prompt-heavy work.
+#              • `-ub/-b 4096` — DEFAULT SINCE 2026-08-25, re-measured. The old
+#                2048 default assumed the compute buffer it frees (worth ~1,254
+#                more resident experts on CUDA0: 2,624 vs 1,370 slots) bought
+#                ~+10% decode. Post-prefetch it does NOT: a 3×3 interleaved soak
+#                measured ub4096 vs ub2048 at −1.6% decode (pooled sd 6.6%, so
+#                only effects >8% are resolvable), while prefill is +18% @40K
+#                and +13% @10K (3 runs/depth, CV ≤2.2%). ⚠️ Pool occupancy spans
+#                2× across these configs with no decode difference — the slot
+#                count is a diagnostic, not a decode predictor. `UBATCH=2048`
+#                restores the old trade; 8192 is NOT better (prefill saturates
+#                at +18.0%, decode −30% as the pool is squeezed).
+#                ⚠️ **"Post-prefetch" is UNVERIFIED against the pinned image**
+#                (flagged 2026-08-27, not silently rewritten). The digest pinned
+#                below does NOT contain the prefetch ring — see the
+#                GGML_EXPERT_PREFETCH block. So either the phrase means
+#                "chronologically after the prefetch program" (measurement stands
+#                as a production number) or "with prefetch active" (in which case
+#                it describes a build we do not serve). Re-derive the ub trade on
+#                whatever image is actually pinned before quoting it as current.
 #              • 262144 boots and serves here (unlike the stock slug, which OOMs
 #                at 262K with a GPU-resident drafter), but costs ~8% decode and
 #                445 expert slots, and this model is PREFILL-BOUND at depth.
@@ -52,7 +69,7 @@
 #              · structoutput-15 14/15 (93%) · dataextract-15 12/15 (80%)
 #              · reasonmath-15 14/15 (93%) · bugfind-15 15/15 (100%)
 #              · hermesagent-20 14/20 (70%) · cli-40 31/40 (78%)
-#              = 128/150 reasoning-ON  (--full, packs v1.0.x, 2026-08-11)
+#              = 128/150 reasoning-ON  (--full, 2026-08-11)  # pack versions not recorded pre-#981
 #              Reasoning-OFF leg: 122/150. repeat=1 per arm.
 #              ⚠️ NO stock-engine comparison arm — this shows the output is
 #              sound, NOT that the expert cache is quality-neutral.
@@ -68,6 +85,10 @@
 #     stock slug              18.34 narr / 23.51 code
 #     this config             23.64 / 22.67 decode · 354.7 t/s prefill @10K
 #                             pool 2,579 + 2,580 slots · hit rate ~56%
+#
+#   ⚠️ The line above was taken at the THEN-default `-ub 2048`; the default is
+#   4096 since 2026-08-25 (see the -ub bullet). Prefill at the new default is
+#   390.2 t/s @10K / 377.7 @40K. Kept as the historical anchor, not re-stated.
 #
 #   ≈ +29% decode vs stock, ≈ −19% prefill. Cache hit rate and pool occupancy
 #   are DIAGNOSTICS ONLY — three times on this stack a config improved every
@@ -106,18 +127,111 @@ services:
   llama-cpp-deepseek-flash-q8-moecache:
     # Digest-pinned, not tag-pinned: tags move, digests do not (#940 precedent).
     # The engine profile is authoritative for this pin; keep them in step.
-    # Built 2026-08-10 from stack/club3090-moe-cache @ e0a208949, CUDA arch 86;89;120.
-    image: ${LLAMACPP_CLUB3090_IMAGE:-ghcr.io/noonghunna/llamacpp-club3090@sha256:17824d4483dbd60c297613bddf130f25e739d3edc7e633e4d973edc4e2165649}
+    # MIGRATED TO v1.5 2026-08-29: image.revision=7104d5f4e,
+    # version=moecachev1.5-rc0, built from stack/club3090-moecachev1.5 on
+    # mainline base b10675. Previously sha256:17824d44 (revision e0a208949).
+    # Validated on this binary BEFORE the switch: shipped compose booted with
+    # the revision asserted, verify-full 10/10, dspark acceptance 0.41-0.73,
+    # moe-cache pools on both cards. Ledger: /opt/ai/moecache-releases.md.
+    image: ${LLAMACPP_CLUB3090_IMAGE:-ghcr.io/noonghunna/llamacpp-club3090@sha256:1c228a52b8193df26a3c7e8b497814739ca06ff34075a2a1ce02989210068210}
     container_name: ${ESTATE_CONTAINER:-llama-cpp-deepseek-flash-q8-moecache}
     restart: unless-stopped
+    # Reap orphaned children. Without this, a wedged llama-server becomes a
+    # <defunct> PID 1 child that docker CANNOT kill ("PID N is zombie and can
+    # not be killed. Use the --init option"), and it keeps holding GPU memory
+    # AND ~117 GB of host RAM — after which preflight correctly refuses every
+    # later boot ("needs ~156 GB; only 39 GB AVAILABLE"). Cost 8 of 9 A/B arms
+    # on 2026-08-25 before it was diagnosed.
+    init: true
     ports:
       - "${BIND_HOST:-0.0.0.0}:${ESTATE_PORT:-${PORT:-8030}}:8080"
     volumes:
       - "${MODEL_DIR:-../../../../../../models-cache}:/models:ro"
     environment:
+      # Drafter toggle - docker forwards only what is declared here.
+      - SPEC_N=${SPEC_N:-}
+      - SPEC=${SPEC:-}
       # Expert-cache tuning — every value MEASURED on 2×24 GB, see Caveats.
       - GGML_CUDA_MOE_CACHE_ADMIT_AFTER=${MOE_ADMIT_AFTER:-64}
       - GGML_CUDA_MOE_CACHE_RESERVE_MB=${MOE_RESERVE_MB:-1536}
+      # Cache hit/miss telemetry. DEFAULT ON (emit every N collect calls per
+      # device) because without it the engine's `stats_every` is 0 and NO
+      # `CUDA<n> hits=…` line is ever produced — see moe-cache.cu:169 (default 0)
+      # and :2795 (`stats_every > 0` gate). It is NOT gated on log verbosity.
+      # ⚠️ This var was previously ABSENT from this block entirely, so docker
+      # never forwarded it and the value was unreachable through the shipped
+      # slug no matter what the caller exported. Every community bench filed
+      # against this compose therefore carried zero cache telemetry, and
+      # bench.sh rendered that absence as a measured `0.0% dhits=0 dlookups=0`
+      # — indistinguishable from "the cache did nothing" (club-3090 #1105/#1106).
+      # ⚠️⚠️ THIS VAR ALONE IS NOT ENOUGH — telemetry needs BOTH knobs. Measured
+      # on a live 2-arm boot 2026-08-26 with one variable between the arms:
+      #   STATS=200, default verbosity -> 0 `[moe-cache]` lines of ANY kind
+      #   STATS=200, LLAMA_ARG_LOG_VERBOSITY=4 -> 228 lines / 211 stats lines
+      # MOE_CACHE_LOG is GGML_LOG_INFO (moe-cache.cu:46) and the server's verbosity
+      # threshold drops it below 4, so without `-lv 4` the whole cache subsystem is
+      # silent. Verbosity is left to the caller (bare passthrough below) because 4
+      # is loud for a serving deployment — but a bench/report run wanting cache
+      # numbers MUST set it. bench.sh now says so when the counters do not advance.
+      # ⚠️ DEFAULT IS 0 (OFF) — telemetry is OPT-IN so instrumentation does not run
+      # when nothing reads it. Set MOE_STATS=200 (plus LLAMA_ARG_LOG_VERBOSITY=4)
+      # for a bench/report run. ⚠️ The counter-gating behaviour was characterised
+      # on the old v1.2-era image; it has NOT been re-checked on v1.5.
+      # ✅ The `=${VAR:-N}` form is SAFE here (unlike the bare-passthrough vars
+      # below): `moe_cache_env_i64` rejects unset AND empty (`!text || !text[0]`,
+      # moe-cache.cu:509) before parsing, so it cannot hit the atoi("")==0 trap.
+      - GGML_CUDA_MOE_CACHE_STATS=${MOE_STATS:-0}
+      # Prefill expert-prefetch and log verbosity.
+      #
+      # ⚠️ STATUS ON THIS PIN IS UNVERIFIED — rewritten 2026-08-29 with the v1.5
+      # migration. The previous text said the knob was INERT because the pinned
+      # digest (sha256:17824d44 / revision e0a208949) predated the prefetch work.
+      # That digest is no longer pinned here: this compose now runs v1.5-rc0
+      # (7104d5f4e, base b10675), and whether the ring exists in THAT binary has
+      # not been checked. A ring WAS observed on rc2 — but rc2 is the ROLLBACK
+      # digest (bf2776f7), not rc0, so it does not settle this.
+      #
+      # ⛔ The "+14.5% / +15.0% prefill" justification is WITHDRAWN regardless: it
+      # was measured on a build carrying the n_copies==1 scheduler race (fixed in
+      # ce8743a05) and is unquotable until re-measured
+      # (moecache-engine-playbook.md section 6). The COST is not withdrawn — a
+      # 2,176 MiB ring on the FIRST CUDA device only, allocated lazily on first
+      # prefill AFTER the pool is sized, so nothing budgets for it.
+      #
+      # ⚠️ BARE PASS-THROUGH FORM ON PURPOSE — do NOT rewrite these as
+      # `- GGML_EXPERT_PREFETCH=${PREFETCH:-}`. The engine tests
+      # `if (on && atoi(on) == 0) return nullptr;` (expert-prefetch.cu:126) and
+      # atoi("") == 0, so an empty-string default would set the var to "" and
+      # SILENTLY DISABLE the prefetch for every user. Bare form leaves the var
+      # UNSET in the container unless the caller exports it, which is the only
+      # spelling that preserves default-ON.
+      #   GGML_EXPERT_PREFETCH=0  stock (no ring; frees ~484 CUDA0 cache slots)
+      #                       =2  BALLAST (ring allocated, every node declined) —
+      #                           the pool-matched control for mechanism A/Bs
+      #   LLAMA_ARG_LOG_VERBOSITY=4  resolved pools + moe-cache statistics
+      - GGML_EXPERT_PREFETCH
+      - GGML_EXPERT_PREFETCH_SLOTS
+      - LLAMA_ARG_LOG_VERBOSITY
+      # Bare passthrough — inert unless the caller sets it. Declared so a
+      # graph-reuse A/B can run through the REAL delivery path: docker forwards
+      # only what is listed here, so without this line the two arms of the
+      # experiment are byte-identical and the null result is an artifact of the
+      # harness rather than a measurement. Measured cost of losing reuse on
+      # Qwen3.8-Flash-Next: ~3.9 ms/token (+13.5% decode with it on, 2 boots/arm,
+      # 2026-09-04) — see learnings/moe-cache-engine.md §8b.
+      - LLAMA_GRAPH_REUSE_DISABLE
+      # Prefix reuse via KV shifting (default 0 = OFF). The between-turn TTFT
+      # lever for agent traffic — the llama.cpp analogue of the vLLM
+      # mamba-align work on the qwen3.8 MTP composes (#1093), though a
+      # different mechanism (KV shift, not SSM-state alignment).
+      # ⚠️ The server force-disables it when the memory layout cannot shift
+      # (server-context.cpp: "cache_reuse is not supported by this context")
+      # — MLA + SWA is a plausible refusal case, so CHECK THE BOOT LOG rather
+      # than assuming it engaged.
+      - LLAMA_ARG_CACHE_REUSE
+      # Thread count. Resolved in the entrypoint (see [threads]) because a
+      # fixed compose default cannot be right on two different rigs.
+      - THREADS
     deploy:
       resources:
         reservations:
@@ -129,6 +243,87 @@ services:
     # Docker Compose's command-line parser REJECTS `(gate|up|down)` inside a
     # folded string. The list form skips shell parsing, so the regex survives
     # byte-for-byte.
+    # The image ENTRYPOINT is ["/app/llama-server"] on every engine we ship
+    # (mainline, ik-llama, beellama, llamacpp-club3090 — all verified). This
+    # wrapper is equivalent to it plus the drafter toggle.
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        # -- Drafter toggle: the same contract on every club-3090 compose --------
+        #   SPEC_N=<n>  drafter depth; SPEC_N=0 disables
+        #   SPEC=off    back-compat alias for SPEC_N=0
+        # Disabling REMOVES the drafter flags rather than passing n=0. At
+        # --spec-draft-n-max 0 llama.cpp sets drafting=false but still builds the
+        # draft context (server-context.cpp), and still loads an external draft
+        # model when one is named -- so the memory stays spent. Removing the
+        # flags is the only clean off. A non-numeric SPEC_N is a hard error, so a
+        # typo can never masquerade as a silent "drafter off".
+        # -- Threads ------------------------------------------------------------
+        # llama.cpp's own default collapses CPU-offload decode (-31% measured on
+        # this workload), and the old `-t ${THREADS:-8}` compose default was worse
+        # still for anyone running `docker compose` directly. Resolve here instead:
+        # THREADS if the caller set it, else nproc/2 -- which MATCHES what the
+        # launcher already computes (scripts/lib/compose-meta.sh
+        # resolve_offload_threads), so the two paths agree instead of diverging.
+        # ⚠️ nproc/2 is a floor, NOT the optimum: on the 32c/8-channel reference
+        # host `-t 28` measured ~20% faster than the launcher's nproc/2=16, which
+        # is why .env pins 28 there. Under the launcher THREADS is always already
+        # set, so this branch only serves direct-compose users.
+        # Exported as LLAMA_ARG_THREADS -- the `-t` flag is therefore NOT in the
+        # command list; adding one back would override this (CLI beats env).
+        if [ -n "$${THREADS:-}" ]; then
+          export LLAMA_ARG_THREADS="$${THREADS}"
+          echo "[threads] -t $${LLAMA_ARG_THREADS} (THREADS set explicitly)" >&2
+        else
+          _np=$$(nproc 2>/dev/null || echo 8)
+          _half=$$(( _np / 2 )); [ "$$_half" -lt 1 ] && _half=1
+          export LLAMA_ARG_THREADS="$$_half"
+          echo "[threads] -t $${LLAMA_ARG_THREADS} (auto = nproc/2, nproc=$$_np)" >&2
+        fi
+
+        _spec_n="$${SPEC_N:-5}"
+        case "$${SPEC:-}" in off|OFF|Off|false|no|0) _spec_n=0 ;; esac
+        case "$$_spec_n" in ""|*[!0-9]*)
+          echo "[spec] SPEC_N='$$_spec_n' is not a non-negative integer." >&2
+          echo "[spec] Fix: SPEC_N=<n> sets depth; SPEC_N=0 (or SPEC=off) disables." >&2
+          exit 1 ;;
+        esac
+        if [ "$$_spec_n" -gt 0 ]; then
+          # Fail loud if the external DSpark drafter GGUF is absent. This model
+          # has NO embedded MTP head, so DSpark is the ONLY speculative path --
+          # a missing file otherwise crash-loops llama-server on a cryptic
+          # "gguf_init_from_file ... No such file" (club-3090#1054). Find the
+          # -md/--model-draft path in argv and verify it exists before exec.
+          _draft=""; _want=0
+          for _a in "$$@"; do
+            if [ "$$_want" = 1 ]; then _draft="$$_a"; _want=0; continue; fi
+            case "$$_a" in -md|--model-draft|--spec-draft-model) _want=1 ;; esac
+          done
+          if [ -n "$$_draft" ] && [ ! -f "$$_draft" ]; then
+            echo "[spec] FATAL: external DSpark drafter not found:" >&2
+            echo "[spec]   $$_draft" >&2
+            echo "[spec] This slug REQUIRES the drafter (no embedded MTP head => no other spec path)." >&2
+            echo "[spec] Fix one of:" >&2
+            echo "[spec]   - download it: hf download unsloth/DeepSeek-V4-Flash-0731-GGUF \\" >&2
+            echo "[spec]       --include 'dspark/*Q8_0*' --local-dir <MODEL_DIR>/deepseek-v4-flash-0731-gguf" >&2
+            echo "[spec]   - or run drafter-off knowingly: SPEC_N=0 (accepts the lower no-spec TPS)" >&2
+            exit 1
+          fi
+          echo "[spec] drafter ON (SPEC_N=$$_spec_n)" >&2
+          exec /app/llama-server "$$@"
+        fi
+        ARGS=(); _skip=0
+        for _a in "$$@"; do
+          if [ "$$_skip" = 1 ]; then _skip=0; continue; fi
+          case "$$_a" in
+            --spec-type|--spec-draft-model|--spec-draft-n-max|--spec-draft-n-min|-md|--model-draft) _skip=1; continue ;;
+          esac
+          ARGS+=("$$_a")
+        done
+        echo "[spec] drafter OFF (SPEC_N=0 / SPEC=off) - drafter flags removed" >&2
+        exec /app/llama-server "$${ARGS[@]}"
+      - --
     command:
       - '-m'
       - '/models/deepseek-v4-flash-0731-gguf/UD-Q8_K_XL/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf'
@@ -138,8 +333,13 @@ services:
       - '8080'
       - '--alias'
       - 'deepseek-v4-flash'
+      # Slots. ⚠️ `-np N` SPLITS `-c` into ctx/N per slot, so the pool and the
+      # compute buffer change with it — a concurrency A/B must re-measure, not
+      # reuse single-stream rows. Default 1 keeps shipped behaviour identical.
+      # ⚠️ LLAMA_ARG_N_PARALLEL cannot override this: common/arg.cpp applies env
+      #    BEFORE argv (~L783 vs ~L808), so the command line always wins.
       - '-np'
-      - '1'
+      - '${NPARALLEL:-1}'
       - '-c'
       - '${CTX:-204800}'
       - '-ngl'
@@ -156,12 +356,10 @@ services:
       # decides residency dynamically, so static pins are counter-productive.
       - '-ot'
       - 'blk\.[0-9]+\.ffn_(gate|up|down)_exps\.weight=CPU'
-      - '-t'
-      - '${THREADS:-8}'
       - '-ub'
-      - '${UBATCH:-2048}'
+      - '${UBATCH:-4096}'
       - '-b'
-      - '${UBATCH:-2048}'
+      - '${UBATCH:-4096}'
       - '--cache-prompt'
       - '--no-mmap'
       - '-md'

@@ -2,7 +2,7 @@
 
 You don't need to touch the curated catalog to serve and validate your own model
 on your rig. The same scripts that gate our shipped composes work on anything you
-serve. The arc is **serve → tune → validate → share**: bring it up, dial it in
+serve. The arc is **serve → tune → validate → catalog → share**: bring it up, dial it in
 with the fast loops, then run the full gate once it's settled.
 
 > **Prefer a guided flow?** The `c3` cockpit's producer lane fronts this same
@@ -246,7 +246,198 @@ Notes:
   cleanly; the `quality-test` wrapper already sets the localhost-resolve env so
   those packs can reach a host model.
 
-## 4. Share it / contribute it back
+## 4. Catalog it on your own rig — the LOCAL layer
+
+Serving by hand (§1) gets you a running model but not a *first-class* one: no
+`launch.sh` / `switch.sh --list` discovery, no VRAM projection, no guard coverage.
+You can have all of that **without touching a single tracked file**.
+
+**If you already have a working compose, that is all you need:**
+
+```bash
+bash scripts/catalog.sh register --compose ./my-compose.yml \
+     --engine my-llamacpp --engine-type llama.cpp \
+     --weights /path/to/model.gguf            # or an HF config.json
+bash scripts/preflight-add-model.sh  my-llamacpp/<your-model>   # diagnose-profile + 9 catalog guards
+```
+
+`register` reads your compose and fills in what it can — engine, context, KV format,
+tensor split, port, model id, weights path — then **prints every value it resolved,
+marked `(given)` or `(derived)`, before writing anything**. `--dry-run` shows the whole
+plan and writes nothing. A compose is read mechanically: it cannot know whether your
+`-ts 1,1` means a layer split or tensor parallelism in the catalog's sense, so check the
+list rather than trusting it.
+
+Three things it will **refuse** rather than guess, because guessing wrong is silent:
+
+| refusal | why |
+|---|---|
+| `--engine` | your image matches nothing we ship. Recording `engine: unknown` is worse than stopping. |
+| `--weights` | a compose cannot state `hidden_size`; the dims come from your GGUF header or an HF `config.json`. Refused **before** writing, so a half-written layer never happens. |
+| `--engine-type` | what your engine *behaves like* (`llama.cpp`, `vllm`, …). It drives drafter and feature logic, and a wrong value fails silently. |
+
+**Running your own engine build is expected, not exceptional.** If `--engine` names an
+engine the catalog does not know, a profile is written for it under
+`profiles-local/engines.d/` from evidence only: your image, the KV format your compose
+actually uses, and the compute capability of the card it demonstrably runs on. Capability
+blocks it cannot verify are left **empty** — the stack makes no promises on your behalf.
+Widen them once you have measured. This is exactly how our own fork is registered:
+`llamacpp-club3090` is a distinct `id` with `type: llama.cpp`.
+
+To remove one again:
+
+```bash
+bash scripts/catalog.sh unregister --slug my-llamacpp/<your-model>   # --dry-run first if you like
+```
+
+It refuses any slug that is not in your local layer, so a curated entry is unreachable
+from it — those are git-tracked and git is their removal tool.
+
+<details><summary>Hand-authoring the spec instead</summary>
+
+Still supported, and what `register` builds for you underneath:
+
+```bash
+python3 scripts/lib/profiles/promote.py --spec-file <spec>.json     # --layer local is the DEFAULT
+```
+
+</details>
+
+That writes `scripts/lib/profiles-local/` — `models.d/<id>.yml`, `composes/<id>/…`
+and `registry.local.json`. Slugs use the **same `<engine>/<name>` shape as curated
+ones** — the layer decides where the *files* go, not what the slug is *called*, and
+provenance lives in the entry's `origin` field rather than in the name. That is what
+lets you name the engine you actually run (`my-llamacpp/my-model`, not just ours),
+and it means publishing later flips a field instead of renaming a slug your scripts
+and notes already point at. A local slug whose name collides with a shipped one is
+**shadowed** — the curated row wins the lookup and yours is marked, not deleted.
+
+> ⚠️ The old `local/<name>` namespace was removed (#1202). A `local/…` slug is now
+> refused with the replacement spelled out; re-register it as `<engine>/<name>`.
+
+### Seeing what you registered
+
+Because local slugs now share the curated `<engine>/<name>` shape, they are marked
+rather than named:
+
+```bash
+bash scripts/switch.sh --local          # only the models YOU registered
+bash scripts/switch.sh --list --all     # everything; yours are tagged “· local”
+```
+
+```
+  single   my-llamacpp/my-model    gguf/base.yml    (NA: 66K) · local
+```
+
+Or from the cockpit, which manages the layer without dropping to the CLI:
+
+| Key | Where | Does |
+|---|---|---|
+| `ctrl+l` | anywhere in c3 | opens the local layer — every slug you registered, `shadowed` included |
+| `r` | on a row | unregister it |
+| `n` | on a row | rename it (moves the compose tree when the engine changes) |
+| `e` | on a row | edit one field, `KEY=VALUE` |
+| `esc` | | close |
+
+`ctrl+l` is advertised in the footer only while the layer has something in it.
+Every one of those actions is a repo write, so it goes through the same confirm
+gate as a serve — you see the `catalog.sh` command before anything is touched,
+and `Enter` commits it. The catalog re-reads itself afterwards; you do not need
+to refresh. A curated slug is unreachable from this view by construction.
+
+If a later `git pull` ships a curated slug under a name you already used, the
+listing tells you so instead of quietly swallowing it:
+
+```
+  ⚠ shadowed local slug(s): vllm/minimal
+    A curated entry now ships under that name, and core wins the lookup.
+    Your registration is intact but unreachable by slug — rename it:
+```
+
+Core wins on purpose: a stack update must never silently change what one of our
+slugs points at. Your files are untouched — rename it and it is reachable again:
+
+```bash
+bash scripts/catalog.sh rename --slug vllm/minimal --to my-llamacpp/minimal --dry-run
+bash scripts/catalog.sh rename --slug vllm/minimal --to my-llamacpp/minimal
+```
+
+The slug's namespace **is** the engine, so renaming across engines moves the compose
+tree and rewrites the entry's `engine` field with it — and is refused outright if the
+target engine has no profile, rather than leaving you with a slug that claims an
+engine which does not exist.
+
+You can also edit an entry in place without re-registering:
+
+```bash
+bash scripts/catalog.sh update --slug my-llamacpp/my-model --set workload=fast-chat --set max_ctx=32768
+```
+
+`origin` is not editable — it is stamped by the loader, and a local row able to call
+itself `core` would hide from the very listings meant to mark it. `model` is not
+editable either: it names the files on disk, so changing it is a move, not an edit.
+
+The directory is
+**gitignored** (everything except its README and `.gitignore`), so:
+
+- `git pull` and branch switches can **never** conflict with or overwrite your models;
+- nothing in the curated catalog is touched — delete the files to revert completely;
+- `get_registry()` merges your entries into the catalog every launcher reads, so
+  `switch.sh --list` and `launch.sh <slug>` just work;
+- a local entry can never become a *curated* default, and a broken local layer
+  fails loudly rather than silently shrinking the catalog.
+
+> **Ports: your models live in the 202xx band.** The curated catalog occupies
+> **8010–8199**, and it grows — so a local model parked in that range can collide
+> with a slug that arrives in a later `git pull`, and it turns the repo's own
+> `test-compose-port-conflicts` guard red on your checkout. `promote.py` refuses a
+> local port that is already curated and tells you the deterministic replacement
+> (`20200 + crc32(model_id) % 100`) — the same value c3's Promote scaffold assigns.
+> Set your compose's `${PORT:-NNNN}` to match.
+
+> ⚠️ **One command destroys this layer: `git clean -xdf`.** Your models here are
+> *gitignored*, which is what makes them survive `git pull`, a branch switch, and even
+> `git reset --hard` (all measured). But `-x` tells `git clean` to remove **ignored**
+> files too, so the reflex "really clean the repo" command deletes every model you
+> registered — silently, with no recovery. `git clean -fd` (no `-x`) is safe; so is
+> `git stash -u`, though `git stash --all` is not.
+>
+> ⚠️ **It is not a backup either.** The layer lives inside this checkout and is resolved
+> from the repo root it was imported from, so a second clone has its own empty layer and
+> re-cloning loses everything. `export_pr.py --out <dir>` (§5) writes a complete portable
+> bundle — the easiest way to keep a copy outside the tree.
+
+> **Guided equivalent:** c3's Bring & Validate lane, stage **⑤ Promote** — the
+> scaffold pre-fills every arch fact the deriver knows and you fill in
+> `display_name` + `family`. Its key line names all three destinations:
+> `⏎ Write LOCAL layer · C WRITE CORE REGISTRY (needs C3_ALLOW_CORE_PROMOTE=1) · E Export as PR bundle`.
+
+## 5. Share it / contribute it back
+
+**Turning your local model into a PR is one command.** `export_pr.py` reads the
+model you validated in §4 and emits a ready-to-commit bundle — the local layer is
+a **staging ground for a contribution, not a dead end**:
+
+```bash
+python3 scripts/lib/profiles/export_pr.py --spec-file <spec>.json --check          # validate only
+python3 scripts/lib/profiles/export_pr.py --spec-file <spec>.json --out ./bundle   # write the bundle
+```
+
+You get `models/<id>.yml`, your compose translated to the **core** layout, and
+`registry-entry.yaml` (the `entries:` map in exactly the `registry.yaml` data
+subset, headed by the canonical merge command). It writes **only** under `--out`
+— nothing in the repo is touched — and it **refuses (exit 3)** when the model is
+missing what a maintainer would bounce the PR for: a real `display_name` /
+`family`, a well-formed weights map, complete registry kwargs, a vLLM
+`kvcalc_key`, and the compose's mandatory `Status:` header. Fix what it names,
+re-run, then open the PR with the bundle's contents.
+
+Writing the curated catalog **directly** is maintainer-only and double-gated
+(`promote.py --layer core` **plus** `C3_ALLOW_CORE_PROMOTE=1`). Note that gate is
+a plain environment variable and **`.env` is not read by these tools** — `export`
+it in your shell or pass it per-invocation.
+
+
 
 - Format your numbers with the [Results Card](RESULTS_CARD.md)
   (Serving · Quality · Takeaways).

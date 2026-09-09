@@ -14,6 +14,7 @@
 #   bash scripts/switch.sh --list               # actionable variants on THIS machine (deprecated hidden) + defaults
 #   bash scripts/switch.sh --list --all         # every variant — all GPU counts + deprecated
 #   bash scripts/switch.sh --list-all           # alias for --list --all
+#   bash scripts/switch.sh --local              # only models YOU registered (local layer)
 #   bash scripts/switch.sh --defaults           # just the per-model defaults view
 #   bash scripts/switch.sh --down               # just bring down whatever's up
 #   bash scripts/switch.sh --set-default <slug>  # pin <slug> as YOUR default for its model (.env)
@@ -67,6 +68,15 @@
 #   FORCE           Set to 1 to skip hardware/free-VRAM preflight
 #   READY_URL       Default: http://localhost:8020/v1/models
 #   READY_TIMEOUT   Default: 600 (seconds — longer for cold cudagraph capture)
+#   READY_PROBE     Default: 1. After /v1/models answers, send ONE max_tokens=1
+#                 completion and require it to succeed before declaring ready
+#                 (#1100) — proves the engine can GENERATE, not just that its
+#                 port is bound, and warms the moe-cache expert pool (allocated
+#                 on first inference). Set 0 to skip.
+#   READY_PROBE_TIMEOUT  Default: 90 (seconds) — hard cap on that one probe.
+#   CLUB3090_THINKING_<MODEL>  .env pin (on|off|inherit) → ENABLE_THINKING at
+#                 launch (#1014 follow-up; set it from the serve-confirm [T]).
+#                 An ENABLE_THINKING exported in the shell wins over the pin.
 
 set -euo pipefail
 
@@ -313,6 +323,69 @@ PY_CLEARKEY
   exit 0
 }
 
+# --- #1014 follow-up: persisted per-model THINKING pin (.env) ----------------
+#
+# The serve-confirm modal's [T] persists the tri-state thinking choice as
+# CLUB3090_THINKING_<MODEL> in .env (same mechanism --set-default uses for
+# CLUB3090_DEFAULT_<MODEL>). This side makes that pin REAL: when resolving the
+# serve env for a launch we read it and inject ENABLE_THINKING accordingly.
+
+# Echo the .env pin key for a model's thinking default — normalization identical
+# to model_default_pin_key (compose_registry.model_thinking_pin_key).
+thinking_pin_key_for() {
+  local model="$1"
+  python3 - "$ROOT_DIR" "$model" <<'PY_THINKKEY'
+import sys
+from pathlib import Path
+root = Path(sys.argv[1]); sys.path.insert(0, str(root))
+from scripts.lib.profiles.compose_registry import model_thinking_pin_key  # noqa: E402
+print(model_thinking_pin_key(sys.argv[2]))
+PY_THINKKEY
+}
+
+# Resolve a model's persisted thinking state to on | off | inherit. Reads the
+# ALREADY-LOADED environment (switch.sh loads .env above; shell-env-wins per
+# #425). Unknown/empty values degrade to inherit (the entrypoint default).
+thinking_pin_state() {
+  local model="$1" key val
+  key="$(thinking_pin_key_for "$model")" || { printf 'inherit'; return 0; }
+  val="${!key:-}"
+  case "${val,,}" in
+    on)  printf 'on' ;;
+    off) printf 'off' ;;
+    *)   printf 'inherit' ;;
+  esac
+}
+
+# Apply the persisted pin to the LAUNCH env right before compose up:
+#   on      → ENABLE_THINKING=true (explicit — beats the passthrough default)
+#   off     → ENABLE_THINKING=false (explicit, per the #1010 lesson)
+#   inherit → nothing injected.
+# An ENABLE_THINKING already present in the SHELL wins (#425 precedence): the
+# .env pin is file-tier defaulting, never a shell override.
+apply_thinking_pin_env() {
+  local variant="$1" eng dir file model state key
+  IFS='|' read -r eng dir file <<< "${VARIANTS[$variant]:-}"
+  # dir = models/<model>/<engine>/compose → model is field 2 (list_variants).
+  IFS=/ read -ra _tp <<< "${dir:-}"
+  model="${_tp[1]:-}"
+  [[ -n "$model" ]] || return 0
+  state="$(thinking_pin_state "$model")"
+  case "$state" in
+    on|off)
+      if [[ -n "${ENABLE_THINKING+x}" ]]; then
+        echo "[switch] thinking pin '${state}' for ${model} ignored — shell exported ENABLE_THINKING=${ENABLE_THINKING} wins (#425)."
+        return 0
+      fi
+      if [[ "$state" == on ]]; then ENABLE_THINKING=true; else ENABLE_THINKING=false; fi
+      export ENABLE_THINKING
+      key="$(thinking_pin_key_for "$model")"
+      echo "[switch] thinking pinned ${state} for ${model} (${key} in .env) → ENABLE_THINKING=${ENABLE_THINKING}."
+      ;;
+  esac
+}
+
+
 # Map a registry status word to the marker shown in --list and to launch
 # gating. `production` → unmarked; `caveats` → "(caveats)"; the (NA) set
 # (experimental/preview/upstream-gated/deprecated) → "(NA: <word>)".
@@ -382,6 +455,20 @@ list_variants() {
   # DEVICES then nvidia-smi). `--list --all` (LIST_ALL=1) shows everything for
   # discoverability. Fail-open: if detection is unavailable we show ALL rather
   # than hide based on a failed probe.
+  # Provenance (#1202). Local rows were INDISTINGUISHABLE in this listing: nothing
+  # rendered a marker, which mattered little while they lived under a `local/`
+  # namespace and matters a lot now they share the curated <engine>/<name> shape.
+  declare -A _is_local=(); local _shadowed=""
+  if declare -F registry_local_slugs >/dev/null; then
+    local _k _v
+    while IFS=$'\t' read -r _k _v; do
+      case "$_k" in
+        LOCAL)    _is_local["$_v"]=1 ;;
+        SHADOWED) _shadowed+="${_shadowed:+, }$_v" ;;
+      esac
+    done < <(registry_local_slugs "$ROOT_DIR" 2>/dev/null)
+  fi
+
   local show_all="${LIST_ALL:-0}" detected_topo max_rank
   detected_topo="$(switch_topology_from_gpus 2>/dev/null || true)"
   if [[ -z "$detected_topo" ]] || ! list_gpu_detect_reliable; then
@@ -425,6 +512,9 @@ list_variants() {
       _hidden_by_topo["$_vtopo"]=$(( ${_hidden_by_topo["$_vtopo"]:-0} + 1 ))
       continue
     fi
+    if [[ "${LIST_LOCAL:-0}" == "1" && -z "${_is_local[$v]:-}" ]]; then
+      continue                       # --local: yours only
+    fi
     _seen_models["${_ds[1]:-?}"]=1
     case "${VARIANT_STATUS[$v]:-production}" in
       production) _prod=$((_prod + 1)) ;;
@@ -463,6 +553,13 @@ list_variants() {
   if [[ "$_inc_hidden" -gt 0 ]]; then
     _inc_note="  (+${_inc_hidden} incubating hidden — --all)"
   fi
+  if [[ -n "$_shadowed" ]]; then
+    echo ""
+    echo "  ⚠ shadowed local slug(s): ${_shadowed}"
+    echo "    A curated entry now ships under that name, and core wins the lookup."
+    echo "    Your registration is intact but unreachable by slug — rename it:"
+    echo "      bash scripts/catalog.sh unregister --slug <slug>   # then re-register under another name"
+  fi
   echo "  Models: ${#_seen_models[@]} · variants: ${_visible} (${_prod} production · ${_cav} caveats · ${_na} NA)${_hidden_note}${_dep_note}${_gated_note}${_inc_note}"
 
   {
@@ -472,6 +569,10 @@ list_variants() {
       IFS=/ read -ra fseg <<< "$file"   # fseg[0]=topology fseg[1]=quant fseg[2]=serving
       topo="${fseg[0]:-unknown}"
       rank="$(topology_rank "$topo")"
+      # --local applies HERE too. Listing is two passes — one that counts, one
+      # that renders — and filtering only the first produced a header saying
+      # "variants: 1" above every curated row.
+      if [[ "${LIST_LOCAL:-0}" == "1" && -z "${_is_local[$v]:-}" ]]; then continue; fi
       if [[ "$show_all" != "1" ]]; then
         case "${VARIANT_STATUS[$v]:-production}" in deprecated|upstream-gated|incubating) continue ;; esac
       fi
@@ -479,8 +580,9 @@ list_variants() {
         continue
       fi
       marker="$(status_marker "${VARIANT_STATUS[$v]:-production}")"
-      printf '%s\t%d\t%s\t%s\t%s/%s\t%s\t%s\n' \
-        "${dseg[1]:-?}" "$rank" "$topo" "$v" "${fseg[1]:-?}" "${fseg[2]:-${file}}" "$marker" "${VARIANT_CTX[$v]:-}"
+      printf '%s\t%d\t%s\t%s\t%s/%s\t%s\t%s\t%s\n' \
+        "${dseg[1]:-?}" "$rank" "$topo" "$v" "${fseg[1]:-?}" "${fseg[2]:-${file}}" "$marker" "${VARIANT_CTX[$v]:-}" \
+        "${_is_local[$v]:+local}"
     done
   } | LC_ALL=C sort -t$'\t' -k1,1 -k2,2n -k4,4 | awk -F'\t' '
     { rows[NR] = $0; cnt[$1]++ }
@@ -494,6 +596,9 @@ list_variants() {
           if (ann == "") ann = ctx                  # production: bare max-ctx (stays "unmarked")
           else sub(/\)$/, ", " ctx ")", ann)         # caveats / NA: fold ctx into the paren
         }
+        # provenance: yours vs shipped. Local rows look exactly like curated ones
+        # since #1202 gave them the same <engine>/<name> shape, so say it.
+        if (f[8] != "") ann = (ann == "" ? "local" : ann " · local")
         printf "  %-8s %-34s %-36s %s\n", tl, f[4], f[5], ann
       }
     }
@@ -603,13 +708,13 @@ from pathlib import Path
 root = Path(sys.argv[1])
 sys.path.insert(0, str(root))
 from scripts.lib.profiles.compose_registry import (  # noqa: E402
-    COMPOSE_REGISTRY,
+    get_registry,
     model_of_slug,
     slug_topology,
 )
 
 slug = sys.argv[2]
-entry = COMPOSE_REGISTRY.get(slug)
+entry = get_registry().get(slug)
 if entry is None:
     print(f"unknown slug {slug!r} — run: scripts/switch.sh --list", file=sys.stderr)
     raise SystemExit(1)
@@ -973,6 +1078,21 @@ export_variant_engine_pin() {
   fi
 }
 
+# Trim a status_note for terminal display. Registry notes are maintainer-facing and
+# long by design (median ~920 chars, worst case 6,116) — dumping a whole one into a
+# user's terminal buries the message it is attached to. Show the opening, cap at
+# ~240 chars, and point at the full text.
+#   Reported via #1036: a --force launch printed ~6 KB of notes ABOVE the real
+#   failure, which was a missing weight shard.
+_note_brief() {
+  local n="${1:-}"
+  [[ -n "$n" ]] || return 0
+  if (( ${#n} <= 240 )); then printf '%s' "$n"; return 0; fi
+  local cut="${n:0:240}"
+  cut="${cut% *}"
+  printf '%s… [truncated — full note: bash scripts/switch.sh --list --all]' "$cut"
+}
+
 status_gate() {
   # Lifecycle gate (PR-A health flag). production → launch silently;
   # caveats → launch with a one-line notice; the (NA) set
@@ -984,17 +1104,17 @@ status_gate() {
     production)
       ;;
     caveats)
-      echo "[switch] NOTE: '${v}' is ⚠️ production-with-caveats.${note:+  ${note}}"
+      echo "[switch] NOTE: '${v}' is ⚠️ production-with-caveats.${note:+  $(_note_brief "${note}")}"
       ;;
     *)
       if [[ "${FORCE:-0}" != "1" ]]; then
-        echo "[switch] ERROR: '${v}' is (NA: ${status}) — not a reliable config.${note:+  ${note}}" >&2
+        echo "[switch] ERROR: '${v}' is (NA: ${status}) — not a reliable config.${note:+  $(_note_brief "${note}")}" >&2
         echo "[switch]        It is surfaced for visibility, but won't launch without an explicit override." >&2
         echo "[switch]        Re-run with --force if you know what you're doing:" >&2
         echo "[switch]          bash scripts/switch.sh --force ${v}" >&2
         exit 1
       fi
-      echo "[switch] WARNING: forcing (NA: ${status}) variant '${v}'.${note:+  ${note}}"
+      echo "[switch] WARNING: forcing (NA: ${status}) variant '${v}'.${note:+  $(_note_brief "${note}")}"
       ;;
   esac
 }
@@ -1015,7 +1135,6 @@ up_variant() {
   fi
 
   # Pre-up sanity:
-  #  - genesis_pin: warn if on-disk Genesis tree differs from GENESIS_PIN in setup.sh
   #  - repo_drift: warn if local HEAD is behind origin/master
   #  - compose_deps: HARD error if compose mounts a model dir that doesn't exist on host
   #    (catches the "you didn't WITH_DFLASH_DRAFT=1 then tried dual-dflash-noviz" case;
@@ -1024,7 +1143,6 @@ up_variant() {
   if [[ -f "${ROOT_DIR}/scripts/preflight.sh" ]]; then
     # shellcheck source=preflight.sh
     source "${ROOT_DIR}/scripts/preflight.sh"
-    preflight_genesis_pin "${ROOT_DIR}" || true
     preflight_repo_drift "${ROOT_DIR}" || true
     preflight_compose_deps "${full_dir}/${file}" || exit 1
     if [[ "$eng" == "vllm" ]]; then
@@ -1047,6 +1165,8 @@ up_variant() {
     preflight_cpu_offload_ram "${full_dir}/${file}" || exit 1
     preflight_offload_split_mode "${full_dir}/${file}" || exit 1
     preflight_kv_format_hint "${full_dir}/${file}" || true
+    # WARN-only first-token-latency hint; never blocks a boot.
+    preflight_offload_thp "${full_dir}/${file}" || true
     # Single-card util-override guard — runs even under --force (the nvfp4 slug
     # launches with --force, and util=0.92 on one card OOMs the tool-prefill; #617).
     preflight_single_card_util "${full_dir}/${file}" "$v" || true
@@ -1056,6 +1176,7 @@ up_variant() {
   echo "[switch] bringing up: ${v}  (${dir}/${file})"
   export_variant_engine_pin "$v"
   preflight_ik_llama_image "$v"   # #633 — cu12 fallback on <13.2 drivers (unless pinned)
+  apply_thinking_pin_env "$v"     # #1014 follow-up — persisted CLUB3090_THINKING_<MODEL> → ENABLE_THINKING
   (cd "${full_dir}" && ${COMPOSE_BIN} -f "${file}" up -d --remove-orphans)
 }
 
@@ -1070,12 +1191,104 @@ resolve_ready_url() {
   READY_URL="http://localhost:${port}/v1/models"
 }
 
+ready_probe() {
+  # #1100 — ONE bounded generation call, so "✓ ready" means the engine can
+  # actually produce a token, not merely that its HTTP port is bound.
+  #
+  # Why /v1/models is not enough:
+  #   * it answers the moment the server binds — before a single token has been
+  #     generated, so a server that binds but cannot generate reads as ready and
+  #     the failure only surfaces in the user's first real request;
+  #   * on the moe-cache slugs the expert pool is allocated on the FIRST
+  #     INFERENCE, not at load (~4.9 GB on GPU0). "Ready" therefore meant a cold
+  #     cache, and whatever ran next paid pool allocation inside its own first
+  #     measured request.
+  #
+  # Degrades gracefully — only a dead/erroring server fails the boot:
+  #   transport failure or timeout → FAIL (bound, but cannot serve)
+  #   HTTP 5xx (except 501)        → FAIL (accepted the request, then broke)
+  #   HTTP 4xx / 501 / odd shape   → WARN (different completion shape, missing
+  #                                  chat template, … — NOT a boot failure)
+  # Opt out with READY_PROBE=0; bound it with READY_PROBE_TIMEOUT (default 90s).
+  local container="$1" served="$2"
+  local base body code rc probe_s started snippet has_choices
+  if [[ "${READY_PROBE:-1}" == "0" ]]; then
+    echo "[switch]   generation probe skipped (READY_PROBE=0)"
+    return 0
+  fi
+  if [[ -z "$served" ]]; then
+    echo "[switch] ⚠ generation probe skipped — could not resolve the served model id from ${READY_URL}" >&2
+    return 0
+  fi
+  # http://host:port/v1/models[/] → http://host:port/v1 (a READY_URL override
+  # that is not a /v1/models URL just yields a 404 → WARN, never a false fail).
+  base="${READY_URL%/}"; base="${base%/models}"
+  # Minimal JSON escaping of the served id (it came out of JSON, but never hand
+  # it back unescaped).
+  local served_esc="${served//\\/\\\\}"; served_esc="${served_esc//\"/\\\"}"
+  body="$(mktemp)"
+  started=$SECONDS
+  code="$(curl -s -o "$body" -w '%{http_code}' --max-time "${READY_PROBE_TIMEOUT:-90}" \
+    -X POST "${base}/chat/completions" \
+    -H 'Content-Type: application/json' \
+    -d "{\"model\":\"${served_esc}\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":1,\"temperature\":0,\"stream\":false}" \
+    2>/dev/null)" && rc=0 || rc=$?
+  probe_s=$((SECONDS - started))
+  snippet="$(head -c 200 "$body" 2>/dev/null | tr '\n' ' ' || true)"
+  has_choices=0
+  # `if`, not `A && B` — under `set -e` a failing AND-list at statement level
+  # exits the shell.
+  if command grep -q '"choices"' "$body" 2>/dev/null; then has_choices=1; fi
+  rm -f "$body"
+
+  if [[ $rc -ne 0 ]]; then
+    echo "[switch] ERROR: server answered /v1/models but could not generate — the completion" >&2
+    echo "[switch]        probe failed after ${probe_s}s (curl exit ${rc}; cap ${READY_PROBE_TIMEOUT:-90}s)." >&2
+    echo "[switch]        Last 30 log lines:" >&2
+    docker logs --tail 30 "$container" 2>&1 | sed 's/^/[switch]   | /' >&2
+    echo "[switch]        Full logs:  docker logs ${container}" >&2
+    echo "[switch]        Slow-but-healthy engine? raise READY_PROBE_TIMEOUT, or READY_PROBE=0 to skip." >&2
+    return 1
+  fi
+
+  case "$code" in
+    2*)
+      if [[ $has_choices -eq 1 ]]; then
+        echo "[switch]   generation probe ok — 1 token in ${probe_s}s (model: ${served})"
+      else
+        echo "[switch] ⚠ generation probe: HTTP ${code} but no choices[] in the reply — treating as ok." >&2
+        echo "[switch]   ${snippet}" >&2
+      fi
+      return 0
+      ;;
+    501|4*)
+      echo "[switch] ⚠ generation probe skipped — endpoint answered HTTP ${code} on ${base}/chat/completions" >&2
+      echo "[switch]   (different completion shape or missing chat template — NOT a boot failure)" >&2
+      echo "[switch]   ${snippet}" >&2
+      return 0
+      ;;
+    5*)
+      echo "[switch] ERROR: server answered /v1/models but FAILED to generate (HTTP ${code})." >&2
+      echo "[switch]        ${snippet}" >&2
+      echo "[switch]        Last 30 log lines:" >&2
+      docker logs --tail 30 "$container" 2>&1 | sed 's/^/[switch]   | /' >&2
+      echo "[switch]        Full logs:  docker logs ${container}" >&2
+      echo "[switch]        Set READY_PROBE=0 to skip this probe if the engine is known-good." >&2
+      return 1
+      ;;
+    *)
+      echo "[switch] ⚠ generation probe inconclusive (HTTP '${code}') — treating as ok." >&2
+      return 0
+      ;;
+  esac
+}
+
 wait_ready() {
   # Find the container we just brought up so we can detect crashes mid-boot
   # AND surface stage progress markers from its logs while we wait.
   local container
   container="${VARIANT_CONTAINER[$VARIANT]:-}"
-  if [[ -z "$container" ]] || ! docker ps --format '{{.Names}}' 2>/dev/null | grep -Fxq -- "$container"; then
+  if [[ -z "$container" ]] || ! docker ps --format '{{.Names}}' 2>/dev/null | command grep -Fxq -- "$container"; then
     # Compose started but no container is up — almost always a syntax error
     # or env-var issue caught before vLLM even started.
     echo "[switch] ERROR: no container running after 'compose up' — boot failed before vLLM started." >&2
@@ -1085,15 +1298,39 @@ wait_ready() {
 
   echo "[switch] waiting for ${READY_URL} (container=${container}, timeout ${READY_TIMEOUT}s)..."
   local elapsed=0 step=4 last_marker=""
+  # #1099 — baseline the restart counter. Under a restart policy (`restart:
+  # unless-stopped`, which most composes set) docker reports
+  # `.State.Running == true` for a container that is crash-looping, so the old
+  # Running-based check never fired and a boot-guard rejection polled a dead
+  # endpoint for the full READY_TIMEOUT. Baseline instead of assuming 0: `up -d`
+  # can leave an already-running container in place with a non-zero count.
+  local restarts_at_start
+  restarts_at_start="$(docker inspect -f '{{.RestartCount}}' "$container" 2>/dev/null || true)"
+  [[ "$restarts_at_start" =~ ^[0-9]+$ ]] || restarts_at_start=0
+
   until curl -sf -o /dev/null --max-time 3 "${READY_URL}"; do
-    # CRASH DETECTION: if the container died, dump tail and exit fast — don't
-    # silently burn through the full timeout on a dead server.
-    local state
-    state=$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null || echo missing)
-    if [[ "$state" != "true" ]]; then
+    # CRASH DETECTION: if the container died OR is crash-looping, dump the tail
+    # and exit fast — don't silently burn through the full timeout on a server
+    # that is never coming up.
+    local state restarts dead=""
+    state="$(docker inspect -f '{{.State.Status}}' "$container" 2>/dev/null || true)"
+    [[ -n "$state" ]] || state="missing"
+    restarts="$(docker inspect -f '{{.RestartCount}}' "$container" 2>/dev/null || true)"
+    [[ "$restarts" =~ ^[0-9]+$ ]] || restarts="$restarts_at_start"
+    if [[ "$state" != "running" ]]; then
+      # exited / dead / restarting / paused / missing — `restarting` is the one
+      # the old .State.Running check could never see.
+      dead="state=${state}"
+    elif [[ "$restarts" -gt "$restarts_at_start" ]]; then
+      # A crash-loop reads `running` in the brief window between two restarts,
+      # so the counter is what makes it visible at an arbitrary sample point.
+      # For a boot-guard rejection even ONE restart means it won't come up.
+      dead="crash-looping (restarts ${restarts_at_start}→${restarts}, state=${state})"
+    fi
+    if [[ -n "$dead" ]]; then
       local exit_code
-      exit_code=$(docker inspect -f '{{.State.ExitCode}}' "$container" 2>/dev/null || echo "?")
-      echo "[switch] ERROR: container '${container}' is no longer running (state=${state}, exit=${exit_code})." >&2
+      exit_code="$(docker inspect -f '{{.State.ExitCode}}' "$container" 2>/dev/null || echo '?')"
+      echo "[switch] ERROR: container '${container}' is not coming up (${dead}, exit=${exit_code})." >&2
       echo "[switch]        Last 30 log lines:" >&2
       docker logs --tail 30 "$container" 2>&1 | sed 's/^/[switch]   | /' >&2
       echo "[switch]        Full logs:  docker logs ${container}" >&2
@@ -1103,13 +1340,16 @@ wait_ready() {
     sleep $step
     elapsed=$((elapsed + step))
 
-    # PROGRESS SIGNAL: surface boot-stage markers so users see WHAT vLLM is
-    # doing, not just that it's "still waiting". The grep is selective — one
-    # line per phase transition, not raw log streaming.
+    # PROGRESS SIGNAL: surface boot-stage markers so users see WHAT the engine
+    # is doing, not just that it's "still waiting". The grep is selective — one
+    # line per phase transition, not raw log streaming. Both engine families are
+    # covered (#1099): vLLM first, then llama.cpp / ik-llama, which emit none of
+    # vLLM's strings and used to show a bare elapsed counter — on exactly the
+    # engines with the longest load times.
     local marker
-    marker=$(docker logs --tail 50 "$container" 2>&1 | grep -oE \
-      'Genesis Results: .* applied|Resolved architecture: \w+|Loading weights|Compilation finished|Memory profiling|Capturing CUDA graphs|Application startup complete' \
-      | tail -1 || true)
+    marker="$(docker logs --tail 50 "$container" 2>&1 | command grep -oE \
+      'Genesis Results: .* applied|Resolved architecture: \w+|Loading weights|Compilation finished|Memory profiling|Capturing CUDA graphs|Application startup complete|load_model: loading model|common_memory_breakdown_print|\[moe-cache\] enabled: first pool allocated|model loaded|listening on http://[^[:space:]]+' \
+      | tail -1 || true)"
     if [[ -n "$marker" && "$marker" != "$last_marker" ]]; then
       echo "[switch]   ${elapsed}s — ${marker}"
       last_marker="$marker"
@@ -1123,7 +1363,7 @@ wait_ready() {
       exit 1
     fi
   done
-  echo "[switch] ✓ ready (${elapsed}s)"
+
   # F3 (CLI parity with c3's serving card): print the USABLE endpoint — the LAN
   # URL an agent/client should point at, the served model id, and the auth
   # status. LANIP's source of truth is the repo .env (#512, loaded above; shell
@@ -1137,8 +1377,16 @@ wait_ready() {
   fi
   _lanip="${_lanip:-localhost}"
   _port="${READY_URL#*://}"; _port="${_port#*:}"; _port="${_port%%/*}"
+  # Resolved BEFORE the ready line now: the generation probe needs the served id
+  # too, and it must come from the endpoint — never a hardcoded name.
   _served="$(curl -sf --max-time 3 "${READY_URL}" \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"][0]["id"])' 2>/dev/null || true)"
+
+  # #1100 — prove generation works (and warm the moe-cache expert pool) before
+  # claiming ready. Only a dead/erroring server fails here; see ready_probe().
+  ready_probe "$container" "$_served" || exit 1
+
+  echo "[switch] ✓ ready (${elapsed}s)"
   echo "[switch] ▶ API:  http://${_lanip}:${_port}/v1   (model: ${_served:-?} · OpenAI-compatible · no auth)"
 }
 
@@ -1148,6 +1396,7 @@ FORCE="${FORCE:-0}"
 VARIANT=""
 LIST_REQUESTED=0
 LIST_ALL=0
+LIST_LOCAL=0
 OWUI_REGISTER=0
 EXPLAIN_REQUESTED=0
 EXPLAIN_SLUG=""
@@ -1161,6 +1410,11 @@ while [[ $# -gt 0 ]]; do
     --list) LIST_REQUESTED=1 ;;
     --all) LIST_ALL=1 ;;
     --list-all) LIST_REQUESTED=1; LIST_ALL=1 ;;
+    # --local: only the models YOU registered (catalog.sh / promote.py). Locality
+    # is the entry's `origin` field, never the slug string — local slugs carry the
+    # same <engine>/<name> shape as curated ones (#1202), so there is nothing in
+    # the name to filter on.
+    --local) LIST_REQUESTED=1; LIST_LOCAL=1; LIST_ALL=1 ;;
     # --explain <slug> [--json] is a deferred terminal action (like --list), so
     # `--explain X --json` and `--explain --json X` both work. The slug is the
     # next non-flag token; --json (below) toggles structured output.

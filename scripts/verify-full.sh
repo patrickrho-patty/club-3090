@@ -29,7 +29,8 @@
 #   MTP_ACCEPT_MIN=1.8 bash scripts/verify-full.sh  # profile-specific measured floor
 #
 # Env (optional):
-#   URL          Default: http://localhost:8020
+#   URL          Default: registry-derived for qwen3.6-27b (curated DEFAULTS
+#                walk; currently :8020)
 #   MODEL        Default: auto-detected from the endpoint's /v1/models, else
 #                qwen3.6-27b
 #   CONTAINER    Default: vllm-qwen36-27b
@@ -81,11 +82,32 @@ if [[ -f "${ROOT_DIR}/scripts/preflight.sh" ]]; then
   source "${ROOT_DIR}/scripts/preflight.sh"
   preflight_autodetect_endpoint
 fi
-URL="${URL:-http://localhost:8020}"
+# Default endpoint follows the registry's curated DEFAULTS walk for qwen3.6-27b
+# instead of a hand-maintained :8020/:8010 literal that drifts from the catalog.
+# The trailing literal is only a last resort when the registry can't be consulted.
+_DEFAULT_ENDPOINT_PORT=""
+if [[ -f "${ROOT_DIR}/scripts/lib/registry-lookup.sh" ]]; then
+  # shellcheck source=lib/registry-lookup.sh
+  source "${ROOT_DIR}/scripts/lib/registry-lookup.sh"
+  REGISTRY_LOOKUP_ROOT="${ROOT_DIR}"
+  _DEFAULT_ENDPOINT_PORT="$(registry_lookup_default_port qwen3.6-27b 2>/dev/null || true)"
+fi
+URL="${URL:-http://localhost:${_DEFAULT_ENDPOINT_PORT:-8020}}"
 # Resolve the served model from /v1/models when MODEL is unset (#372). The qwen
 # literal below is only a last resort if detection no-ops (endpoint unreachable).
 declare -F preflight_autodetect_model >/dev/null && preflight_autodetect_model
 MODEL="${MODEL:-qwen3.6-27b}"
+if [[ -z "${CONTAINER:-}" && -f "${ROOT_DIR}/scripts/lib/registry-lookup.sh" ]]; then
+  # The old literal default 'vllm-qwen36-27b' matches NO registry container, so
+  # container-coupled checks silently no-op'd on an undetected endpoint. Default
+  # to the MODEL's curated-default slug container instead (qwen3.6-27b →
+  # vllm/minimal → vllm-qwen36-27b-minimal); the dead literal stays only as a
+  # last-resort fallback when the registry can't be consulted.
+  # shellcheck source=lib/registry-lookup.sh
+  source "${ROOT_DIR}/scripts/lib/registry-lookup.sh"
+  REGISTRY_LOOKUP_ROOT="${ROOT_DIR}"
+  CONTAINER="$(registry_lookup_default_container "$MODEL" 2>/dev/null || true)"
+fi
 CONTAINER="${CONTAINER:-vllm-qwen36-27b}"
 
 pass() { printf "  \033[32m✓\033[0m %s\n" "$1"; }
@@ -104,16 +126,18 @@ detect_engine() {
   if curl -sf -m 3 "${URL}/props" >/dev/null 2>&1; then
     echo "llamacpp"; return 0
   fi
-  # Hint 2: vLLM's chat-completion response includes system_fingerprint
-  # like "vllm-0.20.2rc1.dev9+g01d4d1ad3-tp2-c9120464".
+  # Hint 2: the chat-completion response's system_fingerprint. vLLM emits
+  # "vllm-0.20.2rc1.dev9+g01d4d1ad3-tp2-c9120464"; llama-server emits its build
+  # string, e.g. "b10454-4df29be4f" (club-3090#1067).
   local fp
   fp="$(curl -sf -m 5 "${URL}/v1/chat/completions" \
     -H 'Content-Type: application/json' \
     -d "{\"model\":\"${MODEL}\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":1}" 2>/dev/null \
     | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('system_fingerprint','') or '')" 2>/dev/null)"
   case "$fp" in
-    vllm-*)   echo "vllm"; return 0 ;;
-    sglang-*) echo "sglang"; return 0 ;;
+    vllm-*)    echo "vllm"; return 0 ;;
+    sglang-*)  echo "sglang"; return 0 ;;
+    b[0-9]*)   echo "llamacpp"; return 0 ;;   # llama-server build str: b10454[-hash]
   esac
   # Hint 3: container name pattern as a fallback (cheap, no extra HTTP)
   case "$CONTAINER" in
@@ -122,7 +146,19 @@ detect_engine() {
   esac
   echo "unknown"
 }
-ENGINE_KIND="$(detect_engine)"
+
+# True only when $CONTAINER names a real Docker container. `--type container`
+# stops `docker inspect none` from matching Docker's built-in `none` *network*
+# object (exit 0 on any Docker host), which let host-build CONTAINER=none runs
+# slip past the "no container" guard into a phantom log lookup (club-3090#1067).
+container_is_real() {
+  [[ -n "${CONTAINER}" && "${CONTAINER}" != "none" ]] \
+    && docker inspect --type container "${CONTAINER}" >/dev/null 2>&1
+}
+
+# Respect an inherited ENGINE_KIND (host builds behind a proxy that hides /props
+# and use CONTAINER=none can't be auto-detected — club-3090#1067).
+ENGINE_KIND="${ENGINE_KIND:-$(detect_engine)}"
 
 # ---- Thinking-control detection -----------------------------------------
 # WHICH chat_template_kwargs key controls reasoning is model-specific, and an
@@ -148,7 +184,14 @@ fi
 # would then fire instead. Scale both together. Every model with a detected
 # switch is unaffected: the multiplier is 1 and the timeouts are unchanged.
 TOK_SCALE=1
-[[ "$THINK_CONTROL" == none* ]] && TOK_SCALE="${VERIFY_TOK_SCALE:-64}"
+# Widen for BOTH "no switch at all" and "switch exists but has no OFF position".
+# The second case is a thinking-only model (GLM-5.3-Flash: the dial accepts only
+# low|high and every level still reasons). It used to fall through to TOK_SCALE=1
+# and got a 30-token budget against ~30 tokens of unavoidable reasoning, which
+# surfaces as "empty completion" and reads as a model fault rather than a budget.
+if [[ "$THINK_CONTROL" == none* || "${THINK_ALWAYS_ON:-0}" == "1" ]]; then
+  TOK_SCALE="${VERIFY_TOK_SCALE:-64}"
+fi
 MT_BASIC=$(( 30 * TOK_SCALE ))
 MT_STREAM=$(( 120 * TOK_SCALE ))
 if (( TOK_SCALE > 1 )); then
@@ -172,7 +215,7 @@ echo ""
 # 1. Server reachable
 # --------------------------------------------------------------------
 check_server() {
-  echo "[1/9] Server reachable on /v1/models ..."
+  echo "[1/10] Server reachable on /v1/models ..."
   if curl -sf -m 5 "${URL}/v1/models" >/dev/null 2>&1; then
     pass "server is serving"
   else
@@ -186,7 +229,7 @@ run_check "server" check_server
 # 2. Genesis patches applied
 # --------------------------------------------------------------------
 check_patches() {
-  echo "[2/9] Genesis patches applied ..."
+  echo "[2/10] Genesis patches applied ..."
   # Genesis is a vLLM-only patcher. Skip cleanly on other engines instead of
   # leaving the user wondering whether "no Genesis marker" means a real
   # problem or a category error.
@@ -199,7 +242,7 @@ check_patches() {
     skip "docker not in PATH (host engine build?)"
     return 0
   fi
-  if ! docker inspect "${CONTAINER}" >/dev/null 2>&1; then
+  if ! container_is_real; then
     skip "container '${CONTAINER}' not found (host engine build? CONTAINER=none for host endpoints)"
     return 0
   fi
@@ -235,11 +278,11 @@ run_check "patches" check_patches
 # Cold-start warmup (not a scored check)
 # --------------------------------------------------------------------
 # The first real inference after a multi-minute boot pays cudagraph/JIT
-# compile for that shape. Without this, [3/9] (a 30s-capped request) is the
+# compile for that shape. Without this, [3/10] (a 30s-capped request) is the
 # one that eats the cold start and false-fails while every later check passes
 # on the now-warm engine. Fire one discard-result request with a generous cap
 # so all *scored* checks reflect warm-engine behavior. Failure here is
-# non-fatal (a real outage still surfaces on [3/9]).
+# non-fatal (a real outage still surfaces on [3/10]).
 echo "[warmup] priming engine (cold cudagraph/JIT, up to 180s, not scored) ..."
 curl -sf -m 180 "${URL}/v1/chat/completions" \
   -H "Content-Type: application/json" \
@@ -249,13 +292,13 @@ curl -sf -m 180 "${URL}/v1/chat/completions" \
     \"max_tokens\": 1,
     \"temperature\": 0.0,
     ${THINK_OFF_STD}\"chat_template_kwargs\": ${THINK_OFF_KW}
-  }" >/dev/null 2>&1 && echo "[warmup] engine warm" || echo "[warmup] warmup request did not return in 180s — [3/9] will surface a real outage if present"
+  }" >/dev/null 2>&1 && echo "[warmup] engine warm" || echo "[warmup] warmup request did not return in 180s — [3/10] will surface a real outage if present"
 
 # --------------------------------------------------------------------
 # 3. Basic completion — Paris sanity
 # --------------------------------------------------------------------
 check_basic() {
-  echo "[3/9] Basic completion — capital of France ..."
+  echo "[3/10] Basic completion — capital of France ..."
   local resp
   resp="$(curl -sf -m ${TMO_BASIC} "${URL}/v1/chat/completions" \
     -H "Content-Type: application/json" \
@@ -281,7 +324,7 @@ run_check "basic" check_basic
 # 4. Tool calling
 # --------------------------------------------------------------------
 check_tools() {
-  echo "[4/9] Tool calling ..."
+  echo "[4/10] Tool calling ..."
   if [[ "${SKIP_TOOLS:-0}" == "1" ]]; then
     skip "SKIP_TOOLS=1 (expected for default config — see README Known issue)"
     return 0
@@ -328,7 +371,7 @@ run_check "tools" check_tools
 # 5. Streaming — SSE chunks add up to coherent text
 # --------------------------------------------------------------------
 check_streaming() {
-  echo "[5/9] Streaming (SSE) ..."
+  echo "[5/10] Streaming (SSE) ..."
   # Collect streamed chunks for 15 seconds max
   local stream_out
   stream_out="$(curl -sf -m ${TMO_STREAM} --no-buffer "${URL}/v1/chat/completions" \
@@ -390,7 +433,7 @@ run_check "streaming" check_streaming
 #    tool_choice=required + MTP is a known-open drop — vLLM#39598, see UPSTREAM.md.
 # --------------------------------------------------------------------
 check_streaming_tools() {
-  echo "[6/9] Streaming tool-calls (thinking-on) ..."
+  echo "[6/10] Streaming tool-calls (thinking-on) ..."
   if [[ "${SKIP_TOOLS:-0}" == "1" ]]; then
     skip "SKIP_TOOLS=1 (expected for default config — see README Known issue)"
     return 0
@@ -446,7 +489,7 @@ run_check "streaming_tools" check_streaming_tools
 # 6. Thinking mode — reasoning + content both populated
 # --------------------------------------------------------------------
 check_thinking() {
-  echo "[7/9] Thinking / reasoning mode ..."
+  echo "[7/10] Thinking / reasoning mode ..."
   local resp
   # enable_thinking: true (Qwen3 default). Math problem that needs visible reasoning.
   resp="$(curl -sf -m 120 "${URL}/v1/chat/completions" \
@@ -497,7 +540,7 @@ run_check "thinking" check_thinking
 #    and for repetitive degeneracy (stale-draft / sampling collapse).
 # --------------------------------------------------------------------
 check_output_quality() {
-  echo "[8/9] Output quality / cascade detection (2K-token completion) ..."
+  echo "[8/10] Output quality / cascade detection (2K-token completion) ..."
   local resp
   # ⚠️ Scaled, not fixed: a 2K-token generation on a CPU-OFFLOAD slug runs at
   # ~10-23 t/s, so it needs 200-400s — DeepSeek-V4-Flash measured 217s and the
@@ -517,7 +560,12 @@ check_output_quality() {
 import sys, json, re
 try:
     d = json.load(sys.stdin)
-    c = d['choices'][0]['message'].get('content') or ''
+    msg = d['choices'][0]['message']
+    c = msg.get('content') or ''
+    # Thinking models put the reasoning elsewhere; an empty content with a
+    # non-empty reasoning trace is a spent budget, not a dead generator.
+    r = msg.get('reasoning_content') or msg.get('reasoning') or ''
+    rlen = len(r)
     finish = d['choices'][0].get('finish_reason') or 'n/a'
     clen = len(c)
     cascade = 'tool_call_cascade' if '<tool_call>' in c else 'none'
@@ -534,14 +582,20 @@ try:
     words = re.findall(r\"[A-Za-z']+\", c.lower())
     sample = words[:200]
     variety = (len(set(sample)) / len(sample)) if sample else 0.0
-    print(f'{clen}|{cascade}|{max_repeat}|{variety:.3f}|{finish}')
+    print(f'{clen}|{cascade}|{max_repeat}|{variety:.3f}|{finish}|{rlen}')
 except Exception as e:
-    print(f'err|{e}|0|0|n/a')
+    print(f'err|{e}|0|0|n/a|0')
 " 2>/dev/null)"
 
-  IFS='|' read -r clen cascade max_repeat variety finish <<< "$analysis"
+  IFS='|' read -r clen cascade max_repeat variety finish rlen <<< "$analysis"
   if [[ "$clen" == "err" ]]; then
     fail "couldn't parse response: $cascade" "$(echo "$resp" | head -c 200)"
+  elif [[ "${clen:-0}" == "0" && "$finish" == "length" ]]; then
+    # finish=length means tokens WERE generated — they just never reached content.
+    # On a thinking model whose thinking switch is inert, the reasoning trace eats
+    # the whole budget. That is not a silent generation failure and must not be
+    # scored as one (see GLM-5.3-Flash: no per-request thinking switch takes effect).
+    skip "coherence INCONCLUSIVE — no content but ${rlen:-0} reasoning chars, finish=length (budget spent on reasoning; raise max_tokens or disable thinking)"
   elif [[ "${clen:-0}" == "0" ]]; then
     fail "empty completion (finish=${finish})" "Likely silent generation failure"
   elif [[ "$cascade" == "tool_call_cascade" ]]; then
@@ -566,7 +620,7 @@ run_check "output_quality" check_output_quality
 #     measured floor when a shallower drafter is independently throughput-positive.
 # --------------------------------------------------------------------
 check_mtp_acceptance() {
-  echo "[9/9] MTP acceptance length threshold ..."
+  echo "[9/10] MTP acceptance length threshold ..."
   # Spec-decode metrics extraction is engine-specific:
   #   vLLM emits "SpecDecoding metrics: Mean acceptance length: N.NN" to stdout
   #   llama.cpp llama-server doesn't emit a "Mean acceptance length" line; spec
@@ -585,7 +639,7 @@ check_mtp_acceptance() {
     skip "docker not in PATH (host engine build? — see #87 for generalized harness work)"
     return 0
   fi
-  if ! docker inspect "${CONTAINER}" >/dev/null 2>&1; then
+  if ! container_is_real; then
     skip "container '${CONTAINER}' not found (CONTAINER=none for host endpoints)"
     return 0
   fi
@@ -637,6 +691,107 @@ check_mtp_acceptance() {
 }
 run_check "mtp" check_mtp_acceptance
 
+# ── [10/10] Vision / multimodal ───────────────────────────────────────────────
+# Capability-PROBED, not inferred from compose/registry: a model configured for
+# vision that is not actually serving it is exactly the failure worth catching
+# (this check exists because a -mmdev default change could not be validated by
+# any existing gate). Scoring reuses the 4-fact ground truth already trusted on
+# this stack. Partial credit FAILS: 1-3/4 is the corruption signature.
+check_vision() {
+  echo "[10/10] Vision / multimodal (image ground truth) ..."
+  local asset="${VERIFY_VISION_ASSET:-${ROOT_DIR}/scripts/assets/vision-test.png}"
+  if [[ ! -f "$asset" ]]; then
+    skip "no vision asset at ${asset} (set VERIFY_VISION_ASSET=/path/to.png)"
+    return 0
+  fi
+
+  # Was vision INTENDED? Container-gated. Lets us turn a silent skip into a fail
+  # when an mmproj is loaded but the image path does not work.
+  local intended=0
+  if container_is_real && command -v docker >/dev/null 2>&1; then
+    if docker logs "${CONTAINER}" 2>&1 | grep -qiE "loaded multimodal model|clip_ctx:|mmproj"; then
+      intended=1
+    fi
+  fi
+
+  local b64
+  b64="$(python3 -c 'import base64,sys; sys.stdout.write(base64.b64encode(open(sys.argv[1],"rb").read()).decode())' "$asset" 2>/dev/null)"
+  if [[ -z "$b64" ]]; then skip "could not base64-encode ${asset}"; return 0; fi
+
+  local resp
+  resp="$(curl -s -m "${VERIFY_LONG_TIMEOUT:-180}" "${URL}/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d "{
+      \"model\": \"${MODEL}\",
+      \"max_tokens\": 400,
+      \"temperature\": 0.0,
+      \"messages\": [{\"role\": \"user\", \"content\": [
+        {\"type\": \"text\", \"text\": \"List every shape in this image with its colour, and read any number shown. Be literal and brief.\"},
+        {\"type\": \"image_url\", \"image_url\": {\"url\": \"data:image/png;base64,${b64}\"}}]}]
+    }" 2>/dev/null)"
+
+  local verdict
+  verdict="$(printf '%s' "$resp" | python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print("ERR|unparseable response"); raise SystemExit
+if isinstance(d, dict) and d.get("error"):
+    msg = json.dumps(d["error"])[:200]
+    print("NOVISION|" + msg); raise SystemExit
+try:
+    c = (d.get("choices", [{}])[0].get("message", {}) or {}).get("content") or ""
+except Exception:
+    c = ""
+if not c.strip():
+    print("ERR|empty content"); raise SystemExit
+t = c.lower()
+facts = {
+    "red circle":     ("red" in t and ("circle" in t or "ellipse" in t)),
+    "blue square":    ("blue" in t and ("square" in t or "rectangle" in t)),
+    "green triangle": ("green" in t and "triangle" in t),
+    "47":             ("47" in t),
+}
+missed = [k for k, v in facts.items() if not v]
+print("SCORE|%d|%s" % (sum(facts.values()), ",".join(missed) if missed else "-"))
+' 2>/dev/null)"
+
+  local kind="${verdict%%|*}"
+  local rest="${verdict#*|}"
+  case "$kind" in
+    NOVISION)
+      if [[ "$intended" == "1" ]]; then
+        fail "server rejected an image request but an mmproj IS loaded: ${rest}" \
+             "Vision is configured but not serving. Check -mmdev / --mmproj and the clip_ctx line."
+        return 1
+      fi
+      skip "endpoint is not multimodal (${rest})"
+      return 0 ;;
+    SCORE)
+      local score="${rest%%|*}" missed="${rest#*|}"
+      if [[ "$score" == "4" ]]; then
+        pass "vision 4/4 on ground truth"
+        return 0
+      fi
+      if [[ "$score" == "0" && "$intended" == "0" ]]; then
+        skip "0/4 and no mmproj detected — endpoint likely text-only"
+        return 0
+      fi
+      fail "vision ${score}/4 — missed: ${missed}" \
+           "Partial vision indicates a broken projector or wrong mmproj for this model."
+      return 1 ;;
+    *)
+      if [[ "$intended" == "1" ]]; then
+        fail "vision request failed (${rest}) while an mmproj is loaded" "Check server logs."
+        return 1
+      fi
+      skip "vision probe inconclusive (${rest})"
+      return 0 ;;
+  esac
+}
+run_check "vision" check_vision
+
 echo ""
 if [[ "$FAILED" == "0" ]]; then
   printf "\033[32mAll checks passed.\033[0m Stack is ready for full-functionality use.\n"
@@ -652,6 +807,19 @@ if [[ "$RUN_BENCH" == "1" && "$FAILED" == "0" ]]; then
   SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
   URL="${URL}" MODEL="${MODEL}" CONTAINER="${CONTAINER}" \
     bash "${SCRIPT_DIR}/bench.sh"
+fi
+
+# --- per-rig #249 record: a functional (smoke) record, no TPS -----------------
+# verify-full is the functional check — it maps cleanly onto smoke_status.
+# resolve-serving maps the served container -> registry slug + auto-detects the
+# fingerprint; an unmatched / bare-metal run skips cleanly. VERIFY_FULL_RECORD=0
+# skips. Never fails the check (|| true).
+if [[ "${VERIFY_FULL_RECORD:-1}" == "1" ]] && command -v python3 >/dev/null 2>&1; then
+  _vf_status="pass"; [[ "$FAILED" == "0" ]] || _vf_status="fail"
+  _vf_ext="$(python3 -c 'import json,sys; print(json.dumps({"failed_checks": int(sys.argv[1])}))' "$FAILED" 2>/dev/null || echo '{}')"
+  python3 "${ROOT_DIR}/scripts/lib/profiles/measurement_record.py" \
+    --resolve-serving --serving-url "$URL" --bench-output /dev/null --result-class verify-only \
+    --smoke-status "$_vf_status" --extension "verify=${_vf_ext}" >/dev/null 2>&1 || true
 fi
 
 exit "$FAILED"

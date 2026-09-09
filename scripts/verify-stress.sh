@@ -46,9 +46,16 @@
 #
 # Usage:
 #   CONTAINER=<your-container> bash scripts/verify-stress.sh
+#   CONTAINER=<your-container> bash scripts/verify-stress.sh --save-json results/stress-curve.json
+#
+# --save-json <path> (#1017): persist the prefill-vs-depth curve — one record
+#   per NIAH rung (depth, recall ✓/✗, prefill t/s, cache-hit delta) — so a
+#   ~45-min run's most reusable output stops evaporating with stdout.
+#   Finalized on EXIT: completed rungs survive even a mid-ladder crash.
 #
 # Env (optional):
-#   URL                    Default: http://localhost:8020
+#   URL                    Default: registry-derived for qwen3.6-27b (curated
+#                          DEFAULTS walk; currently :8020)
 #   MODEL                  Default: auto-detected from /v1/models, else
 #                          qwen3.6-27b
 #   CONTAINER              Default: vllm-qwen36-27b
@@ -101,15 +108,255 @@ export PYTHONUTF8="${PYTHONUTF8:-1}"
 
 set -euo pipefail
 
+# --- CLI (#1017) ------------------------------------------------------------
+# --save-json <path>: persist the full prefill-vs-depth curve (see Usage).
+# The script previously took no arguments; anything else is a hard error so a
+# typo can't silently launch a 45-minute probe set with the wrong intent.
+SAVE_JSON=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --save-json)
+      [[ $# -ge 2 ]] || { echo "verify-stress: --save-json requires a path argument" >&2; exit 2; }
+      SAVE_JSON="$2"; shift 2 ;;
+    --save-json=*)
+      SAVE_JSON="${1#*=}"; shift ;;
+    *)
+      echo "verify-stress: unknown argument '$1' (supported: --save-json <path>)" >&2
+      exit 2 ;;
+  esac
+done
+
+# --------------------------------------------------------------------
+# NIAH haystack builder — shared by probe 1 (small rungs), probe 7 (large
+# rungs, via check_longctx) and probe 8 (ceiling ladder).
+#
+# Usage: build_niah_payload <filler_scale> <secret_file> <req_file>
+#
+# The head of EVERY haystack is salted with SESSION-<32 random
+# alphanumerics>. (#1017). Before the salt, each rung's filler_before was
+# block × half, so a deeper rung's opening was byte-identical to a shallower
+# rung's ENTIRE prefix and vLLM's prefix cache served it from RAM — inflating
+# reported prefill t/s by up to ~37% (measured: 1614 contaminated vs 1023
+# cache-clean t/s, club-3090#1017) and growing the error with rung index.
+# Recall is unaffected either way; the salt cleans the MEASUREMENT.
+# --------------------------------------------------------------------
+build_niah_payload() {
+  local _scale="$1" _secret_file="$2" _req_file="$3"
+  MODEL_VAR="${MODEL}" SECRET_FILE="${_secret_file}" REQ_FILE="${_req_file}" \
+    FILLER_SCALE="${_scale}" python3 - <<'EOF'
+import json, os, random, string
+random.seed(None)
+model = os.environ['MODEL_VAR']
+scale = int(os.environ['FILLER_SCALE'])
+animals = ["otter", "falcon", "platypus", "iguana", "narwhal", "chinchilla", "capybara", "axolotl"]
+colors = ["crimson", "turquoise", "amber", "violet", "emerald", "sapphire", "silver", "golden"]
+animal = random.choice(animals)
+color = random.choice(colors)
+num = random.randint(10, 99)
+secret = f"{color} {animal} {num}"
+salt = ''.join(random.choices(string.ascii_lowercase + string.digits, k=32))
+block = (
+    "This section describes the history of computing in detail. "
+    "Transistors were invented in 1947 at Bell Labs. The integrated circuit came a decade later. "
+    "Microprocessors emerged in the 1970s and changed the world. "
+    "Personal computing followed, then networking, then the web, then cloud and AI. "
+)
+half = scale // 2
+filler_before = block * half
+filler_after  = block * (scale - half)
+content = (
+    f"SESSION-{salt}.\n\n"
+    + filler_before
+    + f"\n\nIMPORTANT MEMORY: The hidden phrase is '{secret}'. Remember this exactly.\n\n"
+    + filler_after
+    + f"\n\nQuestion: In the middle of the document above I wrote 'The hidden phrase is ___'. What was the hidden phrase? Reply with only the phrase, no other text."
+)
+req = {
+    "model": model,
+    "messages": [{"role": "user", "content": content}],
+    # A thinking-only model spends part of every budget reasoning before it can
+    # answer (GLM-5.3-Flash: ~30 tokens even at its lowest level), so a flat 30
+    # leaves nothing for the phrase and the needle reads as a recall miss.
+    # preflight sets NEEDLE_MAX_TOKENS from THINK_ALWAYS_ON.
+    "max_tokens": int(os.environ.get("NEEDLE_MAX_TOKENS") or 30),
+    "temperature": 0.0,
+    **json.loads(os.environ.get("THINK_FRAG_OFF") or '{"chat_template_kwargs": {"enable_thinking": false}}'),
+    }
+with open(os.environ['SECRET_FILE'], 'w') as f:
+    f.write(secret)
+with open(os.environ['REQ_FILE'], 'w') as f:
+    json.dump(req, f)
+EOF
+}
+
+# --------------------------------------------------------------------
+# Prefix-cache-hit guard (#1017 — same probe-validity discipline as #710:
+# assert on vllm:prefix_cache_hits_total, never on the flag). Captured
+# before/after each prefill-measured rung; if the counter INCREASED during
+# the rung, part of that prompt was served from the prefix cache and the
+# rung's prefill t/s is inflated — the rung line gets a loud annotation
+# instead of presenting a clean measurement.
+#
+# vLLM-only: llama.cpp / SGLang expose no such metric → returns empty and
+# the guard degrades to a no-op. It never blocks or fails a run.
+# --------------------------------------------------------------------
+get_prefix_cache_hits() {
+  curl -sf -m 5 "${URL}/metrics" 2>/dev/null \
+    | awk '$1 ~ /^vllm:prefix_cache_hits_total/ {v=$NF} END {print v}'
+}
+
+# Compare before/after hit counters. Prints "<delta> <contaminated>" where
+# contaminated=1 means hits increased → that rung's prefill number is
+# cache-inflated. Empty / non-numeric counters (metric unavailable) → "0 0".
+cache_hit_delta() {
+  local _before="$1" _after="$2"
+  local _b="${_before%%.*}" _a="${_after%%.*}"
+  if ! [[ "${_b}" =~ ^[0-9]+$ && "${_a}" =~ ^[0-9]+$ ]]; then
+    printf '0 0\n'
+    return 0
+  fi
+  printf '%d %d\n' "$(( _a - _b ))" "$(( _a > _b ? 1 : 0 ))"
+}
+
+# --------------------------------------------------------------------
+# --save-json plumbing (#1017). Each prefill-measured rung appends one JSON
+# line to a scratch JSONL; finalize_save_json (EXIT trap) folds the lines
+# into the final document. Per-rung appends + fold-on-EXIT mean completed
+# rungs survive even if the run dies mid-ladder.
+# --------------------------------------------------------------------
+_VS_JSONL=""
+if [[ -n "${SAVE_JSON}" ]]; then
+  _VS_JSONL="$(mktemp --suffix=.jsonl)"
+fi
+# Rungs where the cache-hit guard fired ("probe:rung-id" entries), for the
+# end-of-run report naming exactly which prefill numbers are inflated.
+CACHE_CONTAMINATED_LIST=""
+
+record_rung() {
+  # record_rung <probe> <rung_id> <target_tokens> <http_code> <outcome>
+  #             <prompt_tokens> <prefill_tps> <prefill_ms>
+  #             <cache_hit_delta> <cache_contaminated>
+  # outcome: recalled | recall_miss | skipped | failed
+  [[ -n "${_VS_JSONL}" ]] || return 0
+  VS_PROBE="$1" VS_RUNG="$2" VS_TARGET="$3" VS_HTTP="$4" VS_OUTCOME="$5" \
+  VS_DEPTH="$6" VS_TPS="$7" VS_MS="$8" VS_CDELTA="$9" VS_CDIRTY="${10}" \
+  python3 - <<'PY' >> "${_VS_JSONL}"
+import json, os
+
+def _int(k):
+    v = os.environ.get(k, "").strip()
+    try:
+        return int(float(v)) if v else None
+    except ValueError:
+        return None
+
+def _num(k):
+    v = os.environ.get(k, "").strip()
+    try:
+        return float(v) if v else None
+    except ValueError:
+        return None
+
+outcome = os.environ["VS_OUTCOME"]
+rec = {
+    "probe": os.environ["VS_PROBE"],
+    "rung": os.environ["VS_RUNG"],
+    "target_tokens": _int("VS_TARGET"),
+    "http_code": _int("VS_HTTP"),
+    "outcome": outcome,
+    "recall_ok": outcome == "recalled",
+    "depth_tokens": _int("VS_DEPTH"),
+    "prefill_tps": _num("VS_TPS"),
+    "prefill_ms": _num("VS_MS"),
+    "cache_hit_delta": _int("VS_CDELTA"),
+    "cache_clean": os.environ["VS_CDIRTY"] != "1",
+    }
+print(json.dumps(rec, separators=(",", ":")))
+PY
+}
+
+finalize_save_json() {
+  [[ -n "${SAVE_JSON}" && -n "${_VS_JSONL}" ]] || return 0
+  mkdir -p -- "$(dirname -- "${SAVE_JSON}")" 2>/dev/null || true
+  VS_JSONL="${_VS_JSONL}" VS_OUT="${SAVE_JSON}" \
+  VS_MODEL="${MODEL:-}" VS_URL="${URL:-}" VS_ENGINE="${ENGINE_KIND:-}" VS_CONTAINER="${CONTAINER:-}" \
+  python3 - <<'PY'
+import datetime, json, os
+
+rungs = []
+with open(os.environ["VS_JSONL"], encoding="utf-8") as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rungs.append(json.loads(line))
+        except json.JSONDecodeError:
+            pass
+
+# Per #1017 comment 2: the ladder is a ceiling/ADDRESSABILITY check on a
+# salted uniform haystack — NOT a recall benchmark. Never quote beside
+# published NIAH/RULER scores.
+dirty = [f'{r["probe"]}:rung-{r["rung"]}' for r in rungs if not r["cache_clean"]]
+doc = {
+    "schema": "verify-stress-curve/1",
+    "kind": "ceiling-addressability-check",
+    "label": "ceiling/addressability check (salted uniform haystack) — not a recall benchmark (#1017)",
+    "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    "model": os.environ.get("VS_MODEL", ""),
+    "url": os.environ.get("VS_URL", ""),
+    "engine": os.environ.get("VS_ENGINE", ""),
+    "container": os.environ.get("VS_CONTAINER", ""),
+    "prefix_cache_guard": {
+        "metric": "vllm:prefix_cache_hits_total",
+        "contaminated_rungs": dirty,
+    },
+    "rungs": rungs,
+    }
+with open(os.environ["VS_OUT"], "w", encoding="utf-8") as f:
+    json.dump(doc, f, indent=2)
+    f.write("\n")
+PY
+  local _n
+  _n="$(wc -l < "${_VS_JSONL}")"
+  rm -f "${_VS_JSONL}"
+  echo "  prefill-vs-depth curve (${_n} rungs) saved: ${SAVE_JSON}"
+}
+trap finalize_save_json EXIT
+
+# --------------------------------------------------------------------
+
 # Auto-detect running container + port (URL/CONTAINER env vars still win).
 # See scripts/preflight.sh::preflight_autodetect_endpoint.
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# --- per-rig #249 record: self-tee stdout so the ceiling-ladder line (the ctx
+# ceiling this stress run validates) can be parsed at the end for the corpus
+# record. VERIFY_STRESS_RECORD=0 skips. An unmatched / bare-metal run skips the
+# emit cleanly. Failure here never fails the stress run.
+VERIFY_STRESS_RECORD="${VERIFY_STRESS_RECORD:-1}"
+_VS_REC_LOG=""
+if [[ "${VERIFY_STRESS_RECORD}" == "1" ]] && command -v python3 >/dev/null 2>&1; then
+  _VS_REC_LOG="$(mktemp 2>/dev/null || echo "/tmp/verify-stress-rec.$$.log")"
+  exec > >(tee -a "${_VS_REC_LOG}")
+fi
+
 if [[ -f "${ROOT_DIR}/scripts/preflight.sh" ]]; then
   # shellcheck source=preflight.sh
   source "${ROOT_DIR}/scripts/preflight.sh"
   preflight_autodetect_endpoint
 fi
-URL="${URL:-http://localhost:8020}"
+# Default endpoint follows the registry's curated DEFAULTS walk for qwen3.6-27b
+# instead of a hand-maintained :8020/:8010 literal that drifts from the catalog.
+# The trailing literal is only a last resort when the registry can't be consulted.
+_DEFAULT_ENDPOINT_PORT=""
+if [[ -f "${ROOT_DIR}/scripts/lib/registry-lookup.sh" ]]; then
+  # shellcheck source=lib/registry-lookup.sh
+  source "${ROOT_DIR}/scripts/lib/registry-lookup.sh"
+  REGISTRY_LOOKUP_ROOT="${ROOT_DIR}"
+  _DEFAULT_ENDPOINT_PORT="$(registry_lookup_default_port qwen3.6-27b 2>/dev/null || true)"
+fi
+URL="${URL:-http://localhost:${_DEFAULT_ENDPOINT_PORT:-8020}}"
 # Resolve the served model from /v1/models when MODEL is unset (#372). The qwen
 # literal below is only a last resort if detection no-ops (endpoint unreachable).
 declare -F preflight_autodetect_model >/dev/null && preflight_autodetect_model
@@ -122,12 +369,39 @@ MODEL="${MODEL:-qwen3.6-27b}"
 # failures. See preflight.sh::preflight_detect_thinking_control. THINK_FRAG_*
 # is the complete request fragment, splatted by the python blocks below.
 if declare -F preflight_detect_thinking_control >/dev/null; then
+  # Opt in to the effort-ladder probe. Without it the detector stops at the
+  # template SCAN, which only proves a key is NAMED — and for the GLM-5.3 family
+  # the scan's default off-value `reasoning_effort: "none"` is not a valid level.
+  # The template accepts only low|high and coerces everything else to MAX, so the
+  # "thinking off" request was the strongest possible thinking request: the model
+  # spent the whole budget reasoning, returned empty content, and every needle in
+  # the ladder above read as a recall failure (#1128, #1129). The ladder probe
+  # walks minimal|low|medium and finds a level that actually yields content.
+  # Same reasoning as verify-full.sh: this is a functional check, and one extra
+  # request is cheap next to a ladder that can run for 400s per rung.
+  THINK_PROBE=1
   preflight_detect_thinking_control
 else
   THINK_FRAG_OFF='{"chat_template_kwargs": {"enable_thinking": false}}'
   THINK_FRAG_ON='{"chat_template_kwargs": {"enable_thinking": true}}'
 fi
+# Needle replies are a short phrase, so 30 tokens is right for a model that can
+# actually stop thinking. One that cannot needs room for the reasoning first.
+NEEDLE_MAX_TOKENS=30
+[[ "${THINK_ALWAYS_ON:-0}" == "1" ]] && NEEDLE_MAX_TOKENS="${VERIFY_NEEDLE_MAX_TOKENS:-512}"
+export NEEDLE_MAX_TOKENS
 export THINK_FRAG_OFF THINK_FRAG_ON
+if [[ -z "${CONTAINER:-}" && -f "${ROOT_DIR}/scripts/lib/registry-lookup.sh" ]]; then
+  # The old literal default 'vllm-qwen36-27b' matches NO registry container, so
+  # the EAGER-mode docker inspect below silently no-op'd on an undetected
+  # endpoint. Default to the MODEL's curated-default slug container instead
+  # (qwen3.6-27b → vllm/minimal → vllm-qwen36-27b-minimal); the dead literal
+  # stays only as a last-resort fallback when the registry can't be consulted.
+  # shellcheck source=lib/registry-lookup.sh
+  source "${ROOT_DIR}/scripts/lib/registry-lookup.sh"
+  REGISTRY_LOOKUP_ROOT="${ROOT_DIR}"
+  CONTAINER="$(registry_lookup_default_container "$MODEL" 2>/dev/null || true)"
+fi
 CONTAINER="${CONTAINER:-vllm-qwen36-27b}"
 
 # Detect VLLM_ENFORCE_EAGER=1 in the running container's env. Eager-mode
@@ -152,12 +426,34 @@ fi
 
 pass() { printf "  \033[32m✓\033[0m %s\n" "$1"; }
 fail() { printf "  \033[31m✗\033[0m %s\n" "$1"; printf "    \033[33m→\033[0m %s\n" "$2"; return 1; }
-skip() { printf "  \033[33m⊘\033[0m %s (skipped)\n" "$1"; }
+_SKIPPED=0
+skip() { printf "  \033[33m⊘\033[0m %s (skipped)\n" "$1"; _SKIPPED=1; }
 
 FAILED=0
+# The summary is split into two verdicts because this script answers two
+# DIFFERENT questions and they carry different weight (#1017):
+#   BOUNDARY — does the deployed config survive its edges (tool-prefill OOM,
+#              agent shapes, reasoning-heavy, VRAM ceiling)? Unambiguous.
+#   RECALL   — does the needle come back at depth? Real, but measured against a
+#              haystack built from ONE repeated block (~0.03% unique content at
+#              380K), so it establishes ADDRESSABILITY, not retrieval quality,
+#              and must not be quoted next to published NIAH/RULER scores.
+# One green line for both let a uniform-haystack pass read as "recall validated".
+_RECALL_CHECKS=" longctx longctx_large ceiling_ladder "
+RECALL_RUN=0;   RECALL_FAIL=0
+BOUND_RUN=0;    BOUND_FAIL=0
 run_check() {
   local label="$1"; shift
-  if "$@"; then :; else FAILED=$((FAILED + 1)); fi
+  local rc=0
+  _SKIPPED=0
+  if "$@"; then :; else rc=1; FAILED=$((FAILED + 1)); fi
+  if [[ "$_SKIPPED" == "1" ]]; then return 0; fi   # skipped checks count in neither bucket
+  if [[ "$_RECALL_CHECKS" == *" $label "* ]]; then
+    RECALL_RUN=$((RECALL_RUN + 1)); [[ "$rc" == "1" ]] && RECALL_FAIL=$((RECALL_FAIL + 1))
+  else
+    BOUND_RUN=$((BOUND_RUN + 1));  [[ "$rc" == "1" ]] && BOUND_FAIL=$((BOUND_FAIL + 1))
+  fi
+  return 0
 }
 
 # ---- Engine detection (parallel to verify-full.sh::detect_engine, see #87) ---
@@ -321,6 +617,7 @@ PYEOF
 echo "Running STRESS / boundary test against ${URL}"
 echo "  model=${MODEL}  container=${CONTAINER}  engine=${ENGINE_KIND}"
 echo "  This script does the heavy stuff (longctx needle ladder + ~25K-token tool prefill)."
+echo "  NIAH rungs are a CEILING/ADDRESSABILITY check (salted uniform haystack), not a recall benchmark (#1017)."
 echo "  For the fast functional smoke (~2 min), use verify-full.sh instead."
 echo ""
 
@@ -364,59 +661,30 @@ check_longctx() {
     local secret_file req_file
     secret_file="$(mktemp --suffix=.secret)"
     req_file="$(mktemp --suffix=.json)"
-    MODEL_VAR="${MODEL}" SECRET_FILE="${secret_file}" REQ_FILE="${req_file}" \
-      FILLER_SCALE="${filler_scale}" python3 - <<'EOF'
-import json, os, random
-random.seed(None)
-model = os.environ['MODEL_VAR']
-scale = int(os.environ['FILLER_SCALE'])
-animals = ["otter", "falcon", "platypus", "iguana", "narwhal", "chinchilla", "capybara", "axolotl"]
-colors = ["crimson", "turquoise", "amber", "violet", "emerald", "sapphire", "silver", "golden"]
-animal = random.choice(animals)
-color = random.choice(colors)
-num = random.randint(10, 99)
-secret = f"{color} {animal} {num}"
-block = (
-    "This section describes the history of computing in detail. "
-    "Transistors were invented in 1947 at Bell Labs. The integrated circuit came a decade later. "
-    "Microprocessors emerged in the 1970s and changed the world. "
-    "Personal computing followed, then networking, then the web, then cloud and AI. "
-)
-half = scale // 2
-filler_before = block * half
-filler_after  = block * (scale - half)
-content = (
-    filler_before
-    + f"\n\nIMPORTANT MEMORY: The hidden phrase is '{secret}'. Remember this exactly.\n\n"
-    + filler_after
-    + f"\n\nQuestion: In the middle of the document above I wrote 'The hidden phrase is ___'. What was the hidden phrase? Reply with only the phrase, no other text."
-)
-req = {
-    "model": model,
-    "messages": [{"role": "user", "content": content}],
-    "max_tokens": 30,
-    "temperature": 0.0,
-    **json.loads(os.environ.get("THINK_FRAG_OFF") or '{"chat_template_kwargs": {"enable_thinking": false}}'),
-}
-with open(os.environ['SECRET_FILE'], 'w') as f:
-    f.write(secret)
-with open(os.environ['REQ_FILE'], 'w') as f:
-    json.dump(req, f)
-EOF
+    build_niah_payload "$filler_scale" "$secret_file" "$req_file"
     local secret
     secret="$(cat "$secret_file")"
     local result_file http_code
     result_file="$(mktemp --suffix=.json)"
+    # Prefix-cache-hit guard (#1017): capture vllm:prefix_cache_hits_total
+    # before/after the rung — same discipline as #710. An increase means the
+    # rung was partly served from cache and its prefill number is inflated.
+    local hits_before hits_after hit_delta cache_dirty
+    hits_before="$(get_prefix_cache_hits)"
     send_streaming_niah "$req_file" "$result_file" "$URL" "$STRESS_LONGCTX_TIMEOUT_S"
+    hits_after="$(get_prefix_cache_hits)"
     rm -f "$secret_file" "$req_file"
+    read -r hit_delta cache_dirty <<< "$(cache_hit_delta "$hits_before" "$hits_after")"
     http_code="$(python3 -c "import json; print(json.load(open('$result_file'))['http_code'])" 2>/dev/null || echo 0)"
     if [[ "$http_code" == "400" ]]; then
       printf "    \033[33m⊘\033[0m scale=%d: HTTP 400 (exceeds --max-model-len, expected — clean rejection)\n" "$filler_scale"
+      record_rung "longctx" "scale-${filler_scale}" "" "400" "skipped" "" "" "" "$hit_delta" "$cache_dirty"
       rm -f "$result_file"
       any_skipped=1
       continue
     elif [[ "$http_code" != "200" ]]; then
       printf "    \033[31m✗\033[0m scale=%d: HTTP %s (request failed)\n" "$filler_scale" "$http_code"
+      record_rung "longctx" "scale-${filler_scale}" "" "$http_code" "failed" "" "" "" "$hit_delta" "$cache_dirty"
       rm -f "$result_file"
       any_fail=1
       continue
@@ -438,10 +706,22 @@ EOF
         fi
       fi
     fi
+    # Cache-hit guard annotation (#1017): a rung whose hit counter rose was
+    # partly served from the prefix cache — flag its prefill number loudly.
+    local cache_note=""
+    if [[ "${cache_dirty:-0}" == "1" ]]; then
+      printf -v cache_note '  \033[33m⚠ CACHE-HIT +%s during rung — prefill inflated, NOT cache-clean (#1017)\033[0m' "$hit_delta"
+      CACHE_CONTAMINATED_LIST+="longctx:scale-${filler_scale} "
+    fi
+    prefill_str="${prefill_str}${cache_note}"
     local all_match=1
     for tok in $secret; do
       echo "$content_raw" | grep -qiF "$tok" || all_match=0
     done
+    local outcome="recalled"
+    [[ "$all_match" == "1" ]] || outcome="recall_miss"
+    record_rung "longctx" "scale-${filler_scale}" "" "200" "$outcome" \
+      "$prompt_tok" "$prefill_tps" "$prefill_ms" "$hit_delta" "$cache_dirty"
     if [[ "$all_match" == "1" ]]; then
       printf "    \033[32m✓\033[0m %6s tokens: recalled '%s' (got: %s)%s\n" "$prompt_tok" "$secret" "$(echo "$content_raw" | head -c 60 | tr '\n' ' ')" "$prefill_str"
       any_pass=1
@@ -1284,6 +1564,10 @@ with open('${cal_req}', 'w') as f:
 
   # Step 3: run each rung
   local any_pass=0 any_fail=0 any_skipped=0 any_recall_miss=0 any_sizing_error=0
+  # A recall miss with EMPTY content is not a quality result — the model returned
+  # nothing to score (thinking models can spend the whole budget on reasoning).
+  # Tracked separately so it is never reported as an attention-quality ceiling.
+  local any_recall_empty=0
   local last_pass_tokens=0 last_pass_pct=0
   local first_fail_tokens=0 first_recall_miss_tokens=0 first_recall_miss_pct=0
   local vram_before_all vram_after_all
@@ -1304,53 +1588,22 @@ with open('${cal_req}', 'w') as f:
     secret_file="$(mktemp --suffix=.secret)"
     req_file="$(mktemp --suffix=.json)"
 
-    MODEL_VAR="${MODEL}" SECRET_FILE="${secret_file}" REQ_FILE="${req_file}" \
-      FILLER_SCALE="${filler_scale}" python3 - <<'EOF'
-import json, os, random
-random.seed(None)
-model = os.environ['MODEL_VAR']
-scale = int(os.environ['FILLER_SCALE'])
-animals = ["otter", "falcon", "platypus", "iguana", "narwhal", "chinchilla", "capybara", "axolotl"]
-colors = ["crimson", "turquoise", "amber", "violet", "emerald", "sapphire", "silver", "golden"]
-animal = random.choice(animals)
-color = random.choice(colors)
-num = random.randint(10, 99)
-secret = f"{color} {animal} {num}"
-block = (
-    "This section describes the history of computing in detail. "
-    "Transistors were invented in 1947 at Bell Labs. The integrated circuit came a decade later. "
-    "Microprocessors emerged in the 1970s and changed the world. "
-    "Personal computing followed, then networking, then the web, then cloud and AI. "
-)
-half = scale // 2
-filler_before = block * half
-filler_after  = block * (scale - half)
-content = (
-    filler_before
-    + f"\n\nIMPORTANT MEMORY: The hidden phrase is '{secret}'. Remember this exactly.\n\n"
-    + filler_after
-    + f"\n\nQuestion: In the middle of the document above I wrote 'The hidden phrase is ___'. What was the hidden phrase? Reply with only the phrase, no other text."
-)
-req = {
-    "model": model,
-    "messages": [{"role": "user", "content": content}],
-    "max_tokens": 30,
-    "temperature": 0.0,
-    **json.loads(os.environ.get("THINK_FRAG_OFF") or '{"chat_template_kwargs": {"enable_thinking": false}}'),
-}
-with open(os.environ['SECRET_FILE'], 'w') as f:
-    f.write(secret)
-with open(os.environ['REQ_FILE'], 'w') as f:
-    json.dump(req, f)
-EOF
+    build_niah_payload "$filler_scale" "$secret_file" "$req_file"
 
     local secret
     secret="$(cat "$secret_file")"
 
     local result_file
     result_file="$(mktemp --suffix=.json)"
+    # Prefix-cache-hit guard (#1017): capture vllm:prefix_cache_hits_total
+    # before/after the rung — same discipline as #710. An increase means the
+    # rung was partly served from cache and its prefill number is inflated.
+    local hits_before hits_after hit_delta cache_dirty
+    hits_before="$(get_prefix_cache_hits)"
     send_streaming_niah "$req_file" "$result_file" "$URL" "$rung_timeout"
+    hits_after="$(get_prefix_cache_hits)"
     rm -f "$secret_file" "$req_file"
+    read -r hit_delta cache_dirty <<< "$(cache_hit_delta "$hits_before" "$hits_after")"
 
     http_code="$(python3 -c "import json; print(json.load(open('$result_file'))['http_code'])" 2>/dev/null || echo 0)"
 
@@ -1377,6 +1630,14 @@ EOF
         fi
       fi
     fi
+    # Cache-hit guard annotation (#1017): a rung whose hit counter rose was
+    # partly served from the prefix cache — flag its prefill number loudly.
+    local cache_note=""
+    if [[ "${cache_dirty:-0}" == "1" ]]; then
+      printf -v cache_note '  \033[33m⚠ CACHE-HIT +%s during rung — prefill inflated, NOT cache-clean (#1017)\033[0m' "$hit_delta"
+      CACHE_CONTAMINATED_LIST+="ceiling_ladder:rung-${rung_idx} "
+    fi
+    prefill_str="${prefill_str}${cache_note}"
 
     # Evaluate
     case "$http_code" in
@@ -1391,6 +1652,19 @@ EOF
         done
         local pct=0
         [[ "$prompt_tok" -gt 0 && "$n_ctx" -gt 0 ]] && pct=$(( prompt_tok * 100 / n_ctx ))
+        local outcome="recalled" recall_empty=0 miss_label="quality ceiling reached"
+        if [[ "$all_match" != "1" ]]; then
+          outcome="recall_miss"
+          # Whitespace-only content = the model produced no answer at all. That is
+          # NOT an attention-quality ceiling (it shows up even at trivial depth) —
+          # classify it INCONCLUSIVE and say so.
+          if [[ -z "$(printf '%s' "$content_raw" | tr -d '[:space:]')" ]]; then
+            outcome="recall_empty"; recall_empty=1
+            miss_label="no content returned — INCONCLUSIVE, recall not scorable"
+          fi
+        fi
+        record_rung "ceiling_ladder" "${rung_idx}" "${target_tokens}" "200" "$outcome" \
+          "$prompt_tok" "$prefill_tps" "$prefill_ms" "$hit_delta" "$cache_dirty"
         if [[ "$all_match" == "1" ]]; then
           printf "    \033[32m✓\033[0m rung %d/%d: target=%dK  actual=%dK tok (%d%%)  recalled '%s'%s%s\n" \
             "$rung_idx" "$rung_count" "$((target_tokens / 1000))" "$((prompt_tok / 1000))" "$pct" "$secret" "$prefill_str" "$vram_str"
@@ -1403,10 +1677,11 @@ EOF
           # Log it, break out of the ladder, and pass the probe so the
           # pipeline moves to the next stage without wasting time on
           # unreliable depths.
-          printf "    \033[33m△\033[0m rung %d/%d: target=%dK  actual=%dK tok (%d%%)  recall MISS (got: '%s') — quality ceiling reached%s%s\n" \
+          printf "    \033[33m△\033[0m rung %d/%d: target=%dK  actual=%dK tok (%d%%)  recall MISS (got: '%s') — %s%s%s\n" \
             "$rung_idx" "$rung_count" "$((target_tokens / 1000))" "$((prompt_tok / 1000))" "$pct" \
-            "$(echo "$content_raw" | head -c 60 | tr '\n' ' ')" "$prefill_str" "$vram_str"
+            "$(echo "$content_raw" | head -c 60 | tr '\n' ' ')" "$miss_label" "$prefill_str" "$vram_str"
           any_recall_miss=1
+          [[ "$recall_empty" == "1" ]] && any_recall_empty=1
           if [[ "$first_recall_miss_tokens" -eq 0 ]]; then
             first_recall_miss_tokens="$prompt_tok"
             first_recall_miss_pct="$pct"
@@ -1422,6 +1697,8 @@ EOF
         if [[ "$target_tokens" -lt "$n_ctx" ]]; then
           printf "    \033[31m✗\033[0m rung %d/%d: target=%dK < n_ctx=%d but HTTP 400 — filler sizing overshot%s\n" \
             "$rung_idx" "$rung_count" "$((target_tokens / 1000))" "$n_ctx" "$vram_str"
+          record_rung "ceiling_ladder" "${rung_idx}" "${target_tokens}" "400" "failed" \
+            "" "$prefill_tps" "$prefill_ms" "$hit_delta" "$cache_dirty"
           rm -f "$result_file"
           any_sizing_error=1
           any_fail=1
@@ -1431,6 +1708,8 @@ EOF
         else
           printf "    \033[33m⊘\033[0m rung %d/%d: target=%dK  HTTP 400 (exceeds engine limit — clean rejection)%s\n" \
             "$rung_idx" "$rung_count" "$((target_tokens / 1000))" "$vram_str"
+          record_rung "ceiling_ladder" "${rung_idx}" "${target_tokens}" "400" "skipped" \
+            "" "" "" "$hit_delta" "$cache_dirty"
           rm -f "$result_file"
           any_skipped=1
         fi
@@ -1441,6 +1720,8 @@ EOF
         printf "    \033[31m✗\033[0m rung %d/%d: target=%dK  HTTP 500 (OOM at ~%d%% of n_ctx=%d)%s\n" \
           "$rung_idx" "$rung_count" "$((target_tokens / 1000))" \
           "$(( target_tokens * 100 / n_ctx ))" "$n_ctx" "$vram_str"
+        record_rung "ceiling_ladder" "${rung_idx}" "${target_tokens}" "500" "failed" \
+          "" "$prefill_tps" "$prefill_ms" "$hit_delta" "$cache_dirty"
         rm -f "$result_file"
         any_fail=1
         if [[ "$first_fail_tokens" -eq 0 ]]; then
@@ -1452,6 +1733,8 @@ EOF
       000)
         printf "    \033[31m✗\033[0m rung %d/%d: target=%dK  timeout/crash (>%ds)%s\n" \
           "$rung_idx" "$rung_count" "$((target_tokens / 1000))" "$rung_timeout" "$vram_str"
+        record_rung "ceiling_ladder" "${rung_idx}" "${target_tokens}" "000" "failed" \
+          "" "" "" "$hit_delta" "$cache_dirty"
         rm -f "$result_file"
         any_fail=1
         if [[ "$first_fail_tokens" -eq 0 ]]; then
@@ -1463,6 +1746,8 @@ EOF
       *)
         printf "    \033[31m✗\033[0m rung %d/%d: target=%dK  unexpected HTTP %s%s\n" \
           "$rung_idx" "$rung_count" "$((target_tokens / 1000))" "$http_code" "$vram_str"
+        record_rung "ceiling_ladder" "${rung_idx}" "${target_tokens}" "${http_code}" "failed" \
+          "" "$prefill_tps" "$prefill_ms" "$hit_delta" "$cache_dirty"
         rm -f "$result_file"
         any_fail=1
         if [[ "$first_fail_tokens" -eq 0 ]]; then
@@ -1512,6 +1797,19 @@ EOF
   elif [[ "$any_fail" == "1" ]]; then
     fail "ceiling ladder: first rung at ${ceiling_start} tok already failed — ceiling may be below probe 7 range" \
          "Check whether the engine survived probe 7's 90K rung. If not, the ceiling is <90K. Check: ${LOG_CMD}"
+  elif [[ "$any_recall_empty" == "1" && "$any_fail" == "0" ]]; then
+    # The ladder ran, the system filled the rung, but the model returned no content
+    # so recall could not be scored. Not a system failure, and NOT a quality ceiling
+    # (it shows up at trivial depth too). INCONCLUSIVE — counts in neither bucket.
+    skip "ceiling ladder INCONCLUSIVE — system filled ${first_recall_miss_tokens} tok, model returned no content (recall not scorable)"
+    printf "    \033[33m→\033[0m %s\n" "On thinking models this is the reasoning budget consuming the whole completion."
+    printf "      %s\n" "Disable thinking for this model or raise max_tokens. The engine did NOT crash."
+  elif [[ "$any_recall_miss" == "1" && "$any_fail" == "0" ]]; then
+    # Recall missed on the first rung and the loop broke there by design (see the
+    # ladder body: "break out of the ladder, and pass the probe"). Without this
+    # branch that intent was lost and the run fell through to the catch-all below,
+    # reporting a crash that never happened.
+    pass "ceiling ladder: quality ceiling at or below the first rung (${first_recall_miss_tokens} tok, ${first_recall_miss_pct:-?}% of n_ctx=${n_ctx}) — system filled it, recall missed"
   elif [[ "$any_pass" == "0" && "$any_skipped" == "1" ]]; then
     # All rungs got legitimate HTTP 400 (target > n_ctx) — ladder measured nothing.
     # This is NOT a pass. A ladder that tested nothing must warn.
@@ -1526,9 +1824,80 @@ run_check "ceiling_ladder" check_ceiling_ladder
 ensure_engine_alive "probe 8 (ceiling ladder)" || true
 
 echo ""
+_c_ok=$'\033[32m'; _c_bad=$'\033[31m'; _c_dim=$'\033[2m'; _c_off=$'\033[0m'
+_b_col="$_c_ok"; [[ "$BOUND_FAIL"  == "0" ]] || _b_col="$_c_bad"
+_r_col="$_c_ok"; [[ "$RECALL_FAIL" == "0" ]] || _r_col="$_c_bad"
+if [[ "$BOUND_RUN" != "0" ]]; then
+  printf "  %sboundary checks%s  %d/%d passed  %s(tool-prefill OOM, agent shapes, reasoning-heavy, VRAM ceiling)%s\n" \
+    "$_b_col" "$_c_off" "$((BOUND_RUN - BOUND_FAIL))" "$BOUND_RUN" "$_c_dim" "$_c_off"
+fi
+if [[ "$RECALL_RUN" != "0" ]]; then
+  printf "  %srecall ladder%s    %d/%d passed  %s(uniform-haystack: ADDRESSABILITY, not retrieval%s\n" \
+    "$_r_col" "$_c_off" "$((RECALL_RUN - RECALL_FAIL))" "$RECALL_RUN" "$_c_dim" "$_c_off"
+  printf "                     %squality — do not quote beside NIAH/RULER scores. #1017)%s\n" "$_c_dim" "$_c_off"
+else
+  printf "  %srecall ladder%s    skipped (SKIP_LONGCTX / SKIP_CEILING)%s\n" "$_c_dim" "$_c_off" "$_c_off"
+fi
+# Prefix-cache guard report (#1017): name every rung whose prefill number the
+# guard caught as cache-inflated, so a contaminated curve is never mistaken
+# for a clean measurement.
+if [[ -n "${CACHE_CONTAMINATED_LIST}" ]]; then
+  printf "  %s⚠ prefix-cache guard fired on: %s%s\n" "$_c_dim" "${CACHE_CONTAMINATED_LIST% }" "$_c_off"
+  printf "    %s→ vllm:prefix_cache_hits_total rose during those rungs — their prefill numbers are inflated; treat as upper bounds (#1017)%s\n" "$_c_dim" "$_c_off"
+fi
+echo ""
 if [[ "$FAILED" == "0" ]]; then
   printf "\033[32mAll stress / boundary checks passed.\033[0m KV-cache and prefill paths are sound for the deployed config.\n"
 else
   printf "\033[31m%d stress check(s) failed.\033[0m See hints above.\n" "$FAILED"
 fi
+
+# --- per-rig #249 record: stress pass/fail + the validated ctx ceiling --------
+# The ceiling-ladder pass/fail line carries the deepest fillable tokens + n_ctx;
+# the recall ladder (RECALL_RUN/RECALL_FAIL, global) says whether addressability
+# was validated cleanly at depth. result_class stress-only (no TPS). Never fails
+# the stress run (|| true).
+if [[ -n "${_VS_REC_LOG:-}" && -f "${_VS_REC_LOG}" ]]; then
+  sync 2>/dev/null || true
+  sleep 0.4   # let the tee subprocess flush the ceiling-ladder line before we read it
+  _vs_status="pass"; [[ "$FAILED" == "0" ]] || _vs_status="fail"
+  _vs_ext="$(VS_LOG="${_VS_REC_LOG}" VS_RECALL_RUN="${RECALL_RUN:-0}" VS_RECALL_FAIL="${RECALL_FAIL:-0}" \
+    python3 - <<'PY' 2>/dev/null || true
+import json, os, re
+try:
+    txt = open(os.environ["VS_LOG"], encoding="utf-8", errors="replace").read()
+except OSError:
+    raise SystemExit(0)
+# Deepest validated ctx from the ceiling-ladder line (color codes tolerated).
+tok = n_ctx = pct = None
+mt = re.search(r"ceiling ladder:.*?(?:fillable to|passed up to|filled up to|rejected above)\s*([0-9]+)\s*tok", txt)
+if mt:
+    tok = int(mt.group(1))
+mn = re.search(r"ceiling ladder:.*?n_ctx=([0-9]+)", txt)
+if mn:
+    n_ctx = int(mn.group(1))
+mp = re.search(r"ceiling ladder:.*?\(([0-9]+)% of n_ctx=", txt)
+if mp:
+    pct = int(mp.group(1))
+rr = int(os.environ.get("VS_RECALL_RUN") or 0)
+rf = int(os.environ.get("VS_RECALL_FAIL") or 0)
+if rr > 0 and rf == 0 and tok:
+    niah = f"clean@{round(tok/1000)}K"
+else:
+    niah = "allocation-only"
+out = {"tokens": tok, "niah": niah, "pct_of_n_ctx": pct, "n_ctx": n_ctx,
+       "recall_run": rr, "recall_fail": rf}
+print(json.dumps({k: v for k, v in out.items() if v is not None}, separators=(",", ":")))
+PY
+)"
+  _vs_flag=(--extension "stress={\"status\":\"${_vs_status}\",\"failed_checks\":${FAILED}}")
+  if [[ -n "$_vs_ext" && "$_vs_ext" != "{}" ]]; then
+    _vs_flag+=(--extension "ctx_validated=${_vs_ext}")
+  fi
+  python3 "${ROOT_DIR}/scripts/lib/profiles/measurement_record.py" \
+    --resolve-serving --serving-url "$URL" --bench-output /dev/null --result-class stress-only \
+    "${_vs_flag[@]}" >/dev/null 2>&1 || true
+  rm -f "${_VS_REC_LOG}"
+fi
+
 exit "$FAILED"

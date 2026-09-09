@@ -6,13 +6,15 @@
 #              all-reduce; the skew rebalances the pinned MTP draft card, see TOPOLOGY)
 #   Drafter:   MTP n=2 built-in (--spec-type draft-mtp; the head is EMBEDDED in this GGUF)
 #              ⚠️ n=2 is the house default for Qwen 27B on llama.cpp, NOT measured for 3.8.
+#              Toggle: SPEC_N=<n> sets depth; SPEC_N=0 (or SPEC=off) disables
+#              (removes the flags — n-max=0 would leave the draft context allocated)
 #   KV:        q8_0 K + q8_0 V (serving-grade KV floor — see "KV choice" below)
 #   Vision:    no (base is VL-capable; mmproj NOT fetched, NOT mounted — text-only ship)
 #   Template:  native (GGUF-embedded) via --jinja
 #   Max ctx:   262144 — the ARCHITECTURAL ceiling (config.json
 #              max_position_embeddings); COMPUTED to fit, never measured
 #   Genesis:   N/A — llama.cpp engine; Genesis is vLLM/Qwen3-Next-specific
-#   Status:    🐣 Incubating
+#   Status:    🧪 Experimental
 #   Caveats:   NOTHING HAS BOOTED. Authored 2026-08-14 while the weights were still
 #              downloading; zero runtime evidence exists for any claim below.
 #              Specifically unvalidated:
@@ -47,11 +49,11 @@
 #
 #   | Slug                                | Card(s) | Weights          | KV   | Max ctx | Notes                        |
 #   |-------------------------------------|---------|------------------|------|---------|------------------------------|
-#   | llamacpp/qwen38-27b-single-iq4nl    | 1x 3090 | IQ4_NL 16.3 GB   | q8_0 | 131072  | fits one card                |
+#   | llamacpp/qwen38-27b-single-iq4xs    | 1x 3090 | UD-IQ4_XS 14.3G  | q8_0 | 131072  | fits one card                |
 #   | llamacpp/qwen38-27b-dual-q8kxl      | 2x 3090 | UD-Q8_K_XL 31.5G | q8_0 | 262144  | THIS file — max ctx + fidelity |
 #
 # Dual is not optional here: 31.5 GB of weights does not fit a 24 GB card. Both
-# cards are consumed. If you need one card free, use the single IQ4_NL sibling.
+# cards are consumed. If you need one card free, use the single UD-IQ4_XS sibling.
 #
 # ---------------------------------------------------------------------------
 # Qwen3.8-27B on llama.cpp — dual 3090, UD-Q8_K_XL weights, q8_0 KV, full 262K.
@@ -171,10 +173,13 @@
 #                    PCIe-only 3090s; row-split leans on cross-GPU traffic this
 #                    rig has no fast path for)
 #   SERVED_NAME      --alias value       (default: qwen3.8-27b)
-#   REASONING        thinking gate       (default: off — stack-wide policy)
+#   REASONING        thinking gate       (default: ON — 2026-09-01 flip; INSTRUCT=1 opts out)
 #   REASONING_FORMAT reasoning routing   (default: deepseek — hygiene)
-#   TEMP/TOP_P/TOP_K/MIN_P               (defaults: 0.6 / 0.95 / 20 / 0.0 — the stack's
-#                    Qwen sampler. NOT verified against this model's card.)
+#   TEMP/TOP_P/TOP_K/MIN_P               (defaults: 1.0 / 0.95 / 20 / 0.0 — the card's
+#                    THINKING row. The 0.6/0.95 stated here before 2026-09-01 was stale;
+#                    the command block never used those values.)
+#   INSTRUCT         one-knob opt-out    (unset by default; INSTRUCT=1 restores the card's
+#                    INSTRUCT row AND --reasoning off, together)
 #   REPEAT_PENALTY   anti-loop           (default: 1.0)
 #   PORT             host port           (default: 8087)
 #   CUDA_VISIBLE_DEVICES  which GPUs     (default: 0,1 — both cards)
@@ -197,6 +202,36 @@ services:
     volumes:
       - "${MODEL_DIR:-../../../../../../models-cache}:/models:ro"
     environment:
+      # Drafter toggle - docker forwards only what is declared here.
+      - SPEC_N=${SPEC_N:-}
+      - SPEC=${SPEC:-}
+      # ⭐ Default reasoning effort = low when thinking is on (2026-08-16),
+      # matching the vLLM composes. NOW ACTIVE on every request: thinking became
+      # the default 2026-09-01. It goes INERT only under INSTRUCT=1, because the
+      # template reads reasoning_effort inside
+      # `if enable_thinking is undefined or true`, and --reasoning off passes
+      # enable_thinking:false.
+      # ⚠️ low is an ACTIVE instruction: 'Keep your thinking brief and focused,
+      # moving directly to the conclusion without unnecessary elaboration.' It is
+      # not "less of medium" -- medium has no branch and injects nothing. xhigh
+      # appends 'think carefully, validate key assumptions...', which is what
+      # collides with cli-40's flat 300s per-model-call cap on these sub-55 tok/s
+      # configs.
+      # ⚠️⚠️ THIS ENGINE DIVERGES FROM vLLM ON `high` -- read before setting it.
+      # The unsloth GGUF's EMBEDDED template (read from the GGUF kv 2026-08-16;
+      # byte-identical in UD-Q8_K_XL and IQ4_NL, and present in UD-IQ4_XS too —
+      # checked 2026-08-19) carries a branch the HF
+      # safetensors template does NOT:
+      #     {%- if resolved_reasoning_effort == 'high' %}
+      #         {%- set resolved_reasoning_effort = 'xhigh' %}
+      # So here `high` SILENTLY becomes xhigh -- the slowest, most token-hungry
+      # level, and the one that collides with the 300s cap above -- whereas the
+      # vLLM path RAISES on it. Setting REASONING_EFFORT=high on this engine
+      # gets you the opposite of what the name suggests, with no error.
+      # ⚠️ This corrects two claims previously in this header: `high` does NOT
+      # raise on this path, and the template DOES emit the instruction with no
+      # tools present (it has a no-tools else-branch at template line ~90).
+      - LLAMA_ARG_CHAT_TEMPLATE_KWARGS=${LLAMA_ARG_CHAT_TEMPLATE_KWARGS:-{"reasoning_effort":"${REASONING_EFFORT:-low}"}}
       - CUDA_VISIBLE_DEVICES=${ESTATE_GPUS:-${CUDA_VISIBLE_DEVICES:-0,1}}
     # ⚠ -np 1 is intentional — one decode stream. Extra slots divide throughput
     #   and each takes its own slice of the KV pool, shrinking the per-slot ctx.
@@ -213,21 +248,29 @@ services:
     # ⚠️ Comments CANNOT live inside the `command: >-` folded scalar below — every line there is
     #   part of one command string, and a `#` line becomes literal argv text
     #   ('invalid command line string' at compose parse). Keep notes above this key.
-    # SAMPLER — from the Qwen3.8-27B model card. THIS COMPOSE SHIPS INSTRUCT (NON-THINKING).
+    # SAMPLER — from the Qwen3.8-27B model card. THIS COMPOSE SHIPS THINKING (flipped 2026-09-01).
     #   Qwen publishes two sets and they differ in every value that matters:
-    #     Instruct / non-thinking (SHIPPED HERE) : temp 0.7, top_p 0.80, top_k 20, min_p 0.0,
-    #                                             presence_penalty 1.5, repetition_penalty 1.0
-    #     Thinking                               : temp 1.0, top_p 0.95, top_k 20, min_p 0.0,
+    #     Thinking (SHIPPED HERE)                : temp 1.0, top_p 0.95, top_k 20, min_p 0.0,
     #                                             presence_penalty 0.0, repetition_penalty 1.0
-    #   `--reasoning off` and the instruct sampler are set TOGETHER below. Compose cannot branch,
-    #   so if you flip REASONING=on you MUST also set TEMP=1.0 TOP_P=0.95 PRESENCE_PENALTY=0.0
-    #   — the sampler does NOT follow the reasoning flag, and mismatching them is silent.
+    #     Instruct / non-thinking (INSTRUCT=1)   : temp 0.7, top_p 0.80, top_k 20, min_p 0.0,
+    #                                             presence_penalty 1.5, repetition_penalty 1.0
+    #   `--reasoning on` and the thinking sampler are set TOGETHER below, and INSTRUCT=1 flips
+    #   BOTH back together. The sampler does NOT follow the reasoning flag on its own, so a bare
+    #   REASONING=off leaves the THINKING sampler in place — mismatching them is silent.
+    #   ⭐ WHY THINKING IS THE DEFAULT — a community request, backed by our own 8-pack (issue
+    #   #1027, dual 3090 fp8): instruct scored 120/150 pass@1, the WORST of the four modes
+    #   measured, against 135 (effort=low), 137 (xhigh), 129 (medium). The cost is latency,
+    #   2-6x per turn (cli-40 1.76s -> 8.27s; instructfollow-15 0.48s -> 3.09s) — though
+    #   reasonmath-15 got FASTER (5.26s -> 3.64s). Set INSTRUCT=1 when turn latency outweighs
+    #   accuracy. Those numbers are from the vLLM fp8 dual; this llama.cpp compose is UNMEASURED
+    #   on the 8-pack — the mode choice transfers, the scores do not.
     #   ⚠️ presence_penalty=1.5 is prescribed by the card for THIS mode specifically, to curb
     #   endless repetition; under thinking it must be 0.0 instead, or the reasoning trace's
     #   natural repetition gets penalised. The two values move in OPPOSITE directions between
     #   modes — never carry one across. (The first authoring pass omitted it entirely; llama.cpp
     #   defaults it to 0.0.) Qwen notes 0-2 is the usable band and >2 degrades quality.
-    #   ⚠️ Thinking-off is the stack default for Qwen and is a deliberate policy, not an oversight.
+    #   ⚠️ Thinking-ON is this model's default as of 2026-09-01, superseding the earlier
+    #   thinking-off policy announced in discussion #1024. Both were deliberate.
     #   ⚠️ These are SERVING defaults only. scripts/bench.sh sends its own fixed canonical sampler
     #   (temp 0.6 / top_p 0.95 / top_k 20 / min_p 0.0) on every request so BENCHMARKS.md rows stay
     #   comparable across models and engines — a bench number is NOT evidence about these values.
@@ -236,36 +279,42 @@ services:
     #   * Client sends sampler fields   -> the REQUEST wins (two temperature:0 calls returned
     #                                      byte-identical text while the server default was 0.6).
     #   * Client sends
-    #       "chat_template_kwargs": {"enable_thinking": true}
-    #                                   -> thinking is enabled FOR THAT REQUEST even though the
-    #                                      server runs --reasoning off; the trace lands in
-    #                                      message.reasoning_content and the answer in
+    #       "chat_template_kwargs": {"enable_thinking": false}
+    #                                   -> thinking is disabled FOR THAT REQUEST even though the
+    #                                      server runs --reasoning on. ⚠️ The direction verified
+    #                                      live on b10236 (2026-08-14) was the MIRROR of this one
+    #                                      (enable_thinking:true against a --reasoning off server);
+    #                                      same chat-template kwarg, but this direction is
+    #                                      UNVERIFIED on this build. With thinking on, the trace
+    #                                      lands in message.reasoning_content and the answer in
     #                                      message.content (--reasoning-format deepseek).
     #
-    #   ⚠️ THE TWO KNOBS ARE INDEPENDENT — this is the trap. Enabling thinking per-request does
-    #   NOT change the sampler: the request inherits the INSTRUCT values above, including
-    #   presence_penalty 1.5, which the card prescribes only for non-thinking and which actively
-    #   penalises a reasoning trace's natural repetition. An agent that wants thinking must send
-    #   the thinking sampler in the SAME request:
+    #   ⚠️ THE TWO KNOBS ARE INDEPENDENT — this is the trap, and the 2026-09-01 flip INVERTED
+    #   its direction. Disabling thinking per-request does NOT change the sampler: the request
+    #   inherits the THINKING values above, including presence_penalty 0.0, where the card
+    #   prescribes 1.5 for non-thinking to curb endless repetition. A client that wants instruct
+    #   must send the instruct sampler in the SAME request:
     #
     #     {"messages": [...],
-    #      "chat_template_kwargs": {"enable_thinking": true},
-    #      "temperature": 1.0, "top_p": 0.95, "top_k": 20,
-    #      "min_p": 0.0, "presence_penalty": 0.0}
+    #      "chat_template_kwargs": {"enable_thinking": false},
+    #      "temperature": 0.7, "top_p": 0.80, "top_k": 20,
+    #      "min_p": 0.0, "presence_penalty": 1.5}
     #
-    #   ⇒ No separate thinking slug is needed, and no reboot: a caller opts in per request. That
-    #   is why this compose ships one mode rather than a sibling `thinking.yml`.
-    # ⭐ ONE-KNOB THINKING MODE:  THINKING=1  flips reasoning AND the whole sampler together.
-    #   Without it you get the card's INSTRUCT row (the flags above). With it, the trailing
-    #   ${THINKING:+...} line appends the card's THINKING row, and llama.cpp takes the LAST value
-    #   of a repeated flag — so `THINKING=1` alone is sufficient and correct. top_k/min_p/
+    #   ⇒ No separate instruct slug is needed, and no reboot: a caller opts out per request. That
+    #   is why this compose ships one mode rather than a sibling `instruct.yml`.
+    # ⭐ ONE-KNOB INSTRUCT MODE:  INSTRUCT=1  flips reasoning AND the whole sampler back together.
+    #   Without it you get the card's THINKING row (the flags above). With it, the trailing
+    #   ${INSTRUCT:+...} line appends the card's INSTRUCT row, and llama.cpp takes the LAST value
+    #   of a repeated flag — so `INSTRUCT=1` alone is sufficient and correct. top_k/min_p/
     #   repeat-penalty are identical across both modes, so they are not repeated.
+    #   THINKING=1 is kept as a back-compat NO-OP — it re-asserts what is now already default.
+    #   ⚠️ Do not set both: INSTRUCT is appended last, so INSTRUCT=1 wins over THINKING=1.
     #
-    #   Precedence is preserved: an explicit TEMP/TOP_P/PRESENCE_PENALTY survives THINKING,
-    #   because the appended values are themselves ${VAR:-default}. Verified 2026-08-14:
-    #     (unset)              -> --temp 0.7
-    #     THINKING=1           -> --temp 0.7 ... --temp 1.0        (thinking wins)
-    #     THINKING=1 TEMP=0.42 -> --temp 0.42 ... --temp 0.42      (user wins)
+    #   Precedence is preserved: an explicit TEMP/TOP_P/PRESENCE_PENALTY survives INSTRUCT,
+    #   because the appended values are themselves ${VAR:-default}. Verified 2026-09-01:
+    #     (unset)              -> --temp 1.0
+    #     INSTRUCT=1           -> --temp 1.0 ... --temp 0.7       (instruct wins)
+    #     INSTRUCT=1 TEMP=0.42 -> --temp 0.42 ... --temp 0.42     (user wins)
     #
     #   ⚠️⚠️ RE-TEST TRIGGER — THIS RESTS ON DEPRECATED UPSTREAM BEHAVIOUR.
     #   b10236 warns: "DEPRECATED: argument '--temp' specified multiple times, use
@@ -279,6 +328,44 @@ services:
     #         -m /nonexistent.gguf --temp 0.11 --temp 0.99 2>&1 | grep -i 'multiple times'
     #     Expect the DEPRECATED/last-value warning. If it is gone, verify last-wins still holds
     #     (or convert this to a sibling thinking.yml compose, which needs no such guarantee).
+    # The image ENTRYPOINT is ["/app/llama-server"] on every engine we ship
+    # (mainline, ik-llama, beellama, llamacpp-club3090 — all verified). This
+    # wrapper is equivalent to it plus the drafter toggle.
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        # -- Drafter toggle: the same contract on every club-3090 compose --------
+        #   SPEC_N=<n>  drafter depth; SPEC_N=0 disables
+        #   SPEC=off    back-compat alias for SPEC_N=0
+        # Disabling REMOVES the drafter flags rather than passing n=0. At
+        # --spec-draft-n-max 0 llama.cpp sets drafting=false but still builds the
+        # draft context (server-context.cpp), and still loads an external draft
+        # model when one is named -- so the memory stays spent. Removing the
+        # flags is the only clean off. A non-numeric SPEC_N is a hard error, so a
+        # typo can never masquerade as a silent "drafter off".
+        _spec_n="$${SPEC_N:-1}"
+        case "$${SPEC:-}" in off|OFF|Off|false|no|0) _spec_n=0 ;; esac
+        case "$$_spec_n" in ""|*[!0-9]*)
+          echo "[spec] SPEC_N='$$_spec_n' is not a non-negative integer." >&2
+          echo "[spec] Fix: SPEC_N=<n> sets depth; SPEC_N=0 (or SPEC=off) disables." >&2
+          exit 1 ;;
+        esac
+        if [ "$$_spec_n" -gt 0 ]; then
+          echo "[spec] drafter ON (SPEC_N=$$_spec_n)" >&2
+          exec /app/llama-server "$$@"
+        fi
+        ARGS=(); _skip=0
+        for _a in "$$@"; do
+          if [ "$$_skip" = 1 ]; then _skip=0; continue; fi
+          case "$$_a" in
+            --spec-type|--spec-draft-model|--spec-draft-n-max|--spec-draft-n-min|-md|--model-draft) _skip=1; continue ;;
+          esac
+          ARGS+=("$$_a")
+        done
+        echo "[spec] drafter OFF (SPEC_N=0 / SPEC=off) - drafter flags removed" >&2
+        exec /app/llama-server "$${ARGS[@]}"
+      - --
     command: >-
       --host 0.0.0.0
       --port 8080
@@ -295,17 +382,18 @@ services:
       --cache-type-v ${KV_TYPE:-q8_0}
       -np ${NP:-1}
       --spec-type draft-mtp
-      --spec-draft-n-max ${MTP_DRAFT_N_MAX:-2}
+      --spec-draft-n-max ${SPEC_N:-${MTP_DRAFT_N_MAX:-2}}
       --jinja
-      --reasoning ${REASONING:-off}
+      --reasoning ${REASONING:-on}
       --reasoning-format ${REASONING_FORMAT:-deepseek}
-      --temp ${TEMP:-${TEMPERATURE:-0.7}}
-      --top-p ${TOP_P:-0.80}
+      --temp ${TEMP:-${TEMPERATURE:-1.0}}
+      --top-p ${TOP_P:-0.95}
       --top-k ${TOP_K:-20}
       --min-p ${MIN_P:-0.0}
-      --presence-penalty ${PRESENCE_PENALTY:-1.5}
+      --presence-penalty ${PRESENCE_PENALTY:-0.0}
       --repeat-penalty ${REPEAT_PENALTY:-1.0}
       ${THINKING:+--reasoning ${REASONING:-on} --temp ${TEMP:-${TEMPERATURE:-1.0}} --top-p ${TOP_P:-0.95} --presence-penalty ${PRESENCE_PENALTY:-0.0}}
+      ${INSTRUCT:+--reasoning ${REASONING:-off} --temp ${TEMP:-${TEMPERATURE:-0.7}} --top-p ${TOP_P:-0.80} --presence-penalty ${PRESENCE_PENALTY:-1.5}}
     deploy:
       resources:
         reservations:

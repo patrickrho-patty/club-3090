@@ -27,9 +27,9 @@ python3 - <<'PY'
 from pathlib import Path
 
 from scripts.lib.profiles.compose_registry import (
-    COMPOSE_REGISTRY,
     STATUS_VALUES,
     compose_header_status,
+    get_registry,
 )
 
 failures = []
@@ -45,7 +45,15 @@ def check(cond, msg):
 
 enum = set(STATUS_VALUES)
 
-for key, entry in sorted(COMPOSE_REGISTRY.items()):
+# C4-rev: merged view — a LOCAL layer entry's compose header is drift-checked
+# exactly like a core one.
+# LOCAL rows are skipped. This gate asserts that a compose WE ship carries a
+# Status header matching its registry status. A user's own compose is theirs:
+# demanding our header convention in it makes the whole suite red the moment
+# anyone registers a model (#1202/#1153), which is exactly what happened.
+for key, entry in sorted(get_registry().items()):
+    if (entry or {}).get("origin") == "local":
+        continue
     status = entry.get("status")
     # (a) registry status in the enum.
     check(status in enum, f"{key}: registry status {status!r} in enum")

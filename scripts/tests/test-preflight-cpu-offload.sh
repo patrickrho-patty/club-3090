@@ -47,6 +47,15 @@ INK_M4=models/inkling-small/llamacpp-club3090/compose/multi4/unsloth-ud-iq4xs/mo
 # and the one Inkling compose that legitimately DOES carry the bundle headers.
 # Its presence is why the no-residency-headers assertions below are per-file.
 INK_RES=models/inkling-small/llamacpp-club3090/compose/dual/unsloth-ud-iq4xs/residency.yml
+GLM_DUAL=models/glm-5.3-flash/llamacpp-club3090/compose/dual/unsloth-ud-iq4xs/moecache.yml
+GLM_M4=models/glm-5.3-flash/llamacpp-club3090/compose/multi4/unsloth-ud-iq4xs/moecache.yml
+GLM_M8=models/glm-5.3-flash/llamacpp-club3090/compose/multi8/unsloth-ud-iq4xs/moecache.yml
+GLM3_DUAL=models/glm-5.3-flash/llamacpp-club3090/compose/dual/unsloth-ud-iq3xxs/moecache.yml
+GLM3_M4=models/glm-5.3-flash/llamacpp-club3090/compose/multi4/unsloth-ud-iq3xxs/moecache.yml
+GLM3_M8=models/glm-5.3-flash/llamacpp-club3090/compose/multi8/unsloth-ud-iq3xxs/moecache.yml
+QWN_DUAL=models/qwen3.8-flash-next/llamacpp-club3090/compose/dual/unsloth-ud-q4kxl/moecache.yml
+QWN_M4=models/qwen3.8-flash-next/llamacpp-club3090/compose/multi4/unsloth-ud-q4kxl/moecache.yml
+QWN_M8=models/qwen3.8-flash-next/llamacpp-club3090/compose/multi8/unsloth-ud-q4kxl/moecache.yml
 NONOFF=models/tess-4-27b/llama-cpp/compose/dual/migtissera-q4km/mtp.yml
 
 # ---- detector ----
@@ -402,6 +411,20 @@ while IFS='|' read -r slug reg_gb; do
   case "$slug" in
     *dual-q8-moecache)      f="$FORK_Q8" ;;
     *multi4-q8-moecache)    f="$FORK_M4" ;;
+    # ⚠️ MODEL-QUALIFIED, and these MUST come BEFORE the bare *-iq4xs-moecache arms.
+    # Those are suffix-matched and silently claimed GLM's slugs the moment a second
+    # iq4xs-moecache model existed — comparing GLM's registry figure against
+    # INKLING's header (121) and failing for a reason unrelated to GLM. Any future
+    # model sharing this suffix needs its own arm here too.
+    *qwen38-flash-next-dual-q4kxl-moecache)   f="$QWN_DUAL" ;;
+    *qwen38-flash-next-multi4-q4kxl-moecache) f="$QWN_M4" ;;
+    *qwen38-flash-next-multi8-q4kxl-moecache) f="$QWN_M8" ;;
+    *glm53-flash-dual-iq3xxs-moecache)   f="$GLM3_DUAL" ;;
+    *glm53-flash-multi4-iq3xxs-moecache) f="$GLM3_M4" ;;
+    *glm53-flash-multi8-iq3xxs-moecache) f="$GLM3_M8" ;;
+    *glm53-flash-dual-iq4xs-moecache)   f="$GLM_DUAL" ;;
+    *glm53-flash-multi4-iq4xs-moecache) f="$GLM_M4" ;;
+    *glm53-flash-multi8-iq4xs-moecache) f="$GLM_M8" ;;
     *dual-iq4xs-moecache)   f="$INK_CACHE" ;;
     *multi4-iq4xs-moecache) f="$INK_M4" ;;
     *dual-iq4xs-residency)  f="$INK_RES" ;;
@@ -440,9 +463,20 @@ declare -F resolve_offload_threads >/dev/null 2>&1 && ok "resolve_offload_thread
 # the bare-compose fallback must be LOW, not the reference rig's number: over-subscribing
 # measured -69% vs under-subscribing -9.6%, so err low when the core count is unknown.
 for f in "$Q8" "$IQ2" "$M4" "$FORK_Q8" "$FORK_M4" "$INK_CACHE" "$INK_M4" "$INK_RES"; do
-  fb="$(command grep -oE 'THREADS:-[0-9]+' "$f" | command grep -oE '[0-9]+' | head -1)"
-  [[ -n "$fb" && "$fb" -le 8 ]] && ok "$(basename "$(dirname "$f")")/$(basename "$f"): safe THREADS fallback ($fb)" \
-    || bad "$(basename "$(dirname "$f")")/$(basename "$f"): THREADS fallback '$fb' is too high for an unknown rig"
+  # Two acceptable shapes, both safe on an unknown rig:
+  #   (a) entrypoint resolution to nproc/2  — the CURRENT convention (adapts to the host)
+  #   (b) a literal `THREADS:-N` with N <= 8 — the older bare-compose fallback
+  # A hardcoded high number (e.g. the reference rig's 28) is what this rejects:
+  # it over-subscribes a smaller box. CLI `-t` is separately forbidden because it
+  # beats the entrypoint env.
+  _lbl="$(basename "$(dirname "$f")")/$(basename "$f")"
+  if command grep -qE '_np / 2|nproc/2' "$f"; then
+    ok "$_lbl: resolves THREADS to nproc/2 in the entrypoint (portable)"
+  else
+    fb="$(command grep -oE 'THREADS:-[0-9]+' "$f" | command grep -oE '[0-9]+' | head -1)"
+    [[ -n "$fb" && "$fb" -le 8 ]] && ok "$_lbl: safe THREADS fallback ($fb)" \
+      || bad "$_lbl: THREADS fallback '$fb' is neither nproc/2 nor <=8 — unsafe on an unknown rig"
+  fi
 done
 
 # ---- wiring ----

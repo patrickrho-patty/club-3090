@@ -245,7 +245,17 @@ if [[ -f "$ROOT_DIR/scripts/preflight.sh" ]]; then
   source "$ROOT_DIR/scripts/preflight.sh"
   preflight_autodetect_endpoint
 fi
-URL="${URL:-http://localhost:8010}"
+# Default endpoint follows the registry's curated DEFAULTS walk for qwen3.6-27b
+# instead of a hand-maintained :8010/:8020 literal that drifts from the catalog.
+# The trailing literal is only a last resort when the registry can't be consulted.
+_DEFAULT_ENDPOINT_PORT=""
+if [[ -f "$ROOT_DIR/scripts/lib/registry-lookup.sh" ]]; then
+  # shellcheck source=lib/registry-lookup.sh
+  source "$ROOT_DIR/scripts/lib/registry-lookup.sh"
+  REGISTRY_LOOKUP_ROOT="$ROOT_DIR"
+  _DEFAULT_ENDPOINT_PORT="$(registry_lookup_default_port qwen3.6-27b 2>/dev/null || true)"
+fi
+URL="${URL:-http://localhost:${_DEFAULT_ENDPOINT_PORT:-8020}}"
 
 if ! curl -sf -m 5 "$URL/v1/models" >/dev/null 2>&1; then
   echo "✗ endpoint $URL/v1/models not responding" >&2
@@ -684,6 +694,9 @@ try:
         hardware=hardware, engine_pin=engine_pin, power_cap_w=power_cap,
         smoke_status="pass",   # rebench aborts at step 0 unless verify-full passed
         soak_status=soak,
+        # A real user-facing bench — c3's perf columns accept ONLY this class,
+        # never the optimizer's default `boot-fit-measured` boot-fit probes.
+        result_class="bench-measured",
     )
     q_off = _quality(out_dir / "quality-full.json")
     q_on = _quality(out_dir / "quality-full-thinking.json")

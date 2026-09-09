@@ -1,11 +1,11 @@
 schema_version: 1
 id: vllm-stable
-display_name: vLLM stable v0.25.1 (overlay-free)
+display_name: vLLM stable v0.27.1 (overlay-free)
 type: vllm
 stability: stable
 install:
   method: docker_image
-  spec: vllm/vllm-openai:v0.25.1
+  spec: vllm/vllm-openai:v0.27.1
 min_sm: 7.5
 supported_model_families:
   - dense
@@ -46,6 +46,10 @@ supported_kv_formats:
 supported_drafters:
   - mtp
   - mtp_assistant
+  # dflash: external DFlash/DFlash2 block-drafters (spec_method=dflash). Provided
+  # by the vendored vLLM PR#52816 backport (patches.yml: vllm-dflash2-backport),
+  # mounted on the qwen3.8 *-ultrafast composes; not in the stock image.
+  - dflash
 supported_weight_formats:
   - bf16
   - fp16

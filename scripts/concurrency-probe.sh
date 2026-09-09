@@ -23,16 +23,25 @@
 #   MAX_NUM_SEQS=4 bash scripts/switch.sh vllm/dual   # boot at the candidate
 #   bash scripts/concurrency-probe.sh                 # plain fit check (server's N)
 #   VALIDATE=1 bash scripts/concurrency-probe.sh      # validation-grade fit @ target_ctx
+#   bash scripts/concurrency-probe.sh --sweep         # live N×ctx matrix + card
 #   SWEEP="4 8 12 16" SLUG=vllm/minimal TPS_FLOOR=15 bash scripts/concurrency-probe.sh
 #
-# Env: URL (default http://localhost:8010) · MODEL (auto) · CONTAINER (auto for
-#   VRAM) · CONCURRENCY (default: served max-num-seqs, else 2) · ROUNDS (5) ·
-#   PROMPT_TOKENS (16000) · GEN_TOKENS (256) · VRAM_GROWTH_MB (200) ·
-#   REQ_TIMEOUT (600).
+# Env: URL (default registry-derived for qwen3.6-27b, currently :8020) · MODEL
+#   (auto) · CONTAINER (auto for VRAM) · CONCURRENCY (default: served
+#   max-num-seqs, else 2) · ROUNDS (5; --sweep defaults to 3) ·
+#   PROMPT_TOKENS (16000) · GEN_TOKENS (256) ·
+#   VRAM_GROWTH_MB (200) · REQ_TIMEOUT (600).
 #   Validation knobs: VALIDATE (0) · TARGET_CTX (auto from --max-model-len) ·
 #   TPS_FLOOR (0 = report-only) · RETENTION_MIN (0.98) ·
 #   SWEEP ("" = single-N) · SLUG (required for SWEEP) · SWEEP_DRY (0) ·
 #   BOOT_TIMEOUT (360).
+#   Live --sweep warm-up gate (opt-in): WARMUP (0) — when 1, wait for the
+#   server + fire warm-up gens before the ladder (a rung fired at a cold /
+#   not-ready engine reads as a spurious crash); WARMUP_TIMEOUT (900) ·
+#   WARMUP_REQS (3).
+#   --sweep knobs: CTX_SWEEP (1k 4k 8k 16k 32k) · N_LIST (1 2 4 8 16 32) ·
+#   KV_TOKENS (0 = auto from vLLM logs) · N_MAX · CTX_MAX · WALL_BUDGET (15m) ·
+#   EARLY_STOP (1) · CACHE (shared) · SHARE_FRAC (0.75).
 set -euo pipefail
 
 # Force Python's UTF-8 mode (PEP 540) for every python3 this script runs.
@@ -44,21 +53,134 @@ set -euo pipefail
 # processes and nested scripts inherit it. Guarded by test-locale-utf8.sh.
 export PYTHONUTF8="${PYTHONUTF8:-1}"
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+PROBE_PY="$ROOT_DIR/scripts/lib/concurrency_probe.py"
 
-URL="${URL:-http://localhost:8010}"
-ROUNDS="${ROUNDS:-5}"
+usage() {
+  cat <<'EOF'
+concurrency-probe.sh — concurrent-stream fit + throughput matrix
+
+  bash scripts/concurrency-probe.sh              fit check at the served N
+  VALIDATE=1 bash scripts/concurrency-probe.sh   fill target_ctx + retention
+  bash scripts/concurrency-probe.sh --sweep      live N×ctx matrix + card
+  bash scripts/concurrency-probe.sh --sweep --dry
+  SWEEP="4 8 16" SLUG=<slug> bash scripts/concurrency-probe.sh
+                                                 reboot-per-N envelope knee
+
+--sweep flags (all optional; clipped to the live server):
+  --url URL          default registry-derived for qwen3.6-27b (currently :8020)
+  --ctx 1k,4k,8k,16k,32k
+  --n 1,2,4,8,16,32
+  --budget 15m       stop the matrix and print a partial card
+  --dry              print the clipped grid, do not probe
+
+Does not reboot. Measures the compose that is already serving.
+After --sweep, prints a compose recommendation (MAX_NUM_SEQS / MAX_MODEL_LEN)
+for keep-full-ctx vs max-aggregate (short prompts).
+EOF
+}
+
+MATRIX=0
+N_LIST_EXPLICIT=0
+# Default endpoint follows the registry's curated DEFAULTS walk for qwen3.6-27b
+# — the SAME source bench/verify derive their defaults from — instead of this
+# probe's lone :8010 literal. The trailing literal is only a last resort when
+# the registry can't be consulted.
+_DEFAULT_ENDPOINT_PORT=""
+if [[ -f "${ROOT_DIR}/scripts/lib/registry-lookup.sh" ]]; then
+  # shellcheck source=lib/registry-lookup.sh
+  source "${ROOT_DIR}/scripts/lib/registry-lookup.sh"
+  REGISTRY_LOOKUP_ROOT="${ROOT_DIR}"
+  _DEFAULT_ENDPOINT_PORT="$(registry_lookup_default_port qwen3.6-27b 2>/dev/null || true)"
+fi
+URL="${URL:-http://localhost:${_DEFAULT_ENDPOINT_PORT:-8020}}"
 PROMPT_TOKENS="${PROMPT_TOKENS:-16000}"
 GEN_TOKENS="${GEN_TOKENS:-256}"
+# Sampler, names matching bench.sh. Default GREEDY -- unchanged probe behaviour and
+# what knee-finding wants (determinism). Set to bench.sh's canonical
+# 0.6 / 0.95 / 20 / 0.0 to make per-stream tok/s comparable with a bench.sh run;
+# greedy roughly doubles draft acceptance on a spec-dec model, so by default the
+# two are NOT comparable.
+BENCH_TEMP="${BENCH_TEMP:-0.0}"
+BENCH_TOP_P="${BENCH_TOP_P:-1.0}"
+BENCH_TOP_K="${BENCH_TOP_K:-0}"
+BENCH_MIN_P="${BENCH_MIN_P:-0.0}"
 VRAM_GROWTH_MB="${VRAM_GROWTH_MB:-200}"
 REQ_TIMEOUT="${REQ_TIMEOUT:-600}"
-TPS_FLOOR="${TPS_FLOOR:-0}"           # 0 = report-only; >0 = gate per-stream decode TPS
+TPS_FLOOR="${TPS_FLOOR:-0}"
 RETENTION_MIN="${RETENTION_MIN:-0.98}"
-VALIDATE="${VALIDATE:-0}"             # 1 = fill target_ctx + gate fit + retention
-TARGET_CTX="${TARGET_CTX:-}"          # override; else auto from container --max-model-len
-SWEEP="${SWEEP:-}"                    # e.g. "4 8 12 16" -> reboot+probe per N, find knee
-SLUG="${SLUG:-}"                      # required for SWEEP (reboot target)
+VALIDATE="${VALIDATE:-0}"
+TARGET_CTX="${TARGET_CTX:-}"
+SWEEP="${SWEEP:-}"
+SLUG="${SLUG:-}"
 SWEEP_DRY="${SWEEP_DRY:-0}"
 BOOT_TIMEOUT="${BOOT_TIMEOUT:-360}"
+CTX_SWEEP="${CTX_SWEEP:-}"
+N_LIST="${N_LIST:-}"
+KV_TOKENS="${KV_TOKENS:-}"
+N_MAX="${N_MAX:-}"
+CTX_MAX="${CTX_MAX:-}"
+WALL_BUDGET="${WALL_BUDGET:-}"
+EARLY_STOP="${EARLY_STOP:-1}"
+SHARE_FRAC="${SHARE_FRAC:-0.75}"
+UNIQUE_MIN="${UNIQUE_MIN:-256}"
+# CACHE / ROUNDS default after we know the mode — --sweep wants 3 / shared.
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --sweep) MATRIX=1; shift ;;
+    --validate) VALIDATE=1; shift ;;
+    --dry) SWEEP_DRY=1; shift ;;
+    --url)
+      [[ $# -ge 2 ]] || { echo "--url needs a value" >&2; exit 2; }
+      URL="$2"; shift 2 ;;
+    --ctx)
+      [[ $# -ge 2 ]] || { echo "--ctx needs a value" >&2; exit 2; }
+      CTX_SWEEP="$2"; shift 2 ;;
+    --n)
+      [[ $# -ge 2 ]] || { echo "--n needs a value" >&2; exit 2; }
+      N_LIST="$2"; N_LIST_EXPLICIT=1; shift 2 ;;
+    --budget)
+      [[ $# -ge 2 ]] || { echo "--budget needs a value" >&2; exit 2; }
+      WALL_BUDGET="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *)
+      echo "unknown argument: $1 (try --help)" >&2
+      exit 2 ;;
+  esac
+done
+
+if [[ "$MATRIX" == "1" && "$VALIDATE" == "1" ]]; then
+  echo "[concurrency-probe] --sweep and --validate / VALIDATE=1 cannot combine" \
+       "(VALIDATE is cache-cold fit at target_ctx; --sweep is the live matrix)" >&2
+  exit 2
+fi
+if [[ "$MATRIX" == "1" && -n "$SWEEP" ]]; then
+  echo "[concurrency-probe] --sweep is the live matrix; SWEEP=+SLUG is the reboot knee. Pick one." >&2
+  exit 2
+fi
+
+if [[ "$MATRIX" == "1" ]]; then
+  ROUNDS="${ROUNDS:-3}"
+  CACHE="${CACHE:-shared}"
+  WALL_BUDGET="${WALL_BUDGET:-15m}"
+  CTX_SWEEP="${CTX_SWEEP:-1k 4k 8k 16k 32k}"
+  N_LIST="${N_LIST:-1 2 4 8 16 32}"
+else
+  ROUNDS="${ROUNDS:-5}"
+  CACHE="${CACHE:-cold}"
+  WALL_BUDGET="${WALL_BUDGET:-0}"
+fi
+
+parse_duration() {
+  local s="${1:-0}"
+  if [[ -z "$s" || "$s" == "0" ]]; then echo 0; return; fi
+  if [[ "$s" =~ ^[0-9]+$ ]]; then echo "$s"; return; fi
+  if [[ "$s" =~ ^([0-9]+)s$ ]]; then echo "${BASH_REMATCH[1]}"; return; fi
+  if [[ "$s" =~ ^([0-9]+)m(in)?$ ]]; then echo $((BASH_REMATCH[1] * 60)); return; fi
+  echo "[concurrency-probe] bad --budget / WALL_BUDGET '$s' (use 900, 900s, 15m)" >&2
+  exit 2
+}
+WALL_SECS="$(parse_duration "$WALL_BUDGET")"
 
 # Argument validation BEFORE any environment probing: slot detection (#818) is
 # also a FATAL exit 2, so probing first masks this message on rigs where no
@@ -74,25 +196,112 @@ MODEL_PINNED="${MODEL:+1}"
 MODEL="${MODEL:-$(curl -s -m 5 "${URL}/v1/models" 2>/dev/null \
   | python3 -c 'import json,sys;print(json.load(sys.stdin)["data"][0]["id"])' 2>/dev/null || echo qwen3.6-27b)}"
 # best-effort container for VRAM + cmd introspection (name heuristic)
-CONTAINER="${CONTAINER:-$(docker ps --format '{{.Names}}' 2>/dev/null | grep -m1 -E 'vllm-(qwen|gemma)' || true)}"
+CONTAINER="${CONTAINER:-$(docker ps --format '{{.Names}}' 2>/dev/null | command grep -m1 -E 'vllm-(qwen|gemma)' || true)}"
 
 _container_cmd() { docker inspect "$CONTAINER" --format '{{join .Config.Cmd " "}}' 2>/dev/null || true; }
-_served_seqs()   { _container_cmd | grep -oE 'max-num-seqs [0-9]+'  | grep -oE '[0-9]+' | head -1; }
-_served_np()     { _container_cmd | grep -oE '\-np +[0-9]+'         | grep -oE '[0-9]+' | head -1; }
-_served_ctx()    { _container_cmd | grep -oE 'max-model-len [0-9]+' | grep -oE '[0-9]+' | head -1; }
+_served_seqs()   { _container_cmd | command grep -oE 'max-num-seqs [0-9]+'  | command grep -oE '[0-9]+' | head -1; }
+_served_np()     { _container_cmd | command grep -oE '\-np +[0-9]+'         | command grep -oE '[0-9]+' | head -1; }
+_served_ctx()    { _container_cmd | command grep -oE 'max-model-len [0-9]+' | command grep -oE '[0-9]+' | head -1; }
 # llama.cpp-family servers report the slot count as total_slots on /props.
 _props_slots()   { curl -s -m 3 "${URL}/props" 2>/dev/null \
   | python3 -c 'import json,sys; v=json.load(sys.stdin).get("total_slots",""); print(v if isinstance(v,int) else "")' 2>/dev/null; }
+
+_detect_slots() {
+  local n
+  n="$(_served_seqs || true)"; [[ -n "$n" ]] && { echo "$n"; return; }
+  n="$(_served_np || true)";   [[ -n "$n" ]] && { echo "$n"; return; }
+  n="$(_props_slots || true)"; [[ -n "$n" ]] && { echo "$n"; return; }
+  echo ""
+}
+
+_gpu_fp() {
+  local names n first
+  names="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null \
+    | sed 's/^NVIDIA //' || true)"
+  [[ -z "$names" ]] && { echo "? GPU"; return; }
+  n="$(printf '%s\n' "$names" | wc -l | tr -d ' ')"
+  first="$(printf '%s\n' "$names" | head -1)"
+  if [[ "$n" == "1" ]]; then echo "1× ${first}"
+  else echo "${n}× ${first}"
+  fi
+}
+
+_spec_fp() {
+  local cmd
+  cmd="$(_container_cmd)"
+  if [[ -z "$cmd" ]]; then echo "spec ?"; return; fi
+  if printf '%s' "$cmd" | command grep -qiE 'dflash|spec-dflash'; then echo "DFlash"; return; fi
+  if printf '%s' "$cmd" | command grep -qiE 'num-speculative|speculative-config|--speculative'; then echo "MTP"; return; fi
+  if printf '%s' "$cmd" | command grep -qiE 'ngram'; then echo "ngram"; return; fi
+  echo "spec off"
+}
+
+# --- per-rig #249 record: self-tee stdout so the per-N `RESULT` lines (whichever
+# mode ran: matrix / reboot-knee / single-N) can be parsed at completion for the
+# corpus record. CONCURRENCY_PROBE_RECORD=0 skips. resolve-serving maps the
+# running container -> registry slug + fingerprint; unmatched runs skip cleanly.
+# Emit never fails the probe (|| true). Called explicitly at each mode's end (the
+# modes exit separately, and matrix mode installs its own EXIT trap).
+CONCURRENCY_PROBE_RECORD="${CONCURRENCY_PROBE_RECORD:-1}"
+_CP_REC_LOG=""
+if [[ "${CONCURRENCY_PROBE_RECORD}" == "1" ]] && command -v python3 >/dev/null 2>&1; then
+  _CP_REC_LOG="$(mktemp 2>/dev/null || echo "/tmp/cprobe-rec.$$.log")"
+  exec > >(tee -a "${_CP_REC_LOG}")
+fi
+_cp_emit() {  # args: [knee_n knee_tps knee_agg]
+  [[ -n "${_CP_REC_LOG:-}" && -f "${_CP_REC_LOG}" ]] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  sync 2>/dev/null || true
+  sleep 0.4   # let the tee subprocess flush the RESULT lines before we read them
+  local ext
+  ext="$(CP_LOG="${_CP_REC_LOG}" CP_KNEE="${1:-}" CP_KNEE_TPS="${2:-}" CP_KNEE_AGG="${3:-}" \
+    python3 - <<'PY' 2>/dev/null || true
+import json, os, re
+try:
+    txt = open(os.environ["CP_LOG"], encoding="utf-8", errors="replace").read()
+except OSError:
+    raise SystemExit(0)
+cells = []
+for ln in txt.splitlines():
+    i = ln.find("RESULT ")
+    if i < 0:
+        continue
+    d = {}
+    for tok in ln[i + 7:].split():
+        if "=" in tok:
+            k, v = tok.split("=", 1)
+            d[k] = v
+    if d:
+        cells.append(d)
+if not cells:
+    raise SystemExit(0)
+out = {"cells": cells}
+kn = os.environ.get("CP_KNEE") or None
+if kn:
+    out["knee"] = {"n": kn,
+                   "per_stream_tps": os.environ.get("CP_KNEE_TPS") or None,
+                   "aggregate_tps": os.environ.get("CP_KNEE_AGG") or None}
+print(json.dumps(out, separators=(",", ":")))
+PY
+)"
+  if [[ -n "$ext" ]]; then
+    python3 "$ROOT_DIR/scripts/lib/profiles/measurement_record.py" \
+      --resolve-serving --serving-url "$URL" --bench-output /dev/null --result-class concurrency-only \
+      --extension "concurrency_by_n=${ext}" >/dev/null 2>&1 || true
+  fi
+  rm -f "${_CP_REC_LOG}"
+  _CP_REC_LOG=""
+}
 
 # CONCURRENCY defaults to the served slot count (the thing we're validating).
 # Detection order: vLLM container flag -> llama.cpp container flag -> /props.
 # A failed detection is FATAL (#818): the old silent CONCURRENCY=2 fallback
 # measured queue-wait as concurrency against 1-slot servers and mislabeled arms.
-# SWEEP mode skips detection entirely: each arm passes CONCURRENCY=$N into
-# run_probe after its own boot, and probing the PRE-sweep server (or a
-# serverless box, in SWEEP_DRY) would FATAL on a value nothing consumes.
-if [[ -n "$SWEEP" ]]; then
-  : # per-arm CONCURRENCY comes from the sweep loop
+# SWEEP / --sweep skip detection here: each arm passes CONCURRENCY=$N into
+# run_probe, and probing the PRE-sweep server (or a serverless box, in DRY)
+# would FATAL on a value nothing consumes.
+if [[ -n "$SWEEP" || "$MATRIX" == "1" ]]; then
+  : # per-arm CONCURRENCY comes from the sweep / matrix loop
 elif [[ -z "${CONCURRENCY:-}" ]]; then
   _conc_src="container max-num-seqs"; CONCURRENCY="$(_served_seqs || true)"
   if [[ -z "$CONCURRENCY" ]]; then _conc_src="container -np";          CONCURRENCY="$(_served_np || true)"; fi
@@ -110,7 +319,8 @@ fi
 # VALIDATE preset: fill each stream to the served target context (N full-context
 # sessions is what the row's no-preemption ceiling claims), and run a touch
 # longer so the retention signal is meaningful.
-if [[ "$VALIDATE" == "1" && -z "$SWEEP" ]]; then
+if [[ "$VALIDATE" == "1" && -z "$SWEEP" && "$MATRIX" != "1" ]]; then
+  CACHE=cold
   ctx="${TARGET_CTX:-$(_served_ctx || true)}"; ctx="${ctx:-32768}"
   headroom=$(( GEN_TOKENS + 512 ))
   if (( ctx > headroom )); then PROMPT_TOKENS=$(( ctx - headroom )); else PROMPT_TOKENS="$ctx"; fi
@@ -128,168 +338,302 @@ run_probe() {
   ROUNDS="$ROUNDS" PROMPT_TOKENS="$PROMPT_TOKENS" GEN_TOKENS="$GEN_TOKENS" \
   VRAM_GROWTH_MB="$VRAM_GROWTH_MB" REQ_TIMEOUT="$REQ_TIMEOUT" \
   TPS_FLOOR="$TPS_FLOOR" RETENTION_MIN="$RETENTION_MIN" VALIDATE="$VALIDATE" \
-  python3 - <<'PY'
-import concurrent.futures as cf
-import json, os, statistics, subprocess, time, urllib.request
-
-URL=os.environ["URL"]; MODEL=os.environ["MODEL"]; N=int(os.environ["CONCURRENCY"])
-ROUNDS=int(os.environ["ROUNDS"]); PTOK=int(os.environ["PROMPT_TOKENS"])
-GTOK=int(os.environ["GEN_TOKENS"]); GROWTH=int(os.environ["VRAM_GROWTH_MB"])
-REQ_TIMEOUT=float(os.environ["REQ_TIMEOUT"]); TPS_FLOOR=float(os.environ["TPS_FLOOR"])
-RETENTION_MIN=float(os.environ["RETENTION_MIN"]); VALIDATE=os.environ["VALIDATE"]=="1"
-CONTAINER=os.environ.get("CONTAINER") or ""
-
-BLOCK=("This section describes the history of computing in detail. Transistors "
-       "were invented in 1947 at Bell Labs. The integrated circuit came a decade "
-       "later. Microprocessors emerged in the 1970s and changed the world. ")
-def prompt(stream, rnd):  # ~0.23 tok/char; unique salt per stream -> no prefix-cache free ride
-    reps=int(PTOK/(len(BLOCK)*0.23))+1
-    return f"[probe s{stream} r{rnd}] "+BLOCK*reps+"\nWrite a detailed multi-paragraph summary."
-
-def vram_used_mb():
-    try:
-        out=subprocess.run(["nvidia-smi","--query-gpu=memory.used","--format=csv,noheader,nounits"],
-                           capture_output=True,text=True,timeout=10).stdout
-        return sum(int(x) for x in out.split())
-    except Exception:
-        return -1
-
-def one(stream, rnd):
-    # Streamed so we can separate TTFT (prefill) from decode and report a real
-    # per-stream DECODE tok/s — the signal the bandwidth-knee sweep needs, and
-    # the only honest throughput number at deep context (where prefill dominates
-    # wall time). completion_tokens comes from the include_usage final chunk.
-    body=json.dumps({"model":MODEL,"max_tokens":GTOK,"temperature":0.0,"stream":True,
-        "stream_options":{"include_usage":True},
-        "messages":[{"role":"user","content":prompt(stream,rnd)}]}).encode()
-    req=urllib.request.Request(URL+"/v1/chat/completions",data=body,
-        headers={"Content-Type":"application/json"})
-    t0=time.time(); t_first=None; t_last=None; toks=0; chunks=0
-    try:
-        resp=urllib.request.urlopen(req,timeout=REQ_TIMEOUT)
-        for raw in resp:
-            line=raw.decode("utf-8","ignore").strip()
-            if not line.startswith("data:"): continue
-            data=line[5:].strip()
-            if data=="[DONE]": break
-            try: ch=json.loads(data)
-            except Exception: continue
-            u=ch.get("usage")
-            if u and u.get("completion_tokens"): toks=u["completion_tokens"]
-            ch_choices=ch.get("choices") or []
-            if ch_choices:
-                d=ch_choices[0].get("delta") or {}
-                if d.get("content") or d.get("reasoning_content") or d.get("reasoning"):
-                    now=time.time()
-                    if t_first is None: t_first=now
-                    t_last=now; chunks+=1
-        dt=time.time()-t0
-        if not toks: toks=chunks  # fall back to chunk count if usage absent
-        decode_dt=(t_last-t_first) if (t_first and t_last and t_last>t_first) else 0.0
-        tps=(toks/decode_dt) if (toks>1 and decode_dt>0) else 0.0
-        ttft=(t_first-t0) if t_first else None
-        return {"ok":toks>0,"toks":toks,"silent":toks==0,"err":None,"dt":dt,"ttft":ttft,"tps":tps}
-    except Exception as e:
-        return {"ok":False,"toks":0,"silent":False,"err":str(e)[:80],"dt":time.time()-t0,"ttft":None,"tps":0.0}
-
-print(f"\n{'round':>5} {'done':>7} {'silent':>7} {'errors':>7} {'vram_MB':>8} {'agg_t/s':>8} {'per-strm':>9} {'ttft_ms':>8} {'pf_t/s':>7}")
-vram0=vram_used_mb()
-vram_by_round=[]; mtps_by_round=[]; agg_by_round=[]; ttft_by_round=[]; pf_by_round=[]; bad=0; err_rounds=0
-for rnd in range(1,ROUNDS+1):
-    t0=time.time()
-    with cf.ThreadPoolExecutor(max_workers=N) as ex:
-        res=list(ex.map(lambda s: one(s,rnd), range(N)))
-    wall=time.time()-t0
-    done=sum(1 for r in res if r["ok"]); silent=sum(1 for r in res if r["silent"])
-    errs=sum(1 for r in res if r["err"])
-    v=vram_used_mb(); vram_by_round.append(v)
-    agg=sum(r["toks"] for r in res)/wall if wall else 0
-    tps_ok=[r["tps"] for r in res if r["ok"] and r["tps"]>0]
-    mtps=statistics.median(tps_ok) if tps_ok else 0.0
-    mtps_by_round.append(mtps); agg_by_round.append(agg)
-    # concurrent prefill: median TTFT across streams; prefill rate derived as
-    # PTOK/ttft (same convention as bench.sh's prefill probe: prompt_tokens/TTFT).
-    ttfts=[r["ttft"] for r in res if r["ok"] and r["ttft"]]
-    ttft_med=statistics.median(ttfts) if ttfts else 0.0
-    pf=(PTOK/ttft_med) if ttft_med>0 else 0.0
-    ttft_by_round.append(ttft_med); pf_by_round.append(pf)
-    print(f"{rnd:>5} {done:>4}/{N:<2} {silent:>7} {errs:>7} {v:>8} {agg:>8.1f} {mtps:>9.1f} {ttft_med*1000:>8.0f} {pf:>7.0f}")
-    if done<N or silent or errs: bad+=1
-    if errs: err_rounds+=1
-
-# VRAM: leak = post-warm growth (round 2 baseline), NOT the expected cold->warm fill.
-warm_i=1 if ROUNDS>=3 else 0
-warm=vram_by_round[warm_i]
-pool_fill=warm-vram0 if vram0>=0 else -1
-leak=vram_by_round[-1]-warm if vram0>=0 else -1
-vram_peak=max(vram_by_round) if vram_by_round else -1
-# per-stream decode TPS: steady-state = last round; retention = late vs early.
-# Round 1 is cudagraph/cold warmup (systematically slow) — anchoring retention
-# on it would flatter the ratio, so drop it once there are >=4 rounds.
-report_tps=mtps_by_round[-1] if mtps_by_round else 0.0
-# aggregate = summed completion tokens / wall per round (what "total rig
-# throughput at N agents" means); steady-state = last round, like per-stream.
-report_agg=agg_by_round[-1] if agg_by_round else 0.0
-# An aggregate computed over a round that had errors is not a throughput number:
-# failed streams contribute toks=0 while their prefill still counts in the wall,
-# so the figure is (survivors' tokens)/(full round wall) and reads 5-10x low. It
-# has been quoted out of context as a measured regression before. Report NaN so a
-# broken arm cannot be mistaken for a slow one — clean= and the FAIL verdict below
-# already carry the diagnosis.
-if err_rounds:
-    report_agg=float("nan")
-    report_tps=float("nan")
-warm_tps=mtps_by_round[1:] if ROUNDS>=4 else mtps_by_round
-if len(warm_tps)>=3 and warm_tps[0]>0:
-    early=statistics.median(warm_tps[:2]); late=statistics.median(warm_tps[-2:])
-    retention=(late/early) if early>0 else 0.0
-else:
-    retention=1.0  # too few post-warmup rounds to judge
-
-clean_fit=(bad==0) and (0<=leak<=GROWTH)
-floor_ok=(report_tps>=TPS_FLOOR) if TPS_FLOOR>0 else True
-retention_ok=(retention>=RETENTION_MIN) if ROUNDS>=3 else True
-PASS=clean_fit and floor_ok and (retention_ok if VALIDATE else True)
-
-print(f"\n=== verdict (N={N}) ===")
-print(f"  VRAM: cold {vram0} -> warm {warm} MB (pool fill {pool_fill} MB, expected) "
-      f"-> final {vram_by_round[-1]} MB (post-warm growth {leak} MB / {GROWTH})  peak {vram_peak} MB")
-print(f"  per-stream decode: {report_tps:.1f} tok/s (steady) · aggregate {report_agg:.1f} tok/s "
-      f"({N} streams) · retention {retention*100:.1f}% "
-      f"(min {RETENTION_MIN*100:.0f}%)" + (f" · floor {TPS_FLOOR:.0f}" if TPS_FLOOR>0 else " · floor off"))
-steady_ttft=ttft_by_round[-1] if ttft_by_round else 0.0
-steady_pf=pf_by_round[-1] if pf_by_round else 0.0
-print(f"  concurrent prefill: steady TTFT {steady_ttft*1000:.0f} ms (median of {N} streams) "
-      f"· ~{steady_pf:.0f} tok/s/stream derived @ {PTOK}-tok prompts")
-flags=[]
-if not clean_fit: flags.append("fit")
-if TPS_FLOOR>0 and not floor_ok: flags.append("tps-floor")
-if VALIDATE and not retention_ok: flags.append("retention")
-print(f"  concurrency {N} @ ~{PTOK} tok: {'PASS — sustained clean' if PASS else 'FAIL — '+','.join(flags)}")
-if PASS:
-    print(f"  envelope row: max_num_seqs: {N}  validated: {{ concurrency_soak: "
-          f"'{N} @ ~{PTOK//1000}K, {report_tps:.0f} tok/s/stream, {leak} MB post-warm', "
-          f"vram_peak_gb: {vram_peak/1024:.1f} }}")
-# machine-readable line for SWEEP parsing
-print(f"RESULT N={N} clean={int(clean_fit)} pass={int(PASS)} mps_tps={report_tps:.2f} "
-      f"agg_tps={report_agg:.2f} retention={retention:.3f} leak={leak} vram_peak={vram_peak} floor_ok={int(floor_ok)} "
-      f"ttft_ms={steady_ttft*1000:.0f} pf_tps={steady_pf:.1f}")
-raise SystemExit(0 if PASS else 1)
-PY
+  CACHE="$CACHE" SHARE_FRAC="$SHARE_FRAC" UNIQUE_MIN="$UNIQUE_MIN" \
+    BENCH_TEMP="$BENCH_TEMP" BENCH_TOP_P="$BENCH_TOP_P" \
+    BENCH_TOP_K="$BENCH_TOP_K" BENCH_MIN_P="$BENCH_MIN_P" \
+  python3 "$PROBE_PY"
 }
+
+# --- opt-in readiness + warm-up gate for the live --sweep path ----------------
+# OFF by default (WARMUP=0) so CI / runs against an already-warm server aren't
+# slowed. Set WARMUP=1 when you boot an engine and immediately sweep: cold vLLM
+# needs minutes to load weights + capture CUDA graphs, and a rung fired before
+# it is ready reads as a spurious crash. Waits for /v1/models, re-resolves the
+# served model (the top-of-script autodetect may have fallen back to the default
+# when nothing was serving yet), then fires a few warm-up generations. Returns
+# non-zero only if the server never comes up within WARMUP_TIMEOUT.
+warmup_gate() {
+  [[ "${WARMUP:-0}" == "1" ]] || return 0
+  local timeout="${WARMUP_TIMEOUT:-900}" reqs="${WARMUP_REQS:-3}"
+  echo "[sweep] WARMUP: waiting up to ${timeout}s for ${URL} ..." >&2
+  local ready=0 waited=0
+  for _ in $(seq 1 $(( timeout / 2 )) ); do
+    if curl -s -m 3 "${URL}/v1/models" >/dev/null 2>&1; then ready=1; break; fi
+    sleep 2; waited=$(( waited + 2 ))
+  done
+  if [[ "$ready" != "1" ]]; then
+    echo "[sweep] WARMUP: not ready in ${timeout}s — aborting sweep" >&2
+    return 1
+  fi
+  echo "[sweep] WARMUP: server up after ~${waited}s" >&2
+  # Re-resolve the served model now that the server answers (skip if pinned).
+  if [[ -z "$MODEL_PINNED" ]]; then
+    local det
+    det="$(curl -s -m 5 "${URL}/v1/models" 2>/dev/null \
+      | python3 -c 'import json,sys;print(json.load(sys.stdin)["data"][0]["id"])' 2>/dev/null || true)"
+    if [[ -n "$det" && "$det" != "$MODEL" ]]; then
+      echo "[sweep] WARMUP: served model re-resolved: $det (was: $MODEL)" >&2
+      MODEL="$det"
+    fi
+  fi
+  # Fire warm-up generations to trigger CUDA-graph capture before timing starts.
+  local ok=0 i
+  for i in $(seq 1 "$reqs"); do
+    if curl -s -m 120 "${URL}/v1/chat/completions" \
+         -H 'content-type: application/json' \
+         -d "{\"model\":\"${MODEL}\",\"messages\":[{\"role\":\"user\",\"content\":\"warmup\"}],\"max_tokens\":8}" \
+         >/dev/null 2>&1; then ok=$(( ok + 1 )); fi
+  done
+  echo "[sweep] WARMUP: ${ok}/${reqs} warm-up requests ok" >&2
+  return 0
+}
+
+# --- --sweep: live N×ctx matrix, no reboot ------------------------------------
+if [[ "$MATRIX" == "1" ]]; then
+  if [[ "$SWEEP_DRY" != "1" ]]; then warmup_gate || exit 1; fi
+  slots="$(_detect_slots || true)"
+  slots_src="undetected"
+  if [[ -n "$(_served_seqs || true)" ]]; then slots_src="container max-num-seqs"
+  elif [[ -n "$(_served_np || true)" ]]; then slots_src="container -np"
+  elif [[ -n "$(_props_slots || true)" ]]; then slots_src="server /props total_slots"
+  fi
+  max_len="$(_served_ctx || true)"
+  if [[ -z "$KV_TOKENS" || "$KV_TOKENS" == "0" ]]; then
+    KV_TOKENS="$(CONTAINER="$CONTAINER" python3 "$PROBE_PY" --detect-kv || true)"
+  fi
+
+  if [[ "$SWEEP_DRY" != "1" && -z "$slots" && "$N_LIST_EXPLICIT" != "1" ]]; then
+    echo "[concurrency-probe] FATAL: --sweep cannot detect the served slot count" \
+         "(container cmd and ${URL}/props both failed) — pass --n 1,2,4 or CONCURRENCY=N" >&2
+    exit 2
+  fi
+
+  # ⚠️ A server with fewer slots than the requested concurrency does NOT batch — the
+  # extra streams QUEUE, so the run measures queuing latency and reports it as a
+  # concurrency curve. Silent, and it reads as flat/negative scaling.
+  # (Shipped offload composes hardcoded `-np 1` until 2026-08-31; they now honour
+  # NPARALLEL, so raise it to at least the highest N you intend to probe.)
+  if [[ -n "$slots" ]]; then
+    _max_n="$(printf '%s' "$N_LIST" | tr ', ' '\n\n' | sort -n | tail -1)"
+    if [[ -n "$_max_n" ]] && [[ "$_max_n" -gt "$slots" ]] 2>/dev/null; then
+      echo "[concurrency-probe] WARNING: server has ${slots} slot(s) (${slots_src}) but N goes up to ${_max_n}." >&2
+      echo "[concurrency-probe]   Streams beyond ${slots} QUEUE rather than batch — the curve above N=${slots}" >&2
+      echo "[concurrency-probe]   measures queuing, NOT concurrency." >&2
+      echo "[concurrency-probe]   Fix: reboot the compose with NPARALLEL=${_max_n}. Note -np splits -c into" >&2
+      echo "[concurrency-probe]   ctx/N per slot, so pool and compute buffer change — re-measure, do not reuse rows." >&2
+    fi
+  fi
+
+  export CTX_SWEEP N_LIST GEN_TOKENS KV_TOKENS N_MAX CTX_MAX
+  export SERVED_SLOTS="${slots:-}" SERVED_MAX_LEN="${max_len:-}"
+  cache_label="$CACHE"
+  if [[ "$CACHE" == "shared" ]]; then
+    cache_label="shared $(awk -v f="$SHARE_FRAC" 'BEGIN{printf "%.0f", f*100}')%"
+  fi
+  header="[sweep] live  slots=${slots:-?} (${slots_src:-undetected})  max-len=${max_len:-?}  KV=${KV_TOKENS:-?}  cache=${cache_label}  rounds=${ROUNDS}  budget=${WALL_BUDGET}  floor=${TPS_FLOOR}"
+  PLAN_HEADER="$header" python3 "$PROBE_PY" --plan
+
+  if [[ "$SWEEP_DRY" == "1" ]]; then
+    exit 0
+  fi
+
+  if [[ "${slots:-1}" == "1" && "$N_LIST_EXPLICIT" != "1" ]]; then
+    echo "[sweep] server is 1-slot — raise MAX_NUM_SEQS / -np and rerun for a real sweep" >&2
+  fi
+
+  t0_matrix=$(date +%s)
+  budget_hit=0
+  declare -A ROW_DEAD=()
+  cells_jsonl="$(mktemp /tmp/cprobe-cells.XXXXXX)"
+  trap 'rm -f "$cells_jsonl"' EXIT
+
+  emit_row() {
+    python3 - "$cells_jsonl" <<'PY'
+import json, sys
+path = sys.argv[1]
+row = json.loads(sys.stdin.read())
+with open(path, "a", encoding="utf-8") as fh:
+    fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+PY
+  }
+
+  while IFS=$'\t' read -r action ctx n reason; do
+    [[ -z "${action:-}" ]] && continue
+    if [[ "$budget_hit" == "1" ]]; then
+      echo "[sweep] ${ctx} tok  N=${n}: skip (budget)"
+      printf '%s\n' "{\"ctx\":$ctx,\"n\":$n,\"skip\":\"budget\"}" | emit_row
+      continue
+    fi
+    if [[ "$action" == "skip" ]]; then
+      echo "[sweep] ${ctx} tok  N=${n}: skip (${reason})"
+      printf '%s\n' "$(python3 -c 'import json,sys; print(json.dumps({"ctx":int(sys.argv[1]),"n":int(sys.argv[2]),"skip":sys.argv[3]}))' "$ctx" "$n" "${reason:-clipped}")" | emit_row
+      continue
+    fi
+    if [[ "$EARLY_STOP" == "1" && -n "${ROW_DEAD[$ctx]:-}" ]]; then
+      echo "[sweep] ${ctx} tok  N=${n}: skip (early-stop — N=${ROW_DEAD[$ctx]} failed)"
+      printf '%s\n' "$(python3 -c 'import json,sys; print(json.dumps({"ctx":int(sys.argv[1]),"n":int(sys.argv[2]),"skip":"early-stop"}))' "$ctx" "$n")" | emit_row
+      continue
+    fi
+    echo
+    echo "───────────────── ${ctx} tok × N=${n}  (cache=${CACHE}) ─────────────────"
+    PROMPT_TOKENS="$ctx"
+    set +e
+    out="$(run_probe "$n")"
+    rc=$?
+    set -e
+    printf '%s\n' "$out"
+    line="$(printf '%s\n' "$out" | command grep -m1 '^RESULT ' || true)"
+    python3 - "$cells_jsonl" "$line" "$ctx" "$n" "$rc" <<'PY'
+import json, os, sys
+path, line, ctx, n, rc = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
+fields = {}
+s = line.strip()
+if s.startswith("RESULT "):
+    s = s[7:]
+for part in s.split():
+    if "=" in part:
+        k, v = part.split("=", 1)
+        fields[k] = v
+
+def fnum(k):
+    v = fields.get(k)
+    if v in (None, "", "-", "nan"):
+        return None
+    try:
+        return float(v)
+    except ValueError:
+        return None
+
+row = {
+    "ctx": ctx,
+    "n": n,
+    "skip": None,
+    "clean": int(fields["clean"]) if fields.get("clean", "").isdigit() else 0,
+    "pass": int(fields["pass"]) if fields.get("pass", "").isdigit() else int(rc == 0),
+    "strm": fnum("mps_tps"),
+    "agg": fnum("agg_tps"),
+    "ttft_s": (fnum("ttft_ms") / 1000.0) if fnum("ttft_ms") is not None else None,
+    "vram_gb": (fnum("vram_peak") / 1024.0) if fnum("vram_peak") not in (None, -1.0) else None,
+    "running": fields.get("running", "-"),
+    "waiting": fields.get("waiting", "-"),
+    "result": line,
+}
+with open(path, "a", encoding="utf-8") as fh:
+    fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+PY
+    fail=0
+    clean="$(sed -n 's/.* clean=\([0-9]*\).*/\1/p' <<<"$line")"
+    running="$(sed -n 's/.* running=\([^ ]*\).*/\1/p' <<<"$line")"
+    running_max="$(sed -n 's/.* running_max=\([^ ]*\).*/\1/p' <<<"$line")"
+    waiting_max="$(sed -n 's/.* waiting_max=\([^ ]*\).*/\1/p' <<<"$line")"
+    [[ "$rc" != "0" || "$clean" != "1" ]] && fail=1
+    # Key off the PEAK, not the racy last sample. A rung where every request
+    # completed but whose final metrics sample happened to land after they
+    # finished reads running=0 and used to fail the rung AND early-stop the
+    # ladder — silently truncating the very measurement the sweep exists to
+    # produce. (From @voiceagentscc's #1212.)
+    if [[ "$running_max" =~ ^[0-9]+$ && "$running_max" -lt "$n" ]]; then
+      fail=1
+      echo "[sweep] admitted peak ${running_max}/${n} (waiting ${waiting_max:-?}) — treating as fail for early-stop"
+    fi
+    if [[ "$fail" == "1" && "$EARLY_STOP" == "1" ]]; then
+      ROW_DEAD[$ctx]="$n"
+    fi
+    now=$(date +%s)
+    if [[ "$WALL_SECS" -gt 0 && $((now - t0_matrix)) -ge "$WALL_SECS" ]]; then
+      echo "[sweep] WALL_BUDGET=${WALL_BUDGET} reached — remaining cells skipped"
+      budget_hit=1
+    fi
+  done < <(python3 "$PROBE_PY" --plan-tsv)
+
+  rec_json="$(mktemp /tmp/cprobe-rec.XXXXXX)"
+  if [[ "$slots_src" == "container -np" ]]; then engine="llamacpp"
+  elif [[ "$slots_src" == "container max-num-seqs" ]]; then engine="vllm"
+  else engine=""
+  fi
+  MODEL="$MODEL" SLUG="${SLUG:-}" SPEC="$(_spec_fp)" GPUS="$(_gpu_fp)" \
+  KV_TOKENS="${KV_TOKENS:-}" SLOTS="${slots:-}" GEN_TOKENS="$GEN_TOKENS" \
+  CACHE_LABEL="$cache_label" ENGINE="$engine" SERVED_MAX_LEN="${max_len:-}" \
+  PROBE_LIBDIR="$ROOT_DIR/scripts/lib" \
+  python3 - "$cells_jsonl" "$rec_json" <<'PY'
+import json, os, sys
+sys.path.insert(0, os.environ.get("PROBE_LIBDIR") or "")
+from concurrency_probe import recommend_compose
+rows = []
+with open(sys.argv[1], encoding="utf-8") as fh:
+    for line in fh:
+        line = line.strip()
+        if line:
+            rows.append(json.loads(line))
+kv = os.environ.get("KV_TOKENS") or None
+slots = os.environ.get("SLOTS") or None
+served = os.environ.get("SERVED_MAX_LEN") or None
+rec = {
+    "model": os.environ.get("MODEL") or "?",
+    "slug": os.environ.get("SLUG") or "",
+    "spec": os.environ.get("SPEC") or "spec ?",
+    "gpus": os.environ.get("GPUS") or "? GPU",
+    "kv_tokens": int(kv) if kv and str(kv).isdigit() else None,
+    "slots": int(slots) if slots and str(slots).isdigit() else None,
+    "served_max_len": int(served) if served and str(served).isdigit() else None,
+    "engine": os.environ.get("ENGINE") or "",
+    "gen_tokens": int(os.environ.get("GEN_TOKENS") or 256),
+    "cache": os.environ.get("CACHE_LABEL") or "cold",
+    "command": "bash scripts/concurrency-probe.sh --sweep",
+    "rows": rows,
+}
+rec["recommend"] = recommend_compose(rec)
+with open(sys.argv[2], "w", encoding="utf-8") as fh:
+    json.dump(rec, fh, indent=2)
+    fh.write("\n")
+PY
+
+  echo
+  python3 "$PROBE_PY" --card < "$rec_json"
+
+  out_dir="$ROOT_DIR/results"
+  mkdir -p "$out_dir"
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  safe_model="$(printf '%s' "$MODEL" | tr '/ :' '___')"
+  base="$out_dir/concurrency-${stamp}-${safe_model}"
+  cp "$rec_json" "${base}.json"
+  python3 "$PROBE_PY" --card < "$rec_json" > "${base}.md"
+  echo
+  echo "[sweep] wrote ${base}.md  +  ${base}.json"
+  rm -f "$rec_json"
+  _cp_emit
+  exit 0
+fi
 
 # --- SWEEP: reboot per N, probe, find the throughput knee ----------------------
 if [[ -n "$SWEEP" ]]; then
   # SLUG presence already validated up top, before environment probing.
   echo "[sweep] slug=$SLUG N in { $SWEEP } · floor=${TPS_FLOOR} tok/s/stream · reboots the server per N"
   knee=""; knee_tps=""; knee_agg=""; sweep_rows=""
+  # --force: SWEEP targets the user-named SLUG, which may be status-gated
+  # (experimental/incubating) — switch.sh refuses it without --force, AFTER tearing
+  # the old container down. Restore-on-exit trap returns the slug to its default
+  # config if a probe dies mid-sweep. (Same fix as spec-sweep, 2026-08-20.)
+  #
+  # ⚠️ The restore trap MUST NOT be installed on a dry run. It fires at process
+  # exit — i.e. AFTER the last [sweep:dry] line is printed — so a stdout assertion
+  # of "no boot happened" passes while the trap boots the slug for real. That is
+  # exactly how SWEEP_DRY=1 left a live vllm/minimal behind on this rig
+  # (2026-09-08): the guard suite ran the dry case, went green, and booted a 20 GB
+  # model. A dry run must touch nothing. spec-sweep.sh avoids this by exiting
+  # before its traps; this branch handles dry inside the loop, so it guards here.
+  if [[ "$SWEEP_DRY" == "1" ]]; then
+    trap 'rm -f "${cells_jsonl:-}"' EXIT
+  else
+    trap 'rm -f "${cells_jsonl:-}"; bash "$ROOT_DIR/scripts/switch.sh" --force "$SLUG" >/dev/null 2>&1 || true' EXIT
+  fi
   for N in $SWEEP; do
     if [[ "$SWEEP_DRY" == "1" ]]; then
       echo "[sweep:dry] would: MAX_NUM_SEQS=$N switch.sh $SLUG  ->  wait ready  ->  probe N=$N"
       continue
     fi
     echo "[sweep] boot $SLUG @ MAX_NUM_SEQS=$N ..."
-    if ! MAX_NUM_SEQS="$N" bash "$ROOT_DIR/scripts/switch.sh" "$SLUG" >/dev/null 2>&1; then
+    if ! MAX_NUM_SEQS="$N" bash "$ROOT_DIR/scripts/switch.sh" --force "$SLUG" >/dev/null 2>&1; then
       echo "[sweep] N=$N: boot FAILED — skipping"; continue
     fi
     ready=0
@@ -311,7 +655,7 @@ if [[ -n "$SWEEP" ]]; then
       fi
     fi
     out="$(run_probe "$N" || true)"; echo "$out"
-    line="$(printf '%s\n' "$out" | grep -m1 '^RESULT ' || true)"
+    line="$(printf '%s\n' "$out" | command grep -m1 '^RESULT ' || true)"
     clean="$(sed -n 's/.* clean=\([0-9]*\).*/\1/p' <<<"$line")"
     mps="$(sed -n 's/.* mps_tps=\([0-9.]*\).*/\1/p' <<<"$line")"
     agg="$(sed -n 's/.* agg_tps=\([0-9.]*\).*/\1/p' <<<"$line")"
@@ -332,6 +676,17 @@ if [[ -n "$SWEEP" ]]; then
   else
     echo "  no N met the bar — lower the sweep range or the target_ctx, or check the floor."
   fi
+  # ⚠️ Restore only if we actually changed anything. On SWEEP_DRY the loop above
+  # `continue`s without booting, so there is nothing to restore — and calling
+  # switch.sh here would boot the slug for real at the end of a run whose entire
+  # contract is "print the plan, touch nothing". This is the line that left a live
+  # vllm/minimal on the rig (2026-09-08); the exit trap above was the second one.
+  if [[ "$SWEEP_DRY" != "1" ]]; then
+    echo "[sweep] restoring $SLUG default boot config…"
+    bash "$ROOT_DIR/scripts/switch.sh" --force "$SLUG" >/dev/null 2>&1 || true
+  fi
+  trap - EXIT
+  _cp_emit "$knee" "$knee_tps" "$knee_agg"
   exit 0
 fi
 
@@ -339,3 +694,4 @@ fi
 echo "[concurrency-probe] URL=$URL model=$MODEL N=$CONCURRENCY rounds=$ROUNDS prompt=${PROMPT_TOKENS}tok gen=${GEN_TOKENS}" \
      "$( [[ "$TPS_FLOOR" != "0" ]] && echo "floor=${TPS_FLOOR}" )"
 run_probe "$CONCURRENCY"
+_cp_emit

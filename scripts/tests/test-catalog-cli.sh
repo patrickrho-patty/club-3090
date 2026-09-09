@@ -1,0 +1,216 @@
+#!/usr/bin/env bash
+# Guard: scripts/catalog.sh is the front door to the LOCAL layer (#1202 P4).
+#
+# Pins the four properties that make it safe to hand a stranger:
+#   1. an engine that cannot be inferred REFUSES and names the fix, rather than
+#      writing engine="unknown" into the catalog — that user (their own engine
+#      build) is precisely who the local layer exists for;
+#   2. everything auto-filled is PRINTED before the write. A compose is read
+#      mechanically and cannot know whether `-ts 1,1` is a layer split or tensor
+#      parallelism in the catalog's sense, so a wrong value nobody saw is worse
+#      than a prompt;
+#   3. register -> unregister is a clean round trip in a throwaway root;
+#   4. `unregister` cannot reach the curated catalog.
+set -uo pipefail
+export PYTHONUTF8="${PYTHONUTF8:-1}"
+cd "$(dirname "${BASH_SOURCE[0]}")/../.."
+ROOT="$PWD"
+rc=0
+TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+mkdir -p "$TMP/scripts" "$TMP/tools"
+cp -r scripts/lib "$TMP/scripts/"
+cp -r tools/tui-core "$TMP/tools/"
+
+# Arch dims come from the weights. A fabricated config.json exercises that path
+# without depending on a multi-GB GGUF existing on a contributor's machine.
+cat > "$TMP/config.json" <<'JSON'
+{"hidden_size": 64, "num_hidden_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 2}
+JSON
+W="$TMP/config.json"
+
+C="$TMP/byo.yml"
+cat > "$C" <<'YML'
+services:
+  mine:
+    image: ghcr.io/someone/their-own-engine:v1
+    ports:
+      - "${PORT:-8199}:8199"
+    command: >
+      /app/llama-server -m /models/m.gguf -a byo-probe -c 65536 -ctk q8_0 -ts 1,1
+YML
+
+# 1. unknown engine -> refuse, and say what to do
+out="$(scripts/catalog.sh register --compose "$C" --root "$TMP" --dry-run -y 2>&1)"; code=$?
+if [[ "$code" -eq 0 ]]; then
+  echo "  FAIL an uninferable engine was accepted (would write engine=unknown)"; rc=1
+elif [[ "$out" != *"--engine"* ]]; then
+  echo "  FAIL refusal does not name the fix (--engine)"; rc=1
+else
+  echo "  ok   uninferable engine refused, fix named"
+fi
+
+# 2. derived values are shown
+out="$(scripts/catalog.sh register --compose "$C" --engine their-engine --engine-type llama.cpp --weights "$W" --root "$TMP" --dry-run -y 2>&1)"
+missing=""
+for k in slug model engine workload max_ctx kv_format tp port; do
+  [[ "$out" == *"$k"* ]] || missing="$missing $k"
+done
+if [[ -n "$missing" ]]; then
+  echo "  FAIL derived values not shown before write:$missing"; rc=1
+else
+  echo "  ok   derived values printed for confirmation"
+fi
+[[ "$out" == *"dry-run"* ]] || { echo "  FAIL --dry-run did not reach the executor"; rc=1; }
+
+# 2b. arch is REQUIRED and must be refused BEFORE the write — promote reads it
+# with .get, so a missing arch passes its validation and then dies in the
+# post-write re-check, leaving the layer written and broken ("NO ROLLBACK").
+out="$(scripts/catalog.sh register --compose "$C" --engine their-engine --engine-type llama.cpp --root "$TMP" --dry-run -y 2>&1)"; code=$?
+if [[ "$code" -eq 0 ]]; then
+  echo "  FAIL registered with no arch dims (post-write re-check would break the layer)"; rc=1
+elif [[ "$out" != *"--weights"* ]]; then
+  echo "  FAIL arch refusal does not name the fix (--weights)"; rc=1
+else
+  echo "  ok   missing arch refused BEFORE writing, fix named"
+fi
+
+# 2c. an unknown engine needs a declared lineage, never a guess: `type` has no
+# enum validation, so a wrong value silently costs the fork drafter compat.
+out="$(scripts/catalog.sh register --compose "$C" --engine their-engine --weights "$W" --root "$TMP" --dry-run -y 2>&1)"
+if [[ "$out" == *"--engine-type"* ]]; then
+  echo "  ok   unknown lineage refused, --engine-type named"
+else
+  echo "  FAIL unknown engine lineage was guessed rather than refused"; rc=1
+fi
+
+# 3. round trip
+if scripts/catalog.sh register --compose "$C" --engine their-engine --engine-type llama.cpp --weights "$W" --root "$TMP" -y >/dev/null 2>&1; then
+  REG="$TMP/scripts/lib/profiles-local/registry.local.json"
+  # A registry entry alone proves little: `register` DERIVES the compose path and
+  # model id, so a derivation bug can write an entry pointing at files that were
+  # never created. Assert the artifacts exist and that the entry is USABLE.
+  MID=byo-probe
+  PROF="$TMP/scripts/lib/profiles-local/models.d/$MID.yml"
+  [[ -f "$PROF" ]] && echo "  ok   model profile written" \
+    || { echo "  FAIL no model profile at models.d/$MID.yml"; rc=1; }
+  CPATH="$(python3 -c "
+import json,sys
+d=json.load(open('$REG'))
+print((d.get('their-engine/byo-probe') or {}).get('compose_path',''))" 2>/dev/null)"
+  if [[ -n "$CPATH" && -f "$TMP/$CPATH" ]]; then
+    echo "  ok   compose written where the entry says it is"
+  else
+    echo "  FAIL entry points at a compose that does not exist: ${CPATH:-<none>}"; rc=1
+  fi
+  # The point of registering is that the model becomes addressable.
+  if (cd "$TMP" && python3 -c "
+import sys; sys.path.insert(0,'.')
+from scripts.lib.profiles.compose_registry import get_registry
+raise SystemExit(0 if 'their-engine/byo-probe' in get_registry('.') else 1)") 2>/dev/null
+  then echo "  ok   slug resolves in the merged registry (it is usable)"
+  else echo "  FAIL registered slug is not in the merged registry"; rc=1; fi
+  if command grep -q "their-engine/byo-probe" "$REG" 2>/dev/null; then
+    echo "  ok   register wrote their-engine/byo-probe"
+  else
+    echo "  FAIL slug missing from registry.local.json"; rc=1
+  fi
+  # the engine profile must exist, and carry EVIDENCE not assumptions
+  EP="$TMP/scripts/lib/profiles-local/engines.d/their-engine.yml"
+  if [[ -f "$EP" ]]; then
+    if command grep -q "type: llama.cpp" "$EP" && command grep -q "q8_0" "$EP"; then
+      echo "  ok   engine profile written with evidenced type + kv format"
+    else
+      echo "  FAIL engine profile missing declared lineage or the compose's kv format"; rc=1
+    fi
+    if command grep -qE "^(supported_drafters|features|supported_model_families):" "$EP"; then
+      echo "  FAIL engine profile claims capabilities the compose does not evidence"; rc=1
+    else
+      echo "  ok   engine profile claims nothing unverified"
+    fi
+  else
+    echo "  FAIL no local engine profile written for an unknown engine"; rc=1
+  fi
+
+  if scripts/catalog.sh unregister --slug their-engine/byo-probe --root "$TMP" -y >/dev/null 2>&1; then
+    if [[ -f "$REG" ]] && command grep -q "their-engine/byo-probe" "$REG" 2>/dev/null; then
+      echo "  FAIL unregister left the slug behind"; rc=1
+    else
+      # Removal must take the ARTIFACTS too, not just the registry key —
+      # otherwise re-registering the same model collides with its own leftovers.
+      if [[ -f "$PROF" ]]; then
+        echo "  FAIL unregister left the model profile behind"; rc=1
+      elif [[ -d "$TMP/scripts/lib/profiles-local/composes/$MID" ]]; then
+        echo "  FAIL unregister left the compose tree behind"; rc=1
+      elif [[ -f "$TMP/scripts/lib/profiles-local/engines.d/their-engine.yml" ]]; then
+        echo "  FAIL unregister left an orphaned engine profile behind"; rc=1
+      else
+        echo "  ok   unregister removed it (clean round trip: entry, profile, composes, engine)"
+      fi
+    fi
+  else
+    echo "  FAIL unregister failed"; rc=1
+  fi
+else
+  echo "  FAIL register failed in a throwaway root"; rc=1
+fi
+
+# 3b. THE OTHER ARCH SOURCE. Arch dims come from a GGUF header or an HF
+# config.json, and the two are NOT interchangeable: gguf_facts_from_file does not
+# return `attention_k_eq_v` while a config.json path can set it. Testing only the
+# config.json leg passed while `--weights <model.gguf>` — the likelier path on a
+# GGUF rig — refused every registration. Cover both, and SKIP LOUDLY rather than
+# silently passing when this machine has no .gguf to read.
+# Pick a MODEL gguf, not just any .gguf. The first hit on this rig was
+# `mmproj-F16.gguf` — a multimodal projector with no arch dims — so the leg
+# failed on a bad fixture while the code was correct. Done in ONE python call:
+# the bash loop that did this was fragile under the test's quoting and silently
+# selected nothing, which read as "no gguf on this machine".
+GG="$(python3 - <<'PY_PICK' 2>/dev/null
+import glob, sys
+sys.path.insert(0, ".")
+from scripts.lib.profiles.deriver import gguf_facts_from_file
+
+need = ("hidden_size", "num_hidden_layers", "num_attn_heads", "num_kv_heads")
+for cand in sorted(glob.glob("/mnt/models/huggingface/**/*.gguf", recursive=True))[:40]:
+    try:
+        f = gguf_facts_from_file(cand) or {}
+    except Exception:
+        continue
+    if all(f.get(k) is not None for k in need):
+        print(cand)
+        break
+PY_PICK
+)"
+if [[ -z "$GG" ]]; then
+  echo "  skip GGUF arch leg — no .gguf on this machine (config.json leg still ran)"
+else
+  if scripts/catalog.sh register --compose "$C" --engine gguf-engine --engine-type llama.cpp \
+       --weights "$GG" --root "$TMP" -y >/dev/null 2>&1; then
+    if command grep -q "gguf-engine/byo-probe" "$REG" 2>/dev/null; then
+      echo "  ok   arch derived from a real GGUF header"
+    else
+      echo "  FAIL GGUF register reported success but wrote no entry"; rc=1
+    fi
+    scripts/catalog.sh unregister --slug gguf-engine/byo-probe --root "$TMP" -y >/dev/null 2>&1
+  else
+    echo "  FAIL --weights <gguf> refused; only the config.json path works"; rc=1
+  fi
+fi
+
+# 4. the curated catalog is unreachable from the front door too
+CORE="$(python3 -c "
+import sys; sys.path.insert(0,'.')
+from scripts.lib.profiles.compose_registry import COMPOSE_REGISTRY
+print(next(iter(COMPOSE_REGISTRY)))")"
+before="$(find scripts/lib/profiles -type f | sort | xargs -r md5sum | md5sum)"
+if scripts/catalog.sh unregister --slug "$CORE" -y >/dev/null 2>&1; then
+  echo "  FAIL catalog.sh unregister ACCEPTED the curated slug $CORE"; rc=1
+else
+  echo "  ok   curated slug refused through the front door"
+fi
+[[ "$before" == "$(find scripts/lib/profiles -type f | sort | xargs -r md5sum | md5sum)" ]] \
+  || { echo "  FAIL the curated catalog changed"; rc=1; }
+
+[[ "$rc" == "0" ]] && echo "PASS: catalog.sh registers, unregisters, and cannot reach core" \
+                   || echo "FAIL: catalog.sh regression"
+exit "$rc"

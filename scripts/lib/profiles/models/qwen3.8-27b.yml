@@ -1,6 +1,7 @@
 schema_version: 1
 id: qwen3.8-27b
 display_name: Qwen 3.8 27B
+description: Dense 27B Qwen3.5-class hybrid (16 full-attention + 48 linear-attention layers, embedded MTP, full VLM) at 262K ctx; exploratory candidate primary across llama.cpp and vLLM tiers.
 family: qwen35-dense
 # Qwen/Qwen3.8-27B — architectures: ["Qwen3_5ForConditionalGeneration"],
 # model_type: qwen3_5 (text_config.model_type: qwen3_5_text). Same arch CLASS as
@@ -59,17 +60,17 @@ kv_calc_supported: false
 # separate projector download. Per variant, as of today:
 #   fp8            -> vision-capable (tower + preprocessors present). ⚠️ NEVER
 #                     EXERCISED: no image or video request has been served.
-#   unsloth-iq4nl  -> TEXT-ONLY: the GGUF repo's mmproj-{BF16,F16}.gguf were not
+#   unsloth-iq4xs  -> TEXT-ONLY: the GGUF repo's mmproj-{BF16,F16}.gguf were not
 #   unsloth-q8kxl     pulled, so neither llama.cpp compose mounts a projector.
 #                     Enabling vision there still needs a third download plus a
 #                     `kind: mmproj` weights entry and a `-vision.yml` compose
 #                     (see the qwen3.6-27b gguf_mmproj_f16 entry for the shape).
 vision_capable: true
 weights:
-  unsloth-iq4nl:
-    path: qwen3.8-27b-gguf/unsloth-iq4nl
-    local_subdir: qwen3.8-27b-gguf/unsloth-iq4nl
-    size_gb: 16.3
+  unsloth-iq4xs:
+    path: qwen3.8-27b-gguf/unsloth-iq4xs
+    local_subdir: qwen3.8-27b-gguf/unsloth-iq4xs
+    size_gb: 14.3
     format: gguf
     status: experimental
     hf_repo: unsloth/Qwen3.8-27B-GGUF
@@ -78,14 +79,14 @@ weights:
     # traps"). The artifact sits at the repo ROOT, so it lands flat in
     # local_subdir and needs no subfolder prefix.
     files:
-      - Qwen3.8-27B-IQ4_NL.gguf
+      - Qwen3.8-27B-UD-IQ4_XS.gguf
     engine: llama-cpp
     kind: gguf
     # REQUIRED on GGUF: the schema default is "*.safetensors", which matches
     # nothing here and makes c3 report PARTIAL / setup.sh report "download may
     # have failed" on a complete, correct pull.
     verify_glob: "*.gguf"
-    manual_note: "Unsloth imatrix IQ4_NL (apache-2.0). Single-3090 tier — drives llamacpp/qwen38-27b-single-iq4nl. LANDED on this rig 2026-08-14: 16,337,628,128 bytes = 16.33 GB decimal = 15.22 GiB. size_gb above is the decimal figure (what the setup.sh disk gate wants); the VRAM budget in the compose uses the 15.22 GiB. ⚠️ Size confirmed, CONTENTS NOT independently hash-verified and the file has never been loaded by any engine. Text-only: the sibling mmproj-{BF16,F16}.gguf projectors in the same repo were NOT fetched."
+    manual_note: "Unsloth Dynamic UD-IQ4_XS (apache-2.0). Single-3090 tier — drives llamacpp/qwen38-27b-single-iq4xs. REPLACES unsloth-iq4nl 2026-08-19: unsloth removed Qwen3.8-27B-IQ4_NL.gguf from the repo, so the old artifact is no longer fetchable and the slug was renamed iq4nl -> iq4xs (old launch names are dead). HF API 2026-08-19: 14,252,845,984 bytes = 14.25 GB decimal = 13.27 GiB. size_gb above is the decimal figure (what the setup.sh disk gate wants); the VRAM budget in the compose uses the 13.27 GiB. ⚠️ Size is the HF API figure — the file has NOT landed on this rig and has never been loaded by any engine. Tensor table read from the file header 2026-08-19: qwen35 arch, block_count=65, nextn_predict_layers=1, blk.64.nextn.* present (embedded MTP head confirmed on THIS artifact), embedded chat template carries the resolved_reasoning_effort branch. Text-only: the sibling mmproj-{BF16,F16}.gguf projectors in the same repo were NOT fetched."
   unsloth-q8kxl:
     path: qwen3.8-27b-gguf/unsloth-q8kxl
     local_subdir: qwen3.8-27b-gguf/unsloth-q8kxl
@@ -117,15 +118,79 @@ weights:
     engine: vllm
     kind: main
     verify_glob: "*.safetensors"
-    manual_note: "Official Qwen3.8-27B FP8 release (apache-2.0): quant_method fp8, fmt e4m3, activation_scheme dynamic, weight_block_size [128,128] (BLOCK-wise, weight_scale_inv tensors) — byte-shaped identically to the qwen3.6-27b `fp8` entry, which is what licenses reusing that tier's serving shape. Layer-split safetensors (layers-0..63 + outside.safetensors for embed/lm_head) plus an EMBEDDED MTP head (mtp.safetensors, text_config.mtp_num_hidden_layers=1) — verified in the repo's crc32 manifest, not inferred from the repo name. Drives the 'max' tier: vllm/qwen38-27b-dual-max (TP=2) + vllm/qwen38-27b-multi4-max (TP=4). FULL VLM: modules_to_not_convert excludes every visual.blocks.* so the vision tower stays higher-precision, and preprocessor_config.json + video_preprocessor_config.json ship in-repo — no separate projector needed (unlike the GGUF siblings). ⚠️ On Ampere sm_86 there is NO native FP8 compute: these weights run weight-only via the Marlin FP8 kernel (W8A16) — a memory/fidelity win, NOT a decode win. size_gb 30.9 is DECIMAL GB (= 28.75 GiB for VRAM budgeting — the ~7% unit trap the IQ4_NL sibling already demonstrated); the setup.sh disk gate wants the decimal figure. DOWNLOAD COMPLETE + MEASURED on this rig 2026-08-14: 66 safetensors totalling 30,866,866,928 bytes = 30.87 GB decimal = 28.75 GiB, at repo revision 017b9c7af6b5689d5dd426a76e0bc077eb5ca20a (== current HEAD). ⭐ That byte count is EXACTLY equal to the qwen3.6-27b fp8 checkpoint's (same 66-file layout, same total, distinct md5s) — identical architecture and quant layout, so the VRAM budget transfers 1:1. INTEGRITY: all 66 safetensors CRC32-verify against the repo's own crc32.txt. ⚠️ THREE non-weight files do NOT match that manifest — chat_template.jinja, generation_config.json, tokenizer_config.json — while all three parse/render correctly; the manifest is almost certainly stale relative to the repo's same-day updates (its sibling safetensors-md5sum.txt shipped EMPTY, so the publisher's manifest tooling is demonstrably unreliable here). Weights are trustworthy; do not treat that mismatch as download corruption without re-checking against a fresh manifest. ⚠️ NOTHING has ever loaded this checkpoint in any engine. Pull: WEIGHT_KEY=qwen3.8-27b:fp8 bash scripts/setup.sh qwen3.8-27b."
-default_weight_variant: unsloth-iq4nl
-# No MTP / draft artifact exists for this model on this stack: the source repo is
-# unsloth/Qwen3.8-27B-GGUF (NOT a -MTP-GGUF build), neither pulled quant carries
-# an embedded nextn head we have verified, and no matched external drafter GGUF
-# was fetched. An entry here that names a drafter YAML we don't ship would raise
-# CrossReferenceError at load_profiles() time, so this stays empty until a real
-# drafter is validated for this model.
-compatible_drafters: []
+    manual_note: "Official Qwen3.8-27B FP8 release (apache-2.0): quant_method fp8, fmt e4m3, activation_scheme dynamic, weight_block_size [128,128] (BLOCK-wise, weight_scale_inv tensors) — byte-shaped identically to the qwen3.6-27b `fp8` entry, which is what licenses reusing that tier's serving shape. Layer-split safetensors (layers-0..63 + outside.safetensors for embed/lm_head) plus an EMBEDDED MTP head (mtp.safetensors, text_config.mtp_num_hidden_layers=1) — verified in the repo's crc32 manifest, not inferred from the repo name. Drives the 'max' tier: vllm/qwen38-27b-dual-max (TP=2) + vllm/qwen38-27b-multi4-max (TP=4). FULL VLM: modules_to_not_convert excludes every visual.blocks.* so the vision tower stays higher-precision, and preprocessor_config.json + video_preprocessor_config.json ship in-repo — no separate projector needed (unlike the GGUF siblings). ⚠️ On Ampere sm_86 there is NO native FP8 compute: these weights run weight-only via the Marlin FP8 kernel (W8A16) — a memory/fidelity win, NOT a decode win. size_gb 30.9 is DECIMAL GB (= 28.75 GiB for VRAM budgeting — the ~7% unit trap the IQ4_NL sibling already demonstrated); the setup.sh disk gate wants the decimal figure. DOWNLOAD COMPLETE + MEASURED on this rig 2026-08-14: 66 safetensors totalling 30,866,866,928 bytes = 30.87 GB decimal = 28.75 GiB, at repo revision 017b9c7af6b5689d5dd426a76e0bc077eb5ca20a (== current HEAD). ⭐ That byte count is EXACTLY equal to the qwen3.6-27b fp8 checkpoint's (same 66-file layout, same total, distinct md5s) — identical architecture and quant layout, so the VRAM budget transfers 1:1. INTEGRITY: all 66 safetensors CRC32-verify against the repo's own crc32.txt. ⚠️ THREE non-weight files do NOT match that manifest — chat_template.jinja, generation_config.json, tokenizer_config.json — while all three parse/render correctly; the manifest is almost certainly stale relative to the repo's same-day updates (its sibling safetensors-md5sum.txt shipped EMPTY, so the publisher's manifest tooling is demonstrably unreliable here). Weights are trustworthy; do not treat that mismatch as download corruption without re-checking against a fresh manifest. ✅ BOOTED + MEASURED 2026-08-17 on 2x RTX 3090 (vllm/qwen38-27b-dual-max, stock v0.27.1): verify-full PASS, decode 67.4 narr / 85.8 code tok/s, TTFT 152 ms, KV pool 270,930 tok @262144, MTP acceptance 2.62 — see BENCHMARKS.md. ⚠️ Still ungated: no verify-stress, no NIAH fill depth, no soak, no quality run. Pull: bash scripts/setup.sh qwen3.8-27b (this is now the dispatch default), or WEIGHT_KEY=qwen3.8-27b:fp8 for the explicit form."
+  autoround-int4:
+    path: qwen3.8-27b-autoround-int4
+    local_subdir: qwen3.8-27b-autoround-int4
+    size_gb: 19.0
+    format: autoround
+    status: experimental
+    hf_repo: Frozenlock/Qwen3.8-27B-int4-AutoRound
+    engine: vllm
+    kind: main
+    verify_glob: "*.safetensors"
+    manual_note: "Community AutoRound INT4, Frozenlock export (quant_method auto-round, 4-bit, group_size 128, sym=true, auto-round-packed [k/8,n]). ~19.0 GB decimal. Drives the FAST tier (vllm/qwen38-27b-{dual,multi4,multi8}-fast) opposite the official-FP8 MAX tier. ⭐ REPLACED the prior Avuja/Qwen3.8-27B-int4-AutoRound export 2026-08-20 (club-3090#1052): Avuja’s checkpoint permanently collapsed the built-in MTP drafter to 0% acceptance at ~14.5k cumulative gen tokens; Frozenlock (SAME core recipe, different export) runs the drafter clean past 22-24k in BOTH W4A8 and W4A16 (verify-full 8/9, bench narr ~74.9 / code ~103.5 TPS, MTP accept-len 3.48-5.0, coherent). Distinct from the SEPARATE vllm#50021 GDN spec-decode wild-write crash (still live). ⚠ Unlike Avuja this export QUANTIZES the MTP head (not bf16). ⚠⚠ INHERITED-FROM-AVUJA, NOT re-measured on Frozenlock (re-run before quoting as Frozenlock numbers): the n=4 depth knee (+22.1% narr / +83.8% code; n=1 worse than no drafter), the W4A8 +41.8%-prefill/-8%-decode A/B, verify-full 9/9 both arms. W4A8 (int8 activations) works because it is auto-round-packed [k/8,n], what the vendored negscale fold assumes. VISION tower present (bf16), never served. Full detail: learnings/qwen3.8-27b.md."
+  nvfp4:
+    path: qwen3.8-27b-nvfp4
+    local_subdir: qwen3.8-27b-nvfp4
+    size_gb: 21.9
+    format: modelopt
+    status: experimental
+    hf_repo: RadixArk/Qwen3.8-27B-NVFP4
+    engine: vllm
+    kind: main
+    verify_glob: "*.safetensors"
+    manual_note: "RadixArk NVFP4 (quant_method modelopt, MIXED precision: 2 config groups -- 193 module groups at W4-float/A4-float and 208 at W8-float/A8-float, ignore=2). 20.44 GiB / 21.95 GB decimal, 22 files. Built-in MTP head present (mtp_num_hidden_layers=1). ⚠️⚠️ THE 4-BIT ACTIVATIONS ARE UNREACHABLE ON AMPERE: sm_86 has no FP4 tensor cores, so vLLM serves this weight-only through the Marlin W4A16 fallback and upcasts activations to 16-bit regardless of what the checkpoint declares. The 3.6 sibling records 'no speed edge vs AutoRound' and 'on Ampere the AutoRound tier serves this model faster' -- so on 2x 3090 this is a COMPATIBILITY path, not a performance one. Its real case is Blackwell (sm_120+), where the A4 groups can actually execute. ⚠️ NVFP4 *KV* is a separate matter and is NOT usable on consumer Blackwell: it routes to a trtllm-gen FP4 FMHA kernel built only for datacenter Blackwell (sm_100/103) and crashes (vLLM #43562 / TRT-LLM #10241) -- no hardware class in this catalog lists nvfp4 KV, and launch_compat C5 refuses rather than falling back. fp8_e4m3 is the FP4-era KV here, as on the 3.6 nvfp4 slugs. Chosen over huginnfork/Qwen3.8-27B-NVFP4A16 (uniform W4/A16, ignore=519, 28.9 GiB -- heavier than the official FP8 and no Blackwell upside) and over unsloth/Qwen3.8-27B-NVFP4 (compressed-tensors mixed-precision, 21.8 GiB, only 5 config groups)."
+  # DFlash2 external drafter (syv-ai) — REQUIRED by the 12 super*/ultra* DFlash2
+  # slugs (kind: draft, not a target). Shared across BOTH int4 and fp8 targets:
+  # the drafter is base-arch-keyed (5120/248320), not target-quant-specific.
+  # Fetch with WITH_DFLASH_DRAFT=1 (setup.sh). local_subdir matches the compose
+  # DRAFTER path (/root/.cache/huggingface/qwen3.8-27b-dflash2-w4a16).
+  dflash2:
+    path: qwen3.8-27b-dflash2-w4a16
+    local_subdir: qwen3.8-27b-dflash2-w4a16
+    size_gb: 1.2
+    format: compressed-tensors
+    status: experimental
+    hf_repo: syvai/Qwen3.8-27B-DFlash2-W4A16
+    engine: vllm
+    kind: draft
+    verify_glob: "*.safetensors"
+    setup_env: WITH_DFLASH_DRAFT=1
+  # F16 multimodal projector — the mmproj companion of the VISION slug
+  # (llamacpp/qwen38-27b-single-iq4xs-vision). Quant-INDEPENDENT: one F16 tower
+  # for every llama.cpp GGUF quant of this model, so it lands at the SHARED gguf
+  # level (local_subdir = qwen3.8-27b-gguf), NOT inside a quant subdir. Vision is
+  # OPT-IN: WITH_VISION=1 fetches it (setup.sh CLI), and c3's Download passes it
+  # via the vision slug's weights_companions. The text slugs never fetch it.
+  gguf_mmproj_f16:
+    path: qwen3.8-27b-gguf
+    local_subdir: qwen3.8-27b-gguf
+    size_gb: 0.93
+    format: gguf
+    status: experimental
+    hf_repo: unsloth/Qwen3.8-27B-GGUF
+    # REQUIRED: multi-quant bucket. Without `files:` the fetch is the WHOLE repo
+    # (every quant). The projector sits at the repo ROOT, so it lands flat.
+    files:
+      - mmproj-F16.gguf
+    engine: llama-cpp
+    kind: mmproj
+    verify_glob: "*.gguf"
+    setup_env: WITH_VISION=1
+    manual_note: "Unsloth F16 multimodal projector (928 MB / 927,607,488 B) for Qwen3.8-27B VL — pairs with ANY llama.cpp GGUF quant of this model. Downloaded + boot-verified 2026-08-20: llama-server loads it as 'multimodal model', image recognition correct (blue-circle + red-7 probe). Text decode is projector-free (bench parity with the text-only slug: 61.1 narr / 72.6 code). Drives llamacpp/qwen38-27b-single-iq4xs-vision (q4_0 KV + 262K + vision). Sibling mmproj-BF16.gguf (931 MB) NOT fetched — F16 is the standard tower precision, fine on Ampere."
+
+default_weight_variant: unsloth-iq4xs
+# Validated drafters for this model (each names a drafters/<id>.yml we ship):
+#   - qwen-mtp-builtin      — embedded nextn head (blk.64.nextn.* in the unsloth
+#     GGUFs; mtp.safetensors in the official FP8). The FAST tier's built-in MTP.
+#   - syvai-qwen38-dflash2  — external DFlash2 block-drafter (vLLM PR#52816 backport,
+#     syv-ai). The ULTRAFAST tier; validated 2026-08-20 (verify-full 9/9 + bench +
+#     collapse soak clean). Structurally sidesteps the Avuja MTP acceptance-collapse
+#     (#1052) — it is not the built-in proposer.
+compatible_drafters:
+  - qwen-mtp-builtin
+  - syvai-qwen38-dflash2
 # ⚠️ valid_tp is a VALIDITY list (will vLLM run this shard?), NOT a cleanliness
 # list (does KV divide evenly?). Those two diverge past TP=4 on this model and
 # conflating them is what made this list wrong until 2026-08-15.
@@ -164,3 +229,19 @@ valid_tp:
   - 4
   - 8
 requires_genesis: false
+
+# `setup:` — dispatch policy for scripts/setup.sh (contract C1); see
+# qwen3.6-27b.yml for the field reference. Only the non-default keys appear.
+setup:
+  # setup.sh's default fetch is the fp8 "max accuracy" tier — what DUAL_CARD.md
+  # leads with and the only qwen3.8 config with measured numbers (67.4 / 85.8
+  # tok/s, verify-full PASS, 2026-08-17) — NOT the profile default
+  # (unsloth-iq4xs GGUF). DUAL-card: 30.9 GB of weights do not fit one 24 GB
+  # card. Single card: WEIGHT_KEY=qwen3.8-27b:unsloth-iq4xs.
+  primary: fp8
+  # DFlash2 drafter for the 12 super*/ultra* slugs (WITH_DFLASH_DRAFT=1).
+  dflash: dflash2
+  # F16 mmproj vision projector (WITH_VISION=1) — companion of the
+  # llamacpp/qwen38-27b-single-iq4xs slug; c3's Download also pulls it via that
+  # slug's weights_companions.
+  vision: gguf_mmproj_f16

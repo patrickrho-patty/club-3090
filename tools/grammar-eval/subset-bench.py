@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import os
 import pathlib
 import random
 import re
@@ -16,7 +17,12 @@ from types import SimpleNamespace
 
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
-DEFAULT_STRUCTURED_COT_DIR = pathlib.Path("/home/wasif/structured-cot")
+# Override with STRUCTURED_COT_DIR=/path/to/structured-cot. The default is
+# ~/structured-cot so this works on any machine; it used to be a hardcoded
+# absolute path from the author's box, which leaked a username into a public repo.
+DEFAULT_STRUCTURED_COT_DIR = pathlib.Path(
+    os.environ.get("STRUCTURED_COT_DIR", pathlib.Path.home() / "structured-cot")
+)
 DEFAULT_PRIOR = DEFAULT_STRUCTURED_COT_DIR / "runs/full-humaneval-2026-04-30/results.jsonl"
 DEFAULT_CURRENT_GRAMMAR = DEFAULT_STRUCTURED_COT_DIR / "grammars/fsm_grammar_no_open.gbnf"
 DEFAULT_TAGLINE_GRAMMAR = REPO_ROOT / "tools/grammar-eval/holiday-tagline.gbnf"
@@ -360,7 +366,15 @@ def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--base-url", default="http://localhost:8020/v1")
     p.add_argument("--model", default="qwen3.6-27b")
-    p.add_argument("--tokenizer", default="/opt/ai/github/qwen36-dual-3090/models/qwen3.6-27b-autoround-int4")
+    # Default is env-overridable and repo-relative: the previous hardcoded
+    # "/opt/ai/github/qwen36-dual-3090/..." was a maintainer-rig path (and named the
+    # pre-rename repo), so it resolved for nobody else. GRAMMAR_EVAL_TOKENIZER lets an
+    # operator point at their own weights without editing the script.
+    p.add_argument("--tokenizer",
+                   default=os.environ.get(
+                       "GRAMMAR_EVAL_TOKENIZER",
+                       str(pathlib.Path(__file__).resolve().parents[2]
+                           / "models-cache" / "qwen3.6-27b-autoround-int4")))
     p.add_argument("--structured-cot-dir", type=pathlib.Path, default=DEFAULT_STRUCTURED_COT_DIR)
     p.add_argument("--prior-results", type=pathlib.Path, default=DEFAULT_PRIOR)
     p.add_argument("--current-grammar", type=pathlib.Path, default=DEFAULT_CURRENT_GRAMMAR)

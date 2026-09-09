@@ -2,10 +2,12 @@
 # Profile (at-a-glance):
 #   Model:     DeepSeek-V4-Flash-0731 (284B MoE, unsloth UD-Q8_K_XL — MXFP4
 #              experts + BF16 attention, 151 GB across 5 shards)
-#   Engine:    llamacpp-club3090 (fork: leloch's MoE expert cache v2 + our L1/L3/E
+#   Engine:    llamacpp-club3090-v1.5 (fork: leloch's MoE expert cache v2 + our L1/L3/E
 #              ports, bypass warn-split, and multi-row top-k batching)
 #   Topology:  4× CUDA (layer-split -ts 1,1,1,1)
 #   Drafter:   DSpark n=5 external, PINNED TO CPU (-devd none)
+#              Toggle: SPEC_N=<n> sets depth; SPEC_N=0 (or SPEC=off) disables
+#              (removes the flags — n-max=0 would leave the draft context allocated)
 #   KV:        fp16
 #   Vision:    no
 #   Max ctx:   204800
@@ -85,18 +87,74 @@
 services:
   llama-cpp-deepseek-flash-q8-moecache-multi4:
     # Digest-pinned, not tag-pinned (#940 precedent). Engine profile is authoritative.
-    # Built 2026-08-10 from stack/club3090-moe-cache @ e0a208949, CUDA arch 86;89;120.
-    image: ${LLAMACPP_CLUB3090_IMAGE:-ghcr.io/noonghunna/llamacpp-club3090@sha256:17824d4483dbd60c297613bddf130f25e739d3edc7e633e4d973edc4e2165649}
+    # MIGRATED TO v1.5 2026-08-29: image.revision=7104d5f4e,
+    # version=moecachev1.5-rc0, built from stack/club3090-moecachev1.5 on
+    # mainline base b10675. Previously sha256:17824d44 (revision e0a208949).
+    # Validated on this binary BEFORE the switch: shipped compose booted with
+    # the revision asserted, verify-full 10/10, dspark acceptance 0.41-0.73,
+    # moe-cache pools on both cards. Ledger: /opt/ai/moecache-releases.md.
+    image: ${LLAMACPP_CLUB3090_IMAGE:-ghcr.io/noonghunna/llamacpp-club3090@sha256:1c228a52b8193df26a3c7e8b497814739ca06ff34075a2a1ce02989210068210}
     container_name: ${ESTATE_CONTAINER:-llama-cpp-deepseek-flash-q8-moecache-multi4}
     restart: unless-stopped
     ports:
-      - "${BIND_HOST:-0.0.0.0}:${ESTATE_PORT:-${PORT:-8032}}:8080"
+      - "${BIND_HOST:-0.0.0.0}:${ESTATE_PORT:-${PORT:-8116}}:8080"
     volumes:
       - "${MODEL_DIR:-../../../../../../models-cache}:/models:ro"
     environment:
+      # Bare passthrough — docker forwards ONLY what is declared here, so without
+      # this line the entrypoint's THREADS branch can never fire and the knob is
+      # inert. Never write `- THREADS=${THREADS:-}`: that sets it EMPTY.
+      - THREADS
+      # Drafter toggle - docker forwards only what is declared here.
+      - SPEC_N=${SPEC_N:-}
+      - SPEC=${SPEC:-}
       # ⚠️ PLACEHOLDER VALUES inherited from the 2-card sibling. Re-derive.
       - GGML_CUDA_MOE_CACHE_ADMIT_AFTER=${MOE_ADMIT_AFTER:-64}
       - GGML_CUDA_MOE_CACHE_RESERVE_MB=${MOE_RESERVE_MB:-1536}
+      # Cache hit/miss telemetry. Needs BOTH knobs — measured on a live 2-arm boot
+      # 2026-08-26: STATS alone at default verbosity emitted 0 `[moe-cache]` lines of
+      # ANY kind; STATS + verbosity 4 emitted 228. `stats_every` defaults to 0
+      # (moe-cache.cu:169, gate at :2795) and MOE_CACHE_LOG is GGML_LOG_INFO, which the
+      # server's verbosity threshold drops below 4.
+      # ⚠️ Both were previously ABSENT here, so docker forwarded neither and NO caller
+      # could switch telemetry on (club-3090 #1105/#1106 were filed with no usable
+      # cache data for exactly this reason).
+      # `=${VAR:-N}` is safe for STATS: moe_cache_env_i64 rejects unset AND empty
+      # before parsing (moe-cache.cu:509), so it cannot hit the atoi("")==0 trap.
+      # ⚠️ DEFAULT IS 0 (OFF) — telemetry is OPT-IN, on principle rather than on a
+      # measured cost: instrumentation should not run when nothing reads it.
+      # ⛔ An earlier version of this comment claimed the counters cost ~6% decode.
+      # That is RETRACTED (2026-08-26). Two A/B runs could not support it — the
+      # SHIPPED image itself measured 20.05 then 18.36 narrative TPS across runs
+      # with no code change, so run-to-run variance swamps the effect. Arithmetic
+      # agrees: ~175 bypassed nodes per bench x ~4 atomics is ~1e-4 % of wall time.
+      # The old v1.2-era engine did NOT gate these counters; UNVERIFIED on v1.5, so this
+      # knob controls EMISSION only.
+      # Turn it on for a bench/report run: MOE_STATS=200 LLAMA_ARG_LOG_VERBOSITY=4.
+      # Verbosity stays BARE (caller-owned): 4 is loud for a serving deployment.
+      - GGML_CUDA_MOE_CACHE_STATS=${MOE_STATS:-0}
+      - LLAMA_ARG_LOG_VERBOSITY
+      # ⚠️ BARE FORM ON PURPOSE — matches the dual sibling. The engine tests
+      # `if (on && atoi(on) == 0) return nullptr` (expert-prefetch.cu:126) and
+      # atoi("") == 0, so an `=${VAR:-}` default would set it EMPTY and silently
+      # DISABLE prefetch, flipping this model's documented default-ON policy.
+      # Was absent entirely, so the ring could be neither disabled (=0) nor
+      # ballast-controlled (=2) here, unlike on dual.
+      - GGML_EXPERT_PREFETCH
+      # `--cache-reuse` via env. Inert unless the caller sets it; declared so
+      # trying it produces the ENGINE's answer (it can refuse — see the deepseek
+      # sibling's MLA+SWA note) instead of silence from an undeclared var.
+      - LLAMA_ARG_CACHE_REUSE
+      # Ring size for the above. Inert unless the caller sets it.
+      - GGML_EXPERT_PREFETCH_SLOTS
+      # Bare passthrough — inert unless the caller sets it. Declared so a
+      # graph-reuse A/B can run through the REAL delivery path: docker forwards
+      # only what is listed here, so without this line the two arms of the
+      # experiment are byte-identical and the null result is an artifact of the
+      # harness rather than a measurement. Measured cost of losing reuse on
+      # Qwen3.8-Flash-Next: ~3.9 ms/token (+13.5% decode with it on, 2 boots/arm,
+      # 2026-09-04) — see learnings/moe-cache-engine.md §8b.
+      - LLAMA_GRAPH_REUSE_DISABLE
     deploy:
       resources:
         reservations:
@@ -106,6 +164,81 @@ services:
               capabilities: [gpu]
     # ⚠️ LIST FORM, NOT a folded string — compose rejects `(gate|up|down)` in a
     # folded `command: >-`.
+    # The image ENTRYPOINT is ["/app/llama-server"] on every engine we ship
+    # (mainline, ik-llama, beellama, llamacpp-club3090 — all verified). This
+    # wrapper is equivalent to it plus the drafter toggle.
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        # -- Drafter toggle: the same contract on every club-3090 compose --------
+        #   SPEC_N=<n>  drafter depth; SPEC_N=0 disables
+        #   SPEC=off    back-compat alias for SPEC_N=0
+        # Disabling REMOVES the drafter flags rather than passing n=0. At
+        # --spec-draft-n-max 0 llama.cpp sets drafting=false but still builds the
+        # draft context (server-context.cpp), and still loads an external draft
+        # model when one is named -- so the memory stays spent. Removing the
+        # flags is the only clean off. A non-numeric SPEC_N is a hard error, so a
+        # typo can never masquerade as a silent "drafter off".
+        _spec_n="$${SPEC_N:-5}"
+        case "$${SPEC:-}" in off|OFF|Off|false|no|0) _spec_n=0 ;; esac
+        case "$$_spec_n" in ""|*[!0-9]*)
+          echo "[spec] SPEC_N='$$_spec_n' is not a non-negative integer." >&2
+          echo "[spec] Fix: SPEC_N=<n> sets depth; SPEC_N=0 (or SPEC=off) disables." >&2
+          exit 1 ;;
+        esac
+        if [ "$$_spec_n" -gt 0 ]; then
+          # Fail loud if the external DSpark drafter GGUF is absent. This model
+          # has NO embedded MTP head, so DSpark is the ONLY speculative path --
+          # a missing file otherwise crash-loops llama-server on a cryptic
+          # "gguf_init_from_file ... No such file" (club-3090#1054). Find the
+          # -md/--model-draft path in argv and verify it exists before exec.
+          _draft=""; _want=0
+          for _a in "$$@"; do
+            if [ "$$_want" = 1 ]; then _draft="$$_a"; _want=0; continue; fi
+            case "$$_a" in -md|--model-draft|--spec-draft-model) _want=1 ;; esac
+          done
+          if [ -n "$$_draft" ] && [ ! -f "$$_draft" ]; then
+            echo "[spec] FATAL: external DSpark drafter not found:" >&2
+            echo "[spec]   $$_draft" >&2
+            echo "[spec] This slug REQUIRES the drafter (no embedded MTP head => no other spec path)." >&2
+            echo "[spec] Fix one of:" >&2
+            echo "[spec]   - download it: hf download unsloth/DeepSeek-V4-Flash-0731-GGUF \\" >&2
+            echo "[spec]       --include 'dspark/*Q8_0*' --local-dir <MODEL_DIR>/deepseek-v4-flash-0731-gguf" >&2
+            echo "[spec]   - or run drafter-off knowingly: SPEC_N=0 (accepts the lower no-spec TPS)" >&2
+            exit 1
+          fi
+          echo "[spec] drafter ON (SPEC_N=$$_spec_n)" >&2
+          # -- Threads -------------------------------------------------------------
+          # Resolved HERE, not as a `-t` CLI arg: CLI beats env, so a command-line -t
+          # silently overrides anything set below. PORTABLE DEFAULT = nproc/2, matching
+          # the launcher's resolve_offload_threads so both paths agree. The old `-t 8`
+          # was far below optimum on any capable host; nproc/2 is the safe choice when
+          # the operator's core count is unknown. ⚠️ Still a FLOOR, not the optimum --
+          # the useful zone is an ABSOLUTE ~24-32 threads. Set THREADS=<n> to tune.
+          if [ -n "$${THREADS:-}" ]; then
+            export LLAMA_ARG_THREADS="$${THREADS}"
+            echo "[threads] -t $${LLAMA_ARG_THREADS} (THREADS set explicitly)" >&2
+          else
+            _np=$$(nproc 2>/dev/null || echo 8)
+            _half=$$(( _np / 2 )); [ "$$_half" -lt 1 ] && _half=1
+            export LLAMA_ARG_THREADS="$$_half"
+            echo "[threads] -t $${LLAMA_ARG_THREADS} (auto = nproc/2, nproc=$$_np)" >&2
+          fi
+
+          exec /app/llama-server "$$@"
+        fi
+        ARGS=(); _skip=0
+        for _a in "$$@"; do
+          if [ "$$_skip" = 1 ]; then _skip=0; continue; fi
+          case "$$_a" in
+            --spec-type|--spec-draft-model|--spec-draft-n-max|--spec-draft-n-min|-md|--model-draft) _skip=1; continue ;;
+          esac
+          ARGS+=("$$_a")
+        done
+        echo "[spec] drafter OFF (SPEC_N=0 / SPEC=off) - drafter flags removed" >&2
+        exec /app/llama-server "$${ARGS[@]}"
+      - --
     command:
       - '-m'
       - '/models/deepseek-v4-flash-0731-gguf/UD-Q8_K_XL/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf'
@@ -115,8 +248,13 @@ services:
       - '8080'
       - '--alias'
       - 'deepseek-v4-flash'
+      # Slots. ⚠️ `-np N` SPLITS `-c` into ctx/N per slot, so the pool and the
+      # compute buffer change with it — a concurrency A/B must re-measure, not
+      # reuse single-stream rows. Default 1 keeps shipped behaviour identical.
+      # ⚠️ LLAMA_ARG_N_PARALLEL cannot override this: common/arg.cpp applies env
+      #    BEFORE argv (~L783 vs ~L808), so the command line always wins.
       - '-np'
-      - '1'
+      - '${NPARALLEL:-1}'
       - '-c'
       - '${CTX:-204800}'
       - '-ngl'
@@ -131,8 +269,6 @@ services:
       # -ot occurrence. All experts to CPU; the cache decides residency.
       - '-ot'
       - 'blk\.[0-9]+\.ffn_(gate|up|down)_exps\.weight=CPU'
-      - '-t'
-      - '${THREADS:-8}'
       - '-ub'
       - '${UBATCH:-2048}'
       - '-b'

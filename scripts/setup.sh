@@ -5,31 +5,29 @@
 #   bash scripts/setup.sh                # interactive model picker in a TTY
 #   bash scripts/setup.sh <model-name>   # scripted/CI positional form
 #
-# Currently supported model families are listed in usage(). Exact repositories,
-# files, and local subdirectories live in scripts/lib/profiles/models/*.yml.
+# Supported model families are DERIVED from scripts/lib/profiles/models/*.yml
+# (via weights.py `catalog --json`) — never hand-listed here. Exact repositories,
+# files, and local subdirectories live in those same YAMLs.
 #
 # What it does (per supported model):
-#   - clones Sandermage/genesis-vllm-patches into models/<model>/vllm/patches/genesis
-#     (vLLM-only; skip with SKIP_GENESIS=1 if you only need llama.cpp / SGLang;
-#     Gemma 4 doesn't fetch Genesis at all yet)
 #   - downloads model weights into $MODEL_DIR with SHA256 verification against
 #     the hub's published x-linked-etag (no-redirect resolve HEAD via
 #     scripts/lib/profiles/hf_fetch.py). A file the hub publishes no hash for is
 #     reported UNVERIFIED and EXCLUDED from the verified count — "verified"
 #     never attaches to a size-only check (#857)
 #   - downloads the always-required drafter (Gemma 4: MTP "assistant"; Qwen3.6:
-#     no always-required drafter — DFlash is optional via WITH_DFLASH_DRAFT=1)
+#     no always-required drafter — DFlash is optional via WITH_DFLASH_DRAFT=1;
+#     Qwen3.8: DFlash2 optional via WITH_DFLASH_DRAFT=1 — REQUIRED by the 12
+#     super*/ultra* slugs, so set it when serving those)
 #
 # Env vars (optional):
 #   MODEL_DIR           Where to place model weights. Default: <repo>/models-cache
 #   WEIGHTS             'autoround' (default, vLLM INT4) or 'gguf' (llama.cpp /
 #                       ik_llama). gguf fetches the Q4_K_M MTP GGUF + mmproj for
-#                       the llamacpp/* + ik-llama/* composes (qwen3.6-27b only),
-#                       and skips Genesis. Use this if you're serving via
-#                       llama.cpp/ik_llama rather than vLLM.
-#   HF_TOKEN            HF token (public models, usually unnecessary)
+#                       the llamacpp/* + ik-llama/* composes (qwen3.6-27b only).
+#                       Use this if you're serving via llama.cpp/ik_llama rather than vLLM.
 #   SKIP_MODEL          Set to 1 to skip the model download step
-#   SKIP_GENESIS        Set to 1 to skip cloning Genesis patches
+#   HF_TOKEN            HF token (public models, usually unnecessary)
 #   WITH_DFLASH_DRAFT   Set to 1 to ALSO download the model family's DFlash
 #                       drafter when one is registered in profiles/models/*.yml.
 #                       Default: 0.
@@ -37,8 +35,14 @@
 #                       2026-04-26; bench numbers in DUAL_CARD.md were
 #                       measured against that snapshot. AL improvements
 #                       expected when z-lab tags training-complete.
-#   PREFLIGHT_DISK_GB   Required free space at MODEL_DIR (default: 25, or
-#                       28 if WITH_DFLASH_DRAFT=1)
+#   WITH_VISION         Set to 1 to ALSO download the F16 mmproj vision projector
+#                       when the model registers one (qwen3.8-27b: the companion of
+#                       the llamacpp/qwen38-27b-single-iq4xs slug, which ships
+#                       q4/262K/vision). Default: 0. c3's Download pulls it via the
+#                       slug's weights_companions regardless.
+#   PREFLIGHT_DISK_GB   Required free space at MODEL_DIR. Default: derived from
+#                       the size_gb of every key this run would actually fetch
+#                       (already-present weights cost nothing) + headroom.
 #
 # Idempotent: safe to re-run — skips steps already done.
 
@@ -56,6 +60,68 @@ export PYTHONUTF8="${PYTHONUTF8:-1}"
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 WEIGHTS_READER="${ROOT_DIR}/scripts/lib/profiles/weights.py"
 
+# ---------- Catalog derivation (registry-derived front door) ----------
+# The profile YAMLs are the single source of truth. Everything that used to be
+# a hand-written bash case here (usage list, model labels, the picker, the
+# dispatch, the WEIGHTS= aliases, the "Supported:" error) is derived from
+#   python3 "$WEIGHTS_READER" catalog --json
+# so a new scripts/lib/profiles/models/<id>.yml gets its front door for free.
+# Parity is guarded by scripts/tests/test-setup-registry-derived.sh — the drift
+# guard that replaces these hand-maintained lists (#910-#914 defect class).
+_CATALOG_JSON=""
+
+catalog_json() {
+  if [[ -z "${_CATALOG_JSON}" ]]; then
+    command -v python3 >/dev/null 2>&1 || {
+      echo "ERROR: python3 is required to read the profile catalog." >&2
+      exit 1
+    }
+    _CATALOG_JSON="$(python3 "${WEIGHTS_READER}" catalog --json)" || {
+      echo "ERROR: could not read the model catalog (scripts/lib/profiles/models/*.yml)." >&2
+      echo "       Install python3-yaml/PyYAML if missing, or check the profiles." >&2
+      exit 1
+    }
+  fi
+  printf '%s' "${_CATALOG_JSON}"
+}
+
+# _catalog_py <python-expr> [arg] — evaluate EXPR with `data` bound to the
+# parsed catalog JSON and sys.argv[2] = ARG. Scalars print verbatim; lists
+# print newline-joined; None prints as empty.
+_catalog_py() {
+  python3 -c '
+import json, sys
+data = json.loads(sys.stdin.read())
+val = eval(sys.argv[1], {"data": data, "sys": sys})
+if val is None:
+    print("")
+elif isinstance(val, str):
+    print(val)
+else:
+    print("\n".join(str(v) for v in val))
+' "$1" "${2:-}" < <(catalog_json)
+}
+
+# read_both_models <array-name> — the `both` mode's model pair, derived from
+# RECOMMENDED_DEFAULT_MODELS in compose_registry.py (first two entries) like
+# everything else. Fewer than two entries => `both` has no pair and stays
+# disabled (the shortlist is maintainer-owned; it shrank to one entry when the
+# single-card qwen3.6-27b defaults were retired).
+read_both_models() {
+  local -n _out="$1"
+  _out=()
+  local _m
+  while IFS= read -r _m; do
+    [[ -n "${_m}" ]] && _out+=("${_m}")
+  done < <(CLUB3090_PROFILES_DIR="${ROOT_DIR}/scripts/lib/profiles" python3 -c '
+import os, sys
+sys.path.insert(0, os.environ["CLUB3090_PROFILES_DIR"])
+from compose_registry import RECOMMENDED_DEFAULT_MODELS
+for _m in list(RECOMMENDED_DEFAULT_MODELS)[:2]:
+    print(_m)
+' 2>/dev/null)
+}
+
 usage() {
   echo "Usage: $0 <model-name>"
   echo "       $0              # interactive model picker in a TTY"
@@ -63,27 +129,19 @@ usage() {
   echo "Run with no model name in a normal terminal to open the hardware-aware"
   echo "model picker. Use the positional form in scripts/CI to skip prompts."
   echo ""
-  echo "Supported model names:"
-  echo "  qwen3.6-27b"
-  echo "  qwen3.6-35b-a3b"
-  echo "  gemma-4-31b"
-  echo "  gemma-4-26b-a4b"
-  echo "  deepseek-v4-flash-0731"
+  echo "Supported model names (derived from scripts/lib/profiles/models/*.yml):"
+  local _id
+  while IFS= read -r _id; do
+    echo "  ${_id}"
+  done < <(_catalog_py "[m['id'] for m in data['models']]")
   echo ""
   echo "Exact catalog entry fetch: WEIGHT_KEY=<registry-key> $0 <model-name>"
 }
 
 model_label() {
-  case "$1" in
-    qwen3.6-27b) echo "Qwen 3.6 27B" ;;
-    qwen3.6-35b-a3b) echo "Qwen 3.6 35B-A3B" ;;
-    deepseek-v4-flash-0731) echo "DeepSeek-V4-Flash-0731 (284B MoE, CPU offload)" ;;
-    gemma-4-31b) echo "Gemma 4 31B" ;;
-    gemma-4-26b-a4b) echo "Gemma 4 26B-A4B" ;;
-    diffusiongemma-26b-a4b) echo "DiffusionGemma 26B-A4B (dLLM)" ;;
-    *) echo "$1" ;;
-  esac
+  _catalog_py "next((m['display_name'] for m in data['models'] if m['id'] == sys.argv[2]), sys.argv[2])" "$1"
 }
+
 
 load_weight_recipe() {
   local key="$1"
@@ -115,9 +173,32 @@ load_weight_recipe() {
   echo "[model]   ${WEIGHT_KEY} -> ${MODEL_REPO} ${WEIGHT_FILES} -> ${MODEL_SUBDIR}"
 }
 
-model_picker_line() {
-  local idx="$1" model="$2" size="$3" status mark reason
+# _picker_hw_mark <model> <space-separated compose paths (repo-relative)>
+# Hardware-fit mark for the picker. compose-meta's friendly table only knows
+# the legacy headline pair; for every other catalog model, fall back to the
+# model's registered composes (registry-derived) and fit-check those directly.
+_picker_hw_mark() {
+  local model="$1" paths="$2" status file=""
   status="$(compose_hw_model_status "$ROOT_DIR" "$model" 2>/dev/null || true)"
+  if [[ "${status#*|}" == "unknown model:"* && -n "${paths}" ]]; then
+    for file in ${paths}; do
+      [[ -f "${ROOT_DIR}/${file}" ]] || continue
+      status="$(compose_hw_compose_status "${ROOT_DIR}/${file}" 2>/dev/null || true)"
+      if [[ "${status}" == ok\|* ]]; then
+        printf 'ok|fits your rig'
+        return
+      fi
+    done
+    [[ -n "${file:-}" ]] && { printf '%s' "${status}"; return; }
+    printf 'no|no registered compose'
+    return
+  fi
+  printf '%s' "${status}"
+}
+
+model_picker_line() { # <idx> <model> <size-text> <compose-paths>
+  local idx="$1" model="$2" size="$3" paths="$4" status mark reason
+  status="$(_picker_hw_mark "$model" "$paths")"
   reason="${status#*|}"
   if [[ "$status" == ok\|* ]]; then
     mark="✓"
@@ -131,21 +212,63 @@ pick_model_interactive() {
   # shellcheck source=lib/compose-meta.sh
   source "${ROOT_DIR}/scripts/lib/compose-meta.sh"
 
+  local -a _ids _both=()
+  mapfile -t _ids < <(_catalog_py "[m['id'] for m in data['models']]")
+  read_both_models _both
+
+  # Registry-derived compose paths per model, for the hw-fit fallback above.
+  local _reg_tmp _reg_pick_json="" ; _reg_tmp="$(mktemp)"
+  bash "${ROOT_DIR}/scripts/lib/registry-emit.sh" --json >"${_reg_tmp}" 2>/dev/null && _reg_pick_json=1
+  local -A _model_composes=()
+  if [[ -n "${_reg_pick_json}" ]]; then
+    eval "$(python3 -c '
+import json, shlex, sys
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+acc = {}
+order = []
+for v in data.get("variants", []):
+    m = v.get("model")
+    p = v.get("compose_path") or ""
+    if not m or not p:
+        continue
+    if m not in acc:
+        acc[m] = []
+        order.append(m)
+    acc[m].append(p)
+sep = " "
+for m in order:
+    print(f"_model_composes[{shlex.quote(m)}]={shlex.quote(sep.join(acc[m]))}")
+' "${_reg_tmp}")"
+  fi
+  rm -f "${_reg_tmp}"
+
   echo "[setup] Which model to download?" >&2
   echo "" >&2
-  model_picker_line "1" "qwen3.6-27b" "~14 GB AutoRound INT4" >&2
-  model_picker_line "2" "gemma-4-31b" "~21 GB AutoRound INT4 + drafter" >&2
-  echo "  3. Both           (~30 GB total)  downloads both model families" >&2
+  local _idx=0 _id _size _both_idx=""
+  for _id in "${_ids[@]}"; do
+    _idx=$((_idx + 1))
+    # Size of the model's default weight variant, straight from the catalog.
+    _size="$(_catalog_py "str(next((m.get('size_gb') for m in data['models'] if m['id'] == sys.argv[2]), '?'))" "${_id}")"
+    model_picker_line "$_idx" "${_id}" "~${_size} GB default weights" "${_model_composes[${_id}]:-}" >&2
+  done
+  if ((${#_both[@]} >= 2)); then
+    _idx=$((_idx + 1))
+    _both_idx="${_idx}"
+    echo "  ${_idx}. Both (${_both[0]} + ${_both[1]})   downloads both recommended defaults" >&2
+  fi
   echo "" >&2
+  local _max=$(( ${#_ids[@]} + (${#_both[@]} >= 2 ? 1 : 0) ))
   while true; do
     local pick
-    read -rp "Choice [1-3]: " pick
-    case "$pick" in
-      1) echo "qwen3.6-27b"; return ;;
-      2) echo "gemma-4-31b"; return ;;
-      3) echo "both"; return ;;
-      *) echo "  ! invalid — pick 1, 2, or 3" >&2 ;;
-    esac
+    read -rp "Choice [1-${_max}]: " pick
+    if [[ "${pick}" =~ ^[0-9]+$ ]] && ((pick >= 1 && pick <= ${#_ids[@]})); then
+      echo "${_ids[$((pick - 1))]}"
+      return
+    elif [[ -n "${_both_idx}" && "${pick}" == "${_both_idx}" ]]; then
+      echo "both"
+      return
+    fi
+    echo "  ! invalid — pick 1-${_max}" >&2
   done
 }
 
@@ -184,77 +307,91 @@ if [[ -z "${MODEL_NAME}" ]]; then
   fi
 fi
 
+declare -a BOTH_MODELS=()
+read_both_models BOTH_MODELS
 if [[ "${MODEL_NAME}" == "both" ]]; then
+  if ((${#BOTH_MODELS[@]} < 2)); then
+    echo "ERROR: 'both' needs at least two RECOMMENDED_DEFAULT_MODELS entries in" >&2
+    echo "       scripts/lib/profiles/compose_registry.py (found: ${BOTH_MODELS[*]:-none})." >&2
+    echo "       Download each model explicitly: bash scripts/setup.sh <model-name>" >&2
+    exit 1
+  fi
   # Resolve MODEL_DIR once in the parent by reusing the normal prompt below,
   # then recurse through the positional form for each model.
   SETUP_BOTH_MODE=1
-  MODEL_NAME="qwen3.6-27b"
+  MODEL_NAME="${BOTH_MODELS[0]}"
 else
   SETUP_BOTH_MODE=0
 fi
 
 # The profile YAMLs are the only source of download recipes. setup.sh only
-# maps friendly setup knobs (MODEL_NAME, WEIGHTS, WITH_*) to profile keys.
+# maps friendly setup knobs (MODEL_NAME, WEIGHTS, WITH_*) to profile keys —
+# all of it derived from `weights.py catalog --json`; a model's optional
+# `setup:` block in profiles/models/<id>.yml captures whatever differs from
+# the defaults (primary = default_weight_variant, no aliases, no drafters).
 ALWAYS_DRAFT_KEY=""
 DFLASH_KEY=""
+VISION_KEY=""
+PRISM_EAGLE3_KEY=""
 PRIMARY_WEIGHT_KEY=""
 EXTRA_WEIGHT_KEYS=()
-# Genesis is opt-in: nothing in the shipped catalog requires it anymore (its last
-# unique feature on this stack — turboquant_3bit_nc KV — is now provided by beellama
-# KVarN; #182). The clone only fires if a user explicitly sets NEEDS_GENESIS=1 (e.g.
-# to revive an archived TQ3 compose). The per-model dispatch below no longer flips it on.
-NEEDS_GENESIS="${NEEDS_GENESIS:-0}"
+SETUP_ASSISTANT_DRAFT=""
+SETUP_SUPPORTED_WEIGHTS="autoround"
+declare -A SETUP_ALIAS=()
+declare -A SETUP_ALIAS_EXTRAS=()
 
-case "${MODEL_NAME}" in
-  qwen3.6-27b)
-    PRIMARY_WEIGHT_KEY="qwen3.6-27b:autoround-int4"
-    DFLASH_KEY="qwen3.6-27b:dflash"
-    # Genesis no longer auto-requested: qwen3.6-27b.yml declares requires_genesis:false
-    # and the live autoround composes run overlay-free on vllm-stable v0.22.0 (#182).
-    ;;
-  qwen3.6-35b-a3b)
-    PRIMARY_WEIGHT_KEY="qwen3.6-35b-a3b:autoround-int4"
-    ;;
-  deepseek-v4-flash-0731)
-    # Defaults to the IQ2 REACH tier (~85 GB on disk, ~86 GB host RAM) rather than
-    # Q8 (~151 GB / ~146 GB host RAM): the reach tier is the one most rigs can
-    # actually run, and a wrong guess here costs the user a 151 GB download.
-    # Q8 instead:  WEIGHT_KEY=deepseek-v4-flash-0731:unsloth-q8-kxl scripts/setup.sh deepseek-v4-flash-0731
-    PRIMARY_WEIGHT_KEY="deepseek-v4-flash-0731:unsloth-iq2-xxs"
-    # ⚠️ NOT optional: both slugs pass -md and will not boot without the drafter.
-    # The main GGUF has no embedded nextn head, so DSpark is the only spec path.
-    ALWAYS_DRAFT_KEY="deepseek-v4-flash-0731:dspark"
-    ;;
-  gemma-4-31b)
-    PRIMARY_WEIGHT_KEY="gemma-4-31b:autoround-int4"
-    ALWAYS_DRAFT_KEY="gemma-4-31b:assistant"
-    DFLASH_KEY="gemma-4-31b:dflash"
-    ;;
-  gemma-4-26b-a4b)
-    PRIMARY_WEIGHT_KEY="gemma-4-26b-a4b:autoround-int4-mixed"
-    ;;
-  diffusiongemma-26b-a4b)
-    # dLLM, fp8 only (no autoround variant). Default WEIGHTS=autoround is a no-op
-    # here — the fp8 key set below is what's fetched.
-    PRIMARY_WEIGHT_KEY="diffusiongemma-26b-a4b:fp8"
-    ;;
-  *)
-    # An unknown friendly model name is fatal ONLY when WEIGHT_KEY is NOT set.
-    # WEIGHT_KEY is the authoritative "exact catalog entry" fetch-now flow (used
-    # by preflight + the serve-cockpit Download action): the recipe fully
-    # specifies <model>:<variant>, and load_weight_recipe() validates that the
-    # key's model matches MODEL_NAME — so the hardcoded per-family dispatch isn't
-    # needed for an arbitrary catalog entry. Leave PRIMARY_WEIGHT_KEY empty here;
-    # the WEIGHT_KEY override below sets it.
-    if [[ -z "${WEIGHT_KEY:-}" ]]; then
-      echo "ERROR: unsupported model '${MODEL_NAME}'."
-      echo "Supported: qwen3.6-27b, qwen3.6-35b-a3b, gemma-4-31b, gemma-4-26b-a4b, diffusiongemma-26b-a4b, deepseek-v4-flash-0731"
-      echo "(To add a new model, extend the model dispatch in scripts/setup.sh and profiles/models/*.yml,"
-      echo " or pass WEIGHT_KEY=<model>:<variant> to fetch an exact catalog entry directly.)"
-      exit 1
-    fi
-    ;;
-esac
+# Resolve MODEL_NAME's dispatch policy from the catalog.
+_setup_found=0
+eval "$(python3 - "${MODEL_NAME}" "$(catalog_json)" <<'PY'
+import json, shlex, sys
+
+model, raw = sys.argv[1], sys.argv[2]
+data = json.loads(raw)
+m = next((x for x in data["models"] if x["id"] == model), None)
+
+def q(v):
+    return shlex.quote(str(v if v is not None else ""))
+
+
+if m is None:
+    print("_setup_found=0")
+    raise SystemExit(0)
+print("_setup_found=1")
+print(f"PRIMARY_WEIGHT_KEY={q(m['default_key'])}")
+for var, key in (
+    ("ALWAYS_DRAFT_KEY", "always_draft"),
+    ("DFLASH_KEY", "dflash"),
+    ("VISION_KEY", "vision"),
+    ("PRISM_EAGLE3_KEY", "prism_eagle3"),
+):
+    print(f"{var}={q(model + ':' + m[key] if m.get(key) else '')}")
+# Bare variant — setup.sh qualifies it with MODEL_NAME when
+# WITH_ASSISTANT_DRAFT=1 overrides ALWAYS_DRAFT_KEY.
+print(f"SETUP_ASSISTANT_DRAFT={q(m.get('assistant_draft') or '')}")
+for alias, variant in (m.get("aliases") or {}).items():
+    print(f"SETUP_ALIAS[{q(alias)}]={q(variant)}")
+for alias, extras in (m.get("alias_extras") or {}).items():
+    print(f"SETUP_ALIAS_EXTRAS[{q(alias)}]={q(' '.join(model + ':' + x for x in extras))}")
+aliases = sorted((m.get("aliases") or {}))
+print(f"SETUP_SUPPORTED_WEIGHTS={q(' '.join(['autoround'] + aliases))}")
+PY
+)"
+
+# An unknown friendly model name is fatal ONLY when WEIGHT_KEY is NOT set.
+# WEIGHT_KEY is the authoritative "exact catalog entry" fetch-now flow (used
+# by preflight + the serve-cockpit Download action): the recipe fully
+# specifies <model>:<variant>, and load_weight_recipe() validates that the
+# key's model matches MODEL_NAME — so no per-family dispatch is needed for an
+# arbitrary catalog entry. The supported list is DERIVED, never hand-written:
+# a new model yml is accepted here automatically.
+if ((_setup_found == 0)) && [[ -z "${WEIGHT_KEY:-}" ]]; then
+  echo "ERROR: unsupported model '${MODEL_NAME}'."
+  echo "Supported: $(_catalog_py "[', '.join(m['id'] for m in data['models'])]")"
+  echo "(To add a new model, add scripts/lib/profiles/models/<id>.yml — setup.sh derives"
+  echo " its front door from the catalog automatically. Or pass WEIGHT_KEY=<model>:<variant>"
+  echo " to fetch an exact catalog entry directly.)"
+  exit 1
+fi
 
 # ---------- Weights format / exact registry entry ----------
 # WEIGHTS selects a common weight variant for the model family. WEIGHT_KEY is
@@ -265,81 +402,45 @@ VERIFY_GLOB="*.safetensors"
 
 if [[ -n "${WEIGHT_KEY:-}" ]]; then
   PRIMARY_WEIGHT_KEY="${WEIGHT_KEY}"
-elif [[ "${WEIGHTS}" == "gguf" ]]; then
-  case "${MODEL_NAME}" in
-    qwen3.6-27b)
-      PRIMARY_WEIGHT_KEY="qwen3.6-27b:unsloth-q4km"
-      EXTRA_WEIGHT_KEYS+=("qwen3.6-27b:gguf_mmproj_f16")
-      NEEDS_GENESIS=0
-      ;;
-    *)
-      echo "ERROR: WEIGHTS=gguf is only wired for qwen3.6-27b right now." >&2
-      echo "       Use WEIGHT_KEY=<model>:<variant> for exact catalog entries." >&2
-      exit 1 ;;
-  esac
-elif [[ "${WEIGHTS}" == "iq4ks" ]]; then
-  case "${MODEL_NAME}" in
-    qwen3.6-27b)
-      PRIMARY_WEIGHT_KEY="qwen3.6-27b:ubergarm-iq4ks"
-      NEEDS_GENESIS=0
-      ;;
-    *)
-      echo "ERROR: WEIGHTS=iq4ks is only wired for qwen3.6-27b." >&2
-      exit 1 ;;
-  esac
-elif [[ "${WEIGHTS}" == "awq" ]]; then
-  case "${MODEL_NAME}" in
-    gemma-4-31b) PRIMARY_WEIGHT_KEY="gemma-4-31b:awq" ;;
-    gemma-4-26b-a4b) PRIMARY_WEIGHT_KEY="gemma-4-26b-a4b:awq" ;;
-    *)
-      echo "ERROR: WEIGHTS=awq is only wired for gemma-4-31b and gemma-4-26b-a4b." >&2
-      exit 1 ;;
-  esac
-elif [[ "${WEIGHTS}" == "fp8" ]]; then
-  case "${MODEL_NAME}" in
-    qwen3.6-27b)
-      PRIMARY_WEIGHT_KEY="qwen3.6-27b:fp8"
-      NEEDS_GENESIS=0
-      ;;
-    *)
-      echo "ERROR: WEIGHTS=fp8 is only wired for qwen3.6-27b." >&2
-      exit 1 ;;
-  esac
-elif [[ "${WEIGHTS}" == "qwopus-coder" ]]; then
-  # Qwopus3.6-27B-Coder Q5_K_M GGUF (embedded MTP head) for beellama/qwopus-coder.
-  case "${MODEL_NAME}" in
-    qwen3.6-27b)
-      PRIMARY_WEIGHT_KEY="qwen3.6-27b:qwopus-coder-mtp-q5km"
-      NEEDS_GENESIS=0
-      ;;
-    *)
-      echo "ERROR: WEIGHTS=qwopus-coder is only wired for qwen3.6-27b." >&2
-      exit 1 ;;
-  esac
-elif [[ "${WEIGHTS}" == "carnice-v2" ]]; then
-  # Carnice-V2-27B Q5_K_M GGUF (embedded MTP head) for beellama/carnice-v2-single-q5km-mtp.
-  case "${MODEL_NAME}" in
-    qwen3.6-27b)
-      PRIMARY_WEIGHT_KEY="qwen3.6-27b:carnice-v2-q5km"
-      NEEDS_GENESIS=0
-      ;;
-    *)
-      echo "ERROR: WEIGHTS=carnice-v2 is only wired for qwen3.6-27b." >&2
-      exit 1 ;;
-  esac
-elif [[ "${WEIGHTS}" != "autoround" ]]; then
-  echo "ERROR: WEIGHTS='${WEIGHTS}' not recognized (use 'autoround', 'awq', 'fp8', 'qwopus-coder', 'carnice-v2', 'gguf', or 'iq4ks')." >&2
+elif [[ "${WEIGHTS}" == "autoround" ]]; then
+  # The default: PRIMARY_WEIGHT_KEY already resolved to the model's default key.
+  :
+elif [[ -n "${SETUP_ALIAS[${WEIGHTS}]:-}" ]]; then
+  # WEIGHTS=<alias> -> the model's registered variant for that alias
+  # (profiles/models/<id>.yml `setup:.weights_aliases`).
+  PRIMARY_WEIGHT_KEY="${MODEL_NAME}:${SETUP_ALIAS[${WEIGHTS}]}"
+  if [[ -n "${SETUP_ALIAS_EXTRAS[${WEIGHTS}]:-}" ]]; then
+    read -ra _alias_extras <<< "${SETUP_ALIAS_EXTRAS[${WEIGHTS}]}"
+    EXTRA_WEIGHT_KEYS+=("${_alias_extras[@]}")
+  fi
+else
+  echo "ERROR: WEIGHTS='${WEIGHTS}' not recognized for ${MODEL_NAME} (supported: ${SETUP_SUPPORTED_WEIGHTS})." >&2
+  echo "       Use WEIGHT_KEY=<model>:<variant> for exact catalog entries." >&2
   exit 1
 fi
 
 if [[ "${WITH_ASSISTANT_DRAFT:-0}" == "1" ]]; then
-  case "${MODEL_NAME}" in
-    gemma-4-31b) ALWAYS_DRAFT_KEY="gemma-4-31b:assistant" ;;
-    gemma-4-26b-a4b) ALWAYS_DRAFT_KEY="gemma-4-26b-a4b:assistant" ;;
-    *)
-      echo "ERROR: WITH_ASSISTANT_DRAFT=1 is only wired for Gemma models." >&2
-      exit 1 ;;
-  esac
+  if [[ -z "${SETUP_ASSISTANT_DRAFT:-}" ]]; then
+    echo "ERROR: WITH_ASSISTANT_DRAFT=1 is not wired for ${MODEL_NAME}: no assistant_draft in its profiles/models/<id>.yml setup block." >&2
+    exit 1
+  fi
+  ALWAYS_DRAFT_KEY="${MODEL_NAME}:${SETUP_ASSISTANT_DRAFT}"
+fi
+
+# Debug / CI surface: print the resolved dispatch keys and exit before any
+# preflight or download. Used by scripts/tests/test-setup-registry-derived.sh
+# to assert setup.sh's derived keys agree with `weights.py catalog --json` for
+# EVERY model and alias without exercising the fetch path.
+if [[ "${SETUP_DUMP_KEYS:-0}" == "1" ]]; then
+  echo "model=${MODEL_NAME}"
+  echo "label=$(model_label "${MODEL_NAME}")"
+  echo "primary=${PRIMARY_WEIGHT_KEY}"
+  echo "always_draft=${ALWAYS_DRAFT_KEY}"
+  echo "dflash=${DFLASH_KEY}"
+  echo "vision=${VISION_KEY}"
+  echo "prism_eagle3=${PRISM_EAGLE3_KEY}"
+  echo "extras=${EXTRA_WEIGHT_KEYS[*]:-}"
+  exit 0
 fi
 
 load_weight_recipe "${PRIMARY_WEIGHT_KEY}"
@@ -429,17 +530,16 @@ fi
 MODEL_DIR="${MODEL_DIR:-${ROOT_DIR}/models-cache}"
 if [[ "${SETUP_BOTH_MODE:-0}" == "1" ]]; then
   export MODEL_DIR
-  echo "[setup] downloading both supported models into ${MODEL_DIR}"
+  echo "[setup] downloading the recommended defaults into ${MODEL_DIR}: ${BOTH_MODELS[*]}"
   echo ""
-  bash "$0" qwen3.6-27b
-  echo ""
-  bash "$0" gemma-4-31b
-  echo ""
-  echo "[setup] ✓ Both models downloaded."
+  for _both_model in "${BOTH_MODELS[@]}"; do
+    bash "$0" "${_both_model}"
+    echo ""
+  done
+  echo "[setup] ✓ All recommended models downloaded."
   echo "[setup] Next: bash scripts/launch.sh"
   exit 0
 fi
-GENESIS_DIR="${ROOT_DIR}/models/${MODEL_NAME}/vllm/patches/genesis"
 
 cd "${ROOT_DIR}"
 
@@ -487,6 +587,16 @@ _disk_need_gb() {
       compgen -G "${MODEL_DIR}/${dir}/${glob}" >/dev/null 2>&1 && present=1
     fi
     [[ "$present" == "1" ]] && continue
+    # Some profiles declare a non-numeric size (qwen3.6-27b gguf emits the
+    # literal `WEIGHT_SIZE_GB=variable`, #1131).  Bash arithmetic would read
+    # that string as an unset variable name under `set -u` and kill the
+    # preflight.  Skip it with a note -- the download reports the real size
+    # when it runs -- instead of crashing.  (The note goes to stderr: stdout
+    # of this function is command-substituted into PREFLIGHT_DISK_GB.)
+    if [[ ! "$size" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+      echo "[preflight] WARN:  $key: non-numeric size '$size' -- excluded from the disk estimate; set PREFLIGHT_DISK_GB=<N> to override." >&2
+      continue
+    fi
     total=$(( total + ${size%%.*} ))
   done
   # Headroom for partial-download temp files, plus a floor so a fully-present
@@ -499,16 +609,18 @@ _disk_need_gb() {
 }
 
 _DISK_KEYS=("${PRIMARY_WEIGHT_KEY:-}" "${ALWAYS_DRAFT_KEY:-}")
-[[ "${WITH_DFLASH_DRAFT:-0}" == "1" ]] && _DISK_KEYS+=("${MODEL_NAME}:dflash")
+[[ "${WITH_DFLASH_DRAFT:-0}" == "1" ]] && _DISK_KEYS+=("${DFLASH_KEY:-${MODEL_NAME}:dflash}")
+# WITH_VISION=1 opts into the mmproj projector (disk-gate it AND queue the download).
+[[ "${WITH_VISION:-0}" == "1" && -n "${VISION_KEY:-}" ]] && { _DISK_KEYS+=("${VISION_KEY}"); EXTRA_WEIGHT_KEYS+=("${VISION_KEY}"); }
 PREFLIGHT_DISK_GB="${PREFLIGHT_DISK_GB:-$(_disk_need_gb "${_DISK_KEYS[@]}")}"
 
 echo "[preflight] checking environment..."
-# docker is soft-warn for setup.sh — this script only fetches genesis + models,
-# no docker invocations until you actually `docker compose up` later. Hard-failing
-# blocks non-docker container-runtime users (microk8s / podman / k8s / manual)
-# from running setup at all (club-3090 disc #48). launch.sh keeps the hard check
+# docker is soft-warn for setup.sh — this script only fetches models, no docker
+# invocations until you actually `docker compose up` later. Hard-failing blocks
+# non-docker container-runtime users (microk8s / podman / k8s / manual) from
+# running setup at all (club-3090 disc #48). launch.sh keeps the hard check
 # because it actually invokes docker.
-preflight_docker || echo "[preflight] WARN:  docker unavailable — setup will continue (genesis + model fetch don't need docker), but you'll need a working container runtime before 'docker compose up'."
+preflight_docker || echo "[preflight] WARN:  docker unavailable — setup will continue (model fetch doesn't need docker), but you'll need a working container runtime before 'docker compose up'."
 preflight_gpu 1  || exit 1
 preflight_disk "${MODEL_DIR}" "${PREFLIGHT_DISK_GB}" || exit 1
 preflight_hf_token  # soft-warn only; downloads will surface the hard failure
@@ -556,57 +668,11 @@ need() {
     exit 1
   }
 }
-need git
 need curl
 need sha256sum
 
 echo "Setup root:   ${ROOT_DIR}"
 echo "Model dir:    ${MODEL_DIR}"
-
-# ---------- Genesis patches (opt-in only) ----------
-# Genesis is no longer fetched by default. No shipped compose requires it: its one
-# unique feature on this stack — turboquant_3bit_nc KV — is now covered by beellama
-# KVarN, and the Genesis-anchored vLLM engines were deprecated when the catalog moved
-# to stock vllm/vllm-openai:v0.22.0 (their TQ3/Genesis composes live in compose/_archive/).
-# We are not reviving Genesis in the near term (#182).
-#
-# The pin below is retained ONLY for an explicit revival: running
-#   NEEDS_GENESIS=1 bash scripts/setup.sh qwen3.6-27b
-# clones Sandermage's tree at this commit so an archived TQ3 compose can be brought back.
-# Bumping it is parked on Sander's next *stable* Genesis tag (the in-flight memory-rework
-# WIP supersedes the 7b9fd319 skeleton); any bump requires re-running verify-stress.sh
-# against the revived compose. Override with GENESIS_PIN=<ref> if reviving against another.
-GENESIS_PIN="${GENESIS_PIN:-7b9fd319}"
-
-if [[ "${NEEDS_GENESIS:-1}" != "1" ]]; then
-  echo "[genesis] ${MODEL_NAME} doesn't use Genesis — skipping clone."
-elif [[ "${SKIP_GENESIS:-0}" != "1" ]]; then
-  if [[ -d "${GENESIS_DIR}/.git" ]]; then
-    echo "[genesis] Already cloned at ${GENESIS_DIR} — fetching + checking out ${GENESIS_PIN} ..."
-    (cd "${GENESIS_DIR}" && git fetch origin && git checkout "${GENESIS_PIN}" 2>&1 | tail -3)
-  else
-    echo "[genesis] Cloning Sandermage/genesis-vllm-patches at ${GENESIS_PIN} ..."
-    # Full clone (commit SHAs aren't reachable via --branch + --depth 1).
-    git clone https://github.com/Sandermage/genesis-vllm-patches.git "${GENESIS_DIR}"
-    (cd "${GENESIS_DIR}" && git checkout "${GENESIS_PIN}")
-  fi
-
-  # v7.14+ layout sanity check
-  if [[ ! -d "${GENESIS_DIR}/vllm/_genesis" ]]; then
-    echo "ERROR: genesis tree at ${GENESIS_PIN} missing vllm/_genesis package." >&2
-    echo "       Re-run with GENESIS_PIN=<other-ref> to try a different version." >&2
-    exit 1
-  fi
-  echo "[genesis] Pinned to ${GENESIS_PIN} ($(cd "${GENESIS_DIR}" && git rev-parse --short HEAD))"
-
-  # v7.69 ships PN25 + PN30 + PN34 directly (Sander's accept-and-fold of our
-  # cross-rig sidecars). Local patch_pn25_genesis_register_fix.py +
-  # patch_pn30_dst_shaped_temp_fix.py + patch_workspace_lock_disable.py are
-  # now redundant. Sidecar Python files retained in vllm/patches/ for
-  # rollback if any v7.69 patch regresses on your config.
-else
-  echo "[genesis] SKIP_GENESIS=1 — not cloning."
-fi
 
 # ---------- Model download ----------
 if [[ "${SKIP_MODEL:-0}" == "1" ]]; then
@@ -759,7 +825,8 @@ _verify_downloaded_files() {
   # Pin the etag lookup to the same revision we downloaded (#319). Empty -> main
   # HEAD; a stale pin would otherwise etag-check against a newer HEAD and FAIL.
   local revision="${4:-main}"
-  local fail=0 verified=0 unverified=0 total=0
+  local fail=0 verified=0 unverified=0 total=0 skipped=0
+  local _mk _sz _mt _prev
   local f meta expected exp_size actual local_size
 
   echo "[verify]  Checking SHA256 of every ${verify_glob} against the hub's published"
@@ -793,10 +860,34 @@ _verify_downloaded_files() {
       unverified=$((unverified + 1))
       continue
     fi
+    # ── marker-based skip ────────────────────────────────────────────────
+    # Re-hashing every file on every run costs minutes of pure disk read on a
+    # 157 GB model even when nothing was fetched. Skip ONLY when all four of
+    # (expected-sha, size, mtime, revision) match what was recorded at the last
+    # PASSING verify of THIS file.
+    # ⚠️ Deliberately NOT a bare "verified" flag — the incident this function
+    # exists for was a run that TRUSTED such a flag. The hub's expected sha is
+    # re-fetched every run (above), so an upstream change moves it; any local
+    # mutation moves size or mtime. Either way we fall through and re-hash.
+    # FORCE_VERIFY=1 bypasses the skip entirely.
+    _mk="${MODEL_DIR}/${subdir}/.setup-verified.tsv"
+    _sz="$(stat -c '%s' "$f" 2>/dev/null || echo '?')"
+    _mt="$(stat -c '%Y' "$f" 2>/dev/null || echo '?')"
+    if [[ "${FORCE_VERIFY:-0}" != "1" && -f "$_mk" ]]; then
+      _prev="$(awk -F'\t' -v n="$f" '$5==n {print $1"|"$2"|"$3"|"$4}' "$_mk" 2>/dev/null | tail -1)"
+      if [[ -n "$_prev" && "$_prev" == "${expected}|${_sz}|${_mt}|${revision}" ]]; then
+        printf "  %-50s SKIP  (unchanged since last verify)\n" "$f"
+        skipped=$((skipped + 1))
+        continue
+      fi
+    fi
     actual="$(sha256sum "$f" | awk '{print $1}')"
     if [[ "$expected" == "$actual" ]]; then
       printf "  %-50s OK\n" "$f"
       verified=$((verified + 1))
+      # Record ONLY on a pass, and only for a file we actually hashed.
+      printf '%s\t%s\t%s\t%s\t%s\n' "$expected" "$_sz" "$_mt" "$revision" "$f" \
+        >> "$_mk" 2>/dev/null || true
     else
       printf "  %-50s FAIL  exp=%.12s  act=%.12s\n" "$f" "$expected" "$actual"
       fail=$((fail + 1))
@@ -818,6 +909,12 @@ _verify_downloaded_files() {
   # never be able to read "N file(s) SHA-verified" and conclude N == total when
   # it does not.
   echo "[done]    ${verified}/${total} file(s) SHA-verified in ${subdir}."
+  if [[ "$skipped" != "0" ]]; then
+    echo "[verify]  ${skipped}/${total} file(s) SKIPPED — expected-sha + size + mtime +"
+    echo "            revision all unchanged since their last PASSING verify, so they"
+    echo "            were NOT re-hashed this run. This is a skip, not a verification."
+    echo "            Force a full re-hash with: FORCE_VERIFY=1"
+  fi
   if [[ "$unverified" != "0" ]]; then
     echo "[verify]  ⚠ ${unverified}/${total} file(s) UNVERIFIED — the hub published no sha256 for them,"
     echo "            so nothing checked their contents (a size match is not a verification)."
@@ -848,7 +945,6 @@ for extra_key in "${EXTRA_WEIGHT_KEYS[@]}"; do
 done
 
 echo ""
-[[ -d "${GENESIS_DIR}/.git" ]] && echo "          Genesis pinned at ${GENESIS_PIN} ($(cd "${GENESIS_DIR}" && git rev-parse --short HEAD))."
 echo ""
 
 # ---------- Optional / companion draft models ----------
@@ -873,14 +969,11 @@ fi
 echo ""
 
 if [[ "${WITH_PRISM_EAGLE3:-0}" == "1" ]] && [[ "${SKIP_MODEL:-0}" != "1" ]]; then
-  case "${MODEL_NAME}" in
-    qwen3.6-27b)
-      download_weight_key qwen3.6-27b:prism_eagle3
-      ;;
-    *)
-      echo "ERROR: WITH_PRISM_EAGLE3=1 is only wired for qwen3.6-27b." >&2
-      exit 1 ;;
-  esac
+  if [[ -z "${PRISM_EAGLE3_KEY:-}" ]]; then
+    echo "ERROR: WITH_PRISM_EAGLE3=1 is not wired for ${MODEL_NAME}: no prism_eagle3 in its profiles/models/<id>.yml setup block." >&2
+    exit 1
+  fi
+  download_weight_key "${PRISM_EAGLE3_KEY}"
   echo ""
 fi
 
@@ -890,132 +983,148 @@ fi
 # clone needed. (Previous design required cloning a fork to /opt/ai/engines/vllm/primary/;
 # refactored 2026-05-03 to vendor the two files in-repo, fixing #37.)
 
-# Per-model "next steps" — different composes / served-model-name / port between models.
+
+# Per-model "next steps" — different composes / served-model-name / port between
+# models. Derived from the registry (`scripts/lib/registry-emit.sh --json`),
+# replacing the hand-written per-model case whose arms new models silently
+# missed (#914 class).
 #
-# ⚠️ Initialise every SAMPLE_* here. This case has no default arm, so a model
-# without one left these UNBOUND and `set -u` killed the script on the final
-# echo — AFTER a fully successful download and verify, so the user saw exit 1
-# on a run that had actually worked. (DeepSeek-Flash hit exactly this; found by
-# running setup.sh for real, 2026-08-07.) Empty is the honest value: the echo
-# block below degrades to a generic hint rather than printing a wrong one.
+# Slug pick (deterministic): the model's curated default slug when it is
+# FUNCTIONAL (status production/caveats — mirror of
+# compose_registry.FUNCTIONAL_STATUSES), else the highest-ranked functional
+# slug, else the highest-ranked slug overall. Non-functional pick ⇒ the launch
+# hint carries --force, exactly like switch.sh's gate.
+#
+# ⚠️ Initialise every SAMPLE_* here regardless of derivation success. If the
+# registry emit fails these must be EMPTY, never wrong — and `set -u` must
+# never kill the script AFTER a fully successful download (DeepSeek-Flash hit
+# exactly that; found by running setup.sh for real, 2026-08-07).
 SAMPLE_CONTAINER=""
-SAMPLE_COMPOSE_FLAGS_DUAL=""
+SAMPLE_COMPOSE_PATH=""
 SAMPLE_PORT=""
 SAMPLE_MODEL_NAME=""
 SAMPLE_LAUNCH_HINT=""
 NEXT_STEPS_NOTE=""
+SAMPLE_SLUG=""
+SAMPLE_STATUS=""
 SETUP_MODEL_DISPLAY="$(model_label "${MODEL_NAME}")"
-case "${MODEL_NAME}" in
-  qwen3.6-27b)
-    SAMPLE_CONTAINER="vllm-qwen36-27b"
-    SAMPLE_COMPOSE_FLAGS_DUAL=" -f dual/autoround-int4/fp8-mtp.yml"
-    SAMPLE_PORT="8020"
-    SAMPLE_MODEL_NAME="qwen3.6-27b"
-    NEXT_STEPS_NOTE="Or dual-card vLLM (Marlin patched files already vendored in-repo):
-  cd models/${MODEL_NAME}/vllm/compose && docker compose -f dual/autoround-int4/fp8-mtp.yml up -d"
-    ;;
-  gemma-4-31b)
-    SAMPLE_CONTAINER="vllm-gemma-4-31b-mtp"
-    # Gemma 4 ships specific composes — pick MTP as the canonical default.
-    # Use scripts/switch.sh which auto-selects the right compose by variant.
-    SAMPLE_COMPOSE_FLAGS_DUAL=""
-    SAMPLE_PORT="8030"
-    SAMPLE_MODEL_NAME="gemma-4-31b"
-    NEXT_STEPS_NOTE="Available variants:
-  bash scripts/switch.sh vllm/gemma-31b-dual        # bf16 KV, TP=2, port 8032 (dual-card, v0.24.0 overlay-free)
-  bash scripts/switch.sh vllm/gemma-31b-dual # dual (single-card 31B has no functional config since the beellama retirement)"
-    ;;
-  gemma-4-26b-a4b)
-    SAMPLE_CONTAINER="vllm-gemma-4-26b-a4b"
-    SAMPLE_COMPOSE_FLAGS_DUAL=""
-    SAMPLE_PORT="8035"
-    SAMPLE_MODEL_NAME="gemma-4-26b-a4b"
-    NEXT_STEPS_NOTE="Available variants:
-  bash scripts/switch.sh vllm/gemma-26b-awq
-  WITH_ASSISTANT_DRAFT=1 bash scripts/setup.sh gemma-4-26b-a4b  # fetch MTP assistant if using awq-mtp"
-    ;;
-  diffusiongemma-26b-a4b)
-    SAMPLE_CONTAINER="vllm-diffusiongemma-26b-a4b-fp8-tp2"
-    SAMPLE_COMPOSE_FLAGS_DUAL=""
-    SAMPLE_PORT="8042"
-    SAMPLE_MODEL_NAME="diffusiongemma-26b-a4b"
-    NEXT_STEPS_NOTE="🧪 experimental dLLM (vLLM's first), dual-card. Launch needs --force (non-functional status):
-  bash scripts/switch.sh --force vllm/diffusiongemma-dual
-  # or: gpu-mode dgemma   (stops other GPU models, serves on :8199)"
-    ;;
-  qwen3.6-35b-a3b)
-    SAMPLE_CONTAINER="vllm-qwen36-35b-a3b"
-    SAMPLE_COMPOSE_FLAGS_DUAL=""
-    SAMPLE_PORT="8040"
-    SAMPLE_MODEL_NAME="qwen3.6-35b-a3b-autoround"
-    NEXT_STEPS_NOTE="Preview variants:
-  bash scripts/switch.sh vllm/qwen35-preview"
-    ;;
-  deepseek-v4-flash-0731)
-    # llama.cpp only — there is no vLLM compose for this model, so the generic
-    # "single-card vLLM" line below MUST be overridden or it prints a path that
-    # does not exist. Defaults track the IQ2 reach tier (setup.sh's default
-    # weight key); the Q8 sibling serves on 8030.
-    SAMPLE_CONTAINER="llama-cpp-deepseek-flash-iq2"
-    SAMPLE_COMPOSE_FLAGS_DUAL=""
-    SAMPLE_PORT="8031"
-    SAMPLE_MODEL_NAME="deepseek-v4-flash"
-    SAMPLE_LAUNCH_HINT="  bash scripts/switch.sh --force llamacpp/deepseek-flash-dual-iq2"
-    NEXT_STEPS_NOTE="🐣 incubating — launch needs --force (non-functional by default).
-  Quality tier instead (needs ~146 GB host RAM vs ~86 GB, serves on 8030):
-  bash scripts/switch.sh --force llamacpp/deepseek-flash-dual-q8
-  Expect 8-10 min to load (--no-mmap, and the weights are large)."
-    ;;
-  qwen3.8-27b)
-    # The generic "single-card vLLM" line below MUST be overridden (the #914 class).
-    # ⚠️ NOTE 2026-08-14: vLLM composes NOW EXIST for this model —
-    # vllm/qwen38-27b-dual-max and vllm/qwen38-27b-multi4-max. The override is STILL
-    # correct, but for a different reason than originally written: both vLLM slugs are
-    # DUAL/MULTI-card and 🐣 Incubating, so a single-card next-step line must not point
-    # at them. Only the old "no vLLM compose exists" rationale was stale.
-    # Reached via WEIGHT_KEY=qwen3.8-27b:<variant>: this model is deliberately
-    # NOT in the picker / dispatch / "Supported:" lists above, because both its
-    # slugs are 🐣 incubating and nothing has booted — advertising it in the
-    # front-door picker would contradict that status. Defaults track the
-    # single-card IQ4_NL tier; the dual UD-Q8_K_XL sibling serves on 8087.
-    SAMPLE_CONTAINER="llama-cpp-qwen38-27b-single"
-    SAMPLE_COMPOSE_FLAGS_DUAL=""
-    SAMPLE_PORT="8086"
-    SAMPLE_MODEL_NAME="qwen3.8-27b"
-    SAMPLE_LAUNCH_HINT="  bash scripts/switch.sh --force llamacpp/qwen38-27b-single-iq4nl"
-    NEXT_STEPS_NOTE="🐣 incubating — launch needs --force (non-functional by default), and
-  both slugs are hidden from 'switch.sh --list' (reveal with --list --all).
-  NOTHING HAS BOOTED: no verify-full, no bench, no measured context ceiling.
-  Dual-card max-context tier instead (needs BOTH 3090s — 31.5 GB of weights
-  does not fit one card; serves on 8087):
-  WEIGHT_KEY=qwen3.8-27b:unsloth-q8kxl bash scripts/setup.sh qwen3.8-27b
-  bash scripts/switch.sh --force llamacpp/qwen38-27b-dual-q8kxl"
-    ;;
-esac
+_reg_tmp="$(mktemp)"
+# Don't blind-swallow a broken emit silently: an empty file just degrades the
+# SAMPLE_* block to generic hints (documented above), never a wrong hint.
+bash "${ROOT_DIR}/scripts/lib/registry-emit.sh" --json >"${_reg_tmp}" 2>/dev/null || true
+if [[ -s "${_reg_tmp}" ]]; then
+  eval "$(python3 - "${MODEL_NAME}" "${ROOT_DIR}" "${_reg_tmp}" <<'PY'
+import json, os, re, shlex, sys
+
+model, root, reg_path = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(reg_path, encoding="utf-8") as _fh:
+    data = json.load(_fh)
+
+RANK = {
+    "production": 5,
+    "caveats": 4,
+    "preview": 3,
+    "experimental": 2,
+    "incubating": 1,
+    "upstream-gated": 1,
+    "deprecated": 0,
+}
+FUNCTIONAL = {"production", "caveats"}
+
+variants = [v for v in data.get("variants", []) if v.get("model") == model]
+defaults = [d["slug"] for d in data.get("defaults", []) if d.get("model") == model]
+
+
+def q(v):
+    return shlex.quote(str(v if v is not None else ""))
+
+
+pick = None
+for slug in defaults:
+    c = [v for v in variants if v.get("slug") == slug]
+    if c and c[0].get("status") in FUNCTIONAL:
+        pick = c[0]
+        break
+if pick is None:
+    pool = [v for v in variants if v.get("status") in FUNCTIONAL] or variants
+    if pool:
+        # sorted() is stable: ties keep registry order.
+        pick = sorted(pool, key=lambda v: RANK.get(v.get("status", ""), 0), reverse=True)[0]
+if pick is None:
+    raise SystemExit(0)
+
+slug = pick.get("slug", "")
+status = pick.get("status", "")
+print(f"SAMPLE_SLUG={q(slug)}")
+print(f"SAMPLE_STATUS={q(status)}")
+print(f"SAMPLE_CONTAINER={q(pick.get('container'))}")
+print(f"SAMPLE_PORT={q(pick.get('port'))}")
+print(f"SAMPLE_COMPOSE_PATH={q(pick.get('compose_path'))}")
+
+# served_name is a first-class registry fact now (registry-emit --json); the
+# direct compose grep below stays only as the fallback for a null field.
+served = pick.get("served_name") or ""
+if not served:
+    try:
+        with open(os.path.join(root, pick.get("compose_path") or ""), encoding="utf-8") as fh:
+            m = re.search(r"--served-model-name\s+(?:-\s+)?(\S+)", fh.read())
+        if m:
+            served = m.group(1)
+    except OSError:
+        pass
+print(f"SAMPLE_MODEL_NAME={q(served)}")
+
+force = status not in FUNCTIONAL
+print(f"SAMPLE_LAUNCH_HINT={q('bash scripts/switch.sh ' + ('--force ' if force else '') + slug)}")
+if force:
+    note = f"status '{status}' — launch needs --force (non-functional by default)."
+    if status == "incubating":
+        note += " Incubating slugs are hidden from 'switch.sh --list'; reveal with --list --all."
+else:
+    sibs = sorted(
+        {
+            v["slug"]
+            for v in variants
+            if v.get("status") in FUNCTIONAL and v.get("slug") != slug
+        }
+    )
+    if sibs:
+        lines = ["Functional variants:"]
+        lines += [f"  bash scripts/switch.sh {s}" for s in sibs[:6]]
+        if len(sibs) > 6:
+            lines.append(f"  ... and {len(sibs) - 6} more: bash scripts/switch.sh --list")
+        note = "\n".join(lines)
+    else:
+        note = ""
+print(f"NEXT_STEPS_NOTE={q(note)}")
+PY
+)"
+fi
+rm -f "${_reg_tmp}"
 
 echo "[setup] ✓ ${SETUP_MODEL_DISPLAY} downloaded."
 echo "[setup] Next: bash scripts/launch.sh"
 echo ""
-# A model arm may set SAMPLE_LAUNCH_HINT to override the launch line. Required
-# for models with no vLLM compose — the generic form below would otherwise print
-# a `models/<model>/vllm/compose` path that does not exist.
+# SAMPLE_LAUNCH_HINT is registry-derived (see the derivation above) and always
+# names a real slug — with --force when the slug's status is non-functional.
+# Only a failed registry emit leaves it empty; that fallback points at
+# switch.sh's list rather than printing a models/<model>/vllm/compose path
+# that may not exist (the #914 class).
 if [[ -n "${SAMPLE_LAUNCH_HINT:-}" ]]; then
   echo "Next — launch it:"
-  echo "${SAMPLE_LAUNCH_HINT}"
-  echo "  docker logs -f ${SAMPLE_CONTAINER}"
-elif [[ "${MODEL_NAME}" == "gemma-4-31b" ]]; then
-  echo "Next — single-card vLLM (default):"
-  echo "  bash scripts/switch.sh vllm/gemma-31b-dual"
+  echo "  ${SAMPLE_LAUNCH_HINT}"
   echo "  docker logs -f ${SAMPLE_CONTAINER}"
 else
-  echo "Next — single-card vLLM (default):"
-  echo "  cd models/${MODEL_NAME}/vllm/compose && docker compose up -d"
-  echo "  docker logs -f ${SAMPLE_CONTAINER}"
+  echo "Next — launch it:"
+  echo "  bash scripts/switch.sh --list        # pick a slug for ${MODEL_NAME}"
+  echo "  bash scripts/switch.sh <slug>"
 fi
 echo ""
 echo "${NEXT_STEPS_NOTE}"
 echo ""
-echo "Sanity test (after 'Application startup complete'):"
-echo "  curl -sf http://localhost:${SAMPLE_PORT}/v1/chat/completions \\"
-echo "    -H 'Content-Type: application/json' \\"
-echo "    -d '{\"model\":\"${SAMPLE_MODEL_NAME}\",\"messages\":[{\"role\":\"user\",\"content\":\"Capital of France?\"}],\"max_tokens\":200}'"
+if [[ -n "${SAMPLE_PORT:-}" && -n "${SAMPLE_MODEL_NAME:-}" ]]; then
+  echo "Sanity test (after 'Application startup complete'):"
+  echo "  curl -sf http://localhost:${SAMPLE_PORT}/v1/chat/completions \\"
+  echo "    -H 'Content-Type: application/json' \\"
+  echo "    -d '{\"model\":\"${SAMPLE_MODEL_NAME}\",\"messages\":[{\"role\":\"user\",\"content\":\"Capital of France?\"}],\"max_tokens\":200}'"
+fi

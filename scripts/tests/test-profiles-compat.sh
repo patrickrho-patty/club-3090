@@ -33,10 +33,14 @@ run_test "load_profiles parses all profile groups" <<'PY'
 from scripts.lib.profiles.compat import load_profiles
 p = load_profiles()
 assert len(p.hardware) == 11  # +dgx-spark (#576 follow-up), +rtx-a6000 (#948 thread)
-assert len(p.models) == 18   # +inkling-small, +qwen3.8-27b
+_p = __import__("pathlib").Path
+_nloc = lambda d: len(list(_p(d).glob("*.yml"))) if _p(d).is_dir() else 0
+assert len(p.models) - _nloc("scripts/lib/profiles-local/models.d") == 21   # +inkling-small, +qwen3.8-27b, +glm-5.3-flash, +qwen3.8-flash-next, +deepseek-v4-flash-vision-exp
 assert len(p.workloads) == 5
-assert len(p.engines) == 15   # +llamacpp-club3090-v1.1
-assert len(p.drafters) == 16  # +dspark
+_p = __import__("pathlib").Path
+_nloc = lambda d: len(list(_p(d).glob("*.yml"))) if _p(d).is_dir() else 0
+assert len(p.engines) - _nloc("scripts/lib/profiles-local/engines.d") == 18   # +llamacpp-club3090-v1.1, -v1.5, -v1.6, +sglang-stable
+assert len(p.drafters) == 18  # +syvai-qwen38-dflash2, +anbeeld-glm53-dflash2
 assert len(p.calibration) == 6
 PY
 
@@ -507,5 +511,113 @@ r = validate_estate(instances, [p.hardware["rtx-3090"]] * 6, p, nvlink_active=Fa
 assert r.valid, (r.cross_instance_failures, {k: v.reasons for k, v in r.per_instance.items()})
 PY
 
+run_test "strict keys: every shipped profile group loads under validation" <<'PY'
+from scripts.lib.profiles.compat import load_profiles
+p = load_profiles()  # raises UnknownProfileKeyError on any unknown key
+_p = __import__("pathlib").Path
+_nloc = lambda d: len(list(_p(d).glob("*.yml"))) if _p(d).is_dir() else 0
+assert len(p.models) - _nloc("scripts/lib/profiles-local/models.d") == 21
+PY
+
+run_test "strict keys: typo'd top-level model key fails naming file + closest key" <<'PY'
+import shutil, tempfile
+from pathlib import Path
+from scripts.lib.profiles.compat import load_profiles, UnknownProfileKeyError
+tmp = Path(tempfile.mkdtemp())
+shutil.copytree("scripts/lib/profiles", tmp / "profiles")
+(tmp / "profiles/models/typo.yml").write_text("""schema_version: 1
+id: typo-model
+display_name: Typo
+family: qwen
+hidden_size: 1
+num_hidden_layers: 1
+num_attn_heads: 1
+num_kv_heads: 1
+max_ctx_supported: 1
+attention_k_eq_v: false
+weights: {default: {path: /x, size_gb: 1, format: gguf, status: verified}}
+default_weight_variant: default
+valid_tp: [1]
+descrition: oops
+""")
+try:
+    load_profiles(tmp / "profiles")
+except UnknownProfileKeyError as e:
+    msg = str(e)
+    assert "models/typo.yml" in msg, msg          # names the file
+    assert "descrition" in msg, msg               # names the unexpected key
+    assert "description" in msg, msg              # suggests the closest valid key
+else:
+    raise AssertionError("typo'd top-level key loaded silently")
+PY
+
+run_test "strict keys: typo'd weights-variant verify_glob fails with suggestion" <<'PY'
+import shutil, tempfile
+from pathlib import Path
+from scripts.lib.profiles.compat import load_profiles, UnknownProfileKeyError
+tmp = Path(tempfile.mkdtemp())
+shutil.copytree("scripts/lib/profiles", tmp / "profiles")
+(tmp / "profiles/models/typo.yml").write_text("""schema_version: 1
+id: typo-model
+display_name: Typo
+family: qwen
+hidden_size: 1
+num_hidden_layers: 1
+num_attn_heads: 1
+num_kv_heads: 1
+max_ctx_supported: 1
+attention_k_eq_v: false
+weights:
+  default:
+    path: /x
+    size_gb: 1
+    format: gguf
+    status: verified
+    verify_glb: '*.gguf'
+default_weight_variant: default
+valid_tp: [1]
+""")
+try:
+    load_profiles(tmp / "profiles")
+except UnknownProfileKeyError as e:
+    msg = str(e)
+    assert "models/typo.yml" in msg, msg
+    assert "weights.default" in msg, msg
+    assert "`verify_glb`" in msg and "verify_glob" in msg, msg
+else:
+    raise AssertionError("typo'd verify_glob loaded silently")
+PY
+
+run_test "strict keys: typo'd setup subkey fails with suggestion" <<'PY'
+import shutil, tempfile
+from pathlib import Path
+from scripts.lib.profiles.compat import load_profiles, UnknownProfileKeyError
+tmp = Path(tempfile.mkdtemp())
+shutil.copytree("scripts/lib/profiles", tmp / "profiles")
+(tmp / "profiles/models/typo.yml").write_text("""schema_version: 1
+id: typo-model
+display_name: Typo
+family: qwen
+hidden_size: 1
+num_hidden_layers: 1
+num_attn_heads: 1
+num_kv_heads: 1
+max_ctx_supported: 1
+attention_k_eq_v: false
+weights: {default: {path: /x, size_gb: 1, format: gguf, status: verified}}
+default_weight_variant: default
+valid_tp: [1]
+setup:
+  primarry: default
+""")
+try:
+    load_profiles(tmp / "profiles")
+except UnknownProfileKeyError as e:
+    msg = str(e)
+    assert "setup: unknown key `primarry`" in msg, msg
+    assert "primary" in msg, msg
+else:
+    raise AssertionError("typo'd setup subkey loaded silently")
+PY
 echo ""
 echo "test-profiles-compat: ok"
