@@ -136,6 +136,13 @@
 #                      and belongs in a separate opt-in arm.
 #   CAPTURE            0 = skip the whole capture layer (the pre-capture output
 #                      shape, for a harness that parses it). Default: 1.
+#   BENCH_GPUS         Cards to measure: comma-separated nvidia-smi indices or GPU
+#                      UUIDs (`BENCH_GPUS=2`, `BENCH_GPUS=0,1`). VRAM idle/peak/post,
+#                      PCIe dmon and link state, and the closing GPU-state table then
+#                      read only those cards. Set it whenever the box serves anything
+#                      else: the VRAM figures are SUMS, so unset they include every
+#                      neighbour. Default: all GPUs. A malformed or absent selection
+#                      stops the run rather than measure the wrong cards.
 #   SHORT_EOS_FRAC     A run whose completion is below this fraction of max_tokens
 #                      counts as a short-EOS run and is excluded from "n-usable".
 #                      Chat-tuned models EOS early and silently degenerate a 5-run
@@ -288,6 +295,11 @@ fi
 # Auto-detect running container + port (URL/CONTAINER env vars still win).
 # See scripts/preflight.sh::preflight_autodetect_endpoint.
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+# Canonical engine classification (club-3090#1282). Sourced UNCONDITIONALLY —
+# it was briefly nested under the registry-lookup guard, which would have left
+# engine_kind_* undefined at the call site if that sibling were absent.
+# shellcheck source=lib/engine-kind.sh
+source "${ROOT_DIR}/scripts/lib/engine-kind.sh"
 if [[ -f "${ROOT_DIR}/scripts/preflight.sh" ]]; then
   # shellcheck source=preflight.sh
   source "${ROOT_DIR}/scripts/preflight.sh"
@@ -325,10 +337,26 @@ if [[ -f "${ROOT_DIR}/scripts/lib/registry-lookup.sh" ]]; then
   _DEFAULT_ENDPOINT_PORT="$(registry_lookup_default_port qwen3.6-27b 2>/dev/null || true)"
 fi
 URL="${URL:-http://localhost:${_DEFAULT_ENDPOINT_PORT:-8020}}"
-# Resolve the served model from /v1/models when MODEL is unset (#372). The qwen
-# literal below is only a last resort if detection no-ops (endpoint unreachable).
+# Resolve the served model from /v1/models when MODEL is unset (#372).
 declare -F preflight_autodetect_model >/dev/null && preflight_autodetect_model
-MODEL="${MODEL:-qwen3.6-27b}"
+# #1330: NOT an unconditional `MODEL="${MODEL:-…}"` any more. That fell back to
+# a qwen literal whenever autodetect no-op'd — including against a server that
+# was merely still LOADING — so every request 404'd and the run looked like the
+# config under test was broken. preflight_resolve_model_or_fail refuses the
+# literal exactly when we know better (endpoint unreachable, or we picked the
+# container ourselves and it reports no model) and keeps it otherwise.
+# ⚠️ BENCH_MOCK=1 means "there is deliberately no server" — it short-circuits
+# below at the BENCH_MOCK branch, before any request is made. Refusing here
+# would kill every mocked bench run, and it did: test-bench-capture drives
+# `BENCH_MOCK=1 bash bench.sh` with stderr to /dev/null under `set -e`, so the
+# refusal aborted the whole test SILENTLY, one line after its last ✓.
+# The rule still holds — a guess is fine when we know nothing, and under mock
+# we know there is nothing to know.
+if [[ "${BENCH_MOCK:-0}" != "1" ]] && declare -F preflight_resolve_model_or_fail >/dev/null; then
+  preflight_resolve_model_or_fail "qwen3.6-27b" || exit 1
+else
+  MODEL="${MODEL:-qwen3.6-27b}"
+fi
 if [[ -z "${CONTAINER:-}" && -f "${ROOT_DIR}/scripts/lib/registry-lookup.sh" ]]; then
   # The old literal default 'vllm-qwen36-27b' matches NO registry container, so
   # the docker-inspect/exec consumers below silently no-op'd on an undetected
@@ -343,6 +371,14 @@ fi
 CONTAINER="${CONTAINER:-vllm-qwen36-27b}"
 RUNS="${RUNS:-5}"
 WARMUPS="${WARMUPS:-3}"
+
+# ---- #1076: engine-restart guard -------------------------------------------
+# A fatal engine error mid-bench gets masked by the restart policy: the container
+# comes back and the remaining runs measure a freshly-booted engine, so the
+# numbers silently mix two different engine lifetimes. Snapshot now, compare at
+# the end. See scripts/lib/engine-restart-guard.sh.
+source "${ROOT_DIR}/scripts/lib/engine-restart-guard.sh"
+_RESTARTS_BEFORE="$(restart_guard_snapshot)"
 MAX_TOKENS_NARR="${MAX_TOKENS_NARR:-1000}"
 MAX_TOKENS_CODE="${MAX_TOKENS_CODE:-800}"
 PROMPT_NARR="${PROMPT_NARR:-Write a detailed 800-word essay explaining transformer attention.}"
@@ -427,11 +463,12 @@ ENGINE_KIND="${ENGINE_KIND:-unknown}"
 if [[ "$ENGINE_KIND" == "unknown" && "${CONTAINER:-}" != "none" ]] && command -v docker >/dev/null 2>&1 && docker inspect "${CONTAINER}" >/dev/null 2>&1; then
   container_image="$(docker inspect --format '{{.Config.Image}}' "${CONTAINER}" 2>/dev/null || true)"
   container_name="$(docker inspect --format '{{.Name}}' "${CONTAINER}" 2>/dev/null || true)"
-  if [[ "${container_image} ${container_name}" == *"llama.cpp"* || "${container_image} ${container_name}" == *"llama-cpp"* ]]; then
-    ENGINE_KIND="llamacpp"
-  elif [[ "${container_image} ${container_name}" == *"vllm"* ]]; then
-    ENGINE_KIND="vllm"
-  fi
+  # club-3090#1261 gave SGLang its arm here; club-3090#1282 moved the rules to
+  # scripts/lib/engine-kind.sh so a new engine is added in ONE place. Image
+  # first, then the container name — both are just evidence for the same rules.
+  ENGINE_KIND="$(engine_kind_from_image "${container_image}")"
+  [[ "$ENGINE_KIND" == "unknown" ]] && ENGINE_KIND="$(engine_kind_from_image "${container_name}")"
+  [[ "$ENGINE_KIND" == "unknown" ]] && ENGINE_KIND="$(engine_kind_from_container "${container_name#/}")"
 fi
 
 PP_MODE="log"
@@ -550,7 +587,7 @@ sys.exit(0 if walk(obj) else 1)
      && command -v docker >/dev/null 2>&1 \
      && docker inspect "$CONTAINER" >/dev/null 2>&1; then
     docker inspect "$CONTAINER" 2>/dev/null \
-      | grep -Eq -- '(--reasoning[= ]+on|"--reasoning"[[:space:]]*,[[:space:]]*"on")' && return 0
+      | command grep -Eq -- '(--reasoning[= ]+on|"--reasoning"[[:space:]]*,[[:space:]]*"on")' && return 0
   fi
   return 1
 }
@@ -600,6 +637,18 @@ if [[ "$CAPTURE" == "1" && -f "${ROOT_DIR}/scripts/lib/capture.sh" ]]; then
   CAP_WORK="$(mktemp -d)"
   trap '[[ -n "${CAP_WORK:-}" ]] && rm -rf "$CAP_WORK"' EXIT
   cap_init "$CAP_WORK" || true
+  if [[ -n "${BENCH_GPUS:-}" ]]; then
+    if ! cap_gpus_valid; then
+      echo "ERROR: BENCH_GPUS='${BENCH_GPUS}' is not a comma-separated list of GPU indices or UUIDs." >&2
+      echo "Fix: BENCH_GPUS=2 (one card) or BENCH_GPUS=0,1 — the indices nvidia-smi lists." >&2
+      exit 2
+    fi
+    if cap_have nvidia-smi && [[ "${CAP_NGPU:-0}" -eq 0 ]]; then
+      echo "ERROR: BENCH_GPUS='${BENCH_GPUS}' selects no GPU on this host." >&2
+      echo "Fix: pick from: $(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | paste -sd, -)" >&2
+      exit 2
+    fi
+  fi
 
   CAP_ARGV="$(cap_proc_argv || true)"
 
@@ -613,6 +662,7 @@ if [[ "$CAPTURE" == "1" && -f "${ROOT_DIR}/scripts/lib/capture.sh" ]]; then
     echo "  serving pid    : unknown (set SERVER_PID=<pid> for argv/RSS/swap capture)"
   fi
   echo "  log source     : ${CAP_LOG_SOURCE:-none}${SERVER_LOG:+ (${SERVER_LOG})}"
+  echo "  GPUs measured  : ${BENCH_GPUS:-all} (${CAP_NGPU} card(s); BENCH_GPUS)"
   _v="$(cap_props_get "default_generation_settings.n_ctx" || true)"
   _s="$(cap_props_get "total_slots" || true)"
   [[ -n "$_v" ]] && echo "  served ctx     : ${_v}${_s:+  (slots=${_s})}"
@@ -1604,7 +1654,19 @@ if (( CAP_ENABLED )); then
         }'
       fi
     else
-      echo "  no drafter output in the log (spec-dec off, or the engine does not log acceptance)"
+      # ⚠ THREE DIFFERENT STATES USED TO PRINT THIS ONE LINE. Until 2026-09-11 the
+      # parser knew only vLLM's "draft acceptance rate =" wording, so every SGLang
+      # run landed here — including a DEAD DFlash2 drafter (accept len ~1.0,
+      # sglang#39087), which is slow but never wrong and passes every functional
+      # test. "Nothing to report" and "I cannot read this engine" must not look the
+      # same. Recognised wordings: vLLM `draft acceptance rate = X`; SGLang
+      # `accept len: X, accept rate: Y`.
+      echo "  no acceptance data in the measured window. Either spec-dec is OFF for this"
+      echo "  run, or this engine words its acceptance line differently and the parser"
+      echo "  (scripts/lib/capture.sh, mode=acceptance) has not been taught it."
+      echo "  ⚠ Do NOT read this as 'the drafter is fine' — verify it fired:"
+      echo "      docker logs <container> 2>&1 | grep -oE 'accept len: [0-9.]+' | tail"
+      echo "      healthy is 2-5; ~1.0 means the drafter is drafting garbage"
     fi
   fi
 
@@ -1645,6 +1707,26 @@ print(f"{sum(xs)/len(xs):.2f}" if xs else "")
     fi
   fi
 
+  # ---- exl3 expert arena page size (#1542) ----------------------------------
+  # On exl3 CPU-MoE, 2 MiB vs 4 KiB pages under the CPU-resident experts is ~19% of decode,
+  # and the default arena reaches 2 MiB only through a one-shot collapse that can fail
+  # silently, so a run on 4 KiB pages reads like an engine regression. Say which this was.
+  if [[ "$CAP_ARGV" == *--cpu-moe-split-experts* ]]; then
+    echo ""
+    echo "========== CAPTURE: EXL3 EXPERT ARENA =========="
+    # shellcheck source=lib/exl3-arena.sh
+    . "${ROOT_DIR}/scripts/lib/exl3-arena.sh" 2>/dev/null || true
+    _arena=""
+    declare -F exl3_arena_state >/dev/null 2>&1 && _arena="$(exl3_arena_state "$CONTAINER" || true)"
+    if [[ -n "$_arena" ]]; then
+      echo "  ${_arena}"
+      echo "  $(exl3_arena_explain "$_arena")"
+      [[ "$_arena" == *verdict=4KiB* ]] && echo "  ⚠ WARN: this run's decode numbers are not comparable to a 2 MiB run."
+    else
+      echo "  unavailable: could not read the arena workers in container '${CONTAINER}'"
+    fi
+  fi
+
   # ---- moe-cache: GATED on CPU-offload detection (item 3) ------------------
   echo ""
   echo "========== CAPTURE: EXPERT CACHE (moe-cache) =========="
@@ -1669,7 +1751,17 @@ print(f"{sum(xs)/len(xs):.2f}" if xs else "")
       _enb="$(printf '%s' "$_pd" | command grep -oE 'enabled=[0-9]+' | cut -d= -f2)"
       _nob="$(printf '%s' "$_pd" | command grep -oE 'nobudget=[0-9]+' | cut -d= -f2)"
       echo "  allocation: ${_pd}  (GPUs on this host: ${CAP_NGPU})"
-      if (( CAP_CACHE_WANTED )) && [[ "${_devs:-0}" -lt "${CAP_NGPU:-0}" ]]; then
+      _vbe="$(cap_proc_env LLAMA_ARG_LOG_VERBOSITY 2>/dev/null || true)"
+      if (( CAP_CACHE_WANTED )) && [[ "${_devs:-0}" -lt "${CAP_NGPU:-0}" ]] \
+         && cap_pool_lines_hidden "$_pd" "$_vbe"; then
+        # ⚠️ ABSENCE IS NOT DATA (same rule as the hit-rate branch below): below verbosity 4
+        # the engine prints NO pool line, so a working cache and a missing one look the
+        # same here. Say so, and leave CAP_CACHE_OK alone — flipping it renders as
+        # CACHE_DISABLED, asserting the cache is OFF on every stock moe-cache boot.
+        echo "  allocation: NOT VISIBLE at this log verbosity — the [moe-cache] pool lines print only"
+        echo "              at LLAMA_ARG_LOG_VERBOSITY=4. This is not a sign the cache is off; this run"
+        echo "              cannot see it. To check: re-boot with LLAMA_ARG_LOG_VERBOSITY=4."
+      elif (( CAP_CACHE_WANTED )) && [[ "${_devs:-0}" -lt "${CAP_NGPU:-0}" ]]; then
         CAP_CACHE_OK=0
         echo "  ⚠ WARN: a cache was REQUESTED but only ${_devs:-0} of ${CAP_NGPU} devices hold a pool."
         if [[ "${_nob:-0}" != "0" ]]; then
@@ -2059,8 +2151,9 @@ fi
 if command -v nvidia-smi >/dev/null 2>&1; then
   echo ""
   echo "=== GPU state ==="
-  nvidia-smi --query-gpu=index,utilization.gpu,memory.used,memory.total,power.draw,temperature.gpu \
-             --format=csv,noheader
+  nvidia-smi ${BENCH_GPUS:+-i "$BENCH_GPUS"} \
+             --query-gpu=index,utilization.gpu,memory.used,memory.total,power.draw,temperature.gpu \
+             --format=csv,noheader || true
 fi
 
 # ===========================================================================
@@ -2088,7 +2181,7 @@ bench_interconnect_block() {
   declare -F p2p_gpu_count >/dev/null || return 0
   command -v nvidia-smi >/dev/null 2>&1 || return 0
 
-  local ngpu cap flavor eng_text nccl_line l3 verdict
+  local ngpu cap flavor eng_text nccl_line nccl_runtime l3 verdict
   ngpu="$(p2p_gpu_count 2>/dev/null || echo 0)"
 
   echo ""
@@ -2112,9 +2205,32 @@ bench_interconnect_block() {
     *)        echo "  layer 1  driver P2P grant : REFUSED — topo -p2p reports no all-pairs OK; kernel module: ${flavor}" ;;
   esac
 
+  # ExLlamaV3 uses layer-split CUDA transfers, not NCCL collectives or a
+  # custom all-reduce kernel. The driver capability probe above still applies,
+  # but the NCCL/custom-AR layers and their shared verdict classifier do not.
+  # Reporting them as "unknown" would incorrectly suggest that interconnect
+  # setup failed (the same TabbyAPI-vs-llama.cpp classification trap as #1366).
+  if [[ "$ENGINE_KIND" == "exllamav3" ]]; then
+    echo "  layer 2  NCCL use         : n/a — ExLlamaV3 layer-split does not use NCCL collectives"
+    echo "  layer 3  engine custom-AR : n/a — ExLlamaV3 layer-split; no custom all-reduce kernel"
+    echo "  verdict  : ℹ interconnect capability is reported above; ExLlamaV3's layer-split transport is engine-specific and is not measured by the NCCL/custom-AR probes"
+    return 0
+  fi
+
+  # Gather the ordered engine evidence once. p2p_engine_log_evidence keeps
+  # vLLM and SGLang on the same classifier contract while reducing SGLang's
+  # enormous server_args dict to a short boot marker.
+  eng_text=""
+  if [[ "${CONTAINER:-}" != "none" ]] && command -v docker >/dev/null 2>&1 \
+     && docker inspect "${CONTAINER}" >/dev/null 2>&1; then
+    eng_text="$(docker logs "$CONTAINER" 2>&1 | p2p_engine_log_evidence || true)"
+  fi
+
   # ---- layer 2: NCCL use ---------------------------------------------------
   # Container env first (the serving process's RESOLVED value, post-entrypoint),
-  # then the bare-metal server's /proc environ, then our own.
+  # then the bare-metal server's /proc environ. SGLang also logs successful
+  # NCCL initialization; report it even when transport policy is left at the
+  # engine default and therefore has no NCCL_* env override.
   nccl_line=""
   if [[ "${CONTAINER:-}" != "none" ]] && command -v docker >/dev/null 2>&1 \
      && docker inspect "${CONTAINER}" >/dev/null 2>&1; then
@@ -2131,20 +2247,19 @@ bench_interconnect_block() {
       [[ -n "$got" ]] && nccl_line="${nccl_line}${nccl_line:+ }${v}=${got}"
     done
   fi
-  if [[ -n "$nccl_line" ]]; then
+  nccl_runtime="$(printf '%s\n' "$eng_text" | command grep -F 'sglang is using nccl==' | tail -n 1 \
+    | sed -n 's/.*\(sglang is using nccl==[^[:space:]]*\).*/\1/p')"
+  if [[ -n "$nccl_runtime" && -n "$nccl_line" ]]; then
+    echo "  layer 2  NCCL use         : initialized — ${nccl_runtime}; policy: ${nccl_line}"
+  elif [[ -n "$nccl_runtime" ]]; then
+    echo "  layer 2  NCCL use         : initialized — ${nccl_runtime}; P2P policy: engine default (no NCCL_P2P*/NVLINK_MODE override)"
+  elif [[ -n "$nccl_line" ]]; then
     echo "  layer 2  NCCL use         : ${nccl_line}"
   else
     echo "  layer 2  NCCL use         : no NCCL_P2P*/NVLINK_MODE in the serving environment (engine default)"
   fi
 
   # ---- layer 3: engine custom-AR -------------------------------------------
-  # The classifier wants the same text report.sh feeds it: the [nvlink] decision
-  # trail + vLLM's own gate line + the resolved env.
-  eng_text=""
-  if [[ "${CONTAINER:-}" != "none" ]] && command -v docker >/dev/null 2>&1 \
-     && docker inspect "${CONTAINER}" >/dev/null 2>&1; then
-    eng_text="$(docker logs "$CONTAINER" 2>&1 | command grep -E '\[nvlink\]|Custom allreduce is disabled|disable_custom_all_reduce=True' | head -8 || true)"
-  fi
   if [[ "$ENGINE_KIND" == "llamacpp" || "${CONTAINER:-}" == "none" ]]; then
     # llama.cpp/ik-llama split layers across cards with plain copies — there is
     # no custom all-reduce kernel to engage or veto. Saying "off" would read as
@@ -2152,11 +2267,15 @@ bench_interconnect_block() {
     l3="engine: ${ENGINE_KIND/llamacpp/llama.cpp} — custom-AR n/a"
   else
     case "$(printf '%s\n%s' "$eng_text" "$nccl_line" | p2p_classify_engagement 2>/dev/null || echo unknown)" in
-      on)        l3="ENGAGED — engine reports its custom all-reduce ON" ;;
-      nccl_only) l3="custom-AR OFF, P2P LIVE — the engine is not using its custom all-reduce; peer transfers still go via NCCL. Cause is either vLLM's own NVLink-only gate at world>2 (#786) or an operator-supplied --disable-custom-all-reduce (#922). Check the engine log to tell which; both are healthy states" ;;
+      on)        l3="ENGAGED — engine initialized its custom all-reduce kernel" ;;
+      nccl_only_operator) l3="custom-AR OFF (operator), P2P LIVE — --disable-custom-all-reduce / DISABLE_CUSTOM_ALL_REDUCE=1. Peer transfers still go via NCCL. Healthy, deliberate" ;;
+      nccl_only_gated)    l3="custom-AR OFF (engine-gated), P2P LIVE — the vLLM/SGLang NVLink-only gate at world>2 (#786). Peer transfers still go via NCCL. Healthy" ;;
+      nccl_only_degraded) l3="⚠️ custom-AR OFF (P2P BROKEN) — the engine refused its kernel because peer access is missing or its P2P TEST FAILED. NOT an operator choice and NOT healthy; the grant can be advertised while transfers fail (#873). Run scripts/p2p-validate.sh" ;;
+      nccl_only_nolib)    l3="custom-AR unavailable — this image has no custom all-reduce library. Peer transfers still go via NCCL" ;;
+      nccl_only_failed)   l3="⚠️ custom-AR SETUP FAILED — requested, but the engine logged 'Setup Custom allreduce failed' and fell back to NCCL (#1462). The kernel is NOT running; a custom-AR A/B from this boot measures NCCL" ;;
       off)       l3="OFF — the serving container resolved to PCIe/no-P2P mode" ;;
       requested) l3="REQUESTED but UNVERIFIED — P2P forced on without a driver grant (#688)" ;;
-      *)         l3="unknown — no [nvlink] boot line and no engine gate line in the log" ;;
+      *)         l3="unknown — no current-boot custom all-reduce initialization or veto line" ;;
     esac
   fi
   echo "  layer 3  engine custom-AR : ${l3}"
@@ -2175,7 +2294,14 @@ if [[ "${CONTAINER:-}" != "none" ]] && command -v docker >/dev/null 2>&1 \
    && docker inspect "${CONTAINER}" >/dev/null 2>&1; then
   echo ""
   echo "=== Last 3 SpecDecoding metrics ==="
-  docker logs "${CONTAINER}" 2>&1 | grep "SpecDecoding metrics" | tail -3 || true
+  # vLLM tags these "SpecDecoding metrics"; SGLang writes "accept len: N, accept rate: N"
+  # on its decode-batch line and llama.cpp writes "draft acceptance = N". Grepping only
+  # the vLLM string printed an EMPTY block on the other two — which reads as "spec-dec
+  # produced nothing" rather than "I only know one engine's wording". Seen in the wild on
+  # club-3090#1251 (2x 5090, sgl/qwen38-27b-dual-fast): the section came back blank while
+  # the drafter was running fine.
+  docker logs "${CONTAINER}" 2>&1 \
+    | command grep -E "SpecDecoding metrics|accept len:|draft acceptance" | tail -3 || true
 fi
 
 # Repeated at the END on purpose (#832): a reader who tails the log, or who
@@ -2204,4 +2330,20 @@ if [[ -n "${_BENCH_REC_LOG:-}" && -f "${_BENCH_REC_LOG}" && "${QUICK:-0}" != "1"
     --resolve-serving --serving-url "$URL" --result-class bench-measured \
     --bench-output "${_BENCH_REC_LOG}" >/dev/null 2>&1 || true
   rm -f "${_BENCH_REC_LOG}"
+fi
+
+# ---- #1076: did the engine restart during this bench? -----------------------
+# Last, so it cannot suppress the summary — but non-zero, because a bench that
+# spans an engine restart is not a measurement. BENCH_MOCK runs have no real
+# container and skip cleanly via the guard's own unavailable path.
+if [[ -z "${BENCH_MOCK:-}" ]]; then
+  restart_guard_check "${_RESTARTS_BEFORE:-}" "${CONTAINER:-}" "bench" || _RESTART_RC=$?
+  # ⚠️ An `if`, NOT `[[ … ]] && exit 90`. This is the script's LAST command, so the
+  # bare `&&` form's status IS bench.sh's exit code — and it is 1 whenever there
+  # was no restart. Every clean bench exited 1 from 39343b46 (2026-09-20) until this
+  # was fixed, and report.sh rendered each one FAIL. test-engine-restart-guard runs
+  # this exact block (the mock path above skips it, which is how it went unseen).
+  if [[ "${_RESTART_RC:-0}" == "1" ]]; then
+    exit 90
+  fi
 fi

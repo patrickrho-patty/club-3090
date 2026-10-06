@@ -53,6 +53,13 @@ def _hardware_id_from_gpu(name: str, mem_mib: int, sm: float) -> str:
     normalized = _normalize_name(name)
     vram_gb = round(mem_mib / 1024)
 
+    # CMP 170HX: a GA100 (sm_8.0) mining board. Only the ~64 GB "unlocked" boards
+    # have a profile. A stock 8 GB board falls through and gets none, rather than an
+    # inflated one; and a 64 GB board must be caught HERE, before the sm_8.0
+    # fallback below would read it as an NVLink A100.
+    if "170hx" in normalized and vram_gb >= 60:
+        return "cmp-170hx-64gb"
+
     aliases = (
         # RTX PRO 6000 Blackwell reports as "RTX PRO 6000 Blackwell" -> normalizes
         # to "rtx pro 6000 blackwell" (PRO before 6000), so match "pro 6000".
@@ -72,6 +79,12 @@ def _hardware_id_from_gpu(name: str, mem_mib: int, sm: float) -> str:
         ("5090", "rtx-5090"),
         ("rtx a5000", "rtx-a5000"),
         ("a5000", "rtx-a5000"),
+        # #1364: the rtx-a6000 profile (48 GB, sm_8.6) existed with three
+        # envelopes.yml rows but NO alias, and the sm_8.6 fallback below returned
+        # rtx-3090 for anything >=24 GB -- so the detector could never produce the
+        # id and those rows could never fire.
+        ("rtx a6000", "rtx-a6000"),
+        ("a6000", "rtx-a6000"),
         ("rtx 3060", "rtx-3060-12gb"),
         ("3060", "rtx-3060-12gb"),
         ("a100", "a100-40gb"),
@@ -96,12 +109,27 @@ def _hardware_id_from_gpu(name: str, mem_mib: int, sm: float) -> str:
         return "h100-80gb"
     if sm >= 8.9 and vram_gb >= 24:
         return "rtx-4090"
+    # #1364: sm_8.6 splits by VRAM, largest-first. This branch used to return
+    # rtx-3090 for ANY >=24 GB Ampere, i.e. a 48 GB card resolved to the 24 GB
+    # profile -- a VRAM-keyed envelope table sitting on a detector that discarded
+    # VRAM above the floor, which is exactly the "same arch, more VRAM" case
+    # #1360 hit.
+    if 8.55 <= sm <= 8.65 and vram_gb >= 44:
+        return "rtx-a6000"
     if 8.55 <= sm <= 8.65 and vram_gb >= 24:
         return "rtx-3090"
     if 7.9 <= sm <= 8.1 and vram_gb >= 40:
         return "a100-40gb"
     if 8.55 <= sm <= 8.65 and 11 <= vram_gb <= 13:
         return "rtx-3060-12gb"
+    # ⚠️ DELIBERATE UNDER-PROMISE, not an oversight. Cards with no exact profile
+    # fall to the largest SMALLER profile in their SM family:
+    #     RTX 6000 Ada / L40S (48 GB, sm_8.9) -> rtx-4090 (24 GB)
+    #     A100-80GB           (80 GB, sm_8.0) -> a100-40gb
+    # That is conservative in the safe direction -- an envelope row sized for the
+    # smaller card fits the bigger one; the reverse would not. It costs headroom,
+    # never stability. Add a profile (and rows) to claim it; do NOT widen a
+    # fallback to a LARGER profile than the card actually has.
     raise LaunchCompatError(
         f"could not map GPU `{name}` ({vram_gb} GB, sm_{sm:g}) to a hardware profile"
     )
@@ -161,52 +189,36 @@ def _entry_objects(entry: dict, profiles):
     )
 
 
-# Non-vLLM docker-image engines → the compose env var their image is injected as.
-# (vLLM is special-cased above: VLLM_IMAGE / VLLM_NIGHTLY_SHA.)
-_ENGINE_IMAGE_ENV = {"beellama-local": "BEELLAMA_IMAGE"}
+# #1365: `_ENGINE_IMAGE_ENV = {"beellama-local": "BEELLAMA_IMAGE"}` used to live
+# here -- a hand-maintained code-side map that listed ONE of the 21 engines, so
+# every other non-vLLM engine fell through to a raise. It is superseded by
+# `EngineProfile.image_env`, declared by each profile next to its `install.spec`,
+# so adding an engine can no longer forget to add it here. vLLM nightlies stay
+# special-cased in `resolve_engine_pin` (they pin by SHA, not image tag).
 
 
-# --- #246 Phase 1: arch-aware KV dtype injection (pilot) ---------------------
-# The launchers export KV_CACHE_DTYPE for these slugs when the detected cards'
-# hardware profiles declare a different `kv_format_default.balanced` than the
-# variant's registry kv_format. Expand this set only after the cross-rig A/B
-# (issue #246 acceptance: >=15% on a volunteer 4090/5090, else close-with-data).
-ARCH_KV_PILOT_VARIANTS = frozenset({"vllm/dual", "vllm/minimal"})
-
-# The ONLY substitutions Phase 1 may make. Keyed by the variant's registry
-# kv_format; values are the hardware-profile targets allowed to replace it.
-# fp8_e5m2 -> fp8_e4m3 is the native-FP8-compute swap for sm_89+ cards.
-# Nothing else is injectable: 3090-class profiles declare balanced=fp8_e5m2
-# (the Ampere no-op is data equality), and their long_context default (TQ3)
-# is a Genesis-era format that must never reach stock composes.
-_ARCH_KV_ALLOWED = {"fp8_e5m2": frozenset({"fp8_e4m3"})}
-
-
-def _arch_aware_env(profiles, variant: str, entry: dict, gpu_spec: str,
-                    pin_exports: dict) -> dict[str, str]:
-    """Arch-aware env for a variant (#246 Phase 1). Empty dict = no injection
-    (compose ${VAR:-default} fallbacks apply, i.e. pre-#246 behavior)."""
-    if not gpu_spec or variant not in ARCH_KV_PILOT_VARIANTS:
-        return {}
-    allowed = _ARCH_KV_ALLOWED.get(entry.get("kv_format") or "")
-    if not allowed:
-        return {}  # quant-specific KV (int8-PTH, turbo, bf16, ...) — never override
-    if not ({"VLLM_IMAGE", "VLLM_NIGHTLY_SHA"} & set(pin_exports)):
-        return {}  # vLLM-family variants only; KV_CACHE_DTYPE is a vLLM knob
-    if os.environ.get("KV_CACHE_DTYPE"):
-        return {}  # an explicit user pin always wins
-    try:
-        hardware = _parse_gpu_specs(gpu_spec, profiles)
-    except LaunchCompatError:
-        return {}  # unmapped card -> compose defaults (today's behavior)
-    balanced = {hw.kv_format_default.get("balanced") for hw in hardware}
-    if len(balanced) != 1:
-        return {}  # heterogeneous rig -> no single right answer; don't guess
-    target = balanced.pop()
-    if (not target or target == entry["kv_format"] or target not in allowed
-            or not all(target in hw.supported_kv_formats for hw in hardware)):
-        return {}
-    return {"KV_CACHE_DTYPE": target}
+# --- #246 Phase 1 KV-dtype injection: RETIRED 2026-09-21 (#1371) --------------
+# `_arch_aware_env` + `ARCH_KV_PILOT_VARIANTS` + `_ARCH_KV_ALLOWED` lived here.
+# They upgraded a pilot slug's KV dtype fp8_e5m2 -> fp8_e4m3 on a card whose
+# balanced default was e4m3. Removed because the job is DONE, not because it
+# broke: ZERO of 138 registry slugs still declare `kv_format: fp8_e5m2`, so the
+# allow-map's only source key was orphaned and the function returned {} on every
+# card. The migration it automated was completed statically, in the composes.
+#
+# ⚠️ DO NOT REVIVE IT AS A CARD-KEYED MAP. What decides fp8_e4m3 KV on Ampere is
+# not the card class at all -- it is which ATTENTION BACKEND the checkpoint
+# routes to. fp8-weights / nvfp4 / bf16 / qwen3-next go to FlashInfer (native fp8
+# storage on sm_86, live-validated); gemma-style W4A16 goes to Triton, whose
+# fp8e4nv path needs SM89+ and fails at KV-init on the same stack. That rule is
+# already encoded, correctly, as `_fp8w_ampere_kv` in compat.py's C5 gate -- and
+# it is why the Ampere hardware profiles DELIBERATELY omit fp8_e4m3 from
+# `supported_kv_formats` (it keeps gemma rejected). A card-keyed injector is the
+# wrong shape for a backend-routing question and would have to fight that gate.
+#
+# The general lesson, which cost nine months of silence here: a map keyed on a
+# value ANOTHER FILE owns (the registry's `kv_format`) goes inert the moment that
+# file changes, and inert is indistinguishable from working. See
+# docs/DTYPE_MATRIX.md and learnings/ for the measured story.
 
 
 # --- #246 Phase 2: memory-envelope injection (concurrency-only first pass) ---
@@ -225,14 +237,67 @@ def _load_envelopes() -> dict:
         return doc.get("envelopes") or {}
     except (OSError, ImportError):
         return {}
+# #1361: the concurrency knob has a different SPELLING per engine. The quantity
+# is the same -- "how many sequences may run at once" -- but injecting vLLM's
+# name into an SGLang compose is a silent no-op: the compose reads
+# ${MAX_RUNNING_REQUESTS:-N} and never sees MAX_NUM_SEQS, so the row would look
+# applied and do nothing.
+#
+# Keyed by EngineProfile.TYPE, not by engine id. The dialect is a property of the
+# engine family, so `type` already carries it: 11 vllm ids collapse to one entry
+# and a new vllm-* profile needs no Python edit. An engine family absent from
+# this map gets NO injection rather than a guessed name -- a wrong key is worse
+# than the compose default, because the default is at least a measured value.
+# llama.cpp and exllamav3 are absent deliberately: their composes expose no
+# concurrency cap at all (UBATCH_SIZE / KV_TYPE / THREADS / MOE_SPLIT instead).
+_ENGINE_TYPE_CONCURRENCY_ENV = {
+    "vllm": "MAX_NUM_SEQS",
+    "sglang": "MAX_RUNNING_REQUESTS",
+}
+
+# #1365: same idea for the memory-fraction floor. vLLM reads
+# GPU_MEMORY_UTILIZATION, SGLang reads MEM_FRACTION. Before the image pin became
+# total this never surfaced, because sglang slugs raised before any injector ran;
+# the #1363 matrix then caught GPU_MEMORY_UTILIZATION reaching 10 sgl (slug,card)
+# pairs whose compose does not read it. llama.cpp/exllamav3 have no equivalent
+# fraction knob -- absent means no injection, never a guessed name.
+_ENGINE_TYPE_MEM_UTIL_ENV = {
+    "vllm": "GPU_MEMORY_UTILIZATION",
+    "sglang": "MEM_FRACTION",
+}
 
 
-def _envelope_env(profiles, variant: str, gpu_spec: str) -> dict[str, str]:
-    """Phase 2 concurrency injection. Empty dict = no injection (compose
-    ${MAX_NUM_SEQS:-default} stands)."""
+def _engine_type(profiles, entry) -> str | None:
+    if not isinstance(entry, dict):
+        return None
+    try:
+        return getattr(profiles.engines[entry.get("engine")], "type", None)
+    except (KeyError, AttributeError, TypeError):
+        return None
+
+
+def _concurrency_env_key(profiles, entry: dict | None) -> str | None:
+    """Env var this entry's engine family reads for its concurrency cap, or None
+    when the family has no such knob (-> no injection)."""
+    if not isinstance(entry, dict):
+        return None
+    try:
+        engine = profiles.engines[entry.get("engine")]
+    except (KeyError, AttributeError, TypeError):
+        return None
+    return _ENGINE_TYPE_CONCURRENCY_ENV.get(getattr(engine, "type", None))
+
+
+def _envelope_env(profiles, variant: str, gpu_spec: str,
+                  entry: dict | None = None) -> dict[str, str]:
+    """Phase 2 concurrency injection. Empty dict = no injection (the compose's
+    own ${<KNOB>:-default} stands)."""
     if not gpu_spec:
         return {}
-    if os.environ.get("MAX_NUM_SEQS"):
+    env_key = _concurrency_env_key(profiles, entry)
+    if not env_key:
+        return {}  # unmapped engine -> compose default, never a guessed key
+    if os.environ.get(env_key):
         return {}  # explicit user pin always wins
     row = _load_envelopes().get(variant)
     if not row:
@@ -258,21 +323,32 @@ def _envelope_env(profiles, variant: str, gpu_spec: str) -> dict[str, str]:
     # only inject a validated value that actually raises the ceiling
     if not isinstance(seqs, int) or (isinstance(default, int) and seqs <= default):
         return {}
-    return {"MAX_NUM_SEQS": str(seqs)}
+    return {env_key: str(seqs)}
 
 
-def _mem_util_env(profiles, variant: str, gpu_spec: str) -> dict[str, str]:
+def _mem_util_env(profiles, variant: str, gpu_spec: str,
+                  entry: dict | None = None) -> dict[str, str]:
     """Phase 2 memory-fraction safety floor. Injects GPU_MEMORY_UTILIZATION
-    DOWNWARD only — when a detected card cannot safely give the compose's default
-    fraction. Today that means unified-memory cards (DGX Spark: its LPDDR5X is
-    shared with the Grace CPU/OS, so mem_util_safe=0.85 < the 0.92 default — boot
-    at 0.92 would starve the OS). It NEVER raises above the tested compose
-    default: a bigger discrete card *could* give more, but that touches Cliff-2b
-    margin + boot-OOM, so the upward move stays a validated opt-in, not an
-    automatic bump. Empty dict = no injection (compose default stands)."""
+    DOWNWARD only — when a detected UNIFIED-MEMORY card cannot safely give the
+    compose's default fraction (DGX Spark: its LPDDR5X is shared with the Grace
+    CPU/OS, so mem_util_safe=0.85 < the 0.92 default — boot at 0.92 would starve
+    the OS). It NEVER raises above the tested compose default: a bigger discrete
+    card *could* give more, but that touches Cliff-2b margin + boot-OOM, so the
+    upward move stays a validated opt-in, not an automatic bump. Empty dict = no
+    injection (compose default stands).
+
+    Discrete cards never set the floor (#1516). The RTX 3060's 0.88 predates
+    this injector and was never measured as a boot limit, yet it fired here and
+    pulled every 0.92 slug on a 3090+3060 rig down to 0.88 — including slugs
+    that never touch the 3060, because the spec is every card in the rig, not
+    the slug's ranks. Our composes carry their own tuned fraction; a discrete
+    card's mem_util_safe stays a fit-estimate input (compat.fits)."""
     if not gpu_spec:
         return {}
-    if os.environ.get("GPU_MEMORY_UTILIZATION"):
+    env_key = _ENGINE_TYPE_MEM_UTIL_ENV.get(_engine_type(profiles, entry))
+    if not env_key:
+        return {}  # engine family has no fraction knob -> compose default
+    if os.environ.get(env_key):
         return {}  # explicit user pin always wins
     entry = get_registry().get(variant)
     if not entry:
@@ -284,14 +360,16 @@ def _mem_util_env(profiles, variant: str, gpu_spec: str) -> dict[str, str]:
         hardware = _parse_gpu_specs(gpu_spec, profiles)
     except LaunchCompatError:
         return {}  # unmapped card -> compose default
-    # One GMU applies across every rank, so the safe fraction is the LOWEST card's
-    # ceiling — a unified-memory card in a mixed rig forces the whole rig down.
-    ceilings = [hw.mem_util_safe for hw in hardware if hw.mem_util_safe is not None]
+    # One GMU applies across every rank, so the safe fraction is the LOWEST
+    # unified-memory card's ceiling — such a card in a mixed rig forces the whole
+    # rig down.
+    ceilings = [hw.mem_util_safe for hw in hardware
+                if hw.unified_memory and hw.mem_util_safe is not None]
     if not ceilings:
         return {}
     safe = min(ceilings)
     if safe < compose_gmu:  # downward only — never raise above the tested default
-        return {"GPU_MEMORY_UTILIZATION": f"{safe:g}"}
+        return {env_key: f"{safe:g}"}
     return {}
 
 
@@ -310,6 +388,12 @@ def _deepgemm_env(profiles, variant: str, entry: dict, gpu_spec: str) -> dict[st
     fp8-family weight set — "fp8" AND "fp8-dynamic" (compressed-tensors FP8, e.g.
     agents-a1) — and for "nvfp4" ModelOpt checkpoints, which still route FP8
     attention/linear layers through the same DeepGEMM path. Empty dict = no injection."""
+    # #1365: VLLM_USE_DEEP_GEMM is a vLLM env var. Before the image pin became
+    # total this never surfaced; the #1363 matrix then caught it reaching 108
+    # sgl (slug,card) pairs whose compose does not read it -- a silent no-op
+    # accompanied by a boot line claiming the opposite.
+    if _engine_type(profiles, entry) != "vllm":
+        return {}
     if not gpu_spec:
         return {}
     if os.environ.get("VLLM_USE_DEEP_GEMM"):
@@ -334,26 +418,32 @@ def resolve_engine_pin(profiles, engine_id: str) -> dict[str, str]:
         raise ProfileError(f"unknown engine profile `{engine_id}`") from exc
 
     spec = str(engine.install.get("spec", ""))
-    if engine.install.get("method") != "docker_image":
-        raise ProfileError(f"engine {engine_id!r} install.spec is not a docker image: {spec!r}")
-    if engine.type == "vllm":
-        if ":nightly-" in spec:
-            sha = spec.rsplit(":nightly-", 1)[1].strip()
-            if not sha or any(char.isspace() for char in sha):
-                raise ProfileError(f"engine {engine_id!r} has an invalid nightly SHA in install.spec: {spec!r}")
-            return {"VLLM_NIGHTLY_SHA": sha}
-        if not spec or any(char.isspace() for char in spec):
-            raise ProfileError(f"engine {engine_id!r} has an invalid docker image in install.spec: {spec!r}")
-        return {"VLLM_IMAGE": spec}
-    # Non-vLLM docker-image engines (e.g. beellama-local): inject a plain
-    # <ENGINE>_IMAGE override, mirroring VLLM_IMAGE. The per-compose
-    # ${<ENGINE>_IMAGE:-…} literal is then just a fallback for direct `docker compose`.
-    env_key = _ENGINE_IMAGE_ENV.get(engine_id)
-    if not env_key:
-        raise ProfileError(f"engine {engine_id!r} install.spec is not a docker image: {spec!r}")
+
+    # #1365: NOT AN IMAGE PIN -> {} , never a raise. An engine with no image env
+    # is a normal, expected state (pip installs; llama-cpp-local, whose two
+    # binaries read different vars), and raising here made the whole slug
+    # unresolvable -- which is why both launchers gated the entire call behind a
+    # `vllm/* || beellama/*` prefix test and 73 of 138 slugs got no hardware
+    # injection at all. The image pin and hardware-keyed env injection are
+    # separate concerns; only the first can be absent.
+    if engine.install.get("method") != "docker_image" or not engine.image_env:
+        return {}
+
     if not spec or any(char.isspace() for char in spec):
-        raise ProfileError(f"engine {engine_id!r} has an invalid docker image in install.spec: {spec!r}")
-    return {env_key: spec}
+        raise ProfileError(
+            f"engine {engine_id!r} has an invalid docker image in install.spec: {spec!r}"
+        )
+
+    # vLLM nightlies pin by SHA rather than by image tag.
+    if engine.type == "vllm" and ":nightly-" in spec:
+        sha = spec.rsplit(":nightly-", 1)[1].strip()
+        if not sha or any(char.isspace() for char in sha):
+            raise ProfileError(
+                f"engine {engine_id!r} has an invalid nightly SHA in install.spec: {spec!r}"
+            )
+        return {"VLLM_NIGHTLY_SHA": sha}
+
+    return {engine.image_env: spec}
 
 
 def resolve_variant_pin(profiles, variant: str, gpu_spec: str = "") -> dict[str, str]:
@@ -364,9 +454,8 @@ def resolve_variant_pin(profiles, variant: str, gpu_spec: str = "") -> dict[str,
     # #246: arch-aware env rides the same export channel as the image pin.
     # Only emitted when a gpu_spec is passed (launchers do; the registry-emit
     # baselines join calls without one and sees pins only).
-    exports.update(_arch_aware_env(profiles, variant, entry, gpu_spec, exports))
-    exports.update(_envelope_env(profiles, variant, gpu_spec))   # Phase 2 concurrency
-    exports.update(_mem_util_env(profiles, variant, gpu_spec))   # Phase 2 mem-fraction floor
+    exports.update(_envelope_env(profiles, variant, gpu_spec, entry))  # Phase 2 concurrency
+    exports.update(_mem_util_env(profiles, variant, gpu_spec, entry))  # Phase 2 mem-fraction floor
     exports.update(_deepgemm_env(profiles, variant, entry, gpu_spec))  # fp8w consumer-Blackwell fix
     exports.update(_decode_granularity_env(profiles, entry))     # #809 dLLM decode class
     exports.update(_moe_cache_env(profiles, variant, entry, gpu_spec))  # expert-cache reserve floor
@@ -457,7 +546,11 @@ def _decode_granularity_env(profiles, entry: dict) -> dict[str, str]:
 
 def _print_env(exports: dict[str, str], fmt: str) -> None:
     if fmt == "value":
-        print(next(iter(exports.values())))
+        # #1365: an EMPTY pin is now a normal answer (pip engine; or an engine whose
+        # composes use more than one image var, so there is nothing to inject), not
+        # a raise. Print nothing rather than StopIteration.
+        if exports:
+            print(next(iter(exports.values())))
     elif fmt == "json":
         import json
 
@@ -496,6 +589,7 @@ def _run_fits_for_entry(
         requires_nvlink=bool(entry.get("requires_nvlink", False)) if include_compose_requirements else False,
         required_engine_features=list(entry.get("required_engine_features", [])) if include_compose_requirements else [],
         required_sm=entry.get("required_sm") if include_compose_requirements else None,
+        supported_sm=entry.get("supported_sm") if include_compose_requirements else None,
         project_vram=project_vram,
     )
 

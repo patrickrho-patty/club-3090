@@ -2,7 +2,7 @@
 
 This is the home for **getting the most out of a PCIe-only multi-GPU rig** — understanding your topology, and (optionally) enabling GPU↔GPU peer-to-peer (P2P) over the PCIe bus when you don't have NVLink.
 
-**You don't need any of this to run the stack.** The default dual/multi-card path is PCIe-only with P2P *off* (`NCCL_P2P_DISABLE=1`, custom all-reduce disabled) — it's robust, needs no tuning, and works out of the box on any consumer rig. This doc is for two audiences: anyone who wants to **read their topology correctly** (why does `topo -m` say `PHB`?), and enthusiasts who want to **squeeze a workload-dependent few-to-~20% more** out of the PCIe bus via P2P. If you have an NVLink bridge, see [HARDWARE.md → NVLink](HARDWARE.md#nvlink) instead — that path auto-detects.
+**You don't need any of this to run the stack.** On a stock consumer driver the default dual/multi-card path runs without P2P — the driver refuses it, so NCCL stages GPU↔GPU traffic through host memory — and that is robust, needs no tuning, and works out of the box. ⚠️ Once your driver **grants** P2P (a patched module, some server boards, a VM route in §4a), vLLM and SGLang **use it automatically**; §0c lists the switches, including the one that keeps vLLM's custom all-reduce off. This doc is for two audiences: anyone who wants to **read their topology correctly** (why does `topo -m` say `PHB`?), and enthusiasts who want to **squeeze a workload-dependent gain** out of the PCIe bus via P2P — mostly prefill (+12 % to +59 % across measured rigs, largest in VMs), much less in decode (§6). If you have an NVLink bridge, see [HARDWARE.md → NVLink](HARDWARE.md#nvlink) instead — that path auto-detects.
 
 > **Example rig used throughout:** ASRock Rack **ROMED8-2T** (single-socket EPYC SP3) + 2× RTX 3090. It's just a concrete illustration (one maintainer's box) — the principles are board-agnostic; substitute your own slot/BIOS specifics.
 
@@ -67,18 +67,19 @@ fixing one gate and expecting the whole stack to work.
 flowchart TD
     L0["<b>0 · Topology</b><br/>PIX / PXB / PHB = workable<br/>SYS (cross-socket) = no"]
     L1["<b>1 · BAR1 aperture</b><br/>needed by the <i>patched-module</i> path only<br/>NOT needed by the clique path"]
-    L2["<b>2 · Driver grant</b><br/>three independent routes"]
-    L3["<b>3 · Transfers actually work</b><br/>p2pBandwidthLatencyTest"]
+    L2["<b>2 · Driver grant</b><br/>four demonstrated routes"]
+    L3["<b>3 · Transfers actually work</b><br/>destination-owner bytes + checked collective"]
     L4["<b>4 · Engine uses it</b><br/>vLLM: automatic via NCCL<br/>llama.cpp: GGML_CUDA_P2P (opt-in, OFF)"]
     L5["<b>5 · Workload benefits</b><br/>TP yes · PP barely · EP n/a"]
 
     R1["real chipset<br/>in NVIDIA's table"]
     R2["common PCIe switch<br/>(PLX/BR03/BR04/Mellanox<br/>allowlist only)"]
-    R3["hypervisor clique<br/>x-nv-gpudirect-clique<br/><b>← the VM answer</b>"]
+    R3["hypervisor clique<br/>x-nv-gpudirect-clique<br/>VM route A"]
+    R4["version-matched patched module<br/>validated on Proxmox/Q35<br/>VM route B"]
 
     L0 --> L1 --> L2
-    L2 --- R1 & R2 & R3
-    R1 & R2 & R3 --> L3 --> L4 --> L5
+    L2 --- R1 & R2 & R3 & R4
+    R1 & R2 & R3 & R4 --> L3 --> L4 --> L5
     L5 --> WIN["P2P pays off"]
 
     F0["SYS: stop"]:::f
@@ -152,9 +153,9 @@ systemd-detect-virt          # qemu/kvm = virtualised · none = bare metal
 
 | step | 🖥️ **Bare metal** | 🧊 **VM (VFIO passthrough)** |
 |---|---|---|
-| **Read BAR1 / ReBAR** | `lspci -vv` in place | ⚠️ **on the HOST** — a guest exposes *no* ReBAR capability and reports 256M for a card that supports 32G |
+| **Read BAR1 / ReBAR** | `lspci -vv` in place | ⚠️ **on the HOST** — a guest exposes *no* ReBAR capability; its BAR1 is whatever the host currently has (256M until host ReBAR is on, the full 32G after — both §4a rigs) |
 | **Enable large BAR1** | BIOS: Above 4G + Re-Size BAR | Host BIOS (same), then confirm the guest sees it |
-| **Get the driver grant** | open modules, or the §5 patched module | ⚠️ **`x-nv-gpudirect-clique`** (§4a). The chipset table can never match an emulated bridge |
+| **Get the driver grant** | open modules, or the §5 patched module | Two demonstrated routes (§4a): **`x-nv-gpudirect-clique`** (config-only, host-dependent) **or** the version-matched 610.57.04 BAR1/P2P module path validated on Proxmox/Q35 in [#1454](https://github.com/noonghunna/club-3090/discussions/1454) |
 | **Verify** | transfer test (§7) | transfer test **and a real collective** — copies can pass while collectives hang |
 | **Enable in the engine** | §0c | §0c (identical) |
 
@@ -174,10 +175,10 @@ systemd-detect-virt          # qemu/kvm = virtualised · none = bare metal
 
 | pitfall | why it bites |
 |---|---|
-| **Guest BAR1 reading is a lie** | No ReBAR capability is exposed. We diagnosed our own cards as VBIOS-capped when they support 32G |
+| **Guest BAR1 follows the host** | No ReBAR capability is exposed, so the guest cannot tell you what the card *supports* — only the host's *current* BAR1. 256M while host ReBAR is off (we diagnosed our own cards as VBIOS-capped that way), the full 32G once it is on. Three or more 32G cards also need a large enough OVMF 64-bit MMIO window (`X-PciMmio64Mb`, §4a) |
 | **`CNS` is a chipset-table verdict** | Not fixable by BAR size, driver flavour, IOMMU or ACS. We proved all four (§4a) |
 | `NVreg_RegistryDwords` don't help | Measured, refuted. They relax peer *mapping*, not the chipset check |
-| **A patched module doesn't help either** | The p2p forks never touch `chipset_pcie.c`. The gate fires upstream of everything they change |
+| **Patch behavior is version/branch-specific** | The older `610.43.02-p2p` tree documented below does not clear the VM gate. The pinned `610.57.04-p2p-v3` tree in [#1454](https://github.com/noonghunna/club-3090/discussions/1454) **does** grant and deliver correct peer traffic on two Proxmox/Q35 rigs (3× and 2× RTX 3090, persistent across reboots). Do not generalize one fork to another; verify destination-owner bytes + collectives |
 | Emulated PCIe switch doesn't help | `clFindCommonDownstreamBR()` uses an allowlist; QEMU's TI XIO3130 isn't on it |
 | `hidden=1` silently defeats the clique | It emits `kvm=off`, and the clique path is gated on `bDetected` |
 | Dotted QEMU ids silently defeat it | A bare BDF yields `hostpci0.0`; `-set` can't target dotted ids. Use explicit `.0` |
@@ -193,8 +194,28 @@ A driver grant does **not** mean your engine uses it. Each engine has its own sw
 | engine | default | turn ON | turn OFF (escape hatch) |
 |---|---|---|---|
 | **vLLM** | **auto-enabled** by our composes' entrypoint on a grant | `NVLINK_MODE=pcie_p2p` to force | `NVLINK_MODE=force_off`, or `NCCL_P2P_DISABLE=1` on a raw `docker run` |
+| ↳ vLLM **custom all-reduce kernel** (rides on the transport) | ON with the transport at ≤2 GPUs; vLLM vetoes it itself above 2 PCIe-only GPUs (#786) | — | **`DISABLE_CUSTOM_ALL_REDUCE=1`** — drops the kernel, **keeps** the transport |
 | **llama.cpp** | ⚠️ **OFF** — opt-in regardless of the grant | `GGML_CUDA_P2P=1` **and** `--split-mode row`/`tensor` | unset `GGML_CUDA_P2P` |
-| **SGLang** | no interconnect detection | `NCCL_P2P_DISABLE=0` | `NCCL_P2P_DISABLE=1` |
+| **SGLang** | **used automatically on a grant** — no interconnect detection; NCCL picks the peer path itself (measured on the reference rig, 2026-09-28) | nothing to do | `NCCL_P2P_DISABLE=1` (a saved setting or on the command line) — every multi-GPU SGLang compose forwards it; `test-compose-sglang-nccl-p2p-knob` keeps it that way |
+| ↳ SGLang **custom all-reduce kernel** | **OFF** — every SGLang compose passes `--disable-custom-all-reduce`. Over PCIe SGLang can only run its V1 kernel (V2 needs full NVLink) | not offered: on the reference rig it ran cleanly but gained nothing measurable (§6) | — |
+
+> ⭐ **Transport and kernel are two switches.** `NVLINK_MODE=force_off` turns off *both* — it discards the NCCL prefill win along with the kernel that is usually the actual problem ([#922](https://github.com/noonghunna/club-3090/issues/922), [#1332](https://github.com/noonghunna/club-3090/issues/1332)). `DISABLE_CUSTOM_ALL_REDUCE=1` is the narrow one:
+>
+> ```bash
+> DISABLE_CUSTOM_ALL_REDUCE=1 bash scripts/launch.sh <slug>
+> ```
+>
+> `NCCL_P2P_LEVEL` stays as auto-detect resolved it and `NCCL_P2P_DISABLE` stays unset; only vLLM's own kernel goes. Measured on the reporting rig in #1332: **+10.7 % prefill / −8.6 % TTFT** against disabling the peer path entirely, with the crash gone.
+>
+> **Making it persist.** Save it as a setting — both launchers and `gpu-mode` read your settings (`~/.config/club-3090/club3090.env`, then a legacy repo-root `.env`; see [where settings live](FAQ.md#where-are-my-settings-saved-and-how-do-i-change-one)):
+>
+> ```bash
+> bash scripts/settings.sh set DISABLE_CUSTOM_ALL_REDUCE=1
+> ```
+>
+> ⚠️ **One exception: a raw `docker compose -f …` invocation.** Compose reads `.env` from the *project directory* — the directory of the first `-f` file — so running a compose file directly never picks up your saved settings or the repo-root `.env`, from any working directory, unless you pass `--env-file` — `bash scripts/settings.sh compose-env-file` writes one with all your settings resolved the way the launchers do (remove it afterwards: it holds your secrets too). Use the launchers, or pass the variable on the command line. (`NVLINK_MODE` behaves the same way.)
+>
+> An invalid value is a hard error rather than a silent no-op. The knob works on **every** compose that auto-enables the kernel, including ones this repo does not ship — it is wired at the detector, not per-file.
 
 ⚠️ **The three most common mistakes here:**
 
@@ -411,6 +432,8 @@ Note also that **Above 4G Decoding being on is not the same as ReBAR being on** 
 >   Trusting the sysfs node would make you conclude the override never applied and retry it forever.
 >
 > ⚠️ **And even a patched module may not be enough under VFIO.** Peer DMA between two passed-through devices must be routed by the host IOMMU, and ACS on the root ports — the very thing giving you clean per-GPU IOMMU groups — pushes peer traffic upstream. **Do not reflexively disable ACS to chase this**: on the reference rig each GPU sits alone with its audio function in its own IOMMU group, and merging those groups can break passthrough outright. That is trading "no P2P" for "no GPUs". Treat ACS as a deliberate, reversible experiment, never a default.
+>
+> **Measured since (2026-09-28):** with ACS redirect **left on** at both root ports and each GPU alone in its IOMMU group, the patched route below delivers peer writes correctly on the ROMED8-2T hosts of both rigs — destination-verified, collectives exact, no host `AMD-Vi` / `IO_PAGE_FAULT` entries. On that platform the IOMMU routes guest peer DMA fine; there was nothing to gain from touching ACS.
 
 ### Why a VM reports `CNS` — the exact gate, read from the driver source
 
@@ -443,14 +466,157 @@ nowhere in that table. It falls through to the deny-all, both flags go `NV_FALSE
 fires. **On bare metal the same rig's real bridge (e.g. AMD `[1022:1480]`) matches an allow entry
 and the gate never fires** — which is the entire difference between host and guest.
 
-> ⚠️ **The patched-module forks do NOT change this.** We read the `610.43.02-p2p` tree: it modifies
-> BAR1 P2P *transport* across 17 files, and touches `chipset_pcie.c` **not at all**. On bare metal
-> the gate never fires so this is invisible; in a VM the gate fires first and nothing downstream
-> matters. **Installing a patched module in a VM will not clear `CNS`.** Confirm before you build.
+> ⚠️ **Do not generalize the old `610.43.02-p2p` finding to every fork.** That tree was inspected
+> here because it leaves `chipset_pcie.c` untouched; on the reference VM it could not clear the
+> chipset verdict. A later, version-matched branch has now produced a different measured result:
+> Aikitoria `610.57.04-p2p-v3`, pinned at
+> [`94b69ebc...`](https://github.com/aikitoria/open-gpu-kernel-modules/commit/94b69ebc8980da5dc3385a2014b6310fd92be97b),
+> grants **and delivers** correct P2P on a Proxmox/Q35 VM with 3× RTX 3090 — no clique and no registry
+> overrides ([#1454](https://github.com/noonghunna/club-3090/discussions/1454)).
+>
+> The practical rule is now **branch-specific evidence, not a blanket VM verdict**: match the patch
+> to the exact driver release and prove one-way delivery at the destination plus a value-checked
+> collective before enabling it in a serving engine.
+
+### ✅ Second demonstrated VM route — version-matched patched BAR1 path (Proxmox/Q35, 610.57.04)
+
+A second route is now field-validated on **two Proxmox + Q35/OVMF + VFIO** guests (3× and 2× RTX 3090 — the second is the reference rig, below):
+use a version-matched NVIDIA Open kernel-module P2P branch and validate the delivered mapping before
+making it persistent. This route used **no** `x-nv-gpudirect-clique`, **no** NVLink and **no**
+`NVreg_RegistryDwords` overrides.
+
+Measured rig ([discussion #1454](https://github.com/noonghunna/club-3090/discussions/1454),
+[bench #1453](https://github.com/noonghunna/club-3090/issues/1453)):
+
+| item | value |
+|---|---|
+| host | Proxmox · ASRock Rack ROMED8-2T · EPYC 7502P |
+| guest | Q35/OVMF · Ubuntu 24.04 · kernel `6.8.0-142-generic` |
+| GPUs | 3× RTX 3090 via VFIO |
+| guest BAR1 | **32768 MiB per GPU** before and after the patch |
+| NVIDIA | Open `610.57.04` |
+| patch | aikitoria `610.57.04-p2p-v3` commit `94b69ebc8980da5dc3385a2014b6310fd92be97b` |
+| result | all six directed pairs `OK`; destination-owner byte checks + NCCL collectives pass |
+
+Reporting-VM specifics (recorded for reproducibility; not every item is proven individually necessary):
+- host kernel command line included `amd_iommu=on iommu=pt` with the NVIDIA functions bound to `vfio-pci`;
+- Q35 + OVMF, `cpu: host`, PCIe passthrough enabled, `rombar=0`;
+- OVMF MMIO64 aperture set to **256 GiB** (`X-PciMmio64Mb,string=262144`);
+- no `x-nv-gpudirect-clique` property.
+
+**Bring-up sequence used on that rig:**
+
+1. Keep a recoverable Proxmox snapshot / host console path.
+2. Confirm the guest already has the intended BAR aperture (`nvidia-smi -q -d MEMORY`). On this rig it
+   was 32 GiB on stock; no VBIOS or BAR resizing change was part of the fix.
+3. Pin the patch **exactly** and build only:
+   ```bash
+   git clone --branch 610.57.04-p2p-v3 https://github.com/aikitoria/open-gpu-kernel-modules.git
+   cd open-gpu-kernel-modules
+   git checkout 94b69ebc8980da5dc3385a2014b6310fd92be97b
+   test -z "$(git status --porcelain)"
+   make -j"$(nproc)" modules
+   ```
+4. Stop **every** GPU user; verify `/dev/nvidia*` has no open handles. Do not force-unload.
+5. Temporarily load the built `kernel-open/` module family by explicit path and verify the loaded
+   module identity. On the reporting rig, `nvidia.ko` triggered udev to auto-load the packaged
+   `nvidia_uvm.ko`; the safe recovery was to identify the mismatch by `srcversion`, remove that
+   unused stock UVM module, then load the pinned UVM module.
+6. Require stronger proof than `topo -p2p`:
+   - destination-owner one-way writes with guards, every directed pair;
+   - a value-checked NCCL collective using the **same NCCL** the serving engine loads;
+   - kernel log free of Xid/AER/IOMMU faults.
+7. Only after those pass, benchmark the real workload and then persist through DKMS.
+
+The reporting rig used
+[`owner_verify.cu`](https://github.com/xiaoyanzi191/rtx4090-small-bar-p2p/blob/main/tests/owner_verify.cu)
+compiled for Ampere (`-arch=sm_86`). All six directed pairs passed with destination-local match and
+`guard_errors=0`. The live SGLang workers mapped **NCCL 2.30.7**; official `nccl-tests` linked
+against that exact library passed all-reduce/all-gather/reduce-scatter with `#wrong=0`, and NCCL logged
+`via P2P/direct pointer`.
+
+**Matched serving A/B (custom all-reduce disabled in both arms):**
+
+| metric | P2P off | P2P on | gain |
+|---|---:|---:|---:|
+| 10K fresh-prefix prefill | 2519.65 tok/s | **3071.07 tok/s** | **+21.9%** |
+| 90K fresh-prefix prefill | 1620.75 tok/s | **1885.23 tok/s** | **+16.3%** |
+| narrative decode | 99.79 tok/s | **106.11 tok/s** | **+6.3%** |
+| code decode | 137.52 tok/s | **147.29 tok/s** | **+7.1%** |
+
+**Persistence note (Ubuntu DKMS):** the distro `nvidia-dkms-open 610.57.04-1ubuntu1` source tree used
+on this guest contains a prebuilt `nvidia/nv-kernel.o_binary`, while the tested patch relies on the
+full generated/RM sources too. The working persistence method was to back up the distro source,
+retain the single DKMS identity `nvidia/610.57.04`, replace its source tree with the **full pinned
+patch tree**, rebuild/install that identity, run `depmod` + `update-initramfs`, then verify installed
+`srcversion`s against the temporary known-good build. The matched 610.57.04 NVIDIA package set was
+held to prevent an unattended driver update from silently replacing the validated source/userspace
+pair. After a controlled VM reboot, the loaded module identities, all-six owner checks and NCCL
+direct-P2P checks passed again.
+
+This is a **demonstrated configuration, not a new default**. Treat it exactly like the clique path:
+the grant is only the beginning; destination-delivery and real collectives are the acceptance gate.
+
+#### Reproduced on the reference rig (2026-09-28)
+
+The same pinned patch on the club-3090 reference rig — where the clique route below had failed with a
+mirrored aperture (#899). Nothing was added to the recipe; three things differed:
+
+| item | reporting rig (above) | reference rig |
+|---|---|---|
+| host | Proxmox · ROMED8-2T · EPYC 7502P (Rome) | Proxmox 9.1 · ROMED8-2T rev 1.03 · EPYC **7543 (Milan)** |
+| GPUs | 3× RTX 3090, x16 | **2×** RTX 3090, GPU1 at Gen4 **x8** (an M.2 shares its lanes) |
+| VM | `rombar=0`, `X-PciMmio64Mb=262144` | neither — with two cards OVMF already places both 32 GiB BARs |
+| NCCL checked | 2.30.7 (SGLang v0.5.19) | 2.29.7 (SGLang v0.5.20) |
+
+Starting state: guest BAR1 already 32 GiB (host ReBAR on), stock open 610.57.04 = `NS`, clique removed,
+and our old `RMForceStaticBar1`/`PeerMappingOverride` modprobe file **deleted** so the tested and the
+persistent configuration are identical (with the patch those flags are no longer inert — they touch exactly
+the BAR1/peer mapping it changes). The built modules' `srcversion`s matched the reporting rig's exactly, and
+the `nvidia_uvm` auto-load race in step 5 happened here too.
+
+| gate | result |
+|---|---|
+| `topo -p2p` | `NS` → `OK`, both directions |
+| destination-owner check (the peer writes 256 MiB, the destination verifies its own memory, guard regions around it; a self-test proves it flags bad data) | PASS both directions, 0 mismatches, 0 guard errors |
+| value-checked NCCL collectives, 4 B–64 MiB, NCCL 2.29.7 | all-reduce / all-gather / reduce-scatter exact, `via P2P/CUMEM` both ways |
+| 64 MiB all-reduce bus bandwidth | 12.04 GB/s vs 3.74 with `NCCL_P2P_DISABLE=1` |
+| `scripts/p2p-validate.sh` | HEALTHY (raw peer copy 13.2 GB/s — half the reporting rig's 26.4, as an x8 link would give) |
+| guest and **host** kernel logs | no Xid, AER errors, IOMMU faults or `IO_PAGE_FAULT` |
+
+**Serving A/B** — `sgl/qwen38-27b-dual-fast` (SGLang v0.5.20, AutoRound INT4 W4A8, FP8 KV, MTP n=4,
+custom all-reduce off), `bench.sh` defaults, arms ON → OFF → ON each on its own boot, only
+`NCCL_P2P_DISABLE` changing:
+
+| metric | P2P on (boot 1) | P2P off | P2P on (boot 3) | on vs off |
+|---|---:|---:|---:|---:|
+| 10K fresh prefill | 2,745 | 1,731 | 2,321 | **+34 to +59 %** |
+| 90K fresh prefill | 1,717 | 1,263 | 1,633 | **+29 to +36 %** |
+| narrative decode | 107.7 | 94.2 | 100.9 | +7 to +14 % |
+| code decode | 143.9 | 124.6 | 128.0 | +3 to +15 % |
+
+Prefill clears boot-to-boot noise by a wide margin; decode is positive but inside it (MTP acceptance
+moved between the two ON boots, 4.18 vs 3.62). The gain is larger than the reporting rig's because the
+P2P-off baseline is lower here (1,731 vs 2,520 at 10K) while P2P-on lands close (2,321–2,745 vs 3,071).
+
+**Persistence — three additions to the note above:**
+- **Build the DKMS module for every installed kernel**, not just the running one. With `GRUB_DEFAULT=0` the
+  next boot takes the *newest* installed kernel; on this rig that was not the one running.
+- **Hold the NVIDIA packages before anything else.** On Ubuntu 24.04 a plain `apt upgrade` now offers
+  **615.71.09**; unheld, it installs stock 615 source and rebuilds the driver over the patch. The reference
+  rig came within a minute of it.
+- **Prove the persistent state after a reboot**, with the same gates, reading the **loaded** modules'
+  `srcversion` from `/sys/module/*/srcversion` — a check script that only ran before the reboot would have
+  proven the temporary load, not the install.
+
+⚠️ **vLLM on a newly granted rig turns its custom all-reduce ON.** Our composes enable it on a P2P grant
+(§0c, §6). The reference rig keeps `DISABLE_CUSTOM_ALL_REDUCE=1` in its saved settings until that kernel is tested on
+its own — it is the half behind the wrong-output and hard-reset reports (§7a).
 
 ### ⚠️ THE GRANT-CLEARER — `x-nv-gpudirect-clique` (config-only; clears `CNS`, does NOT prove delivery)
 
 **This clears the `CNS` refusal.** It is NVIDIA's own sanctioned mechanism and needs no patched driver.
+✅ **On the reference rig this route is superseded (2026-09-28)** by the patched route above, which delivers where the clique mirrored. The findings below stay as the record of why the grant alone proves nothing.
 ⚠️ **Corrected 2026-08-10** — this section previously said "transfer-verified": on the reference rig the
 mapping the clique grants was later proven to be a **mirror** (writes reflect back to the writer; the
 peer never receives a byte — see the verdict block below), and the "passing transfer test" was a
@@ -691,11 +857,29 @@ Two hard truths set expectations before you start:
 > bidirectional with P2P, against **~43 GB/s** without — useful as a sanity target for
 > `p2pBandwidthLatencyTest` (§7).
 
-**On this stack**, once the patched module is installed you don't edit composes — set one env var:
+> ### ⚠️ After DKMS installs the patched module, REBUILD THE INITRAMFS — or you boot the stock one
+>
+> Reported by @leo-3889 on Ubuntu 26.04 ([#1332](https://github.com/noonghunna/club-3090/issues/1332)). DKMS installs the patched module to disk, but **the initramfs can still contain the stock `nvidia` module and load it first at boot**. Peer access then looks unavailable and the patch reads as a failed build — when it built fine.
+>
+> **The check compares ONE module's on-disk build against the loaded one:**
+>
+> ```bash
+> modinfo -F srcversion nvidia      # what is on disk
+> cat /sys/module/nvidia/srcversion # what is actually loaded
+> # equal  -> the running kernel module is the one you built
+> # differ -> you are running a different build than the one on disk (this trap)
+> ```
+>
+> ⚠️ **Do not compare `srcversion` *between* `nvidia`, `nvidia_uvm`, `nvidia_modeset` and `nvidia_drm`.** It is a per-module source hash, so those four **always** differ even on a single clean build — on a reference rig here they read `5B7E…`, `DF13…`, `A84C…`, `BA5C…`. A check that expects them to match reports every healthy system as broken. (An earlier revision of this document said exactly that; it was wrong and is corrected here.)
+>
+> Fix: `sudo update-initramfs -u` and reboot. **Redo it after every driver or kernel upgrade** — a routine `apt upgrade` can put you back on the stock module, and the only symptom is that P2P quietly stopped working.
+>
+> ⚠️⚠️ **And the obvious verification is a false-clean.** Inspecting the initramfs needs root; as a normal user `lsinitramfs` fails with a permission error, and piped into a counting grep that error goes to stderr while the count prints **`0`** — which reads exactly like "no stock module in there, all good". Run it under `sudo` and check the exit code, not the count.
+
+**On this stack**, once the patched module is installed you don't edit composes — save one setting:
 
 ```bash
-# in your repo-root .env
-NVLINK_MODE=pcie_p2p
+bash scripts/settings.sh set NVLINK_MODE=pcie_p2p
 ```
 
 `scripts/detect_nvlink.sh` then flips the dual/multi composes to `NCCL_P2P_LEVEL=PHB` + custom-all-reduce **ON** (and strips the `expandable_segments` alloc token that's incompatible with the custom-all-reduce IPC path — see [UPSTREAM.md → #42609](UPSTREAM.md)). The other `NVLINK_MODE` values: `auto` (default), `force_on` (NVLink present), `force_off` (PCIe, P2P off).
@@ -704,9 +888,9 @@ NVLINK_MODE=pcie_p2p
 
 > **Which composes auto-detect, and which don't.** All **24 multi-GPU vLLM composes** source `detect_nvlink.sh` from their own entrypoint, so auto-enable happens **in-container on every boot — `launch.sh`/`switch.sh` and a raw `docker compose up` alike**. The trigger is *only* `nvidia-smi topo -p2p r` reporting `OK` on every pair: it does not inspect your topology, ACS, IOMMU or BAR1, which is why a driver that grants peer access it can't deliver takes you straight to the §8 hang rather than to a slow path.
 >
-> The **llama.cpp-family** composes (`llama-cpp`, `ik-llama`, `beellama`) do no interconnect detection — they don't route peer traffic through NCCL, so there's nothing to toggle. The one **SGLang** dual compose (`eagle3-experimental`) also doesn't: it ships `--disable-custom-all-reduce` and `NCCL_P2P_DISABLE=1` deliberately, and P2P there is opt-in with `NCCL_P2P_DISABLE=0` (untested on a patched rig — report back if you try it).
+> The **llama.cpp-family** composes (`llama-cpp`, `ik-llama`, `beellama`) do no interconnect detection — they don't route peer traffic through NCCL, so there's nothing to toggle. The **SGLang** composes don't detect anything either, and all of them pass `--disable-custom-all-reduce`. The Qwen3.8 / ThinkingCap ones let NCCL use a grant by itself (`NCCL_P2P_DISABLE=1` turns it off; measured on the reference rig, 2026-09-28). The older Qwen3.6 `eagle3-experimental` still defaults to `NCCL_P2P_DISABLE=1`, so P2P there is opt-in with `NCCL_P2P_DISABLE=0` (untested on a patched rig — report back if you try it).
 
-⚠️ **The flip side of auto-enable: installing the patched module changes launcher behavior by itself.** The next launch after the module is in place, `detect_nvlink.sh` sees the new `OK` grant and switches every dual/multi compose to the P2P path (`NCCL_P2P_LEVEL=PHB` + custom-all-reduce) with no config change on your side. A driver *grant* is not the same as *working transfers* — if the grant doesn't actually carry bytes (**the driver not using the patch's static full-VRAM BAR1 mapping** — what forcing it resolved in [#873](https://github.com/noonghunna/club-3090/issues/873) — patch branch not matching your exact driver version, or ACS/IOMMU redirecting peer TLPs), NCCL blocks forever on its first peer operation and **every vLLM slug hangs silently at `pynccl` init with weights never loading** (§8). The escape hatch is always `NVLINK_MODE=force_off` in `.env`. Before trusting a fresh grant, run the transfer check (§7, `VLLM_SKIP_P2P_CHECK=0`) or cuda-samples `p2pBandwidthLatencyTest` — both move real bytes; the topo matrix does not.
+⚠️ **The flip side of auto-enable: installing the patched module changes launcher behavior by itself.** The next launch after the module is in place, `detect_nvlink.sh` sees the new `OK` grant and switches every dual/multi compose to the P2P path (`NCCL_P2P_LEVEL=PHB` + custom-all-reduce) with no config change on your side. A driver *grant* is not the same as *working transfers* — if the grant doesn't actually carry bytes (**the driver not using the patch's static full-VRAM BAR1 mapping** — what forcing it resolved in [#873](https://github.com/noonghunna/club-3090/issues/873) — patch branch not matching your exact driver version, or ACS/IOMMU redirecting peer TLPs), NCCL blocks forever on its first peer operation and **every vLLM slug hangs silently at `pynccl` init with weights never loading** (§8). The escape hatch is always `NVLINK_MODE=force_off` (`bash scripts/settings.sh set NVLINK_MODE=force_off`). Before trusting a fresh grant, run the transfer check (§7, `VLLM_SKIP_P2P_CHECK=0`) or cuda-samples `p2pBandwidthLatencyTest` — both move real bytes; the topo matrix does not.
 
 > **Blackwell / 50-series — boots, but needs one extra step (updated 2026-08-04, [#873](https://github.com/noonghunna/club-3090/issues/873)).** The first field report (2026-08-01: 5090 pair, driver 610.43.03 + patch) got a granted `OK` matrix and the silent `pynccl` hang above, and this guide read that as *possibly hard-locked, treat as experimental*. **That reading was wrong** — the same rig now boots vLLM with P2P engaged after forcing the static BAR1 mapping via the two-key `NVreg_RegistryDwords` line above, and `report.sh` reports `✓ interconnect: PCIe P2P engaged (patched driver, custom all-reduce ON)`. So on 50-series, plan on the patched module alone being insufficient and the registry override being part of the recipe. What's validated so far is a **clean P2P boot**, not a throughput result: no P2P-on-vs-off A/B exists on Blackwell yet (§6). Still confirm a fresh grant with `p2pBandwidthLatencyTest` or §7's transfer check, and expect the patch branch to lag new driver releases.
 
@@ -725,13 +909,17 @@ From cross-rig data on this stack. ⚠️ **The gain is strongly card-dependent*
 | `dual.yml` (fp8 KV) — patched P2P vs unpatched ⚠️ **custom AR ON** | **+2% narrative / +9% code** | [#91](https://github.com/noonghunna/club-3090/issues/91) |
 | DFlash / spec-decode path — patched P2P | **+19–22%** | [#95](https://github.com/noonghunna/club-3090/issues/95) |
 | **2× RTX 5090, P2P on-vs-off at fixed TP=2** (`qwen-35b-a3b-dual-nvfp4`, same slug, same sitting) | **decode +32.5% · prefill@90K +33.9%** (net, vs a pristine no-dwords system) — the isolated interconnect delta is **+36.9%**, of which ~3% is given back by the `NVreg` override the 50-series path requires. ⚠️ **Ratio is clean, absolutes are not** — that sitting's P2P-off baseline runs 17.7% below the same rig's own earlier measurement of the same slug (BENCHMARKS `⤷ P2P on-vs-off A/B`), so a cross-session read gives only ~+9%. Treat +32.5% as the interconnect delta, **not** as a promised upgrade gain | [#873](https://github.com/noonghunna/club-3090/issues/873) (@paulp83) |
+| **Dual 3090 TP=2 in a Proxmox VM, SGLang, patched P2P, custom AR off** — reporting rig ([#1453](https://github.com/noonghunna/club-3090/issues/1453)) | **prefill @10K +21.9% · @90K +16.3% · decode +6–7%** | §4a, one boot per arm |
+| **Same route, reference rig** (2× 3090, GPU1 x8) | **prefill @10K +34–59% · @90K +29–36% · decode inside boot noise** | §4a, ON→OFF→ON boots |
+| **Same rig, SGLang custom AR ON vs OFF** (P2P on in both arms, MTP n=4) | **decode +0.6% narrative / +1.8% code · prefill @10K +1.2% · @90K −0.3% — all inside boot noise** | reference rig 2026-09-28, A,B,A,B boots; the only boot ahead was the first, cold one |
 | NVLink hardware — workload-shaped (same-host A/B) | **decode +3–5% · prefill/long-ctx +35–49%** | [#698](https://github.com/noonghunna/club-3090/issues/698) — supersedes the flat ~+15% from [#77](https://github.com/noonghunna/club-3090/issues/77) (older v7.72.2 image) |
 
 **Translation — read the custom-AR column first.** The decode gains in this table come from **two different
 mechanisms**, and they are not equally available:
 
 - **NCCL peer transport** — the reliable half. It is a **prefill lever**: ~**+12–14%** with TTFT down 13–15%,
-  repeatable at CV ≤1%. It survives `--disable-custom-all-reduce`.
+  repeatable at CV ≤1%. It survives `--disable-custom-all-reduce`. **In a VM it is worth more** (+16 % to
+  +59 % on the two §4a rigs): the host-staged P2P-off path is slower there, so there is more to recover.
 - **vLLM's custom all-reduce kernel** — where the decode gains live (#91's +9% code, #773's +15%, #873's +32.5%).
   With it **neutralised in both arms**, decode sits inside run-to-run noise (#922) — which is how we know the
   decode gain is the *kernel*, not the transport. ⚠️ **But our composes AUTO-ENABLE it the moment P2P is
@@ -740,6 +928,12 @@ mechanisms**, and they are not equally available:
   measure **+7.7% to +12.5% decode** with the kernel on (disc #903, disc #921). An earlier revision of this
   page said decode was "inside noise" without that qualifier — true only with the kernel forced off, and
   misleading for anyone running our stack.
+- **SGLang's custom all-reduce kernel** — not the same story. Over PCIe SGLang runs its V1 kernel (V2 needs
+  full NVLink). On the reference rig it was safe (bench, verify-full, `soak-test.sh --continuous`, no AER/Xid)
+  but added nothing measurable, so the SGLang composes keep it off and there is no switch for it. A local
+  compose that turns it on can check it really started: V1's only success sign is `Registering N cuda graph
+  addresses`, which `report.sh` and the bench card now read ([#1470](https://github.com/noonghunna/club-3090/pull/1470));
+  UUID-pinned GPUs no longer break its setup ([#1462](https://github.com/noonghunna/club-3090/issues/1462)).
 
 ⚠️ **Do not quote the +32.5% as an expected upgrade gain.** Its no-P2P baseline was low (17.7%), and a cross-session
 re-read put the honest figure nearer **+9%**. Quote it, if at all, as an upper bound from one Blackwell pair.
@@ -862,13 +1056,21 @@ Everything below was hit for real. Start from the symptom.
 > | byte-verified transfer test | data crosses and round-trips | a collective can still be wrong (this section) |
 > | **`verify-full`** | the model still produces *language* | fluent-but-wrong output |
 > | quality pack / needle with known answer | the output is *correct* | — |
+> | **a real decode run** — `bench.sh`, or `soak-test.sh --continuous` for longer | the path survives the workload the kernel is actually used for | — |
+>
+> ⭐ **Why a needle test is not the stress it looks like.** vLLM's custom all-reduce only handles tensors below `max_size`, **8 MiB by default** — `should_custom_ar()` ends `return inp_size < self.max_size`. A decode step all-reduces one token's hidden state, a few KB, so it goes through the custom kernel. A prefill chunk of a few thousand tokens is tens of MiB, so it **falls back to NCCL and never touches the custom kernel at all**.
+>
+> So on a rig where that kernel is the problem, prefill-shaped work is safe for a structural reason: the kernel is not in its path. A 240,660-token needle test is almost entirely prefill. That is why [#1332](https://github.com/noonghunna/club-3090/issues/1332) passed every tier above — `verify-full` 10/10 and correct needle recall at every depth — minutes before each hard reset.
+>
+> ⚠️ **What is still unexplained:** `verify-full`'s own step 8 is a single uninterrupted 2000-token generation, which is decode, and it passed — while `bench.sh` reset the machine within a few hundred tokens. Both use the kernel, so kernel-vs-no-kernel does not separate them. One untested difference: `bench.sh` defaults to `CAPTURE=1` and runs `nvidia-smi dmon` plus a PCIe link sampler concurrently, through the patched driver; `verify-full` does not. `CAPTURE=0 bash scripts/bench.sh` on the failing arm would test that. Until someone runs it, **run a real decode bench before trusting a P2P bring-up, and do not assume a long-context test covered you.**
 
 
 | symptom | cause | fix |
 |---|---|---|
+| ⚠️⚠️ The **machine hard-resets** a few seconds into decode-heavy work over a patched peer path — kernel log ends mid-line, **no panic, no oops, no MCE, no Xid, kdump produces nothing**, no systemd shutdown, filesystem needs orphan cleanup on the next boot | vLLM's **custom all-reduce** over BAR1 P2P. Same kernel as the wrong-data row below, different consequence. **Mechanism unestablished** — nothing is logged and there is no crash dump, so what is on record is the correlation, not the cause. The reporter offers `iommu=pt` removing DMA isolation while the patch has GPUs writing to peer BAR1 addresses; a PCIe *fatal* error resetting a consumer board fits the same silence. Neither is distinguishable without out-of-band logging | **`DISABLE_CUSTOM_ALL_REDUCE=1`** (§0c) — keeps the NCCL transport and its prefill win. Isolated by @leo-3889 ([#1332](https://github.com/noonghunna/club-3090/issues/1332)) on 2× 3090 (Ti + non-Ti), AM5 / Ryzen 7 7700, gen4 x8+x8, driver 610.57.04 patched via DKMS, vLLM 0.29.0 TP=2 + DFlash2: three arms in one sitting at identical clocks and power limits — P2P+kernel **resets**, P2P off **clean**, P2P+kernel-off **clean and faster** (+10.7 % prefill, −8.6 % TTFT). The reporter concludes the two working arms rule out the PSU and the overclock, since both run the same workload at the same draw; note that the failing arm also has its own load *shape*, so treat that as their inference rather than an independent finding |
 | ⚠️⚠️ Collectives **complete**, at a plausible TPS, but the model emits **garbage on every request** (e.g. `!!!!!!!!!!!!` at 18 prompt tokens) over a patched peer path | vLLM's **custom all-reduce** over BAR1 P2P returns WRONG DATA — NCCL itself is fine. aikitoria [#21](https://github.com/aikitoria/open-gpu-kernel-modules/issues/21) class; related `vllm#28334` (IMA in custom AR during graph capture with spec-decode). **NOT universal on Ampere** — a configuration interaction, not "Ampere is broken" | **`--disable-custom-all-reduce`** — keeps NCCL P2P *and* its prefill gain. `NVLINK_MODE=force_off` also works but discards the win. Reported by @juslex + independently reproduced by @fkrutko ([#922](https://github.com/noonghunna/club-3090/issues/922)) on **two** Intel-platform patched-P2P rigs (Z390/Gen3/FP8 · Z690/Gen4/INT4, two driver point-releases) — **reseat-persistent** on both, identical signature (`!!!!` + 0% MTP accept); a Threadripper x16 rig did **not** reproduce. NCCL over the same link stays correct (`p2p-validate.sh` HEALTHY), so the fault is the custom kernel, not the transport |
-| `topo -p2p` = **`CNS`** in a VM | Emulated front host bridge isn't in the driver's chipset table (§4a) | `x-nv-gpudirect-clique` (§4a). **Not** a BAR, driver-flavour or topology problem |
-| `CNS` persists after a **large BAR1** + **open driver** | BAR/driver were never the gate; the chipset table is | Same — clique. Measured: 32 GB BAR1 + `nvidia-open` still `CNS` |
+| `topo -p2p` = **`CNS`** in a VM | Emulated front host bridge isn't in the driver's chipset table (§4a) | Two demonstrated routes: `x-nv-gpudirect-clique` (config-only, host-dependent) **or** the version-matched 610.57.04 patched BAR1 route in [#1454](https://github.com/noonghunna/club-3090/discussions/1454). In either case, require destination-owner delivery + a checked collective |
+| `CNS` persists after a **large BAR1** + **stock open driver** | BAR aperture alone is not the grant; stock `nvidia-open` can still refuse the emulated bridge | Use one measured VM route from §4a: clique, or a patch branch **validated on your exact driver/version**. Do not assume every P2P fork behaves the same |
 | `CNS` persists after `NVreg_RegistryDwords` | Those keys relax peer *mapping*, not the chipset verdict | Refuted on-rig. Don't retry |
 | **`--split-mode tensor` hangs in warmup** | **NCCL collectives over a clique-granted peer path** — same root cause as the vLLM TP=2 hang. ⚠️ **NOT** [#24489](https://github.com/ggml-org/llama.cpp/issues/24489), whose real fix ([PR #24491](https://github.com/ggml-org/llama.cpp/pull/24491), `cuMemSetAccess` on llama.cpp's VMM pool) is already in `b10236` | **`NCCL_P2P_DISABLE=1`** — verified: boots 16 s, benches on par with `layer`. `GGML_CUDA_ALLREDUCE=internal` does **not** clear it |
 | `-sm tensor` segfaults with no clear error | **Flash attention is REQUIRED for `-sm tensor`** and nothing validates it (#24489) | Pass `-fa on` |
@@ -918,13 +1120,13 @@ Everything below was hit for real. Start from the symptom.
 | Second GPU trains at **x8** or disappears | A populated M.2 / adjacent slot is stealing its lanes → move the card or clear the bifurcation jumper (board manual). |
 | `topo -p2p rw` shows `CNS` ("chipset not supported") | Stock driver refusing P2P on consumer GPU → install the patched module (§5), then re-check. |
 | `topo -p2p rw` shows `GNS` **and** `lspci` `BAR 1: supported:` caps at 256MB | **First rule out virtualisation (§4a)** — a QEMU guest exposes no Resizable BAR capability, so it reports this while the physical card supports 32GB. Run `systemd-detect-virt`; if it says `qemu`/`kvm`, re-read on the host, and the fix is host BIOS Re-Size BAR, not a VBIOS. **On bare metal**, this is a genuine **pre-ReBAR / BAR1-capped VBIOS** — a firmware gate, not a driver or topology problem (#734). No BIOS setting or driver swap helps; the §5 patched path needs large BAR1. Vendor ReBAR VBIOS first (§4 note + the board-ID tip in §5), then re-check `supported:`. |
-| BAR1 is large, driver is open (`Dual MIT/GPL`), but `topo -p2p r` still says **`CNS`** | **Chipset-table verdict, not an aperture problem** (§4a). Expected inside a VM: the emulated Q35/ICH9 is not on NVIDIA's supported list, and no BAR size or registry key changes that. Needs the §5 patched module — and even then, verify with a **transfer** check, because VFIO peer DMA can still be blocked by host IOMMU/ACS routing. |
+| BAR1 is large, driver is open (`Dual MIT/GPL`), but `topo -p2p r` still says **`CNS`** | **Chipset-table/grant problem, not an aperture problem** (§4a). Expected with the stock driver in a Q35 VM. Use a demonstrated VM route from §4a; then verify destination-owner bytes **and a real collective**, because VFIO can still produce a false or unusable grant. |
 | `[nvlink] WARNING: … BAR1 is far smaller than VRAM …` | The launcher's BAR1 sanity check fired: P2P is being enabled, but the aperture is too small to back the patch's static full-VRAM mapping (§5) — the firmware-gated #734 class, caught *before* the hang instead of after. It **warns rather than gating**; the config is applied unchanged, so if this boot then hangs at `pynccl`, that's the row below. ⚠️ **Silence is not a clean bill of health** — [#873](https://github.com/noonghunna/club-3090/issues/873) had a full-size 32 GB BAR1 and still needed the §5 override, so the absence of this warning does not mean the mapping is in use. If P2P demonstrably works on your rig *despite* the warning, say so in an issue and bring `nvidia-smi -q -d MEMORY`. |
 | Boot crash after enabling P2P: `custom_all_reduce.cuh … invalid argument` | Known `expandable_segments` ↔ custom-all-reduce IPC clash → `detect_nvlink.sh` strips the token on the P2P path automatically; ensure you're on a current pin ([UPSTREAM.md → #42609](UPSTREAM.md)). |
-| **vLLM slugs HANG at `pynccl` init after installing a patched driver/module** (last line `vLLM is using nccl==…`, weights never load, no error) | The driver now *grants* P2P, so `detect_nvlink.sh` auto-enabled the P2P path (§5) — but the grant doesn't carry actual transfers, so NCCL blocks on its first peer op. **Unblock: `NVLINK_MODE=force_off` in `.env`, relaunch** (back to pre-patch behavior). Then validate the grant with raw transfers: cuda-samples `p2pBandwidthLatencyTest`, or §7's `VLLM_SKIP_P2P_CHECK=0` transfer check. If raw P2P hangs/reads garbage, in order: (1) **force the static BAR1 mapping** with the two-key registry override in §5 — this is what resolved the 5090 case ([#873](https://github.com/noonghunna/club-3090/issues/873)), and note it was needed *even though* `nvidia-smi -q -d MEMORY` already showed a full-size 32 GB BAR1, so **a healthy BAR1 number does not rule this out**; (2) match the patch branch to your **exact** driver version; (3) check ACS (`lspci -vvv \| grep ACSCtl` — ACS redirect stalls peer TLPs) and confirm `iommu=pt` per §4. Common right after a driver upgrade: the patch fork lags new driver branches. |
+| **vLLM slugs HANG at `pynccl` init after installing a patched driver/module** (last line `vLLM is using nccl==…`, weights never load, no error) | The driver now *grants* P2P, so `detect_nvlink.sh` auto-enabled the P2P path (§5) — but the grant doesn't carry actual transfers, so NCCL blocks on its first peer op. **Unblock: `bash scripts/settings.sh set NVLINK_MODE=force_off`, relaunch** (back to pre-patch behavior). Then validate the grant with raw transfers: cuda-samples `p2pBandwidthLatencyTest`, or §7's `VLLM_SKIP_P2P_CHECK=0` transfer check. If raw P2P hangs/reads garbage, in order: (1) **force the static BAR1 mapping** with the two-key registry override in §5 — this is what resolved the 5090 case ([#873](https://github.com/noonghunna/club-3090/issues/873)), and note it was needed *even though* `nvidia-smi -q -d MEMORY` already showed a full-size 32 GB BAR1, so **a healthy BAR1 number does not rule this out**; (2) match the patch branch to your **exact** driver version; (3) check ACS (`lspci -vvv \| grep ACSCtl` — ACS redirect stalls peer TLPs) and confirm `iommu=pt` per §4. Common right after a driver upgrade: the patch fork lags new driver branches. |
 | Raw `p2pBandwidthLatencyTest` passes but vLLM still hangs | The grant works; the issue is in the NCCL/custom-AR layer. Rerun one slug with `NCCL_DEBUG=INFO` and read the last transport lines; try `NCCL_P2P_DISABLE=1` in the compose env to split NCCL peer transport from the custom-all-reduce path, and re-check the `expandable_segments` row above. |
 | Enabled it but TPS didn't move | Check it actually engaged (§7); then check your workload — narrative decode barely benefits, code/spec-decode does (§6). |
 
 ---
 
-**See also:** [HARDWARE.md → NVLink](HARDWARE.md#nvlink) (the bridge path) · [DUAL_CARD.md → NVLink auto-detection](DUAL_CARD.md#nvlink-auto-detection) · [BENCHMARKS.md](../BENCHMARKS.md) (cross-rig interconnect rows) · [CONTAINER_RUNTIMES.md](CONTAINER_RUNTIMES.md) (P2P/NVLink under VM passthrough) · [UPSTREAM.md](UPSTREAM.md) (#42609 alloc-conf fix).
+**See also:** [HARDWARE.md → NVLink](HARDWARE.md#nvlink) (the bridge path) · [DUAL_CARD.md](DUAL_CARD.md) · [BENCHMARKS.md](../BENCHMARKS.md) (cross-rig interconnect rows) · [CONTAINER_RUNTIMES.md](CONTAINER_RUNTIMES.md) (P2P/NVLink under VM passthrough) · [UPSTREAM.md](UPSTREAM.md) (#42609 alloc-conf fix).

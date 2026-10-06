@@ -39,6 +39,7 @@
 # its two composes ship no drafter today.
 
 set -euo pipefail
+export CLUB3090_CONFIG_DIR=/nonexistent/club-3090-test-config   # tests never read your real settings (#1466)
 export PYTHONUTF8="${PYTHONUTF8:-1}"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -197,13 +198,35 @@ def argv_under(text, env):
         etc = dp / "etc" / "club3090"
         etc.mkdir(parents=True, exist_ok=True)
         (etc / "detect_nvlink.sh").write_text("_NVLINK_ENABLED=0\n")
+        # Library-path exports are irrelevant to the speculative CLI contract.
+        (etc / "fa2-runtime.env").write_text("", encoding="utf-8")
         # any `bash /etc/club3090/<x>/install.sh` the entrypoint runs
         for sub in set(re.findall(r"/etc/club3090/([\w.-]+)/install\.sh", body)):
             (etc / sub).mkdir(parents=True, exist_ok=True)
             (etc / sub / "install.sh").write_text("#!/bin/bash\nexit 0\n")
+        # #1358: the fa2 envelope helper is sourced, not an installer — ship the
+        # REAL one, so the entrypoint runs it exactly as the container would.
+        if "/etc/club3090/fa2/envelope.sh" in body:
+            (etc / "fa2").mkdir(parents=True, exist_ok=True)
+            (etc / "fa2" / "envelope.sh").write_text(
+                (root / "models/qwen3.8-27b/vllm/patches/fa2-fp8kv-sm86/envelope.sh").read_text(encoding="utf-8"))
+        # A vLLM drafter compose may fail loud when its EXTERNAL draft model
+        # directory is absent, rather than letting the engine emit a bare
+        # missing-config.json (club-3090#1304 — the vLLM twin of the llama.cpp
+        # #1054 check below). That path is embedded in the ENTRYPOINT, not in
+        # `command:`, so the -md stubbing further down cannot reach it: redirect
+        # the container HF cache into the sandbox and materialise every model
+        # dir the body names, so the entrypoint reaches the engine stub and its
+        # argv stays inspectable. As with -md, the contract asserts on flag
+        # PRESENCE, not on the path value.
+        hfc = dp / "hf"
+        for name in set(re.findall(r"/root/\.cache/huggingface/([\w.-]+)", body)):
+            (hfc / name).mkdir(parents=True, exist_ok=True)
+            (hfc / name / "config.json").write_text("{}", encoding="utf-8")
         script = dp / "ep.sh"
         script.write_text(body.replace("$$", "$")
                               .replace("/etc/club3090", str(etc))
+                              .replace("/root/.cache/huggingface", str(hfc))
                               .replace("/app/llama-server", str(srv)))
         # only what the compose declares crosses into the container
         e = {k: v for k, v in os.environ.items() if not k.startswith(("SPEC", "NUM_SPEC"))}

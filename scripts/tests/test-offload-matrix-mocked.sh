@@ -18,12 +18,22 @@
 # Asserts STRUCTURE and STATUS only — never a throughput value. Numbers from a fake
 # server mean nothing, and real numbers are not portable across rigs.
 set -euo pipefail
+export CLUB3090_CONFIG_DIR=/nonexistent/club-3090-test-config   # tests never read your real settings (#1466)
 export PYTHONUTF8="${PYTHONUTF8:-1}"   # repo rule: locale must not decide python decoding
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SWEEP="$ROOT_DIR/scripts/offload-matrix.sh"
 REND="$ROOT_DIR/scripts/offload-matrix-render.py"
 FIX="$ROOT_DIR/scripts/tests/fixtures/offload-matrix"
-PORT="${TEST_PORT:-8137}"
+# ⚠️⚠️ FIXTURE PORTS LIVE ABOVE THE PRODUCT PORT SPACE, ON PURPOSE.
+# The registry allocates real slug `default_port`s across 8010-8199, so a
+# fixture base inside that span silently collides: a slug parked on one of
+# these ports makes this guard fail WHENEVER THAT MODEL IS SERVING, and the
+# failure reads as a broken test rather than a port clash. Measured
+# 2026-09-18 on test-bench-capture, whose 8147 base overlapped ELEVEN
+# registry slugs; three suite failures were misdiagnosed as pre-existing
+# before the cause was found. 18xxx is clear — the product never allocates
+# above 8199. Keep the last three digits so the old base stays greppable.
+PORT="${TEST_PORT:-18137}"
 fail() { echo "FAIL: $1" >&2; exit 1; }
 
 for f in "$SWEEP" "$FIX/fake-llama-server" "$FIX/fake-nvidia-smi"; do

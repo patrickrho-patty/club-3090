@@ -43,10 +43,18 @@ def root(tmp_path):
         shutil.copytree(
             REPO / rel,
             repo / rel,
-            ignore=shutil.# #1142: skip root-owned container torch_compile caches under
+            # #1142: skip root-owned container torch_compile caches under
             # models/ — copytree dies on them (Permission denied) on any
             # rig that has served a model. Pure build artifact.
-            ignore_patterns("__pycache__", "cache"),
+            #
+            # ⚠️⚠️ `profiles-local` is skipped for a DIFFERENT and sharper reason
+            # (#1316 follow-up): it is the REAL local layer of whoever is running
+            # the suite. Copying it in makes these tests inherit that machine's
+            # promoted models — so they pass on a clean checkout and fail on any
+            # rig that has ever run `promote.py --layer local`, which is the very
+            # feature under test. Every test here seeds its own synthetic layer;
+            # the real one must never be visible.
+            ignore=shutil.ignore_patterns("__pycache__", "cache", "profiles-local"),
         )
     return repo
 
@@ -54,7 +62,11 @@ def root(tmp_path):
 MID = "my-model"
 QUANT = "autoround-int4"
 CORE_SLUG = f"vllm/{MID}-dual-{QUANT}"
-LOCAL_SLUG = f"local/{MID}-dual-{QUANT}"
+# ⭐ PUBLISH IS NO LONGER A RENAME (#1205). `local/` was hard-cut, so a local slug
+# already IS '<engine>/<name>' — the core slug is the slug the user has been
+# running, and every reference they hold survives publication. These are
+# deliberately the SAME string; that identity is the contract under test.
+LOCAL_SLUG = CORE_SLUG
 LOCAL_COMPOSE_REL = (
     f"scripts/lib/profiles-local/composes/{MID}/vllm/compose/dual/{QUANT}/base.yml"
 )
@@ -123,7 +135,7 @@ def _entry_kwargs() -> dict:
     }
 
 
-def _seed_local(root: Path, *, profile_text=None, entry_kwargs=None):
+def _seed_local(root: Path, *, profile_text=None, entry_kwargs=None, slug=None):
     """Seed the gitignored LOCAL layer exactly as promote.py --layer local
     writes it."""
     (root / "scripts/lib/profiles-local/models.d").mkdir(parents=True, exist_ok=True)
@@ -140,7 +152,7 @@ def _seed_local(root: Path, *, profile_text=None, entry_kwargs=None):
     reg = root / "scripts/lib/profiles-local/registry.local.json"
     if reg.exists():
         raw = json.loads(reg.read_text(encoding="utf-8"))
-    raw[LOCAL_SLUG] = entry_kwargs or _entry_kwargs()
+    raw[slug or LOCAL_SLUG] = entry_kwargs or _entry_kwargs()
     reg.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
 
 
@@ -214,9 +226,9 @@ class TestHappyPath:
         assert comp.exists(), sorted(p.relative_to(out) for p in out.rglob("*"))
         assert comp.read_text(encoding="utf-8") == COMPOSE_TEXT
 
-        # Artifact 3 — the registry ENTRY FILE: the core slug namespace
-        # (local/ stripped → engine prefix), the TRANSLATED compose_path, and
-        # the setup-block notes + canonical merge command as comments.
+        # Artifact 3 — the registry ENTRY FILE: the core slug (identical to the
+        # local one since #1205 — publish is not a rename), the TRANSLATED
+        # compose_path, and the setup-block notes + merge command as comments.
         entry = out / "registry-entry.yaml"
         assert entry.exists()
         text = entry.read_text(encoding="utf-8")
@@ -326,20 +338,56 @@ class TestHappyPath:
             "unsloth-q4km/base.yml"
         )
         kw["compose_path"] = local_compose
-        _seed_local(root, entry_kwargs=kw)
+        # ⚠️ The slug's engine slot must AGREE with the compose path's engine dir.
+        # Since #1205 publish no longer renames (it used to strip `local/` and
+        # re-derive the prefix from the path), so a `vllm/` slug on a llama-cpp
+        # compose is now a packaging mistake the exporter refuses — see
+        # test_slug_must_match_its_compose_path_namespace below. Seed the
+        # matching slug: llama.cpp FILESYSTEM dir → `llamacpp` slug prefix
+        # (ADDING_MODELS Step 3).
+        llama_slug = f"llamacpp/{MID}-dual-{QUANT}"
+        _seed_local(root, entry_kwargs=kw, slug=llama_slug)
         (root / local_compose).write_text(COMPOSE_TEXT, encoding="utf-8")
         out = tmp_path / "bundle"
         res = _run_cli(root, out)
         assert res.returncode == 0, res.stderr + res.stdout
         text = (out / "registry-entry.yaml").read_text(encoding="utf-8")
         assert "kvcalc_key: SKIP" in text
-        # llama.cpp FILESYSTEM dir → llamacpp slug prefix (ADDING_MODELS Step 3).
-        assert f"llamacpp/{MID}-dual-{QUANT}:" in text
+        assert f"{llama_slug}:" in text
         assert (out / "models" / MID / "llama-cpp/compose/single"
                 / "unsloth-q4km/base.yml").exists()
 
 
 class TestRefusals:
+    def test_slug_must_match_its_compose_path_namespace(self, root, tmp_path):
+        # #1205 made publish a no-op on the slug, so the engine slot is now
+        # load-bearing: it is what the core catalog will carry. A slug whose
+        # engine disagrees with the engine dir its compose lives in is a
+        # packaging mistake, and the exporter says so rather than silently
+        # publishing one of the two.
+        kw = _entry_kwargs()
+        kw["compose_path"] = (
+            f"scripts/lib/profiles-local/composes/{MID}/llama-cpp/compose/single/"
+            "unsloth-q4km/base.yml"
+        )
+        _seed_local(root, entry_kwargs=kw, slug=f"vllm/{MID}-dual-{QUANT}")
+        (root / kw["compose_path"]).write_text(COMPOSE_TEXT, encoding="utf-8")
+        res = _run_cli(root, tmp_path / "bundle")
+        assert res.returncode == 3
+        assert "does not match the namespace implied by its compose path" in res.stderr
+        assert not (tmp_path / "bundle").exists()
+
+    def test_removed_local_namespace_refused_with_the_fix_named(self, root, tmp_path):
+        # A user holding a pre-#1205 registry.local.json meets this. The message
+        # must describe what is wrong (it USES `local/`) — it previously said the
+        # slug "lacks" that namespace, which was the inverse of the truth.
+        _seed_local(root, slug=f"local/{MID}-dual-{QUANT}")
+        res = _run_cli(root, tmp_path / "bundle")
+        assert res.returncode == 3
+        assert "was removed" in res.stderr
+        assert "lacks" not in res.stderr
+        assert f"'<engine>/{MID}-dual-{QUANT}'" in res.stderr
+
     def test_incomplete_entry_refused_and_writes_nothing(self, root, tmp_path):
         # The scaffold's leftover <...> family placeholder — the exact state a
         # contributor exports too early.

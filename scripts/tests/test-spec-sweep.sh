@@ -5,6 +5,7 @@
 # from the registry, the vLLM-needs-SLUG refusal, and that SWEEP_DRY plans
 # arms WITHOUT booting or measuring.
 set -euo pipefail
+export CLUB3090_CONFIG_DIR=/nonexistent/club-3090-test-config   # tests never read your real settings (#1466)
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SWEEP="$ROOT_DIR/scripts/spec-sweep.sh"
 fail() { echo "FAIL: $1" >&2; exit 1; }
@@ -86,10 +87,15 @@ fi
 echo "  ✓ vLLM SWEEP_DRY plans reboot-per-arm (one knob, SPEC_N=0 baseline)"
 echo "  ✓ SWEEP_DRY booted nothing at the docker layer (both slugs)"
 
-# 6. vLLM without SLUG refused (exit 2) — can't reboot without a target.
-#    (Engine defaults to llamacpp without a slug, so force via a vllm slug
-#    minus SLUG isn't expressible — assert the guard directly instead.)
-grep -q 'vLLM sweeps need SLUG' "$SWEEP" || fail "vLLM-needs-SLUG guard missing from script"
-echo "  ✓ vLLM-needs-SLUG guard present"
+# 6. A reboot-per-arm engine without SLUG refused (exit 2) — can't reboot
+#    without a target. (Engine defaults to llamacpp without a slug, so forcing
+#    it via a vllm slug minus SLUG isn't expressible — assert the guard itself.)
+#    ⚠️ club-3090#1282 widened this from `== "vllm"` to `!= "llamacpp"` so a
+#    NEWLY ADDED engine inherits the safe reboot path instead of silently taking
+#    llama.cpp's per-request fast path. Assert the condition, not the old
+#    vLLM-specific wording.
+command grep -q 'ENGINE_FAMILY" != "llamacpp" && -z "$SLUG"' "$SWEEP" \
+  || fail "reboot-per-arm-needs-SLUG guard missing (or narrowed back to == vllm)"
+echo "  ✓ reboot-per-arm-needs-SLUG guard present, and engine-agnostic"
 
 echo "test-spec-sweep: ok"

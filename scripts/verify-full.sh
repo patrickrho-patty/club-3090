@@ -77,6 +77,10 @@ done
 # Auto-detect running container + port (URL/CONTAINER env vars still win).
 # See scripts/preflight.sh::preflight_autodetect_endpoint.
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+# Canonical engine classification (club-3090#1282). Sourced unconditionally:
+# the rules live in ONE place and every consumer delegates to them.
+# shellcheck source=lib/engine-kind.sh
+source "${ROOT_DIR}/scripts/lib/engine-kind.sh"
 if [[ -f "${ROOT_DIR}/scripts/preflight.sh" ]]; then
   # shellcheck source=preflight.sh
   source "${ROOT_DIR}/scripts/preflight.sh"
@@ -93,10 +97,19 @@ if [[ -f "${ROOT_DIR}/scripts/lib/registry-lookup.sh" ]]; then
   _DEFAULT_ENDPOINT_PORT="$(registry_lookup_default_port qwen3.6-27b 2>/dev/null || true)"
 fi
 URL="${URL:-http://localhost:${_DEFAULT_ENDPOINT_PORT:-8020}}"
-# Resolve the served model from /v1/models when MODEL is unset (#372). The qwen
-# literal below is only a last resort if detection no-ops (endpoint unreachable).
+# Resolve the served model from /v1/models when MODEL is unset (#372).
 declare -F preflight_autodetect_model >/dev/null && preflight_autodetect_model
-MODEL="${MODEL:-qwen3.6-27b}"
+# #1330: NOT an unconditional `MODEL="${MODEL:-…}"` any more. That fell back to
+# a qwen literal whenever autodetect no-op'd — including against a server that
+# was merely still LOADING — so every request 404'd and the run looked like the
+# config under test was broken. preflight_resolve_model_or_fail refuses the
+# literal exactly when we know better (endpoint unreachable, or we picked the
+# container ourselves and it reports no model) and keeps it otherwise.
+if declare -F preflight_resolve_model_or_fail >/dev/null; then
+  preflight_resolve_model_or_fail "qwen3.6-27b" || exit 1
+else
+  MODEL="${MODEL:-qwen3.6-27b}"
+fi
 if [[ -z "${CONTAINER:-}" && -f "${ROOT_DIR}/scripts/lib/registry-lookup.sh" ]]; then
   # The old literal default 'vllm-qwen36-27b' matches NO registry container, so
   # container-coupled checks silently no-op'd on an undetected endpoint. Default
@@ -122,8 +135,19 @@ skip() { printf "  \033[33m⊘\033[0m %s (skipped)\n" "$1"; }
 # that the user can't act on. Surfaced by @lamentofhighborne in #85, fixed
 # per #87. Engine class is detected ONCE at startup and cached.
 detect_engine() {
-  # Hint 1: llama-server's /props endpoint (vLLM doesn't ship it)
+  # Hint 1: a /props endpoint (vLLM does not ship one).
+  # ⚠️⚠️ /props IS NO LONGER llama.cpp-EXCLUSIVE. TabbyAPI (exl3) serves a
+  # compatible /props AND emits no `system_fingerprint`, so this hint alone
+  # classified every exl3 run as llamacpp — which sent step 9 down the llamacpp
+  # branch to SKIP, reading as "no drafter" on an engine whose MTP was running
+  # at ~0.69 acceptance the whole time. Prefer container/image evidence whenever
+  # it names a family; fall back to llamacpp otherwise, so host builds and
+  # unconventional container names behave exactly as before.
   if curl -sf -m 3 "${URL}/props" >/dev/null 2>&1; then
+    local _props_kind
+    _props_kind="$(engine_kind_from_container "$CONTAINER")"
+    [[ "$_props_kind" == "unknown" ]] && _props_kind="$(engine_kind_from_image "$CONTAINER")"
+    [[ "$_props_kind" != "unknown" ]] && { echo "$_props_kind"; return 0; }
     echo "llamacpp"; return 0
   fi
   # Hint 2: the chat-completion response's system_fingerprint. vLLM emits
@@ -134,17 +158,21 @@ detect_engine() {
     -H 'Content-Type: application/json' \
     -d "{\"model\":\"${MODEL}\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":1}" 2>/dev/null \
     | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('system_fingerprint','') or '')" 2>/dev/null)"
-  case "$fp" in
-    vllm-*)    echo "vllm"; return 0 ;;
-    sglang-*)  echo "sglang"; return 0 ;;
-    b[0-9]*)   echo "llamacpp"; return 0 ;;   # llama-server build str: b10454[-hash]
-  esac
-  # Hint 3: container name pattern as a fallback (cheap, no extra HTTP)
-  case "$CONTAINER" in
-    vllm-*)      echo "vllm"; return 0 ;;
-    llama-cpp-*) echo "llamacpp"; return 0 ;;
-  esac
-  echo "unknown"
+  local k
+  k="$(engine_kind_from_fingerprint "$fp")"
+  [[ "$k" != "unknown" ]] && { echo "$k"; return 0; }
+  # Hint 3: container name pattern as a fallback (cheap, no extra HTTP).
+  # ⚠️ sglang-* was MISSING here until club-3090#1261. SGLang does not set a
+  # `sglang-`-prefixed system_fingerprint, so hint 2 never matches it and every
+  # SGLang run fell through to "unknown" — which meant the `case "$ENGINE_KIND"`
+  # dispatch below skipped straight past the SGLang branch into the vLLM one and
+  # SKIPPED the acceptance check. A dead DFlash2 drafter (sglang#39087) leaves
+  # output correct and only collapses decode, so that skip is silent. The prefix
+  # is the same one rebench-full.sh and club3090-env.sh already use.
+  # The prefix arms themselves now live in scripts/lib/engine-kind.sh
+  # (club-3090#1282) so adding an engine is a ONE-place change.
+  engine_kind_from_container "$CONTAINER"
+  return 0
 }
 
 # True only when $CONTAINER names a real Docker container. `--type container`
@@ -236,6 +264,7 @@ check_patches() {
   case "$ENGINE_KIND" in
     llamacpp) skip "llama.cpp engine — Genesis is vLLM-only, not applicable"; return 0 ;;
     sglang)   skip "SGLang engine — Genesis is vLLM-only, not applicable";    return 0 ;;
+    exllamav3) skip "exl3/TabbyAPI engine — Genesis is vLLM-only, not applicable"; return 0 ;;
     unknown)  ;;  # fall through; might still be vLLM under a non-standard container name
   esac
   if ! command -v docker >/dev/null 2>&1; then
@@ -311,7 +340,7 @@ check_basic() {
     }")" || { fail "completion request failed" "Check docker logs ${CONTAINER}"; return 1; }
   local content
   content="$(echo "$resp" | python3 -c "import sys,json; print(json.load(sys.stdin)['choices'][0]['message']['content'])" 2>/dev/null || true)"
-  if echo "$content" | grep -qi "Paris"; then
+  if echo "$content" | command grep -qi "Paris"; then
     pass "reply contains 'Paris'"
   else
     fail "reply didn't mention Paris: $(echo "$content" | head -c 80)" \
@@ -356,10 +385,28 @@ try:
 except Exception as e:
     print(f'__PARSE_ERROR__: {e}')
 " 2>&1)"
-  if echo "$tool_calls" | grep -q "__INLINED__"; then
-    fail "model emitted <tool_call> as inline text (tool_calls[] empty)" \
-         "Known issue: MTP × TurboQuant incompat. Use docker-compose.tools.yml or .tools-text.yml. See README Known issues."
-  elif echo "$tool_calls" | grep -qi "get_weather"; then
+  if echo "$tool_calls" | command grep -q "__INLINED__"; then
+    # This hint was hardcoded to the Qwen3.6/vLLM cause and printed on EVERY engine.
+    # A GLM-on-llama.cpp reporter was told "MTP x TurboQuant incompat, use
+    # docker-compose.tools.yml" — a file that does not exist for that model, naming a
+    # mechanism absent from their stack (club-3090#1250). A hint that confidently names
+    # the WRONG cause is worse than no hint: it sends the reporter to fix something that
+    # was never broken, and they cannot tell it is wrong without knowing the codebase.
+    case "$ENGINE_KIND" in
+      llamacpp)
+        fail "model emitted <tool_call> as inline text (tool_calls[] empty)" \
+             "llama.cpp builds its tool parser by statically walking the chat template. If the template uses constructs minja cannot evaluate, parser generation FAILS and the tags stay in content. Re-send a request WITH tools and look for HTTP 400 'Unable to generate parser for this template' — if present this is template/minja, not the model or the quant (GLM-5.3-Flash hits it at _args.items(): club-3090#1250). Otherwise check --jinja and --chat-template-file." ;;
+      sglang)
+        fail "model emitted <tool_call> as inline text (tool_calls[] empty)" \
+             "Check --tool-call-parser matches the model family (qwen3_coder on the Qwen3.x composes) and that the chat template emits the format that parser expects." ;;
+          exllamav3)
+            fail "model emitted <tool_call> as inline text (tool_calls[] empty)" \
+                 "exl3/TabbyAPI picks the parser with --tool-format (qwen3_coder for Qwen3.x, glm4_5 for GLM); unset, the server emits the tags as plain text. Also check --tool-calls-in-reasoning matches how the model emits calls while reasoning is on." ;;
+      *)
+        fail "model emitted <tool_call> as inline text (tool_calls[] empty)" \
+             "On the Qwen3.6 vLLM tiers this is the MTP x TurboQuant incompat - use docker-compose.tools.yml or .tools-text.yml (README Known issues). On other stacks check --tool-call-parser and the chat template first." ;;
+    esac
+  elif echo "$tool_calls" | command grep -qi "get_weather"; then
     pass "tool_calls[] populated with get_weather"
   else
     fail "unexpected tool_calls structure" "Raw: $(echo "$tool_calls" | head -c 300)"
@@ -491,12 +538,15 @@ run_check "streaming_tools" check_streaming_tools
 check_thinking() {
   echo "[7/10] Thinking / reasoning mode ..."
   local resp
-  # enable_thinking: true (Qwen3 default). Math problem that needs visible reasoning.
+  # enable_thinking: true (Qwen3 default). A problem that takes a couple of steps:
+  # this used to ask "What is 2+2?", which adaptive and concise thinkers
+  # (MiMo, ThinkingCap) rightly answer with little or no reasoning, so the check
+  # failed healthy boots. max_tokens still bounds the verbose models.
   resp="$(curl -sf -m 120 "${URL}/v1/chat/completions" \
     -H "Content-Type: application/json" \
     -d "{
       \"model\": \"${MODEL}\",
-      \"messages\": [{\"role\": \"user\", \"content\": \"What is 2+2? One-line answer.\"}],
+      \"messages\": [{\"role\": \"user\", \"content\": \"A train leaves at 14:35 and the trip takes 3 hours and 13 minutes. What time does it arrive? Answer with the time only.\"}],
       \"max_tokens\": 4000,
       \"temperature\": 0.3,
       ${THINK_ON_STD}\"chat_template_kwargs\": ${THINK_ON_KW}
@@ -526,7 +576,11 @@ print(f'{len(reasoning)}|{len(content)}|{finish}|{(reasoning[:60] or \"(empty)\"
     fail "reasoning present but content empty, finish=$fin (not length)" \
          "Likely genuine stall — finish_reason should be length if it's just verbosity. reasoning: $r_head"
   elif [[ "$r_len" -lt 50 ]]; then
-    fail "reasoning suspiciously short ($r_len chars)" "reasoning: $r_head"
+    # Short but present, with an answer in content: thinking engaged and was parsed
+    # into its own field, which is what this check tests. How much a model thinks
+    # is a trait (ThinkingCap is concise), not a fault. It used to FAIL here.
+    pass "reasoning $r_len chars (short — a concise thinker; thinking engaged and parsed), content $c_len chars (finish=$fin)"
+    printf "    \033[2mreasoning:\033[0m %s\n" "$r_head"
   else
     pass "reasoning $r_len chars, content $c_len chars (finish=$fin)"
     printf "    \033[2mreasoning:\033[0m %s...\n" "$r_head"
@@ -633,7 +687,83 @@ check_mtp_acceptance() {
   # generalized harness).
   case "$ENGINE_KIND" in
     llamacpp) skip "llama.cpp engine — MTP acceptance check is vLLM-log-format-specific (run engine-side verification separately)"; return 0 ;;
-    sglang)   skip "SGLang engine — MTP acceptance check is vLLM-log-format-specific";   return 0 ;;
+    exllamav3)
+      # ⚠️ A `skip` here is exactly the failure the SGLang branch below documents:
+      # a drafter that is dead — or absent — looks identical to a healthy one,
+      # because speculative decoding REJECTS bad drafts and the output stays
+      # correct, only slower. exl3 was skipping for a WORSE reason still: it was
+      # misclassified as llamacpp (see detect_engine), so this branch was never
+      # even reached and the run read as "no drafter" while MTP was live.
+      # exl3/TabbyAPI wording is per-request, appended to the completion line:
+      #     ... total 3.18 s · draft 108/173      (accepted/drafted)
+      # There is no rate and no accept-len in the log — derive the rate.
+      if ! container_is_real; then
+        skip "container '\''${CONTAINER}'\'' not found (CONTAINER=none for host endpoints)"
+        return 0
+      fi
+      curl -sf -m 120 "${URL}/v1/chat/completions" \
+        -H "Content-Type: application/json" \
+        -d "{
+          \"model\": \"${MODEL}\",
+          \"messages\": [{\"role\": \"user\", \"content\": \"Count from 1 to 80, one number per line.\"}],
+          \"max_tokens\": 500,
+          \"temperature\": 0.0
+        }" >/dev/null 2>&1 || { fail "acceptance-trigger request failed" "Check docker logs"; return 1; }
+      sleep 2
+      local exl_rate
+      exl_rate="$(docker logs --tail 400 "${CONTAINER}" 2>&1 \
+                  | command grep -oE 'draft [0-9]+/[0-9]+' | tail -5 \
+                  | awk -F'[ /]' '{a+=$2; d+=$3} END{if(d>0) printf "%.3f", a/d}')"
+      if [[ -z "$exl_rate" ]]; then
+        skip "no '\''draft N/M'\'' in the last 400 log lines (draft_mode unset for this compose?)"
+        return 0
+      fi
+      if awk -v a="$exl_rate" -v m="${EXL3_ACCEPT_MIN:-0.25}" 'BEGIN{exit !(a+0 >= m+0)}'; then
+        pass "draft acceptance ${exl_rate} >= ${EXL3_ACCEPT_MIN:-0.25} (exl3)"
+      else
+        fail "draft acceptance ${exl_rate} < ${EXL3_ACCEPT_MIN:-0.25} (exl3)" \
+             "The MTP head is drafting tokens that get rejected — output stays correct, decode collapses. Check draft_mode is 'mtp', that the quant actually CONTAINS an MTP head (some conversions drop it: grep the GGUF/safetensors index for nextn/mtp tensors), and that draft_num_tokens is a ceiling used with dynamic_draft rather than a fixed depth."
+      fi
+      return 0 ;;
+    sglang)
+      # ⚠ THIS USED TO `skip`, AND THAT IS HOW A DEAD DRAFTER PASSED verify-full.
+      # sglang#39087: a compressed-tensors DFlash2 drafter drafts garbage — accept
+      # len 1.03 vs 3.71 for identical BF16 weights, decode ~38 vs ~171 tok/s — with
+      # no error and no warning, because speculative decoding REJECTS bad drafts:
+      # the output stays correct, it is just slow. This check was the only gate that
+      # could have caught it, and it was skipping on the one engine where it happened.
+      # SGLang's wording is `accept len: N.NN, accept rate: N.NN` (scheduler
+      # metrics_reporter.py) — parseable, just not vLLM's.
+      if ! container_is_real; then
+        skip "container '${CONTAINER}' not found (CONTAINER=none for host endpoints)"
+        return 0
+      fi
+      curl -sf -m 60 "${URL}/v1/chat/completions" \
+        -H "Content-Type: application/json" \
+        -d "{
+          \"model\": \"${MODEL}\",
+          \"messages\": [{\"role\": \"user\", \"content\": \"Count from 1 to 80, one number per line.\"}],
+          \"max_tokens\": 500,
+          \"temperature\": 0.0,
+          ${THINK_OFF_STD}\"chat_template_kwargs\": ${THINK_OFF_KW}
+        }" >/dev/null 2>&1 || { fail "metrics-trigger request failed" "Check docker logs"; return 1; }
+      sleep 3
+      local sgl_al
+      sgl_al="$(docker logs --tail 400 "${CONTAINER}" 2>&1 \
+                | command grep -oE 'accept len: [0-9]+\.[0-9]+' | tail -5 \
+                | command grep -oE '[0-9]+\.[0-9]+' \
+                | awk '{s+=$1; n++} END{if(n) printf "%.3f", s/n}')"
+      if [[ -z "$sgl_al" ]]; then
+        skip "no 'accept len' in the last 400 log lines (spec-dec off for this compose?)"
+        return 0
+      fi
+      if awk -v a="$sgl_al" -v m="${MTP_ACCEPT_MIN:-2.0}" 'BEGIN{exit !(a+0 >= m+0)}'; then
+        pass "acceptance length ${sgl_al} >= ${MTP_ACCEPT_MIN:-2.0} (SGLang)"
+      else
+        fail "acceptance length ${sgl_al} < ${MTP_ACCEPT_MIN:-2.0} (SGLang)" \
+             "A drafter near 1.0 is drafting garbage and being rejected — output stays correct but decode collapses (sglang#39087). Check the drafter checkpoint is UNQUANTIZED and that --speculative-draft-model-quantization is 'unquant'."
+      fi
+      return 0 ;;
   esac
   if ! command -v docker >/dev/null 2>&1; then
     skip "docker not in PATH (host engine build? — see #87 for generalized harness work)"
@@ -658,15 +788,15 @@ check_mtp_acceptance() {
   sleep 3  # let log line flush
 
   local recent
-  recent="$(docker logs --tail 200 "${CONTAINER}" 2>&1 | grep -iE "SpecDecoding|acceptance length|spec_decode" | tail -3)"
+  recent="$(docker logs --tail 200 "${CONTAINER}" 2>&1 | command grep -iE "SpecDecoding|acceptance length|spec_decode" | tail -3)"
   if [[ -z "$recent" ]]; then
     skip "no SpecDecoding metrics in logs (compose may not have spec-decode enabled)"
     return 0
   fi
 
   local al
-  al="$(echo "$recent" | grep -oiE "(mean acceptance length|acceptance length|al|mean_acceptance_length)[: ]+[0-9]+\.[0-9]+" \
-        | grep -oE "[0-9]+\.[0-9]+" | tail -1)"
+  al="$(echo "$recent" | command grep -oiE "(mean acceptance length|acceptance length|al|mean_acceptance_length)[: ]+[0-9]+\.[0-9]+" \
+        | command grep -oE "[0-9]+\.[0-9]+" | tail -1)"
   if [[ -z "$al" ]]; then
     skip "couldn't parse AL from: $(echo "$recent" | head -c 240 | tr '\n' ' ')"
     return 0
@@ -709,7 +839,7 @@ check_vision() {
   # when an mmproj is loaded but the image path does not work.
   local intended=0
   if container_is_real && command -v docker >/dev/null 2>&1; then
-    if docker logs "${CONTAINER}" 2>&1 | grep -qiE "loaded multimodal model|clip_ctx:|mmproj"; then
+    if docker logs "${CONTAINER}" 2>&1 | command grep -qiE "loaded multimodal model|clip_ctx:|mmproj"; then
       intended=1
     fi
   fi

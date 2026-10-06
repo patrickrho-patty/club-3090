@@ -16,10 +16,22 @@
 #   3. genuine silent-empty (completion_tokens == 0) still reports 0.0 and still
 #      counts toward the silent-empty verdict — the discriminator must not regress
 #   4. a fast AUTOREGRESSIVE rig with a narrow-but-real window (#849: 82 ms on
-#      dual NVFP4 5090s) is NOT reclassified, and its output is byte-identical
-#      to origin/master — both the per-turn stream and the summary
+#      dual NVFP4 5090s) is NOT reclassified as canvas
 #   5. SOAK_DECODE_GRANULARITY=autoregressive restores the pre-fix behaviour
+#
+# ⚠️ Two expectations here were SUPERSEDED by #1267 / #1268, deliberately:
+#   - a narrow-but-real window no longer prints `decode_tps=0.0`. That zero was
+#     byte-identical to a genuine silent-empty turn, so it now renders as
+#     `decode_tps=n/a` plus the window width. The byte-identity-with-master leg
+#     therefore covers the `ok` shape only; `narrow` asserts the new contract.
+#   - a run with unmeasurable turns now DOES emit a "Decode-window basis:" line.
+#     It used to appear only when a canvas turn existed, which left an
+#     autoregressive run's p50 describing an unstated subset of its turns.
+# What has NOT changed, and is still asserted below: canvas turns stay
+# wall-derived and labelled, the two series stay apart, and the silent-empty
+# discriminator still keys on completion_tokens.
 set -euo pipefail
+export CLUB3090_CONFIG_DIR=/nonexistent/club-3090-test-config   # tests never read your real settings (#1466)
 
 # Force Python's UTF-8 mode (PEP 540) for every python3 this script runs.
 # Repo sources are full of unicode (— × → ⚠), and without this a rig on a real
@@ -75,13 +87,25 @@ assert_contains "$(tail -1 "${SOAK_ENV_DIR}/run-canvas/turn-log.csv")" ",wall"
 # A canvas run with no errors is still a PASS.
 [[ "$SOAK_RC" -eq 0 ]] || fail "clean canvas run should exit 0, got $SOAK_RC"
 
-# ── 2. escape hatch: forcing autoregressive restores the pre-fix zeroing ─────
+# ── 2. escape hatch: forcing autoregressive disables the canvas derivation ───
+# Pre-#1267 this asserted a bare `decode_tps=0.0`. The canvas apparatus is still
+# off — that is what this leg exists to prove — but the turns it produces are
+# `unmeasurable`, and an unmeasurable turn must no longer wear a silent-empty
+# turn's rendering.
 soak_stub_start "${PLAN_DIR}/canvas"
 soak_run "$ROOT_DIR" "${SOAK_ENV_DIR}/run-canvas-forced" SOAK_DECODE_GRANULARITY=autoregressive
 soak_stub_stop
-assert_contains "$SOAK_OUT" "decode_tps=0.0 "
+forced_summary="$(cat "${SOAK_ENV_DIR}/run-canvas-forced/summary.md")"
+assert_contains "$SOAK_OUT" "decode_tps=n/a"
+assert_contains "$SOAK_OUT" "no decode figure"
+assert_not_contains "$SOAK_OUT" "decode_tps=0.0"
 assert_not_contains "$SOAK_OUT" "(wall-derived, canvas)"
-assert_not_contains "$(cat "${SOAK_ENV_DIR}/run-canvas-forced/summary.md")" "Decode-window basis:"
+assert_contains "$(tr -d '\r' < "${SOAK_ENV_DIR}/run-canvas-forced/turn-log.csv" | tail -1)" ",unmeasurable"
+# The basis line is now emitted for an unmeasurable run too (#1267) — but it
+# must describe them as unmeasurable, never as canvas.
+assert_contains "$forced_summary" "Decode-window basis:"
+assert_contains "$forced_summary" "unmeasurable"
+assert_not_contains "$forced_summary" "wall-derived"
 
 # ── 3. silent-empty must not regress ────────────────────────────────────────
 # HTTP 200, >=1s, completion_tokens == 0. Not canvas — nothing was produced —
@@ -121,19 +145,61 @@ mixed_basis="$(tr -d '\r' < "${SOAK_ENV_DIR}/run-mixed/turn-log.csv" | cut -d, -
 # The leg that matters most. Two plans: a normal stream (measurable window) and
 # the #849 fast-burst shape (82 ms window — sub-threshold but NOT zero). Both
 # must behave exactly as they do on master, per-turn stream included.
+
+# A base run that could not start leaves no summary.md. Without this the gate
+# dies on `cat:` and the reader has no idea the BASE TREE was the problem.
+require_base_summary() {
+  local d="$1"
+  if [[ ! -f "$d/summary.md" ]]; then
+    echo "FAIL: the BASELINE soak run produced no summary.md in $d." >&2
+    echo "      The base tree could not run — almost always a dependency that" >&2
+    echo "      origin/master's soak-test.sh sources but this gate does not extract." >&2
+    exit 1
+  fi
+  cat "$d/summary.md"
+}
 BASE_TREE="${SOAK_ENV_DIR}/base-tree"
-mkdir -p "${BASE_TREE}/scripts"
+mkdir -p "${BASE_TREE}/scripts/lib"
 have_base=1
-for f in soak-test.sh soak-helper.py; do
+# ⚠️ THIS LIST MUST COVER EVERY FILE THE BASE soak-test.sh RESOLVES RELATIVE TO
+# ITSELF (BASH_SOURCE), not just the entrypoints. soak-test.sh sources
+# lib/club-containers.sh; while that was missing, the base tree was unrunnable,
+# the base run produced no summary.md, and this gate died on a bare
+# `cat: .../summary.md: No such file or directory` that named neither the cause
+# nor the fix. The have_base guard below did not catch it because it only tests
+# whether `git show` succeeded — which it did, for the two files it knew about.
+for f in soak-test.sh soak-helper.py lib/club-containers.sh; do
   if ! git show "origin/master:scripts/${f}" > "${BASE_TREE}/scripts/${f}" 2>/dev/null; then
-    echo "SKIP: origin/master not available — cannot run the byte-identity leg" >&2
+    echo "SKIP: origin/master:scripts/${f} not available — cannot run the byte-identity leg" >&2
     have_base=0
     break
   fi
 done
 
+# Coverage check: re-derive the BASE script's own relative dependencies and
+# assert we extracted them. This is what makes the next added `source` fail
+# LOUDLY here instead of silently three steps later at a missing summary.md.
+if [[ -n "$have_base" ]]; then
+  while IFS= read -r dep; do
+    [[ -z "$dep" || -f "${BASE_TREE}/scripts/${dep}" ]] && continue
+    # ⚠️ FAIL, not SKIP. "origin/master unavailable" is an ENVIRONMENT condition and
+    # skipping is honest. An incomplete extraction list is OUR BUG, fixable in-repo —
+    # skipping it would silently retire the byte-identity leg while the gate stayed
+    # green, which is the exact failure this whole guard exists to prevent.
+    echo "FAIL: base tree INCOMPLETE — origin/master's soak-test.sh sources scripts/${dep}," >&2
+    echo "      which this gate does not extract. Add it to the extraction list above." >&2
+    exit 1
+  done < <(command grep -oE 'pwd\)/[A-Za-z0-9_./-]+' "${BASE_TREE}/scripts/soak-test.sh" 2>/dev/null | sed 's|pwd)/||')
+fi
+
 normalise() {
+  # The per-turn provenance label and the decode-rate-source banner are new in
+  # #1267/#1268 and have no counterpart on master. They are dropped here so this
+  # leg keeps asserting what it was written to assert: that no FIGURE drifted.
+  # Their presence is asserted in test-soak-decode-source.sh.
   sed -E \
+    -e '/decode-rate source:/d' \
+    -e 's/ \((client-timed|engine-reported)[^)]*\)$//' \
     -e 's#run-ar-(new|base)-[a-z]+#<RUNDIR>#g' \
     -e 's#http://127\.0\.0\.1:[0-9]+#<ENDPOINT>#g' \
     -e 's/[0-9]+\.[0-9]+/<NUM>/g' \
@@ -171,7 +237,7 @@ if [[ "$have_base" == "1" ]]; then
     soak_run "$BASE_TREE" "${SOAK_ENV_DIR}/run-ar-base-${shape}"
     soak_stub_stop
     base_out="$SOAK_OUT"
-    base_summary="$(cat "${SOAK_ENV_DIR}/run-ar-base-${shape}/summary.md")"
+    base_summary="$(require_base_summary "${SOAK_ENV_DIR}/run-ar-base-${shape}")"
 
     # No canvas apparatus may appear on an autoregressive run.
     assert_not_contains "$new_out" "canvas"
@@ -179,16 +245,20 @@ if [[ "$have_base" == "1" ]]; then
     if [[ "$shape" == "narrow" ]]; then
       # Prove this leg is actually exercising the #849 fast-burst path rather
       # than quietly landing in the measurable branch: the window is under the
-      # 100 ms floor, so it must still print a bare 0.0 and record the
-      # 'unmeasurable' basis — NOT be reclassified as canvas.
-      assert_contains "$new_out" "decode_tps=0.0 "
+      # 100 ms floor, so it must record the 'unmeasurable' basis — NOT be
+      # reclassified as canvas. Its RENDERING is #1267's, not master's, so the
+      # byte-identity comparison below deliberately does not cover this shape.
+      assert_contains "$new_out" "decode_tps=n/a"
+      assert_not_contains "$new_out" "decode_tps=0.0"
       assert_contains "$(tr -d '\r' < "${SOAK_ENV_DIR}/run-ar-new-${shape}/turn-log.csv" | tail -1)" ",unmeasurable"
+      # NB: no base-vs-new comparison here on purpose, in either direction. An
+      # assertion that master still PRINTS the defect would pass today and fail
+      # the moment this lands on master — a test that dies of its own success.
     else
       assert_contains "$(tr -d '\r' < "${SOAK_ENV_DIR}/run-ar-new-${shape}/turn-log.csv" | tail -1)" ",decode"
+      assert_same "${shape} summary" "$base_summary" "$new_summary"
+      assert_same "${shape} stdout"  "$base_out"     "$new_out"
     fi
-
-    assert_same "${shape} summary" "$base_summary" "$new_summary"
-    assert_same "${shape} stdout"  "$base_out"     "$new_out"
   done
 fi
 

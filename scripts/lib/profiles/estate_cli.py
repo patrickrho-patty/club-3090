@@ -78,18 +78,12 @@ def utc_now() -> str:
 
 
 def load_dotenv() -> dict[str, str]:
+    """The environment an estate launch runs with: the real environment, plus any
+    setting it doesn't already set, through the ONE loader (club-3090 config, then
+    the repo .env; club-3090#1466). The environment wins."""
+    from scripts.lib.club_config import load as load_config
     env = dict(os.environ)
-    path = REPO_ROOT / ".env"
-    if not path.exists():
-        return env
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip().strip('"').strip("'")
-        env.setdefault(key, value)
+    load_config(REPO_ROOT, env)
     return env
 
 
@@ -474,6 +468,11 @@ def compose_override_doc(inst: InstanceSpec) -> dict[str, Any]:
     In that setup, CUDA may still enumerate physical GPU 0 first. Pass
     CUDA_VISIBLE_DEVICES inside the container so each estate instance uses the
     GPUs it claimed.
+
+    Also labels each service with the slug it runs (``club3090.slug``). The
+    container is ``club3090-<name>``, not the compose's default container name,
+    so without the label a bench / verify / soak against a pod could not say
+    which slug it measured, and wrote no measurement record (#1477).
     """
     joined = ",".join(str(gpu) for gpu in inst.gpu_indices)
     # UUID-pin (#610 Phase A): CDI ignores the NVIDIA index form and the
@@ -486,7 +485,8 @@ def compose_override_doc(inst: InstanceSpec) -> dict[str, Any]:
                 "environment": {
                     "CUDA_VISIBLE_DEVICES": visible,
                     "NVIDIA_VISIBLE_DEVICES": visible,
-                }
+                },
+                "labels": {"club3090.slug": inst.compose_name},
             }
             for service in compose_service_names(inst.compose_name)
         }
@@ -539,18 +539,26 @@ def append_log(path: Path, message: str) -> None:
 
 
 def run_compose(inst: InstanceSpec, action: str, log_path: Path | None = None) -> None:
-    cmd = compose_cmd() + ["-p", project_name(inst.name), "-f", str(compose_abs_path(inst.compose_name))]
+    compose_path = compose_abs_path(inst.compose_name)
+    cmd = compose_cmd() + ["-p", project_name(inst.name), "-f", str(compose_path)]
+    env = compose_env(inst)
     if action == "up":
-        cmd += ["-f", str(write_compose_override(inst))]
+        override = write_compose_override(inst)
+        cmd += ["-f", str(override)]
+        # #1466 4a/4b — the shared compile-cache and KV-disk-tier dirs, created as you and
+        # keyed by the image this instance runs; same helper as switch.sh and gpu-mode.
+        from scripts.lib.engine_cache import prepare as engine_cache_prepare
+        env.update(engine_cache_prepare([compose_path, override], env=env, compose_cmd=compose_cmd(),
+                                        repo_root=REPO_ROOT))
     cmd.append(action)
     if action == "up":
         cmd.append("-d")
     if log_path is not None:
         append_log(log_path, f"$ {' '.join(cmd)}")
         with log_path.open("a", encoding="utf-8") as fh:
-            proc = subprocess.run(cmd, cwd=REPO_ROOT, env=compose_env(inst), text=True, stdout=fh, stderr=subprocess.STDOUT)
+            proc = subprocess.run(cmd, cwd=REPO_ROOT, env=env, text=True, stdout=fh, stderr=subprocess.STDOUT)
     else:
-        proc = subprocess.run(cmd, cwd=REPO_ROOT, env=compose_env(inst), text=True)
+        proc = subprocess.run(cmd, cwd=REPO_ROOT, env=env, text=True)
     if proc.returncode != 0:
         raise EstateCliError(f"`{' '.join(cmd)}` failed with exit {proc.returncode}")
 

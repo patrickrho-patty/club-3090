@@ -31,7 +31,7 @@
 #   max-num-seqs, else 2) · ROUNDS (5; --sweep defaults to 3) ·
 #   PROMPT_TOKENS (16000) · GEN_TOKENS (256) ·
 #   VRAM_GROWTH_MB (200) · REQ_TIMEOUT (600).
-#   Validation knobs: VALIDATE (0) · TARGET_CTX (auto from --max-model-len) ·
+#   Validation knobs: VALIDATE (0) · TARGET_CTX (auto: the served context length) ·
 #   TPS_FLOOR (0 = report-only) · RETENTION_MIN (0.98) ·
 #   SWEEP ("" = single-N) · SLUG (required for SWEEP) · SWEEP_DRY (0) ·
 #   BOOT_TIMEOUT (360).
@@ -195,44 +195,68 @@ fi
 MODEL_PINNED="${MODEL:+1}"
 MODEL="${MODEL:-$(curl -s -m 5 "${URL}/v1/models" 2>/dev/null \
   | python3 -c 'import json,sys;print(json.load(sys.stdin)["data"][0]["id"])' 2>/dev/null || echo qwen3.6-27b)}"
-# best-effort container for VRAM + cmd introspection (name heuristic)
+# Container for VRAM, GPU label and flag introspection: the one publishing URL's port, any
+# engine (#1537: the old `vllm-(qwen|gemma)` name heuristic never found an SGLang container, so
+# its card listed every GPU on the host). The heuristic stays as the last resort.
+CONTAINER="${CONTAINER:-$(URL="$URL" python3 "$PROBE_PY" --container-for-url 2>/dev/null || true)}"
 CONTAINER="${CONTAINER:-$(docker ps --format '{{.Names}}' 2>/dev/null | command grep -m1 -E 'vllm-(qwen|gemma)' || true)}"
 
 _container_cmd() { docker inspect "$CONTAINER" --format '{{join .Config.Cmd " "}}' 2>/dev/null || true; }
 _served_seqs()   { _container_cmd | command grep -oE 'max-num-seqs [0-9]+'  | command grep -oE '[0-9]+' | head -1; }
 _served_np()     { _container_cmd | command grep -oE '\-np +[0-9]+'         | command grep -oE '[0-9]+' | head -1; }
-_served_ctx()    { _container_cmd | command grep -oE 'max-model-len [0-9]+' | command grep -oE '[0-9]+' | head -1; }
+# The served context: what the ENGINE reports first (SGLang server info, vLLM /v1/models, vLLM's
+# boot line), the container's literal --max-model-len only as the fallback. #1537: the flag grep
+# read "?" for vLLM auto-fit (--max-model-len -1) and for every SGLang compose.
+_served_ctx()    {
+  local n
+  n="$(URL="$URL" CONTAINER="$CONTAINER" python3 "$PROBE_PY" --served-max-len 2>/dev/null || true)"
+  if [[ -n "$n" ]]; then echo "$n"; return; fi
+  _container_cmd | command grep -oE 'max-model-len [0-9]+' | command grep -oE '[0-9]+' | head -1
+}
+# SGLang names the same knob --max-running-requests. Without this the detector fell
+# through vLLM's --max-num-seqs, llama.cpp's -np and /props (none of which SGLang has)
+# and hit the #818 FATAL — so concurrency-probe could not run against ANY sgl/ slug.
+_served_max_running() { _container_cmd | command grep -oE 'max-running-requests [0-9]+' | command grep -oE '[0-9]+' | head -1; }
 # llama.cpp-family servers report the slot count as total_slots on /props.
 _props_slots()   { curl -s -m 3 "${URL}/props" 2>/dev/null \
   | python3 -c 'import json,sys; v=json.load(sys.stdin).get("total_slots",""); print(v if isinstance(v,int) else "")' 2>/dev/null; }
+# SGLang exposes it on /get_server_info (flat, top-level). Used when the compose set
+# it via env rather than a literal flag in the container cmd.
+_sgl_max_running() { curl -s -m 3 "${URL}/get_server_info" 2>/dev/null \
+  | python3 -c 'import json,sys; v=json.load(sys.stdin).get("max_running_requests",""); print(v if isinstance(v,int) else "")' 2>/dev/null; }
 
 _detect_slots() {
   local n
   n="$(_served_seqs || true)"; [[ -n "$n" ]] && { echo "$n"; return; }
   n="$(_served_np || true)";   [[ -n "$n" ]] && { echo "$n"; return; }
+  n="$(_served_max_running || true)"; [[ -n "$n" ]] && { echo "$n"; return; }
+  n="$(_sgl_max_running || true)";    [[ -n "$n" ]] && { echo "$n"; return; }
   n="$(_props_slots || true)"; [[ -n "$n" ]] && { echo "$n"; return; }
   echo ""
 }
 
+# The GPUs the probed container sees, not every GPU on the host (#1502): a container pinned to the one
+# RTX 3060 of a 3090 + 3060 rig was labelled "4× RTX 3090". Falls back to every GPU when unresolvable.
 _gpu_fp() {
-  local names n first
-  names="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null \
-    | sed 's/^NVIDIA //' || true)"
-  [[ -z "$names" ]] && { echo "? GPU"; return; }
-  n="$(printf '%s\n' "$names" | wc -l | tr -d ' ')"
-  first="$(printf '%s\n' "$names" | head -1)"
-  if [[ "$n" == "1" ]]; then echo "1× ${first}"
-  else echo "${n}× ${first}"
-  fi
+  CONTAINER="$CONTAINER" python3 "$PROBE_PY" --gpu-label 2>/dev/null || echo "? GPU"
 }
 
+# The drafter the ENGINE reports (vLLM's engine-config log line / SGLang's server info) wins. The
+# container's flags are only the fallback: composes that build --speculative-config in their
+# entrypoint script from SPEC_N have no spec flag in Cmd, so a Cmd grep read "spec off" with MTP
+# n=4 running (#1537). When the entrypoint itself mentions spec flags, "no flag in Cmd" proves
+# nothing, so it says "spec ?" rather than guess "spec off".
 _spec_fp() {
-  local cmd
+  local s cmd ep
+  s="$(CONTAINER="$CONTAINER" URL="$URL" python3 "$PROBE_PY" --spec-label 2>/dev/null || true)"
+  if [[ -n "$s" ]]; then echo "$s"; return; fi
   cmd="$(_container_cmd)"
   if [[ -z "$cmd" ]]; then echo "spec ?"; return; fi
   if printf '%s' "$cmd" | command grep -qiE 'dflash|spec-dflash'; then echo "DFlash"; return; fi
   if printf '%s' "$cmd" | command grep -qiE 'num-speculative|speculative-config|--speculative'; then echo "MTP"; return; fi
   if printf '%s' "$cmd" | command grep -qiE 'ngram'; then echo "ngram"; return; fi
+  ep="$(docker inspect "$CONTAINER" --format '{{join .Config.Entrypoint " "}}' 2>/dev/null || true)"
+  if printf '%s' "$ep" | command grep -qiE 'speculative|dflash|ngram|model-draft'; then echo "spec ?"; return; fi
   echo "spec off"
 }
 
@@ -305,7 +329,9 @@ if [[ -n "$SWEEP" || "$MATRIX" == "1" ]]; then
 elif [[ -z "${CONCURRENCY:-}" ]]; then
   _conc_src="container max-num-seqs"; CONCURRENCY="$(_served_seqs || true)"
   if [[ -z "$CONCURRENCY" ]]; then _conc_src="container -np";          CONCURRENCY="$(_served_np || true)"; fi
+  if [[ -z "$CONCURRENCY" ]]; then _conc_src="container max-running-requests"; CONCURRENCY="$(_served_max_running || true)"; fi
   if [[ -z "$CONCURRENCY" ]]; then _conc_src="server /props total_slots"; CONCURRENCY="$(_props_slots || true)"; fi
+  if [[ -z "$CONCURRENCY" ]]; then _conc_src="server /get_server_info max_running_requests"; CONCURRENCY="$(_sgl_max_running || true)"; fi
   if [[ -z "$CONCURRENCY" ]]; then
     echo "[concurrency-probe] FATAL: cannot detect the served slot count" \
          "(container cmd and ${URL}/props both failed) — pass CONCURRENCY=N explicitly" >&2
@@ -395,11 +421,13 @@ if [[ "$MATRIX" == "1" ]]; then
   slots_src="undetected"
   if [[ -n "$(_served_seqs || true)" ]]; then slots_src="container max-num-seqs"
   elif [[ -n "$(_served_np || true)" ]]; then slots_src="container -np"
+  elif [[ -n "$(_served_max_running || true)" ]]; then slots_src="container max-running-requests"
+  elif [[ -n "$(_sgl_max_running || true)" ]]; then slots_src="server max_running_requests"
   elif [[ -n "$(_props_slots || true)" ]]; then slots_src="server /props total_slots"
   fi
   max_len="$(_served_ctx || true)"
   if [[ -z "$KV_TOKENS" || "$KV_TOKENS" == "0" ]]; then
-    KV_TOKENS="$(CONTAINER="$CONTAINER" python3 "$PROBE_PY" --detect-kv || true)"
+    KV_TOKENS="$(CONTAINER="$CONTAINER" URL="$URL" python3 "$PROBE_PY" --detect-kv || true)"
   fi
 
   if [[ "$SWEEP_DRY" != "1" && -z "$slots" && "$N_LIST_EXPLICIT" != "1" ]]; then
@@ -447,11 +475,13 @@ if [[ "$MATRIX" == "1" ]]; then
   cells_jsonl="$(mktemp /tmp/cprobe-cells.XXXXXX)"
   trap 'rm -f "$cells_jsonl"' EXIT
 
+  # emit_row <json>: append one skipped cell. The row is an ARGUMENT: `python3 -` reads its program
+  # from stdin, so a row piped in was swallowed by the heredoc, json.loads("") raised, and set -e
+  # killed the sweep at its first skipped cell, before the card and results were written (#1502).
   emit_row() {
-    python3 - "$cells_jsonl" <<'PY'
+    python3 - "$cells_jsonl" "$1" <<'PY'
 import json, sys
-path = sys.argv[1]
-row = json.loads(sys.stdin.read())
+path, row = sys.argv[1], json.loads(sys.argv[2])
 with open(path, "a", encoding="utf-8") as fh:
     fh.write(json.dumps(row, ensure_ascii=False) + "\n")
 PY
@@ -461,17 +491,17 @@ PY
     [[ -z "${action:-}" ]] && continue
     if [[ "$budget_hit" == "1" ]]; then
       echo "[sweep] ${ctx} tok  N=${n}: skip (budget)"
-      printf '%s\n' "{\"ctx\":$ctx,\"n\":$n,\"skip\":\"budget\"}" | emit_row
+      emit_row "{\"ctx\":$ctx,\"n\":$n,\"skip\":\"budget\"}"
       continue
     fi
     if [[ "$action" == "skip" ]]; then
       echo "[sweep] ${ctx} tok  N=${n}: skip (${reason})"
-      printf '%s\n' "$(python3 -c 'import json,sys; print(json.dumps({"ctx":int(sys.argv[1]),"n":int(sys.argv[2]),"skip":sys.argv[3]}))' "$ctx" "$n" "${reason:-clipped}")" | emit_row
+      emit_row "$(python3 -c 'import json,sys; print(json.dumps({"ctx":int(sys.argv[1]),"n":int(sys.argv[2]),"skip":sys.argv[3]}))' "$ctx" "$n" "${reason:-clipped}")"
       continue
     fi
     if [[ "$EARLY_STOP" == "1" && -n "${ROW_DEAD[$ctx]:-}" ]]; then
       echo "[sweep] ${ctx} tok  N=${n}: skip (early-stop — N=${ROW_DEAD[$ctx]} failed)"
-      printf '%s\n' "$(python3 -c 'import json,sys; print(json.dumps({"ctx":int(sys.argv[1]),"n":int(sys.argv[2]),"skip":"early-stop"}))' "$ctx" "$n")" | emit_row
+      emit_row "$(python3 -c 'import json,sys; print(json.dumps({"ctx":int(sys.argv[1]),"n":int(sys.argv[2]),"skip":"early-stop"}))' "$ctx" "$n")"
       continue
     fi
     echo
@@ -549,6 +579,7 @@ PY
   rec_json="$(mktemp /tmp/cprobe-rec.XXXXXX)"
   if [[ "$slots_src" == "container -np" ]]; then engine="llamacpp"
   elif [[ "$slots_src" == "container max-num-seqs" ]]; then engine="vllm"
+  elif [[ "$slots_src" == "container max-running-requests" || "$slots_src" == "server max_running_requests" ]]; then engine="sglang"
   else engine=""
   fi
   MODEL="$MODEL" SLUG="${SLUG:-}" SPEC="$(_spec_fp)" GPUS="$(_gpu_fp)" \

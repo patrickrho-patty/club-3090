@@ -114,12 +114,13 @@ derive — reuse the curated compose and swap the weights.** Three things to get
   **`-MTP` variant** (the head is embedded in the checkpoint), or drop
   `--speculative-config`.
 
-Example — abliterated Qwen3.6-27B:
+Examples — abliterated Qwen3.6-27B / Qwen3.8-27B:
 
 | You have | Reuse this curated compose | Notes |
 |---|---|---|
 | an **AWQ + MTP** variant (vLLM) | `models/qwen3.6-27b/vllm/compose/dual/awq-bf16-int4/int8.yml` | match `--quantization` (`awq` / `compressed-tensors`) to the repo |
 | a **GGUF + MTP** variant (llama.cpp) | a `llama-cpp` compose (path **B** above) | self-contained — simplest |
+| a **Qwen3.8-27B FP8** variant with the MTP head (vLLM), e.g. `munekazu/Huihui-Qwen3.8-27B-abliterated-FP8` | `models/qwen3.8-27b/vllm/compose/dual/fp8/mtp.yml` | keeps `--quantization fp8`; Qwen3.8 reports the same config arch as Qwen3.6, so the `pull.sh` refusal naming `qwen3.6-27b` is expected |
 
 ```bash
 # 1. download the quantized + MTP variant
@@ -433,9 +434,11 @@ missing what a maintainer would bounce the PR for: a real `display_name` /
 re-run, then open the PR with the bundle's contents.
 
 Writing the curated catalog **directly** is maintainer-only and double-gated
-(`promote.py --layer core` **plus** `C3_ALLOW_CORE_PROMOTE=1`). Note that gate is
-a plain environment variable and **`.env` is not read by these tools** — `export`
-it in your shell or pass it per-invocation.
+(`promote.py --layer core` **plus** `C3_ALLOW_CORE_PROMOTE=1`). `promote.py` reads
+that gate from your shell or, failing that, from your saved settings
+(`~/.config/club-3090/`, then a legacy repo-root `.env`), and says so when a file
+set it. `export` it in your shell or pass it per-invocation; a saved one leaves
+the gate open for every run.
 
 
 

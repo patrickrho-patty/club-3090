@@ -78,8 +78,22 @@ per_token_bytes = num_growing_layers
                 × k_v_tensors            ← 2 for K and V stored separately; 1 when K=V tied
                 × bytes_per_kv_element   ← see KV-format table below
 
-kv_pool_per_card = (per_token_bytes / TP) × max_ctx × max_num_seqs
+kv_pool_per_card = (per_token_bytes / min(TP, num_kv_heads)) × max_ctx × max_num_seqs
 ```
+
+⚠️ **The divisor is `min(TP, num_kv_heads)`, not `TP`.** vLLM shards KV heads across
+tensor-parallel ranks but clamps at one head per rank:
+
+```python
+self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)   # vllm 0.29.0
+```
+
+Once `TP` exceeds `num_kv_heads` the heads **replicate** (vLLM's own comment: *"Number of KV
+heads is less than TP size, so we replicate the KV heads across multiple tensor parallel
+GPUs"*), so per-card KV stops shrinking. Dividing by `TP` past that point over-predicts the
+pool by `TP / num_kv_heads` — in the dangerous direction, predicting PASS where reality is
+FAIL. Example: qwen3.8-27b has 4 KV heads, so TP=8 gives the **same** per-card KV as TP=4;
+only the weights keep shrinking. Implemented as `_kv_tp_divisor()` in `tools/kv-calc.py`.
 
 For hybrid architectures (DeltaNet, SWA), only the **growing** attention layers contribute to this formula. Fixed-window or recurrent-state layers contribute a separate, context-independent term (see per-model sections).
 
@@ -295,14 +309,57 @@ This term is exact (the checkpoint is a fixed size). DeltaNet's `linear_attn.in_
 
 ### 2. KV pool (attention layers only)
 
-In the Qwen3-Next hybrid architecture, **only the 16 full_attention layers contribute to the growing KV cache**. The 48 GDN (Gated DeltaNet) layers maintain a fixed-size recurrent state instead (Yang et al., [Gated Delta Networks ICLR 2025](https://github.com/NVlabs/GatedDeltaNet)).
+In the Qwen3-Next hybrid architecture, the 48 GDN (Gated DeltaNet) layers maintain a fixed-size recurrent state rather than a growing KV cache (Yang et al., [Gated Delta Networks ICLR 2025](https://github.com/NVlabs/GatedDeltaNet)), so only the **full_attention** layers grow per token.
 
-Applying the general formula:
+⚠️ **A drafter adds KV-bearing layers, and they are NOT free.** This section previously counted 16 layers unconditionally, which under-predicts per-token KV on **every drafter compose**. Corrected 2026-09-15 from a measured pool sweep (see below).
 
 ```
-per_token_bytes = 16 (growing layers) × 4 (kv_heads) × 256 (head_dim) × k_v_tensors=2 × bpe
-                = 32,768 × bpe bytes
+per_token_bytes = kv_bearing_layers × kv_heads × head_dim × k_v_tensors=2 × bpe
+
+   base model            16 × 4 × 256 × 2  = 32,768 × bpe
+   + built-in MTP head   17 × 4 × 256 × 2  = 34,816 × bpe      (+6.25%)
+   + DFlash2 drafter     (16 × 4 × 256 + 5 × 8 × 128) × 2 = 43,008 × bpe   (+31.25%)
 ```
+
+⚠️ The DFlash2 drafter's 5 `sliding_attention` layers have **different geometry** from the main model
+(8 kv_heads, head_dim 128, vs 4 × 256) — so it is not "21 layers at the main model's shape". And its
+KV is allocated **per token from the same pool**, not window-bounded, despite being sliding-window layers.
+
+**Where the layer count comes from:** `text_config.layer_types` (count `full_attention`) **plus**
+`text_config.mtp_num_hidden_layers` when a built-in MTP drafter is configured, **plus** the external
+drafter's own KV-bearing layers when one is loaded.
+
+> **Measured, not derived** (Qwen3.8-27B, SGLang v0.5.19, TP=2, fp8 KV — same 16+48 hybrid geometry).
+> Sweeping `--max-mamba-cache-size` and reading `max_total_num_tokens` gives an exactly linear
+> state↔KV exchange rate. Predicting it with 16 layers gave 2,394 tokens/slot; the measured value was
+> **2,253.2**, a ratio of exactly **17/16** — the MTP head. On the DFlash2 tier the measured slope was
+> **1,824.0**, matching 16+5 layers to the decimal (16-only predicts 2,394; 16+5+MTP predicts 1,741).
+> ⚠️ Turning the drafter off entirely also frees its weights and speculative buffers, so the **total**
+> context gain is far larger than the per-token rate implies: **+48.6% KV tokens at identical K**
+> (−33% context for having MTP on). Full detail in `learnings/sglang-engine.md`, 2026-09-15.
+
+> ⚠️⚠️ **That 17/16 slope is SGLang-specific — vLLM measures more than twice the cost.**
+> Measured 2026-09-17 on vLLM v0.29.0, `vllm/qwen38-27b-dual-fast`, 2× RTX 3090, TP=2, read from
+> the engine's own `GPU KV cache size:` line: MTP n=4 on → **508,356 tok**; `SPEC_N=0`
+> (`speculative_config=None`) → **590,577 tok**. That is **−13.9%**, not the −6.25% the 17/16
+> layer ratio predicts.
+>
+> The reason is that vLLM's token figure is **not** `pool_bytes / per_token_bytes`. It is
+> `int(num_blocks / blocks_per_request × max_model_len)`, where `blocks_per_request` sums over all
+> KV groups after (a) **hybrid group padding** — layer counts padded to
+> `group_size = min(#layers per type)`, (b) **mamba snapshot blocks** costing `(2 + n_spec)` per
+> group per request, and (c) **window-bounded** drafter SWA layers rather than per-token ones.
+> Worked example: `dual-ultramax` pins `--kv-cache-memory-bytes 6,335,076,762` **per GPU** and
+> measures 267,493 tok — of which ~4.32 GB is real attention, **~1.08 GB is pure padding**,
+> ~0.76 GB mamba snapshots, ~0.04 GB drafter.
+>
+> ⇒ **kv-calc models per-token bytes, not vLLM's block accounting**, so it carries the 6.25%
+> slope. That is an accepted limitation of a directional estimator (±1.5 GB band) — but do **not**
+> calibrate kv-calc against raw vLLM token lines without the group/mamba accounting or the
+> discrepancy gets baked in (`bootlog_solve.py` currently does exactly that).
+
+The table below is the **base model (16 layers, no drafter)**. Multiply by **1.0625** for built-in
+MTP, or **1.3125** for the DFlash2 drafter.
 
 | KV format | bpe | per-token KV (TP=1) | per-token KV (TP=2) |
 |---|---:|---:|---:|

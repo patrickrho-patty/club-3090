@@ -82,3 +82,16 @@ results/*
 *.bak
 *.orig
 *.rej
+
+# LiteLLM RUNTIME view — rendered per-rig by scripts/lib/litellm-sync.sh from the
+# endpoints that are actually serving. The tracked config.yaml is the CATALOG
+# view and stays in git; this one is rig state and must never be committed, or
+# every checkout would conflict on a file nobody edited.
+services/litellm/config.runtime.yaml
+services/litellm/config.runtime.yaml.tmp
+# this rig's own gateway routes + their keys (see services/litellm/config.local.yaml.example)
+services/litellm/config.local.yaml
+services/litellm/local.env
+
+# gpu-mode upgrade: support-service volume backups (e.g. Qdrant before a storage migration)
+backups/

@@ -44,7 +44,12 @@
 {%- endif %}
 {%- set reasoning_instructions = '' %}
 {%- if enable_thinking is undefined or enable_thinking is true %}
-    {%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') %}
+    {#- club-3090 PATCH: `default_reasoning_effort` is the server-side default, read
+        ONLY when the request names no reasoning_effort. SGLang composes set it via
+        --default-chat-template-kwargs instead of `reasoning_effort` itself, because
+        SGLang <= 0.5.20 lets a default `reasoning_effort` OVERRIDE the request's
+        (sglang#38104). vLLM composes never pass it, so they render as before. -#}
+    {%- set resolved_reasoning_effort = reasoning_effort|default(default_reasoning_effort|default('xhigh')) %}
     {#- club-3090 PATCH: Qwen3.8's ladder is low/medium/xhigh with no `high`, which
         OpenAI- and Anthropic-shaped clients send as their TOP rung. Map it onto
         `xhigh` -- the real top rung -- so the three standard values map bijectively
@@ -58,6 +63,17 @@
         default (`low`, via --default-chat-template-kwargs) still governs them.
         Otherwise upstream. -#}
     {%- if resolved_reasoning_effort == 'high' %}
+        {%- set resolved_reasoning_effort = 'xhigh' %}
+    {%- endif %}
+    {#- club-3090 PATCH: the wider OpenAI-compatible vocabulary (Hermes Agent,
+        OpenRouter-shaped clients) also sends `minimal` and `max`, which reached
+        this template and 400'd on both engines. Clamp each to the nearest real
+        rung: `minimal` -> `low` (never to "off": `none` is thinking off, and the
+        engines turn it into enable_thinking=false before the template runs) and
+        `max` -> `xhigh`, the top. -#}
+    {%- if resolved_reasoning_effort == 'minimal' %}
+        {%- set resolved_reasoning_effort = 'low' %}
+    {%- elif resolved_reasoning_effort == 'max' %}
         {%- set resolved_reasoning_effort = 'xhigh' %}
     {%- endif %}
     {%- if resolved_reasoning_effort not in ('xhigh', 'medium', 'low') %}
@@ -77,7 +93,13 @@
     {{- "# Tools\n\nYou have access to the following functions:\n\n<tools>" }}
     {%- for tool in tools %}
         {{- "\n" }}
-        {{- tool | tojson }}
+        {#- club-3090 PATCH: sort each tool schema's keys. This block renders FIRST in
+            the prompt, so a client, gateway or MCP server that re-serialises a schema
+            with its keys in a different order changes the prompt at its start and the
+            engine's prefix cache misses the WHOLE conversation (vLLM: 0 of 29.6K
+            tokens cached after one reordered tool). Sorted, the same tools always
+            render the same bytes. Otherwise upstream. -#}
+        {{- tool | tojson(sort_keys=True) }}
     {%- endfor %}
     {{- "\n</tools>" }}
     {{- '\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>' }}
@@ -118,7 +140,18 @@
     {%- set content = render_content(message.content, true)|trim %}
     {%- if message.role == "system" %}
         {%- if not loop.first %}
-            {{- raise_exception('System message must be at the beginning.') }}
+            {#- club-3090 PATCH: a system message after the first is rendered WHERE IT SITS,
+                as its own system turn, instead of raising 'System message must be at the
+                beginning.'. Claude Code (2.1.x) sends its `# Environment` block that way,
+                and vLLM hands it to the template in place, so every Claude Code request
+                400'd on the vLLM slugs (#1447). In place, not hoisted into the leading
+                system turn: the prompt stays append-only, so the prefix cache holds.
+                Same content rules as the first system message; empty ones are skipped.
+                Approach from froggeric's Qwen-Fixed-Chat-Templates. -#}
+            {%- set content = render_content(message.content, false, true)|trim %}
+            {%- if content %}
+                {{- '<|im_start|>system\n' + content + '<|im_end|>\n' }}
+            {%- endif %}
         {%- endif %}
     {%- elif message.role == "user" %}
         {{- '<|im_start|>' + message.role + '\n' + content + '<|im_end|>' + '\n' }}

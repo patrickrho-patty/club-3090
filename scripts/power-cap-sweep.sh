@@ -207,7 +207,7 @@ while [ $# -gt 0 ]; do
     --include-commit) INCLUDE_COMMIT=1; shift ;;
     --no-reset)    RESET=0; shift ;;
     -h|--help)
-      sed -n '1,/^set -euo/p' "$0" | grep '^#' | sed 's/^# \?//'
+      sed -n '1,/^set -euo/p' "$0" | command grep '^#' | sed 's/^# \?//'
       exit 0 ;;
     *)             echo "unknown arg: $1" >&2; exit 1 ;;
   esac
@@ -290,7 +290,7 @@ gpu_indices_from_container() {
   # uses all GPUs / can't be determined (caller then falls back to all GPUs).
   local c="$1" nvd
   nvd="$(docker inspect "$c" 2>/dev/null \
-    | grep -o 'NVIDIA_VISIBLE_DEVICES=[^"]*' | head -1 | cut -d= -f2)"
+    | command grep -o 'NVIDIA_VISIBLE_DEVICES=[^"]*' | head -1 | cut -d= -f2)"
   case "${nvd:-}" in
     ""|all|void|none) echo "" ;;
     *) echo "$nvd" | tr -d ' ' ;;
@@ -847,7 +847,7 @@ import json
 import sys
 try:
     with open(sys.argv[1], encoding="utf-8") as f:
-        print(json.load(f).get("usage", {}).get("prompt_tokens", 0))
+        print((json.load(f).get("usage") or {}).get("prompt_tokens", 0))
 except Exception:
     print(0)
 PY
@@ -929,7 +929,7 @@ PY
   for i in $(seq 1 "$n"); do
     if [ -s "$dir/out-N${n}-${i}.json" ]; then
       local t
-      t=$(python3 -c "import json; print(json.load(open('$dir/out-N${n}-${i}.json')).get('usage',{}).get('completion_tokens',0))" 2>/dev/null || echo 0)
+      t=$(python3 -c "import json; print((json.load(open('$dir/out-N${n}-${i}.json')).get('usage') or {}).get('completion_tokens',0))" 2>/dev/null || echo 0)
       total_tokens=$((total_tokens + t))
     fi
   done

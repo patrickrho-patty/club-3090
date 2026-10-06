@@ -9,7 +9,7 @@ What this stack assumes about your hardware. True regardless of which model or e
 - **NVIDIA RTX 3090 (24 GB, Ampere SM 8.6)** — 1 or 2 cards.
 - **PCIe Gen 4 slot** — Gen 3 works but allreduce on dual-card is slower (mild impact on multi-tenant; minimal impact on single-stream).
 - **NVIDIA driver 580.x or newer** — for CUDA 13 runtime in vLLM nightly. `nvidia-smi` to check. Older drivers won't load CUDA 13 kernels.
-  - ⚠️ **The ik-llama `cu13` pin needs CUDA ≥ 13.2 specifically** (not just 580.x). Its digest is a CUDA 13.2 runtime, so a driver whose *supported* CUDA < 13.2 — e.g. 580.159 = CUDA 13.0 — forward-compat-fails on GeForce (error 804) → CPU fallback → crash loop ([#633](../../../noonghunna/club-3090/issues/633)). The launcher **auto-selects the cu12 sibling build** (same build, backward-compatible) on such drivers; override with `IK_LLAMA_IMAGE=…:cu12-server-4574` in `.env`. Check your ceiling top-right in `nvidia-smi`.
+  - ⚠️ **The ik-llama `cu13` pin needs CUDA ≥ 13.2 specifically** (not just 580.x). Its digest is a CUDA 13.2 runtime, so a driver whose *supported* CUDA < 13.2 — e.g. 580.159 = CUDA 13.0 — forward-compat-fails on GeForce (error 804) → CPU fallback → crash loop ([#633](../../../noonghunna/club-3090/issues/633)). The launcher **auto-selects the cu12 sibling build** (same build, backward-compatible) on such drivers; override with `bash scripts/settings.sh set IK_LLAMA_IMAGE=…:cu12-server-4574`. Check your ceiling top-right in `nvidia-smi`.
 - **Linux** (Ubuntu 22.04+ tested). vLLM is Linux + CUDA only. llama.cpp works on macOS / Windows but our recipes assume Linux paths.
 - **Docker + NVIDIA Container Toolkit** for vLLM. llama.cpp doesn't need Docker.
 
@@ -28,6 +28,7 @@ The recipes are written against 3090 specifically but should work on:
 | RTX 5090 | 32 GB | sm_120 | Untested; more VRAM relaxes the prefill cliffs but kernel paths might differ |
 | RTX A5000 | 24 GB | sm_86 | Identical SM and VRAM to 3090; should run identically. |
 | RTX A6000 | 48 GB | sm_86 | Should work; double VRAM lets you skip the cliff workarounds (use Sandermage's reference defaults) |
+| CMP 170HX (64 GB) | 64 GB | sm_80 | **Community-tested 2026-10-05 by [@xtj7](https://github.com/xtj7) ([#1537](https://github.com/noonghunna/club-3090/issues/1537)); not tested here.** A GA100 mining board (the A100's chip), 64 GB on a PCIe Gen 2 x4 link. Use it as a single card: model loads are slow over that link, and splitting a model across it and 24 GB cards (TP) is link-bound and caps every card at 24 GB. `vllm/qwen38-27b-single-fast` and `sgl/qwen38-27b-single-fast` run their full tier on it (W4A8, MTP n=4, vision, 262K context) and pass the whole `report.sh` chain at the board's stock 250 W: vLLM 84 / 114 tok/s narrative / code, SGLang 79 / 107. vLLM is the better pick there: faster prefill and long-context decode, and 8 concurrent requests to SGLang's 2. Mining boards are reported to have firmware-limited compute; it did not stop these recipes. Profile `cmp-170hx-64gb` (boards reporting less than 60 GB get none). On a mixed rig, pin the card: `CLUB3090_GPU=<index> bash scripts/switch.sh --force <slug>`. Only single-card composes that declare `Requires-*` hardware metadata auto-select the largest card, and never under `--force`, which every 🧪 slug needs. |
 | H100 SXM | 80 GB | sm_90 | Different beast; flash-attn 3 paths available; not what these recipes target |
 
 > See [DTYPE_MATRIX.md](DTYPE_MATRIX.md) for the per-arch hardware-accelerator matrix — which dtypes (BF16, FP8, NVFP4, INT4) and quant schemes (AutoRound, AWQ, GPTQ, FP8 weights, SmoothQuant, NVFP4) run on which GPU classes natively vs in software. Useful when targeting a non-3090 rig.
@@ -42,8 +43,11 @@ For TP=1 vLLM composes, `switch.sh` auto-selects the largest eligible GPU and ex
 
 Overrides:
 
+`CLUB3090_GPU=<index>` pins any single-card slug to that GPU (by UUID), on every engine and with `--force` too — which every 🧪 slug needs, and which skips the automatic largest-card pick above:
+
 ```bash
 CLUB3090_GPU=1 bash scripts/switch.sh vllm/default
+CLUB3090_GPU=1 bash scripts/switch.sh --force vllm/qwen38-27b-single-fast
 NVIDIA_VISIBLE_DEVICES=2,3 bash scripts/switch.sh vllm/dual
 bash scripts/switch.sh --force vllm/gemma-mtp-tp1
 ```
@@ -60,7 +64,7 @@ On 20 GB cards (modded 3080) the cudagraph-profiling overhead is a meaningful sl
 MAX_MODEL_LEN=32768 GPU_MEMORY_UTILIZATION=0.85 bash scripts/switch.sh vllm/minimal
 ```
 
-Same `MAX_MODEL_LEN` / `GPU_MEMORY_UTILIZATION` env overrides apply for any setup running vLLM alongside other GPU consumers on the same card. See [SINGLE_CARD.md "Running alongside a desktop"](SINGLE_CARD.md#running-alongside-a-desktop--sub-24-gb-usable-vram) for safe ranges.
+Same `MAX_MODEL_LEN` / `GPU_MEMORY_UTILIZATION` env overrides apply for any setup running vLLM alongside other GPU consumers on the same card. See [SINGLE_CARD.md "Running alongside a desktop"](SINGLE_CARD.md#before-you-rely-on-it) for safe ranges.
 
 **`dual-turbo.yml` on 20 GB Ampere — swap TQ3 KV → fp8_e5m2.** The shipped `dual-turbo.yml` uses `--kv-cache-dtype turboquant_3bit_nc` (the technique from [TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate](https://arxiv.org/abs/2504.19874), ICLR 2026 — random rotation + scalar quantizers + 1-bit QJL transform on the residual; the paper claims near-optimal *average* distortion at ~3.5 bits/channel). **That's a perplexity-level claim, not tail-level** — on our exact Qwen3.6-27B / 3090, [Anbeeld's KV-quant benchmarks](https://anbeeld.com/articles/kv-cache-quantization-benchmarks-for-long-context) put `turbo3_tcq` at **~82% 99.9th-percentile KLD tail precision** (visible loss on the worst 0.1% of positions — JSON keys, closing braces, tool calls). So **TQ3 is a context/concurrency trade, not quality-neutral**: good for prose + long-ctx, but prefer `fp8` / `q5_0` KV for code / JSON / agent workloads (see [FAQ — which KV-cache quant](FAQ.md) + [CLIFFS.md](CLIFFS.md)). It's still the right pick on 24 GB / 3090 for **context + concurrency**: smaller KV pool → more concurrency, and the 24 GB budget absorbs the dequant activation cost during the DeltaNet GDN forward. On 20 GB cards the trade flips: TQ3's activation peak (~1 GB/card more pressure than fp8 during the materialized block — see [PerfMamba arxiv 2511.22849](https://arxiv.org/html/2511.22849) for the underlying Mamba-2 block-state-materialization mechanism the GDN forward inherits) exceeds the per-card budget after TP=2 split, and Cliff 2 fires at 90K. **Override to `--kv-cache-dtype fp8_e5m2`** and you get the full 262K context working with verify-stress 7/7 PASS including 91K needles. Validated 2026-05-04 by [@efschu](https://github.com/noonghunna/club-3090/issues/47) on 2× 3080 modded 20 GB at 0.82 mem-util: bench 82.4 narr / 107.9 code TPS, full 257K-token auto-discovery needle PASS at 90% depth. Trade-off: fp8 KV is roomier per cached token but each token's KV state is larger, so concurrency at full ctx drops vs TQ3. Single-stream long-ctx works cleanly.
 
@@ -73,15 +77,15 @@ The shipped composes carry **Ampere-safe defaults** (fp8_e5m2 KV etc.). Since [#
 | Detected class | What the launchers do |
 |---|---|
 | **ampere** (sm_8.6/8.7) | Nothing — compose defaults apply, byte-for-byte pre-#246 behavior |
-| **ada** (sm_8.9) / **hopper** (sm_9.x) / **blackwell** (sm_10+) | Export `KV_CACHE_DTYPE=fp8_e4m3` for the **pilot slugs** — a **better-precision** FP8 KV format. NB: it's storage-only (≡e5m2 in speed) on consumer cards; native FP8 *attention* is Hopper/datacenter-only. See [DTYPE_MATRIX](DTYPE_MATRIX.md#having-the-tensor-cores--using-them-the-two-axes-that-decide-real-behavior) |
+| **ada** (sm_8.9) / **hopper** (sm_9.x) / **blackwell** (sm_10+) | Nothing — see below. This row used to read "Export `KV_CACHE_DTYPE=fp8_e4m3` for the pilot slugs"; that injection was **retired in [#1371](https://github.com/noonghunna/club-3090/issues/1371)** and had in fact been inert on every card for months before that. e4m3 is storage-only (≡e5m2 in speed) on consumer cards anyway; native FP8 *attention* is Hopper/datacenter-only. See [DTYPE_MATRIX](DTYPE_MATRIX.md#having-the-tensor-cores--using-them-the-two-axes-that-decide-real-behavior) |
 | unknown / heterogeneous mix / no nvidia-smi | Nothing — compose defaults apply |
 
 Mechanics and boundaries:
 
-- **Pilot slugs only**: `vllm/dual`, `vllm/minimal` — the two Qwen fp8-KV reference configs. Expansion to the rest of the catalog is gated on the cross-rig A/B in #246 (≥15% on either canonical prompt on a volunteer 4090/5090; within CV → the injection framework gets closed out instead).
-- **The injected value comes from the hardware profiles** (`scripts/lib/profiles/hardware/<card>.yml` → `kv_format_default.balanced`) — one source of truth shared with the pull gates and c3. 3090-class profiles declare `fp8_e5m2` there, which equals the compose default: the Ampere no-op is data, not a code branch.
-- **Your env wins**: an explicit `KV_CACHE_DTYPE=…` before `launch.sh`/`switch.sh` suppresses the injection entirely.
-- **Quant-specific KV slugs are never touched** — int8-PTH (compressed-tensors weights *reject* fp8 KV), TurboQuant, and bf16 configs keep their registry KV format.
+- ⚠️ **There is no KV-dtype injection any more.** #246 Phase 1 upgraded the pilot slugs (`vllm/dual`, `vllm/minimal`) from `fp8_e5m2` to `fp8_e4m3` on cards whose profile preferred e4m3. The composes then migrated to `fp8_e4m3` outright, which left **zero slugs declaring the source format** — so the injector returned nothing on every card, for months, while this page said otherwise. Retired in [#1371](https://github.com/noonghunna/club-3090/issues/1371).
+- **What decides fp8_e4m3 KV is the attention backend, not the card.** fp8-weights / nvfp4 / bf16 / qwen3-next checkpoints route to FlashInfer, which does native fp8 storage on sm_86; gemma-style W4A16 routes to Triton, whose fp8e4nv path needs SM89+ and fails at KV-init on Ampere. That rule lives in `compat.py`'s C5 gate, and it is why the Ampere hardware profiles deliberately **omit** `fp8_e4m3` from `supported_kv_formats` — it keeps gemma correctly rejected. See [DTYPE_MATRIX](DTYPE_MATRIX.md).
+- **Your env still wins, and always did**: `KV_CACHE_DTYPE=…` is read by the composes as `${KV_CACHE_DTYPE:-…}` and interpolated by docker. It never travelled through the launcher, so nothing about that path changed.
+- **Quant-specific KV slugs keep their registry format** — int8-PTH (compressed-tensors weights *reject* fp8 KV), TurboQuant and bf16 configs.
 - **Direct `docker compose -f … up` bypasses all of this** and keeps the Ampere-safe compose defaults on any card.
 - The preflight banner names the detected class: `[preflight] arch: ada (sm_8.9) — arch-aware KV defaults active for pilot slugs (#246)`.
 - `VLLM_ATTENTION_BACKEND` is plumbed through the same channel but **ships no value** — vLLM's backend auto-detect is the default until someone measures a better per-arch choice.
@@ -129,7 +133,7 @@ then `bash scripts/launch.sh --gpus 1,2` as normal (the composes pass `CUDA_VISI
 
 - 3090s have an NVLink connector but a **bridge has to be physically installed**. Most consumer setups don't have one. (Cost: ~$70-150 for a working 3-slot bridge if you wanted to add one.)
 - **Auto-detection**: each dual compose sources `scripts/detect_nvlink.sh` in its entrypoint at boot. The script checks `nvidia-smi topo -m` and sets the correct NCCL env vars + vLLM flags.
-- **Override**: set `NVLINK_MODE=force_on|force_off` in your `.env` to bypass auto-detection.
+- **Override**: set `NVLINK_MODE=force_on|force_off` to bypass auto-detection — for one launch in the shell, or saved for every launch with `bash scripts/settings.sh set NVLINK_MODE=force_off` (see [where settings live](FAQ.md#where-are-my-settings-saved-and-how-do-i-change-one)).
 - Without NVLink (PCIe), `--disable-custom-all-reduce` is passed to vLLM and `NCCL_P2P_DISABLE=1` is set. With NVLink, custom all-reduce is enabled and NCCL uses the NVLink path.
 - **If you have NVLink installed and working**, single-stream TPS on dual-card will be ~1.6-1.8× single-card (vs ~1.05× without). Measured NVLink lift is ~10-15% over PCIe on the same rig. See [BENCHMARKS.md](../BENCHMARKS.md) for cross-rig data.
 - **No NVLink?** You can still enable GPU↔GPU P2P over the PCIe bus on a patched driver for a workload-dependent gain — and learn why `nvidia-smi topo -m` reports `PHB` instead of `PIX` — in [PCIE_P2P.md](PCIE_P2P.md).
@@ -523,7 +527,7 @@ Reported + diagnosed by [@mgabor3141](https://github.com/noonghunna/club-3090/is
 
 WSL2's container CUDA context consumes **~1.31 GiB before vLLM's profiler runs** — the Windows display driver, CUDA runtime, and WDDM overhead reserve memory that's invisible to `nvidia-smi --query-gpu=memory.used` at idle but locked in once the container starts.
 
-This means the shipped `gpu_memory_utilization` defaults (0.92 for single, 0.95 for `long-text.yml`) crash before model load with `ValueError: gpu_memory_utilization too high`. Cross-rig validated by [@easel on 2× WSL2 5090 Laptop machines](https://github.com/noonghunna/club-3090/issues/102#issuecomment-4414111137):
+This means any shipped compose whose `gpu_memory_utilization` default is above ~0.94 (about a third of the vLLM composes default to 0.95) crashes before model load with `ValueError: gpu_memory_utilization too high`. Cross-rig validated by [@easel on 2× WSL2 5090 Laptop machines](https://github.com/noonghunna/club-3090/issues/102#issuecomment-4414111137):
 
 | `gpu_memory_utilization` | 24 GB card | Result |
 |---|---|---|
@@ -533,7 +537,7 @@ This means the shipped `gpu_memory_utilization` defaults (0.92 for single, 0.95 
 
 **Formula**: `safe_util = (vram_total_gib - 1.31) / vram_total_gib`. On 24 GB cards that's 0.945. The overhead is variable (idle reports as low as ~300 MiB) but the upper bound is consistent across rigs.
 
-**Recommendation**: drop `GPU_MEMORY_UTILIZATION=0.94` in your `.env` when running on WSL2. The shipped composes' defaults (0.92 / 0.95) are calibrated for headless Linux and can crash on WSL2 at the higher value.
+**Recommendation**: on WSL2, launch a compose whose default is above 0.94 with `GPU_MEMORY_UTILIZATION=0.94 bash scripts/switch.sh <slug>`. The shipped composes' defaults (mostly 0.92 or 0.95) are calibrated for headless Linux, and the higher ones can crash on WSL2. Set it per launch rather than saving it: a saved `GPU_MEMORY_UTILIZATION` applies to every vLLM compose, including the many that default lower, and would raise them.
 
 ### TDR — kernel-timeout watchdog
 
@@ -582,19 +586,19 @@ Setting `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False` resolves the crash. 
 
 Known occurrences:
 
-- JusefPol — NVLink-wired dual-3090 setups (PR #31). NVLink rigs can hit this; set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False` in `.env` (the dual composes default it on; the old `dual-nvlink*.yml` variants are retired — NVLink is auto-detected at boot via `NVLINK_MODE`).
+- JusefPol — NVLink-wired dual-3090 setups (PR #31). NVLink rigs can hit this; save `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False` as a setting (see Override below; the dual composes default it on; the old `dual-nvlink*.yml` variants are retired — NVLink is auto-detected at boot via `NVLINK_MODE`).
 - club-3090 issue (this PR, 2026-05-06) — single-card RTX 3090 Ti on WSL2, driver 596.36, vLLM nightly `01d4d1ad` (the v7.72.2-uplift pin).
 
 #### Override
 
-All single-card and PCIe dual-card composes now expose `PYTORCH_CUDA_ALLOC_CONF` as a `${...}` override knob. Drop a `.env` next to the compose file (or export the var in your shell):
+All single-card and PCIe dual-card composes now expose `PYTORCH_CUDA_ALLOC_CONF` as a `${...}` override knob. On WSL2, `setup.sh` saves `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False` to your [settings](FAQ.md#where-are-my-settings-saved-and-how-do-i-change-one) for you, unless `PYTORCH_CUDA_ALLOC_CONF` is already set. Anywhere else, set it yourself:
 
 ```sh
-# models/qwen3.6-27b/vllm/compose/.env
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False
+bash scripts/settings.sh set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False           # every vLLM launch
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False bash scripts/switch.sh <slug>          # one launch
 ```
 
-Then `docker compose up -d` as usual. No edits to tracked files needed.
+No edits to tracked files needed. Older versions of this page said to put it in `models/qwen3.6-27b/vllm/compose/.env`. Nothing reads that file: docker compose looks for `.env` only in the compose file's own directory (`<topology>/<quant>/`). If you have one, move its lines into your settings and delete it.
 
 #### Possible secondary effect on weight-load time
 
@@ -606,31 +610,31 @@ A third runtime failure mode separate from TDR + `expandable_segments`: at ~50-6
 
 **Workaround**: pass `--enforce-eager` to vLLM, which disables CUDA graphs and frees the activation memory the cliff was contesting. Tradeoff: ~20-30% TPS reduction in exchange for stable long-context behavior.
 
-Since 2026-05-07 ([PR #99](https://github.com/noonghunna/club-3090/pull/99) by @easel) all qwen3.6-27b vLLM composes expose `VLLM_ENFORCE_EAGER` as an env-var hook so you can enable the flag from gitignored `.env` instead of editing tracked files:
+Since 2026-05-07 ([PR #99](https://github.com/noonghunna/club-3090/pull/99) by @easel) all qwen3.6-27b vLLM composes expose `VLLM_ENFORCE_EAGER` as an env-var hook so you can enable the flag without editing tracked files:
 
 ```sh
-# models/qwen3.6-27b/vllm/compose/.env
-VLLM_ENFORCE_EAGER=1
+VLLM_ENFORCE_EAGER=1 bash scripts/switch.sh <slug>      # one launch
+bash scripts/settings.sh set VLLM_ENFORCE_EAGER=1       # every vLLM launch, each paying the TPS cost
 ```
 
-Then `docker compose up -d` as usual. The bash entrypoint expands `${VLLM_ENFORCE_EAGER:+--enforce-eager}` only when the var is non-empty, so desktop users with no `.env` see zero behavior change.
+The bash entrypoint expands `${VLLM_ENFORCE_EAGER:+--enforce-eager}` only when the var is non-empty, so leaving it unset changes nothing. Any non-empty value turns it on, `0` included; `bash scripts/settings.sh unset VLLM_ENFORCE_EAGER` removes a saved one.
 
-### Combined WSL2 / laptop `.env` template
+### Combined WSL2 / laptop settings
 
-Three overrides commonly land together on WSL2 / laptop rigs (5090 Laptop validated 2026-05-07 by @easel). Drop this into `models/qwen3.6-27b/vllm/compose/.env`:
+Three overrides commonly land together on WSL2 / laptop rigs (5090 Laptop validated 2026-05-07 by @easel):
 
 ```sh
-# WSL2 boot overhead caps safe gpu_memory_utilization at ~0.94 (vs 0.95 desktop default)
-GPU_MEMORY_UTILIZATION=0.94
+# expandable_segments:True crashes weight repack on WSL2 driver 596.36.
+# Saved: applies to every vLLM launch (setup.sh already saves expandable_segments:False on WSL2)
+bash scripts/settings.sh set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False,max_split_size_mb:512
 
-# expandable_segments:True crashes weight repack on WSL2 driver 596.36
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False,max_split_size_mb:512
-
-# Disable CUDA graphs — Cliff 2 GDN-spike workaround (~20-30% TPS cost, stable >50K ctx)
-VLLM_ENFORCE_EAGER=1
+# WSL2 boot overhead caps safe gpu_memory_utilization at ~0.94 (only matters for a compose
+# whose default is higher); eager disables CUDA graphs — the Cliff 2 GDN-spike workaround
+# (~20-30% TPS cost, stable >50K ctx). Per launch:
+GPU_MEMORY_UTILIZATION=0.94 VLLM_ENFORCE_EAGER=1 bash scripts/switch.sh <slug>
 ```
 
-All three are `${VAR}`-interpolated by docker-compose at boot, so adding/removing any of them needs only an `.env` edit + recreate.
+All three are read when the container is created, so a change takes effect at the next launch. Older versions of this page put all three in `models/qwen3.6-27b/vllm/compose/.env`, which nothing reads (see Override above).
 
 ### Additional WSL2 considerations
 

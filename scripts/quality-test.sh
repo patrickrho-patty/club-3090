@@ -127,17 +127,54 @@ OPTIONS (extra)
                    --reasoning suite). Mutually exclusive with --enable-thinking.
                    Use for a clean all-off arm of a reasoning A/B. Also
                    settable via NO_THINKING=1 env.
+                   All four degrade gracefully: across 150 saved hermesagent-20
+                   entries the off arm medians 11/20 vs 12/20 on, i.e. ~1-2
+                   scenarios of 20 (#1269). A pack that comes back 0/N is a
+                   structural failure, not a thinking-off score — the
+                   structural-zero guard drops it out of the reported TOTAL
+                   whatever the cause (#1270).
   --thinking-max-tokens N
-                   Forward to benchlocal-cli --thinking-max-tokens N. The
-                   budget applies only to packs whose thinking gate resolves on
-                   (pack default or --enable-thinking). Also settable via
-                   THINKING_MAX_TOKENS env.
-  --max-tokens N   Forward to benchlocal-cli --max-tokens N — overrides the
-                   per-pack completion budget (~1024 default) for BOTH arms.
-                   Use when a verbose model truncates the deterministic packs
-                   (finish_reason=length) before emitting its final answer; the
-                   thinking arm still uses --thinking-max-tokens if that is set.
-                   Also settable via MAX_TOKENS env.
+                   Completion budget for packs whose thinking gate resolves on
+                   (pack default or --enable-thinking). Default 16384, sent
+                   explicitly: benchlocal-cli would otherwise give thinking packs
+                   the --max-tokens value. Also settable via THINKING_MAX_TOKENS.
+  --max-tokens N   Completion budget for BOTH arms. Default 4096 — benchlocal's
+                   per-pack ~1024 cuts long answers off into token_limit
+                   failures that read as wrong answers (docs/RUN_EVALS.md).
+                   Per-scenario timeouts scale with it on their own. Also
+                   settable via MAX_TOKENS env.
+  --pack-budgets   Use benchlocal-cli's own per-pack budgets (~1024 tokens,
+                   300s model turns, 300s hermes episode) instead of the
+                   wrapper's defaults — to compare with results taken that way.
+                   Also settable via PACK_BUDGETS=1.
+  --thinking-budget N
+                   OPT-IN (never a default — every published BENCHMARKS row
+                   was measured unbounded). Bound the model's REASONING to N
+                   tokens in whatever spelling the serving engine uses, and
+                   VERIFY it can take effect before running — refusing with
+                   the fix when it cannot (#1383):
+                     llama.cpp  boot flag --reasoning-budget N — the running
+                                server must already carry EXACTLY N (the
+                                shipped composes read REASONING_BUDGET=N);
+                                a present-but-unset flag boots -1 = unbounded
+                     vLLM       per-request thinking_token_budget; needs the
+                                server booted with --reasoning-parser
+                     SGLang     per-request custom_logit_processor +
+                                custom_params.thinking_budget; needs the
+                                server booted with --enable-custom-logit-processor
+                   Also derives the matching client cap: --thinking-max-tokens
+                   = N + THINKING_BUDGET_HEADROOM (default 4096) unless you set
+                   one above N. A reasoning cap alone RELOCATES the overrun
+                   into content (measured: 8192 budget, no total cap → one
+                   request still reached 13,238 tokens).
+                   Checked PER PACK CLASS: on vLLM/SGLang the selection may
+                   not include hermesagent-20 / aider-polyglot-30 — their
+                   agent runs inside the sandbox and makes its own model
+                   calls, which a per-request budget never reaches. On
+                   llama.cpp the boot flag governs them for free.
+                   Also settable via THINKING_BUDGET env. Verification is
+                   docker-inspect / server-readback based; when NO evidence is
+                   available it refuses unless THINKING_BUDGET_UNVERIFIED=1.
   --retry-runaways
                    Forward to benchlocal-cli --retry-runaways: ALSO retry
                    timeout / token_limit runaway failures. **Default OFF** —
@@ -191,12 +228,34 @@ ENV VARS
                   --enable-thinking) in one invocation. --both-modes is
                   equivalent.
   THINKING_MAX_TOKENS
-                   Optional thinking budget passed through to benchlocal-cli.
-                   Applies only to packs whose thinking gate resolves on.
-  MAX_TOKENS       Optional completion budget passed through to benchlocal-cli
-                   (--max-tokens) for BOTH arms — overrides the per-pack ~1024
-                   default. Raise for verbose models that self-truncate the
-                   deterministic packs. --max-tokens is equivalent.
+                   Completion budget for thinking-enabled packs (default 16384).
+                   --thinking-max-tokens is equivalent.
+  MAX_TOKENS       Completion budget for BOTH arms (default 4096).
+                   --max-tokens is equivalent.
+  PACK_BUDGETS     Set to 1 for benchlocal-cli's own per-pack budgets instead
+                   of the defaults above. --pack-budgets is equivalent.
+  BENCHLOCAL_MODEL_TURN_TIMEOUT
+                   Cap on one runner-owned sandbox model call (cli-40,
+                   bugfind-15). Default 900s here (benchlocal's 300s cannot fit
+                   a 16384-token answer below ~55 tok/s).
+  BENCHLOCAL_HERMES_SUBPROCESS_TIMEOUT_S
+                   The hermes agent's per-scenario episode cap. Default 600s
+                   here (benchlocal's 300s). Unlike the other packs' timeouts it
+                   does not scale with the token budget.
+  THINKING_BUDGET  Equivalent to --thinking-budget N (opt-in reasoning budget,
+                   verified per engine and per pack class).
+  THINKING_BUDGET_HEADROOM
+                   Answer tokens added to the budget when deriving
+                   --thinking-max-tokens (default 4096).
+  THINKING_BUDGET_UNVERIFIED
+                   Set to 1 to run --thinking-budget when NO evidence about the
+                   server is available (no container, no readback). Positive
+                   evidence that the budget would not take effect is never
+                   bypassed. The run is labelled unverified.
+  THINKING_BUDGET_SGLANG_PROCESSOR
+                   SGLang only: the ThinkingBudgetLogitProcessor subclass to
+                   send when the server's reasoning parser is not one the
+                   wrapper maps (qwen3 / qwen3-thinking / glm45 / deepseek-r1).
 
 EXAMPLES
   bash scripts/quality-test.sh                          # --medium against running compose
@@ -209,6 +268,10 @@ EXAMPLES
   bash scripts/quality-test.sh --full --no-thinking -- --retry-runaways --strict-thinking
                                        # 8-pack, pass benchlocal-cli flags the wrapper
                                        # doesn't name (everything after `--`)
+  REASONING_BUDGET=8192 bash scripts/switch.sh --force <llama.cpp slug>   # boot with the budget
+  bash scripts/quality-test.sh --full --enable-thinking --thinking-budget 8192
+                                       # bounded thinking-on 8-pack: verifies the
+                                       # server carries 8192, caps at 12288 total
 
 INSTALL benchlocal-cli (one-time)
   pip install git+https://github.com/noonghunna/benchlocal-cli.git
@@ -218,6 +281,12 @@ INSTALL benchlocal-cli (one-time)
 OUTPUT
   - Markdown table to stdout (paste-ready for BENCHMARKS quality rows)
   - JSON blob to results/quality/quality-<timestamp>.json (full detail)
+  - STRUCTURAL-ZERO GUARD block when ANY pack scored 0/N (#1270): both TOTALs
+    (valid subset + all packs, the latter marked "do not cite") plus the zeroed
+    pack's p50 as corroboration. Cause-agnostic and post-hoc — it reports the
+    outcome and lists candidate causes, it does not guess one; the per-rig
+    quality record is not published for such a run. A verifier_fail row is the
+    MODEL being wrong and keeps counting — only a WHOLE pack at 0/N trips it.
   - Compact one-liner for the compose `Quality:` profile field, stamped with
     per-pack versions and run provenance (#981/#983E)
 
@@ -290,6 +359,10 @@ NO_THINKING="${NO_THINKING:-0}"
 REASONING_EFFORT="${REASONING_EFFORT:-}"
 THINKING_MAX_TOKENS="${THINKING_MAX_TOKENS:-}"
 MAX_TOKENS="${MAX_TOKENS:-}"
+PACK_BUDGETS="${PACK_BUDGETS:-0}"
+# #1383: opt-in reasoning budget, resolved per engine and VERIFIED before the
+# run. Empty = no budget = the unbounded baseline every published row used.
+THINKING_BUDGET="${THINKING_BUDGET:-}"
 # #252: passthroughs to benchlocal-cli for the quality-baseline corpus —
 # --repeat (n>=3 aggregate), --previous-result (diff vs a baseline), and a
 # --save-json override (write the run to an explicit path, e.g. a baseline file).
@@ -431,6 +504,20 @@ while [[ $# -gt 0 ]]; do
       fi
       shift 2
       ;;
+    --pack-budgets)
+      PACK_BUDGETS=1
+      shift
+      ;;
+    --thinking-budget)
+      THINKING_BUDGET="${2:-}"
+      # ≥ 1: 0 is "no reasoning", which is --no-thinking's job, and llama.cpp's
+      # -1 is "unbounded", which is the default this flag exists to leave.
+      if [[ -z "$THINKING_BUDGET" ]] || ! [[ "$THINKING_BUDGET" =~ ^[1-9][0-9]*$ ]]; then
+        echo "✗ --thinking-budget requires a positive integer (reasoning tokens)" >&2
+        exit 2
+      fi
+      shift 2
+      ;;
     --repeat)
       REPEAT="${2:-}"
       if [[ -z "$REPEAT" ]] || ! [[ "$REPEAT" =~ ^[0-9]+$ ]]; then
@@ -562,6 +649,7 @@ if [[ -n "$RESUME" ]]; then
   if [[ "$ENABLE_THINKING" == "1" ]]; then _resume_conflicts+=(--enable-thinking); fi
   if [[ "$NO_THINKING" == "1" ]]; then _resume_conflicts+=(--no-thinking); fi
   if [[ -n "$THINKING_MAX_TOKENS" ]]; then _resume_conflicts+=(--thinking-max-tokens); fi
+  if [[ -n "$THINKING_BUDGET" ]]; then _resume_conflicts+=(--thinking-budget); fi
   if [[ -n "$MAX_TOKENS" ]]; then _resume_conflicts+=(--max-tokens); fi
   if [[ "$SAMPLING_FROM_SERVER" == "1" ]]; then _resume_conflicts+=(--sampling-from-server); fi
   if [[ ${#_resume_conflicts[@]} -gt 0 ]]; then
@@ -668,9 +756,8 @@ fi
 #                    case: /v1/models returns the first registered model (often
 #                    the wrong one), and clobbering the user's choice routes the
 #                    whole run at the wrong model (see disc #152, @ampersandru).
-DETECTED_MODEL=$(curl -sf -m 5 "${URL}/v1/models" 2>/dev/null \
-  | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['data'][0]['id'])" 2>/dev/null \
-  || echo "")
+source "${ROOT_DIR}/scripts/lib/served-model.sh"   # #1360: TabbyAPI-aware served id
+DETECTED_MODEL="$(club_served_model_id "${URL}")"
 if [[ -n "$DETECTED_MODEL" && "$DETECTED_MODEL" != "$MODEL" ]]; then
   if [[ "$MODEL_EXPLICIT" == "1" ]]; then
     echo "[quality-test] NOTE: endpoint /v1/models reports '${DETECTED_MODEL}', but you set MODEL='${MODEL}' — using YOUR value." >&2
@@ -722,7 +809,24 @@ sys.exit(0 if walk(obj) else 1)
      && command -v docker >/dev/null 2>&1 \
      && docker inspect "$CONTAINER" >/dev/null 2>&1; then
     docker inspect "$CONTAINER" 2>/dev/null \
-      | grep -Eq -- '(--reasoning[= ]+on|"--reasoning"[[:space:]]*,[[:space:]]*"on")' && return 0
+      | command grep -Eq -- '(--reasoning[= ]+on|"--reasoning"[[:space:]]*,[[:space:]]*"on")' && return 0
+    # SGLang spells it --reasoning-parser <name>; vLLM spells it --reasoning-parser too.
+    docker inspect "$CONTAINER" 2>/dev/null \
+      | command grep -Eq -- '--reasoning-parser' && return 0
+  fi
+  # SGLang has no /props, so the probe above cannot see it. /get_model_info carries
+  # reasoning_parser; a non-null value means the server splits <think> into
+  # reasoning_content, i.e. reasoning parsing IS on. Without this the mismatch warning
+  # never fired on SGLang — and an unforced leg silently inherits the pack defaults,
+  # which is the "no-thinking leg is really a second thinking leg" trap.
+  if curl -sf -m 3 "${URL}/get_model_info" 2>/dev/null | python3 -c '
+import json, sys
+try: d = json.load(sys.stdin)
+except Exception: sys.exit(1)
+rp = d.get("reasoning_parser")
+sys.exit(0 if rp else 1)
+' >/dev/null 2>&1; then
+    return 0
   fi
   return 1
 }
@@ -750,6 +854,145 @@ if [[ ${#SCENARIOS[@]} -gt 0 || -n "$SCENARIOS_FILE" ]]; then
   fi
 fi
 
+# ---- #1383: --thinking-budget — resolve the engine's spelling, then VERIFY ----
+# OPT-IN, never a default: every published BENCHMARKS row was measured
+# unbounded, and a default would silently break comparability with all of them.
+#
+# Verification IS the feature. llama.cpp's budget is a boot flag the harness
+# cannot set per request — and the shipped composes always emit
+# `--reasoning-budget "${REASONING_BUDGET:--1}"`, so the flag being PRESENT
+# proves nothing; only its resolved VALUE does. vLLM v0.29.0 and SGLang v0.5.20
+# reject the per-request field outright when their prerequisite is missing, so
+# an unverified run would 400 on every scenario. Either way the run is not
+# what it claims to be, so the wrapper reads the evidence first and refuses
+# with the fix when it does not hold. Mechanism, evidence rules and the
+# per-engine request shapes: scripts/lib/thinking-budget.sh.
+THINKING_BUDGET_EXTRA_BODY=""
+THINKING_MAX_TOKENS_DERIVED=0
+if [[ -n "$THINKING_BUDGET" ]]; then
+  # shellcheck source=lib/thinking-budget.sh
+  source "${ROOT_DIR}/scripts/lib/thinking-budget.sh"
+  _tb_kind="$(thinking_budget_engine_kind)"
+  if [[ "$_tb_kind" == "unknown" ]]; then
+    echo "✗ --thinking-budget ${THINKING_BUDGET}: cannot tell which engine family is serving ${URL} (container='${CONTAINER:-unset}')" >&2
+    echo "  The budget's spelling AND its verification are per engine, so an unknown engine is a refusal, not a guess." >&2
+    thinking_budget_fix_hint unknown "$THINKING_BUDGET" >&2
+    exit 2
+  fi
+  _tb_rc=0
+  thinking_budget_verify "$_tb_kind" "$THINKING_BUDGET" || _tb_rc=$?
+  case "$_tb_rc" in
+    0) ;;
+    1)
+      echo "✗ --thinking-budget ${THINKING_BUDGET}: the budget would NOT take effect on this ${_tb_kind} server — refusing to run something that would only LOOK bounded" >&2
+      echo "  Evidence: ${THINKING_BUDGET_EVIDENCE}" >&2
+      thinking_budget_fix_hint "$_tb_kind" "$THINKING_BUDGET" >&2
+      exit 2
+      ;;
+    *)
+      if [[ "${THINKING_BUDGET_UNVERIFIED:-0}" == "1" ]]; then
+        echo "[quality-test] ⚠  THINKING BUDGET UNVERIFIED (THINKING_BUDGET_UNVERIFIED=1): ${THINKING_BUDGET_EVIDENCE}" >&2
+        echo "               Proceeding on your word that this ${_tb_kind} server carries its prerequisite. If it does not," >&2
+        echo "               the run is unbounded or every scenario fails, and nothing downstream will say which." >&2
+        THINKING_BUDGET_EVIDENCE="UNVERIFIED — asserted by the operator via THINKING_BUDGET_UNVERIFIED=1"
+      else
+        echo "✗ --thinking-budget ${THINKING_BUDGET}: cannot verify the budget can take effect on this ${_tb_kind} server" >&2
+        echo "  ${THINKING_BUDGET_EVIDENCE}" >&2
+        echo "  A budget that is accepted and ignored is worse than none — success would be indistinguishable from failure." >&2
+        echo "  Point the harness at the serving container (CONTAINER=<name>); or, if you KNOW the server carries the" >&2
+        echo "  prerequisite, say so explicitly with THINKING_BUDGET_UNVERIFIED=1 (the run is then labelled unverified)." >&2
+        thinking_budget_fix_hint "$_tb_kind" "$THINKING_BUDGET" >&2
+        exit 2
+      fi
+      ;;
+  esac
+
+  # Pack class 2 — the sandboxed AGENTIC packs. Their model calls are made by
+  # an agent INSIDE the sandbox container, not by benchlocal's runner. A
+  # server-wide budget (llama.cpp) governs those calls for free; a per-request
+  # budget (vLLM/SGLang) never reaches them — the sandbox protocol forwards
+  # sampling and the token cap, not extra_body — so they would run UNBOUNDED
+  # while every other pack was bounded. That is exactly the silent partial this
+  # flag exists to prevent, so it is a refusal, not a footnote.
+  _tb_agentic=()
+  if [[ "$SANDBOXED_ONLY" == "1" ]]; then
+    _tb_agentic+=(hermesagent-20)
+  elif [[ -n "$PACK" ]]; then
+    for _p in $THINKING_BUDGET_AGENTIC_PACKS; do
+      if [[ "$PACK" == "$_p" ]]; then _tb_agentic+=("$_p"); fi
+    done
+  elif [[ -n "${_sel_lines:-}" ]]; then
+    for _p in $THINKING_BUDGET_AGENTIC_PACKS; do
+      if command grep -qE "^${_p}/" <<<"$_sel_lines"; then _tb_agentic+=("$_p"); fi
+    done
+  elif [[ "$MODE" == "--full" && "$NO_SANDBOX" != "1" ]]; then
+    _tb_agentic+=(hermesagent-20)
+  fi
+  if [[ ${#_tb_agentic[@]} -gt 0 && "$_tb_kind" != "llamacpp" ]]; then
+    echo "✗ --thinking-budget on ${_tb_kind}: the selection includes ${_tb_agentic[*]}, whose model calls are made by an agent INSIDE the sandbox" >&2
+    echo "  A per-request ${_tb_kind} budget does not cross the sandbox protocol, so those packs would run UNBOUNDED while" >&2
+    echo "  every other pack was bounded — a silently partial run. Options: drop them (--no-sandboxed, or --pack <id> per" >&2
+    echo "  pack), or serve on llama.cpp, where --reasoning-budget is a server property that governs every caller." >&2
+    exit 2
+  fi
+
+  # Matched client-side cap. A reasoning cap alone RELOCATES the overrun:
+  # measured with --reasoning-budget 8192 and no total cap, one request still
+  # reached 13,238 tokens — reasoning stopped at 8192 and the model rambled on
+  # in content instead. --thinking-max-tokens overrides --max-tokens on
+  # thinking-enabled packs, so it is the cap that has to move.
+  _tb_headroom="${THINKING_BUDGET_HEADROOM:-4096}"
+  if ! [[ "$_tb_headroom" =~ ^[1-9][0-9]*$ ]]; then
+    echo "✗ THINKING_BUDGET_HEADROOM must be a positive integer (answer tokens after the reasoning budget), got '${_tb_headroom}'" >&2
+    exit 2
+  fi
+  if [[ -z "$THINKING_MAX_TOKENS" ]]; then
+    THINKING_MAX_TOKENS=$(( THINKING_BUDGET + _tb_headroom ))
+    THINKING_MAX_TOKENS_DERIVED=1
+  elif [[ "$THINKING_MAX_TOKENS" -le "$THINKING_BUDGET" ]]; then
+    echo "✗ --thinking-max-tokens ${THINKING_MAX_TOKENS} is not above --thinking-budget ${THINKING_BUDGET}: the answer would have no" >&2
+    echo "  headroom after the reasoning budget, so every budget-exhausted scenario is a token_limit with no answer." >&2
+    echo "  Drop --thinking-max-tokens to derive it (budget + THINKING_BUDGET_HEADROOM, default 4096), or set it above the budget." >&2
+    exit 2
+  fi
+
+  _tb_proc=""
+  if [[ "$_tb_kind" == "sglang" ]]; then
+    _tb_proc="${THINKING_BUDGET_SGLANG_PROCESSOR:-$(thinking_budget_sglang_processor "$THINKING_BUDGET_REASONING_PARSER")}"
+    if [[ -z "$_tb_proc" ]]; then
+      echo "✗ --thinking-budget on SGLang: no ThinkingBudgetLogitProcessor is known for reasoning_parser='${THINKING_BUDGET_REASONING_PARSER}'" >&2
+      echo "  Mapped: qwen3 / qwen3-thinking / glm45 / deepseek-r1. If this model's think-token ids match one of SGLang's" >&2
+      echo "  subclasses, name it: THINKING_BUDGET_SGLANG_PROCESSOR=<subclass>." >&2
+      exit 2
+    fi
+  fi
+  if [[ "$_tb_kind" != "llamacpp" ]]; then
+    THINKING_BUDGET_EXTRA_BODY="$(thinking_budget_extra_body "$_tb_kind" "$THINKING_BUDGET" "$_tb_proc")"
+  fi
+
+  case "$_tb_kind" in
+    llamacpp) _tb_mech="llama.cpp --reasoning-budget (boot flag, server-wide)" ;;
+    vllm)     _tb_mech="vLLM per-request thinking_token_budget" ;;
+    sglang)   _tb_mech="SGLang per-request custom_logit_processor=${_tb_proc} + custom_params.thinking_budget" ;;
+    *)        _tb_mech="$_tb_kind" ;;
+  esac
+  echo "[quality-test] thinking budget: ${THINKING_BUDGET} reasoning tokens via ${_tb_mech}"
+  echo "[quality-test]   verified: ${THINKING_BUDGET_EVIDENCE}"
+  if [[ "$THINKING_MAX_TOKENS_DERIVED" == "1" ]]; then
+    echo "[quality-test]   client cap: --thinking-max-tokens ${THINKING_MAX_TOKENS} (= ${THINKING_BUDGET} budget + ${_tb_headroom} answer headroom; a reasoning cap alone relocates the overrun into content)"
+  else
+    echo "[quality-test]   client cap: --thinking-max-tokens ${THINKING_MAX_TOKENS} (yours: ${THINKING_BUDGET} budget + $(( THINKING_MAX_TOKENS - THINKING_BUDGET )) answer headroom)"
+  fi
+  if [[ ${#_tb_agentic[@]} -gt 0 ]]; then
+    echo "[quality-test]   sandboxed agentic packs (${_tb_agentic[*]}): governed — the budget is a property of the server, so the in-sandbox agent's own calls are bounded too"
+  else
+    echo "[quality-test]   sandboxed agentic packs: none in this selection"
+  fi
+  if [[ "$NO_THINKING" == "1" ]]; then
+    echo "[quality-test]   note: thinking is forced OFF on this leg — the budget is verified but inert until a thinking-on leg"
+  fi
+fi
+
 if { [[ -z "$PACK" ]] && { [[ "$MODE" == "--full" && "$NO_SANDBOX" != "1" ]] || [[ "$SANDBOXED_ONLY" == "1" ]]; }; } || [[ "$SELECTION_HAS_SANDBOX" == "1" && "$NO_SANDBOX" != "1" ]]; then
   _sb_missing=()
   _sb_stale=()
@@ -766,14 +1009,16 @@ if { [[ -z "$PACK" ]] && { [[ "$MODE" == "--full" && "$NO_SANDBOX" != "1" ]] || 
     # WITHOUT rewriting the console script, so the script mtime under-reports
     # "CLI last updated". Take max(script mtime, checkout last-commit time).
     if [[ -n "$_bl_bin" ]]; then
-      _bl_py="$(head -1 "$_bl_bin" 2>/dev/null | sed 's/^#!//')"
+      # Take only the interpreter path: pipx writes a two-token shebang
+      # (`#!/.../python -E`), and keeping the flag makes the -x test below fail.
+      _bl_py="$(head -1 "$_bl_bin" 2>/dev/null | sed 's/^#!//' | awk '{print $1}')"
       _bl_src_dir="$([[ -x "$_bl_py" ]] && "$_bl_py" -c 'import importlib.metadata as m, json
 try:
     d = json.loads(m.distribution("benchlocal-cli").read_text("direct_url.json") or "{}")
     u = d.get("url", "")
     print(u[7:] if (d.get("dir_info") or {}).get("editable") and u.startswith("file://") else "")
 except Exception:
-    pass' 2>/dev/null)"
+    pass' 2>/dev/null || true)"
       if [[ -n "$_bl_src_dir" && -d "$_bl_src_dir" ]]; then
         _bl_commit_ts="$(git -C "$_bl_src_dir" log -1 --format=%ct 2>/dev/null || echo 0)"
         [[ "$_bl_commit_ts" -gt "$_bl_mtime" ]] && _bl_mtime="$_bl_commit_ts"
@@ -897,6 +1142,42 @@ if [[ "${BENCHLOCAL_HERMES_RESOLVE_LOCALHOST:-}" == "1" && "$NO_SANDBOX" != "1" 
   fi
 fi
 
+# ---- budget defaults (docs/RUN_EVALS.md) -------------------------------------
+# benchlocal-cli's per-pack budgets (~1024 completion tokens, 300s per sandbox
+# model turn, 300s per hermes episode) cut long answers off into token_limit and
+# timeout rows that read as wrong answers. Every published recipe passed the
+# values below by hand, and a run that forgot them measured the budget rather
+# than the model, so they are the defaults here. Each fills only what nothing
+# set: a flag or env var wins, --pack-budgets keeps benchlocal's own, and
+# --resume keeps the saved run's.
+# --timeout-per-case is deliberately NOT defaulted (see TIMEOUT_PER_CASE_SET
+# above): left unset, benchlocal scales each scenario's clock with the token
+# budget and the rig's measured speed (benchlocal-cli #103), so 4096 tokens get
+# a longer clock on their own. A fixed value switches that scaling off, cuts the
+# thinking arm's clock, and lowers aider-polyglot-30's 1800s.
+BUDGETS_NOTE=""
+if [[ -z "$RESUME" ]]; then
+  if [[ "$PACK_BUDGETS" == "1" ]]; then
+    BUDGETS_NOTE="benchlocal per-pack (--pack-budgets)"
+  else
+    _bd_default=()
+    if [[ -z "$MAX_TOKENS" ]]; then MAX_TOKENS=4096; _bd_default+=(max-tokens); fi
+    # Explicit even though 16384 is benchlocal's own thinking default: once
+    # --max-tokens is set, benchlocal gives thinking packs THAT value instead.
+    if [[ -z "$THINKING_MAX_TOKENS" ]]; then THINKING_MAX_TOKENS=16384; _bd_default+=(thinking-max-tokens); fi
+    if [[ -z "${BENCHLOCAL_MODEL_TURN_TIMEOUT:-}" ]]; then
+      export BENCHLOCAL_MODEL_TURN_TIMEOUT=900; _bd_default+=(model-turn)
+    fi
+    if [[ -z "${BENCHLOCAL_HERMES_SUBPROCESS_TIMEOUT_S:-}" ]]; then
+      export BENCHLOCAL_HERMES_SUBPROCESS_TIMEOUT_S=600; _bd_default+=(hermes-episode)
+    fi
+    BUDGETS_NOTE="max ${MAX_TOKENS} · thinking ${THINKING_MAX_TOKENS} · model turn ${BENCHLOCAL_MODEL_TURN_TIMEOUT}s · hermes episode ${BENCHLOCAL_HERMES_SUBPROCESS_TIMEOUT_S}s"
+    if [[ ${#_bd_default[@]} -gt 0 ]]; then
+      BUDGETS_NOTE+=" (wrapper default: ${_bd_default[*]})"
+    fi
+  fi
+fi
+
 # ---- run benchlocal-cli ------------------------------------------------------
 
 RESULTS_DIR="${ROOT_DIR}/results/quality"
@@ -990,6 +1271,61 @@ if [[ "$SAMPLING_FROM_SERVER" == "1" ]]; then
   CLI_ARGS+=(--sampling-from-server)
   echo "[quality-test] sampling: inherited from server (non-canonical)"
 fi
+# ---- #1396: record the sampling in effect and the rig with the results --------
+# vLLM and SGLang expose no sampling-defaults endpoint and nothing recorded the
+# topology, so reports from different rigs could not be compared. run_context.py
+# reads what the engine APPLIES (its own startup log lines, not our flags) plus
+# the GPUs the container sees; benchlocal-cli stores them in the results JSON and
+# prints them on the header and the Results Card. The engine family comes from
+# engine-kind.sh (#1282). On --resume the journal already holds the first
+# session's values, so nothing is re-read. A user's own `-- --run-meta k=v` is
+# appended later and wins per key.
+if [[ -z "$RESUME" && -n "${CONTAINER:-}" && "${CONTAINER}" != "none" ]] \
+   && command -v docker >/dev/null 2>&1 && docker inspect "$CONTAINER" >/dev/null 2>&1; then
+  if benchlocal-cli run --help 2>/dev/null | command grep -q -- "--run-meta"; then
+    # shellcheck source=lib/engine-kind.sh
+    source "${ROOT_DIR}/scripts/lib/engine-kind.sh"
+    _rc_kind="$(engine_kind_from_container "$CONTAINER")"
+    if [[ "$_rc_kind" == "unknown" ]]; then
+      _rc_kind="$(engine_kind_from_image "$(docker inspect "$CONTAINER" --format '{{.Config.Image}}' 2>/dev/null || true)")"
+    fi
+    _rc_flags=(--engine "$_rc_kind" --container "$CONTAINER" --emit-args)
+    [[ "$SAMPLING_FROM_SERVER" == "1" ]] || _rc_flags+=(--no-server-defaults)
+    _rc_err="$(mktemp)"
+    _rc_args=()
+    _rc_rc=0
+    _rc_out="$(python3 "${ROOT_DIR}/scripts/lib/run_context.py" "${_rc_flags[@]}" 2>"$_rc_err")" || _rc_rc=$?
+    if [[ "$_rc_rc" == "0" ]]; then
+      [[ -n "$_rc_out" ]] && mapfile -t _rc_args <<<"$_rc_out"
+      CLI_ARGS+=("${_rc_args[@]+"${_rc_args[@]}"}")
+      _rc_rig=""; _rc_has_defaults=0; _rc_i=0
+      while [[ $_rc_i -lt ${#_rc_args[@]} ]]; do
+        case "${_rc_args[$_rc_i]}" in
+          --run-meta)        _rc_rig+="${_rc_rig:+ · }${_rc_args[$((_rc_i+1))]}" ;;
+          --server-defaults) _rc_has_defaults=1 ;;
+        esac
+        _rc_i=$((_rc_i+2))
+      done
+      echo "[quality-test] rig (${_rc_kind}): ${_rc_rig:-nothing resolved}"
+      if [[ "$SAMPLING_FROM_SERVER" == "1" ]]; then
+        if [[ "$_rc_has_defaults" == "1" ]]; then
+          echo "[quality-test] sampling: server defaults resolved from the ${_rc_kind} boot log (recorded with the results)"
+        elif [[ "$_rc_kind" != "llamacpp" ]]; then
+          echo "[quality-test] sampling: could not resolve the server's defaults from the boot log — the report will say 'not exposed'" >&2
+        fi
+      fi
+      command grep -E '^\[run-context\]' "$_rc_err" >&2 || true
+    else
+      echo "[quality-test] WARN: could not resolve the rig/sampling context (#1396); the report will lack it:" >&2
+      sed 's/^/[quality-test]   /' "$_rc_err" >&2
+    fi
+    rm -f "$_rc_err"
+  else
+    echo "[quality-test] WARN: this benchlocal-cli predates --run-meta/--server-defaults (#1396) — the report" >&2
+    echo "[quality-test]   will not record the rig or the server's sampling. Upgrade:" >&2
+    echo "[quality-test]   pip install --upgrade git+https://github.com/noonghunna/benchlocal-cli.git" >&2
+  fi
+fi
 if [[ "$ENABLE_THINKING" == "1" ]]; then
   CLI_ARGS+=(--enable-thinking)
   echo "[quality-test] thinking: enabled for every pack (non-canonical)"
@@ -1013,7 +1349,7 @@ fi
 #
 # ⚠️ The capability check below is the guard that matters: a benchlocal-cli older
 # than #131 fails SILENTLY on such a model — no error, just a null A/B.
-if ! benchlocal-cli run --help 2>/dev/null | grep -q -- "--reasoning-effort"; then
+if ! benchlocal-cli run --help 2>/dev/null | command grep -q -- "--reasoning-effort"; then
   echo "[quality-test] WARN: this benchlocal-cli predates the model-specific thinking fix (#131)." >&2
   echo "[quality-test]   On a model that does not use chat_template_kwargs.enable_thinking (e.g. an" >&2
   echo "[quality-test]   effort-dial model), --no-thinking and --enable-thinking are BOTH ignored and" >&2
@@ -1031,6 +1367,15 @@ fi
 if [[ -n "$MAX_TOKENS" ]]; then
   CLI_ARGS+=(--max-tokens "$MAX_TOKENS")
   echo "[quality-test] max tokens: $MAX_TOKENS (overrides the per-pack completion budget for both arms)"
+fi
+if [[ -n "$BUDGETS_NOTE" ]]; then
+  echo "[quality-test] budgets: ${BUDGETS_NOTE}"
+  # Recorded with the results: the JSON keeps no budget of its own, so a
+  # ~1024-token run and a 4096-token run would otherwise read the same later.
+  # A user's own `-- --run-meta budgets=…` comes later and wins.
+  if benchlocal-cli run --help 2>/dev/null | command grep -q -- "--run-meta"; then
+    CLI_ARGS+=(--run-meta "budgets=${BUDGETS_NOTE}")
+  fi
 fi
 if [[ -n "$API_KEY" ]]; then
   CLI_ARGS+=(--api-key "$API_KEY")
@@ -1053,6 +1398,55 @@ if [[ -n "$REPORT_OUT" ]]; then
   CLI_ARGS+=(--report-out "$REPORT_OUT")
   echo "[quality-test] report-out: $REPORT_OUT"
 fi
+# #1383: the per-request budget (vLLM/SGLang) rides in benchlocal's --extra-body.
+# A pass-through --extra-body would REPLACE it — argparse last-wins, and the
+# pass-through goes last — silently dropping the budget the run was verified
+# for. So the two are merged into ONE object, refusing on a key both set.
+if [[ -n "$THINKING_BUDGET_EXTRA_BODY" ]]; then
+  _pt_extra=""; _pt_rest=()
+  _pi=0; _pn=${#PASSTHROUGH[@]}
+  while [[ $_pi -lt $_pn ]]; do
+    _pa="${PASSTHROUGH[$_pi]}"
+    if [[ "$_pa" == "--extra-body" ]]; then
+      _pt_extra="${PASSTHROUGH[$((_pi+1))]:-}"; _pi=$((_pi+2)); continue
+    fi
+    if [[ "$_pa" == --extra-body=* ]]; then
+      _pt_extra="${_pa#--extra-body=}"; _pi=$((_pi+1)); continue
+    fi
+    _pt_rest+=("$_pa"); _pi=$((_pi+1))
+  done
+  if [[ -n "$_pt_extra" ]]; then
+    _pt_merged=""; _pt_rc=0
+    _pt_merged="$(python3 - "$THINKING_BUDGET_EXTRA_BODY" "$_pt_extra" <<'PY'
+import json, sys
+try:
+    ours, theirs = json.loads(sys.argv[1]), json.loads(sys.argv[2])
+except Exception as exc:
+    print("pass-through --extra-body is not valid JSON: %s" % exc)
+    sys.exit(3)
+if not isinstance(theirs, dict):
+    print("pass-through --extra-body must be a JSON object")
+    sys.exit(3)
+clash = sorted(set(ours) & set(theirs))
+if clash:
+    print("pass-through --extra-body also sets %s — two sources of truth for the budget" % ", ".join(clash))
+    sys.exit(3)
+merged = dict(theirs)
+merged.update(ours)
+print(json.dumps(merged))
+PY
+)" || _pt_rc=$?
+    if [[ "$_pt_rc" != "0" ]]; then
+      echo "✗ --thinking-budget: ${_pt_merged}" >&2
+      exit 2
+    fi
+    THINKING_BUDGET_EXTRA_BODY="$_pt_merged"
+    PASSTHROUGH=(${_pt_rest[@]+"${_pt_rest[@]}"})
+    echo "[quality-test] extra-body: merged your pass-through --extra-body with the thinking-budget fields"
+  fi
+  CLI_ARGS+=(--extra-body "$THINKING_BUDGET_EXTRA_BODY")
+  echo "[quality-test] extra-body: ${THINKING_BUDGET_EXTRA_BODY}"
+fi
 # `--` pass-through goes LAST so pass-through flags can override wrapper ones
 # (argparse-style CLIs let the last occurrence win).
 if [[ ${#PASSTHROUGH[@]} -gt 0 ]]; then
@@ -1060,9 +1454,163 @@ if [[ ${#PASSTHROUGH[@]} -gt 0 ]]; then
   echo "[quality-test] pass-through (${#PASSTHROUGH[@]} arg(s)): ${PASSTHROUGH[*]}"
 fi
 
+# ---- #1076: engine-restart guard ------------------------------------------
+# A fatal EngineCore error kills the engine, Docker restarts it, and the harness
+# retries against a booting engine — the run then COMPLETES AND REPORTS A
+# PLAUSIBLE SCORE. RestartCount is the only signal that separates "model got it
+# wrong" from "engine was dead". Snapshot before, compare after.
+source "${ROOT_DIR}/scripts/lib/engine-restart-guard.sh"
+_RESTARTS_BEFORE="$(restart_guard_snapshot)"
+
 # Run; capture exit code so we can also try to emit the compact one-liner
 benchlocal-cli "${CLI_ARGS[@]}" || RC=$?
 RC="${RC:-0}"
+
+restart_guard_check "$_RESTARTS_BEFORE" "${CONTAINER:-}" "run" || _RESTART_RC=$?
+if [[ "${_RESTART_RC:-0}" == "1" ]]; then
+  # Taint the exit code: a restarted engine makes the score uncomparable, and a
+  # warning alone gets scrolled past — which is how three tainted --full scores
+  # were published in #1076 before anyone noticed.
+  RC=90
+fi
+
+# ---- #1270: structural-zero guard — refuse a bare TOTAL when a pack scored 0/N
+# The #960 preflight above guards ONE cause of a zeroed pack (endpoint not
+# reachable from the sandbox container). @paulp83's #1253 endpoint WAS reachable,
+# so that preflight passed correctly and the damage happened anyway: his leg A
+# read 102/150 (68%) where the valid subset was 102/130 (78%) — ten points of
+# apparent instruct deficit that was one structurally-zeroed pack.
+#
+# Any cause produces the same misleading arithmetic: unreachable endpoint
+# (guarded above), a sandboxed pack whose agent harness failed to initialise,
+# Docker dying mid-run, an image pull failure, a sandbox OOM, a pack version
+# mismatch. So this check is cause-AGNOSTIC — it fires on the OUTCOME, after the
+# results are in, whatever produced it. The 0/N is the trigger; latency is
+# printed as corroboration only and never gates the warning.
+#
+# ⚠️ Deliberately NOT thinking-aware, and #1269 is why. That issue proposed
+# treating hermesagent-20 as incompatible with --no-thinking; the saved results
+# refute it. Across 150 full 20-scenario hermesagent-20 entries (per-pack
+# thinking_enabled, run-level as fallback): thinking OFF n=74, median 11/20,
+# range 0-15, 4 runs at 0/20; thinking ON n=76, median 12/20, range 0-16, 6 runs
+# at 0/20. Structural zeros occur on BOTH arms and slightly MORE often with
+# thinking ON, and paired per model the off arm costs ~1-2 scenarios of 20 — the
+# same graceful degradation the other three thinking-default-on packs show. So
+# forced thinking-off is NOT a candidate cause, and a guard that pointed at it
+# would send triage the wrong way. It is also why no blanket pre-run drop of the
+# pack exists: it would discard valid measurements, and benchlocal-cli has no
+# pack-exclusion flag anyway (the only wrapper-side spelling is a scenario
+# enumeration, which tags the run PARTIAL).
+#
+# Three of those four thinking-off zeros are ONE incident: three consecutive
+# runs, every scenario ~1.5s, reported as 20 x verifier_fail, trace carrying
+# agent_exit_code=1 / tool_events=0 / an AIAgent.__init__() keyword mismatch. A
+# harness constructor fault wearing the model's label — which is exactly the
+# shape this guard exists to catch, and which qualifies the verifier_fail
+# caveat below: per row a verifier_fail is the model being wrong, but a WHOLE
+# PACK of them can be the harness.
+#
+# Exit contract of the probe below: 0 = nothing to report, 3 = a pack scored
+# 0/N (block printed), anything else = the probe itself broke and said so.
+ZERO_GUARD_RC=0
+if [[ -f "$JSON_OUT" ]]; then
+  python3 - "$JSON_OUT" <<'PYZERO' || ZERO_GUARD_RC=$?
+import json
+import sys
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+path = sys.argv[1]
+
+try:
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+except Exception as exc:
+    # Unreadable/truncated results must be LOUD. A silent skip here would make
+    # "guard found nothing" indistinguishable from "guard never ran".
+    print(
+        "[quality-test] WARN: structural-zero guard could not read %s (%s)" % (path, exc),
+        file=sys.stderr,
+    )
+    print(
+        "[quality-test]   the TOTAL above has NOT been checked for 0/N packs (#1270).",
+        file=sys.stderr,
+    )
+    sys.exit(0)
+
+# Only SCORED packs count. total == 0 means the pack never ran (sandbox
+# unavailable, stubbed metadata gate) — a skip, not a zero score.
+scored = [p for p in (data.get("packs") or []) if int(p.get("total") or 0) > 0]
+zeroed = [p for p in scored if int(p.get("passed") or 0) == 0]
+if not zeroed:
+    sys.exit(0)
+
+def fraction(passed, total):
+    if not total:
+        return "%d / 0" % passed
+    return "%d / %d (%d%%)" % (passed, total, round(100.0 * passed / total))
+
+
+all_passed = sum(int(p.get("passed") or 0) for p in scored)
+all_total = sum(int(p.get("total") or 0) for p in scored)
+valid = [p for p in scored if int(p.get("passed") or 0) > 0]
+valid_passed = sum(int(p.get("passed") or 0) for p in valid)
+valid_total = sum(int(p.get("total") or 0) for p in valid)
+
+bar = "=" * 74
+print()
+print(bar)
+print("⚠️  STRUCTURAL-ZERO GUARD (#1270) — a pack scored 0/N, so the bare TOTAL")
+print("    printed above is NOT citable.")
+print(bar)
+for pack in zeroed:
+    pid = pack.get("pack_id") or "?"
+    total = int(pack.get("total") or 0)
+    p50 = (pack.get("latency") or {}).get("p50")
+    p50_txt = "p50 %.2fs" % p50 if isinstance(p50, (int, float)) else "p50 n/a"
+    print(
+        "  %s scored 0/%d (%s, status=%s) — excluded from the TOTAL as a"
+        % (pid, total, p50_txt, pack.get("status") or "?")
+    )
+    print("    suspected structural failure, not as a model score.")
+    print("    * cause not determined here — candidates, cheapest first: endpoint not")
+    print("      reachable from a container (#960); a sandboxed agent whose harness failed")
+    print("      to initialise (returns fast, reports every scenario as verifier_fail);")
+    print("      Docker/sandbox health; sandbox image build or pull; sandbox OOM; pack")
+    print("      version mismatch. Read the trace before reading the score:")
+    print("      benchlocal-cli inspect <json> --pack %s --full" % pid)
+    print("    * %s is CORROBORATION only, never the trigger. A p50 far below this" % p50_txt)
+    print("      pack's own healthy figure means it failed FAST — returning without")
+    print("      attempting — rather than failing hard. Compare against a run that passed.")
+print()
+if valid_total:
+    print("  TOTAL (valid subset)  %s" % fraction(valid_passed, valid_total))
+else:
+    print("  TOTAL (valid subset)  none — every scored pack returned 0/N; the whole run")
+    print("                        is suspect, not just one pack.")
+print("  TOTAL (all packs)     %s   <- do not cite" % fraction(all_passed, all_total))
+print()
+print("  A whole pack at 0/N is a harness/config outcome until proven otherwise.")
+print("  Individual verifier_fail rows are the MODEL being wrong and DO keep counting")
+print("  toward both figures — this guard fires only on a whole pack scoring zero.")
+print("  But a whole pack OF verifier_fail rows can itself be a harness fault: a")
+print("  sandboxed agent that dies in its constructor reports exactly that shape.")
+print(bar)
+sys.exit(3)
+PYZERO
+fi
+STRUCTURAL_ZERO=0
+case "$ZERO_GUARD_RC" in
+  0) ;;
+  3) STRUCTURAL_ZERO=1 ;;
+  *)
+    echo "[quality-test] WARN: the structural-zero guard (#1270) exited ${ZERO_GUARD_RC} — the" >&2
+    echo "               TOTAL above has NOT been checked for 0/N packs." >&2
+    ;;
+esac
 
 # ---- emit compact one-liner suitable for compose Quality: schema field -------
 
@@ -1114,6 +1662,10 @@ elif tm == "force-off":
     suffix_parts.append("thinking OFF")
 if d.get("sampling_source") == "server":
     suffix_parts.append("sampling=server")
+# #1396: the topology the scores were measured on (run_meta, from run_context.py).
+tp = (d.get("run_meta") or {}).get("tp")
+if tp:
+    suffix_parts.append(f"tp={tp}")
 validity = d.get("thinking_validity") or {}
 if validity:
     statuses = {o.get("status") for o in validity.values()}
@@ -1161,7 +1713,14 @@ fi
 # quality run's score supersedes in c3 (append-only history kept). resolve-serving
 # maps the served container -> slug; unmatched/bare-metal runs skip cleanly. This
 # writes a quality-ONLY record (no TPS) that MERGES with the bench TPS record.
-if [[ "${QUALITY_RECORD:-1}" == "1" && -f "${JSON_OUT:-}" ]] && command -v python3 >/dev/null 2>&1; then
+# Same defect, a different consumer: the record's 8pk field IS a bare TOTAL
+# (c3 renders it verbatim), so a run that tripped the structural-zero guard has
+# no citable figure to publish. Skip it and say so — the skip and this notice
+# are the same branch.
+if [[ "$STRUCTURAL_ZERO" == "1" && "${QUALITY_RECORD:-1}" == "1" && -f "${JSON_OUT:-}" ]]; then
+  echo "[quality-test] per-rig quality record NOT written: a pack scored 0/N, so this run has no citable TOTAL (#1270)."
+fi
+if [[ "$STRUCTURAL_ZERO" != "1" && "${QUALITY_RECORD:-1}" == "1" && -f "${JSON_OUT:-}" ]] && command -v python3 >/dev/null 2>&1; then
   _qt_score="$(python3 - "$JSON_OUT" <<'PYQ' 2>/dev/null
 import json, sys
 try:

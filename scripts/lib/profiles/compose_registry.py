@@ -12,6 +12,7 @@ generator and it does not attempt to normalize away historical variants.
 """
 
 import json
+import math
 from pathlib import Path
 
 # Slug lifecycle / availability statuses — the canonical health flag.
@@ -35,6 +36,10 @@ STATUS_VALUES = (
     "upstream-gated",  # ⏸️ Upstream-gated — blocked by external action (pin/PR/HW).
     "deprecated",      # 🗑️ Deprecated — kept for reference; flagged for removal.
 )
+
+# `kv_offload` values: None = not wired; "opt-in" = the compose exposes the
+# KV-offload knob, off by default.
+KV_OFFLOAD_VALUES = (None, "opt-in")
 
 # Statuses that launch without --force. Everything else is "(NA)".
 FUNCTIONAL_STATUSES = frozenset({"production", "caveats"})
@@ -111,6 +116,13 @@ def _entry(
     # "host RAM" column so a user sees it BEFORE selecting a slug, rather than
     # discovering it at launch refusal. None = fully VRAM-resident, nothing to warn about.
     host_ram_gb=None,
+    # KV-cache offload tier the compose EXPOSES (distinct from `offload`, which is
+    # WEIGHT placement). None = not wired. "opt-in" = the compose carries the
+    # KV_OFFLOAD_GB / KV_OFFLOAD_DISK knob (vLLM native OffloadingConnector: a
+    # host-RAM prefix-cache tier, optional disk tier below it), OFF by default.
+    # Surfaced as "kv opt-in" in the c3 catalog offload column; test-kv-offload-knob
+    # asserts it matches the compose exactly (registry <-> OFFLOAD_ARGS).
+    kv_offload=None,
     chat_template="native",
     tp,
     max_ctx,
@@ -145,6 +157,7 @@ def _entry(
     required_engine_features=None,
     recommended_engine_features=None,
     required_sm=None,
+    supported_sm=None,
     fallback_sm=None,
     default_arch_allow=None,
     status="production",
@@ -197,6 +210,10 @@ def _entry(
     category=None,
     weights_companions=None,
 ):
+    if kv_offload not in KV_OFFLOAD_VALUES:
+        raise ValueError(
+            f"{compose_path}: kv_offload={kv_offload!r} not in {KV_OFFLOAD_VALUES}"
+        )
     if status not in STATUS_VALUES:
         raise ValueError(
             f"{compose_path}: status={status!r} not in {STATUS_VALUES}"
@@ -215,6 +232,7 @@ def _entry(
         "offload": offload,
         "moe_cache": bool(moe_cache),
         "host_ram_gb": host_ram_gb,
+        "kv_offload": kv_offload,
         "chat_template": chat_template,
         "tp": tp,
         "pp": 1,
@@ -245,6 +263,14 @@ def _entry(
         entry["recommended_engine_features"] = list(recommended_engine_features)
     if required_sm is not None:
         entry["required_sm"] = required_sm
+    if supported_sm is not None:
+        if not isinstance(supported_sm, (list, tuple)) or not supported_sm or any(
+            isinstance(sm, bool) or not isinstance(sm, (int, float))
+            or not math.isfinite(sm) or sm <= 0
+            for sm in supported_sm
+        ):
+            raise ValueError(f"{compose_path}: supported_sm must be a nonempty list of positive compute capabilities")
+        entry["supported_sm"] = [float(sm) for sm in supported_sm]
     if fallback_sm is not None:
         # Weight-only fallback floor. required_sm = the NATIVE-kernel SM;
         # fallback_sm = the lowest SM where the format still RUNS via a

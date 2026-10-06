@@ -54,6 +54,8 @@
 #   CONTAINER    docker container to scrape with `docker logs` (or "none")
 #   SERVER_PID   pin the serving process; "none" disables /proc inspection
 #   URL          endpoint base, for /props
+#   BENCH_GPUS   limit every nvidia-smi read to these cards (comma-separated
+#                indices or GPU UUIDs, the `nvidia-smi -i` syntax). Unset = all.
 
 [[ -n "${_CAPTURE_SH_LOADED:-}" ]] && return 0
 _CAPTURE_SH_LOADED=1
@@ -83,6 +85,35 @@ cap_note_unavailable() {
 cap_have() { command -v "$1" >/dev/null 2>&1; }
 
 # ---------------------------------------------------------------------------
+# GPU selection — BENCH_GPUS
+# ---------------------------------------------------------------------------
+# Every VRAM figure below is a SUM over the cards nvidia-smi reports, so on a rig
+# that serves something else on other cards the neighbours are measured too: a
+# one-card run on GPU 2 beside a TP=2 server on GPU 0/1 reported peak=68382 MiB
+# while the card under test peaked at 23232. BENCH_GPUS restricts every read in
+# this lib (VRAM, dmon, PCIe link, GPU count) to the listed cards. Labels keep the
+# real nvidia-smi index, so BENCH_GPUS=2 reports GPU2, not GPU0.
+_CAP_GPU_ID='([0-9]+|GPU-[0-9A-Za-z-]+)'
+_CAP_GPUS_RE="^${_CAP_GPU_ID}(,${_CAP_GPU_ID})*\$"
+
+# cap_gpus_valid — 0 when BENCH_GPUS is unset or well-formed.
+cap_gpus_valid() {
+  [[ -z "${BENCH_GPUS:-}" ]] && return 0
+  [[ "$BENCH_GPUS" =~ $_CAP_GPUS_RE ]]
+}
+
+# cap_smi <query args...> — nvidia-smi limited to BENCH_GPUS. A malformed selection
+# runs nothing and fails, so a typo reads as "unavailable", never as the all-GPU
+# number it was meant to replace. (cap_dmon_start builds its own `-i`: stdbuf
+# cannot exec a shell function.)
+cap_smi() {
+  cap_gpus_valid || return 1
+  local -a sel=()
+  [[ -n "${BENCH_GPUS:-}" ]] && sel=(-i "$BENCH_GPUS")
+  nvidia-smi "${sel[@]}" "$@"
+}
+
+# ---------------------------------------------------------------------------
 # resolution: serving process, log source, GPU count
 # ---------------------------------------------------------------------------
 CAP_PID=""          # serving process pid, or "" when unknown
@@ -93,7 +124,10 @@ CAP_TMPDIR=""
 
 cap_gpu_count() {
   if cap_have nvidia-smi; then
-    nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | command grep -c . || echo 0
+    local n
+    n="$(cap_smi --query-gpu=index --format=csv,noheader,nounits 2>/dev/null \
+         | command grep -cE '^[0-9]+$' || true)"
+    echo "${n:-0}"
   else
     echo 0
   fi
@@ -269,6 +303,19 @@ cap_kv_type() {
   v="$(cap_props_get "default_generation_settings.params.cache_type_k" || true)"
   [[ -n "$v" ]] && { echo "$v (source: /props)"; return 0; }
   if [[ -n "$CAP_LOG" && -r "$CAP_LOG" ]]; then
+    # SGLang runs under python inside Docker, so its argv is not normally visible
+    # through the host /proc scan. Its server_args dump is the current boot's
+    # resolved configuration and appears before allocation. Prefer the LAST dump
+    # so a restarted container cannot leak an earlier boot's KV type.
+    v="$(command grep -E 'server_args=.*kv_cache_dtype' "$CAP_LOG" 2>/dev/null | tail -1 \
+         | sed -nE "s/.*['\"]kv_cache_dtype['\"][[:space:]]*:[[:space:]]*['\"]([^'\"]+)['\"].*/\1/p" || true)"
+    [[ -n "$v" ]] && { echo "$v (source: SGLang server_args)"; return 0; }
+    # Some SGLang versions omit the dict dump but still announce the dtype when
+    # the cache is allocated. Keep the framework's exact runtime spelling
+    # (for example torch.float8_e4m3fn) rather than guessing an alias.
+    v="$(command grep -oE 'KV Cache is allocated\. dtype: [^,[:space:]]+' "$CAP_LOG" 2>/dev/null \
+         | tail -1 | sed -E 's/.*dtype: //' || true)"
+    [[ -n "$v" ]] && { echo "$v (source: SGLang allocation log)"; return 0; }
     v="$(command grep -oE 'type_k *= *[A-Za-z0-9_]+|cache_type_k *= *[A-Za-z0-9_]+' "$CAP_LOG" 2>/dev/null \
          | tail -1 | sed -E 's/.*= *//' || true)"
     [[ -n "$v" ]] && { echo "$v (source: boot log)"; return 0; }
@@ -295,21 +342,44 @@ cap_kv_type() {
 # ---------------------------------------------------------------------------
 # CPU-offload detection (item 3 — the gate for every moe-cache capture)
 # ---------------------------------------------------------------------------
-# Two independent signals, either is sufficient:
-#   argv     -ot / --override-tensor / --n-cpu-moe / --cpu-moe
-#   boot log a "CUDA_Host model buffer" allocation (weights parked in host RAM)
+# Signals are engine-specific, but all mean that at least part of the MoE
+# weights is resident outside GPU VRAM:
+#   llama.cpp argv  -ot / --override-tensor / --n-cpu-moe / --cpu-moe
+#   ExLlamaV3 argv  --cpu-moe-split-experts / --cpu-moe-threads
+#   boot log       a "CUDA_Host model buffer" allocation
+# For containerized TabbyAPI, the Python server argv is not visible in the host
+# /proc namespace, so inspect the container command as a last resort. This is
+# important for Qwen3.8-Flash-Next: its CPU-MoE path is configured with
+# --cpu-moe-split-experts, not any llama.cpp spelling.
 # Echoes the reason; returns 0 when offload is active.
 cap_offload_detected() {
-  local argv="${1:-}"
+  local argv="${1:-}" inspect_argv=""
   if [[ -n "$argv" ]]; then
     local f
-    for f in -ot --override-tensor --n-cpu-moe --cpu-moe -ncmoe; do
+    for f in -ot --override-tensor --n-cpu-moe --cpu-moe -ncmoe \
+             --cpu-moe-split-experts --cpu-moe-threads; do
       if cap_argv_has "$argv" "$f"; then echo "argv ${f}"; return 0; fi
+    done
+  fi
+  if [[ -z "$argv" && -n "${CONTAINER:-}" && "${CONTAINER:-}" != "none" ]] \
+     && cap_have docker && docker inspect "$CONTAINER" >/dev/null 2>&1; then
+    # Config.Cmd/Entrypoint are JSON, but a literal flag match is sufficient and
+    # avoids depending on jq (the launcher path is stdlib-only).
+    inspect_argv="$(docker inspect "$CONTAINER" 2>/dev/null || true)"
+    for f in --cpu-moe-split-experts --cpu-moe-threads; do
+      if printf '%s\n' "$inspect_argv" | command grep -qF -- "\"$f\""; then
+        echo "container argv ${f}"; return 0
+      fi
     done
   fi
   if [[ -n "$CAP_LOG" && -r "$CAP_LOG" ]] \
      && command grep -qE 'CUDA_Host +model buffer|CPU +model buffer size' "$CAP_LOG" 2>/dev/null; then
     echo "boot log (CUDA_Host model buffer)"
+    return 0
+  fi
+  if [[ -n "$CAP_LOG" && -r "$CAP_LOG" ]] \
+     && command grep -qE 'cpu[-_]moe[-_]split[-_]experts|cpu[-_]moe[-_]threads|CPU-MoE' "$CAP_LOG" 2>/dev/null; then
+    echo "boot log (CPU-MoE/offload marker)"
     return 0
   fi
   return 1
@@ -496,23 +566,92 @@ elif mode == "acceptance":
     # Acceptance WITHOUT a fire rate is a deception: measured 2026-08-01, a drafter
     # reported 0.992 acceptance while firing on 5 of ~20 requests (zero on novel
     # content). Report how OFTEN it fired alongside how WELL it did when it fired.
-    acc, drafted, accepted = [], 0, 0
+    # TWO ENGINES, TWO WORDINGS, AND THEY DO NOT LOG THE SAME QUANTITY.
+    #   vLLM    : "draft acceptance rate = 0.85"        -> a RATE in [0,1]
+    #   SGLang  : "accept len: 5.66, accept rate: 0.67" -> a LENGTH (tok/step) AND a rate
+    # Until 2026-09-11 only the vLLM wording was matched, so on SGLang this parser
+    # failed outright and bench printed "no drafter output in the log (spec-dec off,
+    # or the engine does not log acceptance)" -- collapsing THREE different states
+    # (drafter off / drafter DEAD / wording not recognised) into one benign-looking
+    # line. A dead DFlash2 drafter (accept len ~1.0, sglang#39087) read identically
+    # to a healthy SGLang run. Keep the two quantities in SEPARATE lists: averaging a
+    # length into a rate silently produces a number that is neither.
+    acc, alen, drafted, accepted = [], [], 0, 0
     for ln in lines:
         m = re.search(r"draft acceptance(?: rate)?\s*=\s*([0-9.]+)", ln)
         if m:
             acc.append(float(m.group(1)))
+        m_sgl_rate = re.search(r"accept rate:\s*([0-9.]+)", ln)
+        if m_sgl_rate:
+            acc.append(float(m_sgl_rate.group(1)))
+        m_sgl_len = re.search(r"accept len:\s*([0-9.]+)", ln)
+        if m_sgl_len:
+            alen.append(float(m_sgl_len.group(1)))
         m2 = re.search(r"\(\s*(\d+)\s*accepted\s*/\s*(\d+)\s*(?:generated|drafted)", ln)
         if m2:
             accepted += int(m2.group(1))
             drafted += int(m2.group(2))
-    if not acc:
+        # ---- vLLM, MODERN wording (2026-09-18) -------------------------------
+        # The `draft acceptance rate = X` form above is OLD vLLM. Current vLLM
+        # emits a SpecDecoding block instead, and matched NONE of the patterns
+        # above -- so our PRIMARY engine was reading as "spec-dec off" on every
+        # bench. Caught on the bucko rebuild, whose log carried 26 of these while
+        # bench.sh printed "no acceptance data in the measured window":
+        #   SpecDecoding metrics: Mean acceptance length: 3.37, Accepted
+        #   throughput: 7.10 tokens/s, Drafted throughput: 9.00 tokens/s,
+        #   Accepted: 71 tokens, Drafted: 90 tokens, Per-position acceptance
+        #   rate: 0.867, 0.767, 0.733, Avg Draft acceptance rate: 78.9%
+        # ⚠️ The rate is a PERCENT here, not a [0,1] fraction -- do not append it
+        # raw next to the vLLM/SGLang rates or the mean becomes meaningless.
+        if "SpecDecoding metrics" in ln:
+            m_v = re.search(r"Mean acceptance length:\s*([0-9.]+)", ln)
+            if m_v:
+                alen.append(float(m_v.group(1)))
+            m_vr = re.search(r"Avg Draft acceptance rate:\s*([0-9.]+)\s*%", ln)
+            if m_vr:
+                acc.append(float(m_vr.group(1)) / 100.0)
+            m_va = re.search(r"Accepted:\s*(\d+)\s*tokens", ln)
+            m_vd = re.search(r"Drafted:\s*(\d+)\s*tokens", ln)
+            if m_va and m_vd:
+                accepted += int(m_va.group(1))
+                drafted += int(m_vd.group(1))
+            continue
+        # ---- exl3 / TabbyAPI -------------------------------------------------
+        # Per-request, appended to the completion line, accepted/drafted:
+        #   ... total 3.18 s · draft 108/173
+        # There is no rate and no length in the log -- derive the rate, and let
+        # accepted/drafted accumulate so the summary carries real counters.
+        # ⚠️ `continue` above keeps the vLLM block from reaching this: vLLM's
+        # "Drafted throughput: 9.00 tokens/s" must never be read as a ratio.
+        m_exl = re.search(r"(?:^|\s|·)draft\s+(\d+)\s*/\s*(\d+)(?:\s|$)", ln)
+        if m_exl:
+            a, d = int(m_exl.group(1)), int(m_exl.group(2))
+            if d > 0:
+                accepted += a
+                drafted += d
+                acc.append(a / d)
+    if not acc and not alen:
         sys.exit(1)
+    # SGLang emits a length but the caller's summary line is rate-shaped; surface the
+    # length explicitly rather than letting it vanish. accept len ~1.0 means the
+    # drafter is drafting garbage and being rejected -- slow, never wrong, and
+    # invisible to every functional test (sglang#39087).
+    if alen:
+        _al = f" accept_len_mean={sum(alen)/len(alen):.3f} accept_len_last={alen[-1]:.3f}"
+        _al += f" accept_len_min={min(alen):.3f} accept_len_max={max(alen):.3f}"
+        if sum(alen)/len(alen) < 1.5:
+            _al += " ⚠DRAFTER-LOOKS-DEAD(accept_len<1.5)"
+    else:
+        _al = ""
+    if not acc:
+        print(f"fired={len(alen)}{_al}")
+        sys.exit(0)
     # `last` is the final acceptance the log carries. It exists because the sweep's
     # TSV `accept` column has always meant exactly that — a per-arm boot ends with
     # its own last value — and swapping in the mean would silently redefine every
     # historical row. bench.sh quotes the mean; the sweep quotes last. Same scrape.
     print(f"fired={len(acc)} last={acc[-1]:.3f} mean={sum(acc)/len(acc):.3f} "
-          f"min={min(acc):.3f} max={max(acc):.3f} accepted={accepted} drafted={drafted}")
+          f"min={min(acc):.3f} max={max(acc):.3f} accepted={accepted} drafted={drafted}{_al}")
 
 elif mode == "timings":
     # llama.cpp per-request print_timing. `prompt eval time` is PREFILL; the bare
@@ -582,12 +721,39 @@ elif mode == "pooldev":
             if "pool[" in ln and DEV.search(ln)}
     nobudget = sum(1 for ln in lines if "no cache budget" in ln)
     enabled = 1 if any("[moe-cache] enabled:" in ln for ln in lines) else 0
+    # The engine's own log verbosity ('common_params_print_info: verbosity = 3'). Every
+    # [moe-cache] line, pool lines included, is dropped below 4, so at the default 3 a
+    # healthy cache logs NO pool line and the counts above read 0 — absence, not data.
+    vb = None
+    for ln in lines:
+        m = re.search(r"\bverbosity = (\d+)", ln)
+        if m:
+            vb = m.group(1)
     print(f"devices={len(devs)} pool_lines={sum(1 for ln in lines if 'pool[' in ln)} "
-          f"enabled={enabled} nobudget={nobudget} devlist={','.join(sorted(devs)) or '-'}")
+          f"enabled={enabled} nobudget={nobudget} devlist={','.join(sorted(devs)) or '-'} "
+          f"verbosity={vb or '-'}")
 
 else:
     sys.exit(2)
 PY
+}
+
+# cap_pool_lines_hidden <pooldev-line> [env-verbosity]
+# 0 when this run's log CANNOT show pool lines, so "0 devices hold a pool" is an
+# absence, not a finding: no pool line at all AND the engine logged below verbosity 4.
+# [moe-cache] lines (pool lines included) print only at LLAMA_ARG_LOG_VERBOSITY>=4, and
+# the default is 3, so every stock moe-cache boot used to read as HALF-CACHED /
+# CACHE_DISABLED (our own 2026-10-02 bench; community #1543/#1547). Verbosity comes from
+# the engine's own `verbosity = N` line, else the env value, else llama.cpp's default 3.
+# Any pool line proves the lines were visible, so a PARTIAL allocation is never hidden.
+cap_pool_lines_hidden() {
+  local pd="$1" envv="${2:-}" pl v
+  pl="$(command grep -oE 'pool_lines=[0-9]+' <<<"$pd" | cut -d= -f2)"
+  [[ "${pl:-0}" == "0" ]] || return 1
+  v="$(command grep -oE 'verbosity=[0-9]+' <<<"$pd" | cut -d= -f2)"
+  [[ -z "$v" && "$envv" =~ ^[0-9]+$ ]] && v="$envv"
+  [[ -z "$v" ]] && v=3
+  (( v < 4 ))
 }
 
 # cap_marginal_rates <snap-start> <snap-end>
@@ -695,18 +861,20 @@ PY
 # VRAM triplet + leak delta (item 11b) — a free soak-lite leak check per run
 # ---------------------------------------------------------------------------
 
-# cap_vram_used — total MiB across all GPUs (one integer).
+# cap_vram_used — total MiB across the selected GPUs (BENCH_GPUS; all by default).
+# Only numeric rows count: `nvidia-smi -i <absent card>` prints "No devices were
+# found" on stdout, which a plain sum would turn into a fabricated 0.
 cap_vram_used() {
   cap_have nvidia-smi || return 1
-  nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null \
-    | awk 'NF{s+=$1} END{if(NR) print s+0; else exit 1}'
+  cap_smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null \
+    | awk '$1 ~ /^[0-9]+$/ {s+=$1; n++} END{if(n) print s+0; else exit 1}'
 }
 
-# cap_vram_per_device — "GPU<i> <MiB>" per line.
+# cap_vram_per_device — "GPU<i> <MiB>" per line, <i> the real nvidia-smi index.
 cap_vram_per_device() {
   cap_have nvidia-smi || return 1
-  nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null \
-    | awk 'NF{printf "GPU%d %d\n", NR-1, $1}'
+  cap_smi --query-gpu=index,memory.used --format=csv,noheader,nounits 2>/dev/null \
+    | awk -F', *' '$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ {printf "GPU%d %d\n", $1, $2}'
 }
 
 # cap_vram_peak_start <outfile> — background sampler; echoes its pid.
@@ -716,8 +884,8 @@ cap_vram_peak_start() {
   : > "$out"
   ( local peak=0 v
     while :; do
-      v="$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null \
-           | awk 'NF{s+=$1} END{print s+0}')"
+      v="$(cap_smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null \
+           | awk '$1 ~ /^[0-9]+$/ {s+=$1; n++} END{if(n) print s+0}')"
       if [[ -n "$v" ]] && (( v > peak )); then peak="$v"; echo "$peak" > "$out"; fi
       sleep 2
     done ) >/dev/null 2>&1 &
@@ -745,10 +913,13 @@ cap_dmon_start() {
   # Echoes a PID on stdout — the caller emits the notice (see cap_kv_type).
   cap_have nvidia-smi || return 1
   : > "$out"
+  cap_gpus_valid || return 1
+  local -a sel=()
+  [[ -n "${BENCH_GPUS:-}" ]] && sel=(-i "$BENCH_GPUS")
   local sb=""
   cap_have stdbuf && sb="stdbuf -oL"
   # shellcheck disable=SC2086
-  $sb nvidia-smi dmon -s ut -d 1 2>/dev/null \
+  $sb nvidia-smi dmon "${sel[@]}" -s ut -d 1 2>/dev/null \
     | while IFS= read -r line; do printf '%s %s\n' "$(date +%s)" "$line"; done > "$out" &
   echo $!
 }
@@ -800,12 +971,12 @@ cap_dmon_phase() {
 }
 
 # cap_pcie_link — queried AVAILABLE link state, per device.
-# Prints: "GPU<i> gen=<cur>/<max> width=<cur>/<max>".
+# Prints: "GPU<i> gen=<cur>/<max> width=<cur>/<max>", <i> the real nvidia-smi index.
 cap_pcie_link() {
   cap_have nvidia-smi || return 1
-  nvidia-smi --query-gpu=pcie.link.gen.current,pcie.link.gen.max,pcie.link.width.current,pcie.link.width.max \
-             --format=csv,noheader,nounits 2>/dev/null \
-    | awk -F', *' 'NF>=4 && $1 ~ /[0-9]/ {printf "GPU%d gen=%s/%s width=%s/%s\n", NR-1, $1, $2, $3, $4}'
+  cap_smi --query-gpu=index,pcie.link.gen.current,pcie.link.gen.max,pcie.link.width.current,pcie.link.width.max \
+          --format=csv,noheader,nounits 2>/dev/null \
+    | awk -F', *' 'NF>=5 && $1 ~ /^[0-9]+$/ && $2 ~ /[0-9]/ {printf "GPU%d gen=%s/%s width=%s/%s\n", $1, $2, $3, $4, $5}'
 }
 
 # cap_pcie_link_sampler_start <outfile> — link state sampled UNDER LOAD.

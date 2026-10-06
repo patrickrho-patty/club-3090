@@ -2,7 +2,7 @@
 # Profile (at-a-glance):
 #   Model:     DeepSeek-V4-Flash-0731 (284B MoE, unsloth UD-IQ2_XXS — ~2.6-bit
 #              experts, 85 GB across 3 shards)
-#   Engine:    llama.cpp (mainline server-cuda-b10236, external DSpark drafter)
+#   Engine:    llama.cpp mainline — the shared `llama-cpp-local` pin (build = engines/llama-cpp-mainline.yml install.spec; external DSpark drafter)
 #   Topology:  Dual 3090 PCIe (layer-split -ts 1,1, no NVLink)
 #   Drafter:   DSpark n=5 external (--spec-type draft-dspark) — REQUIRES b10236+
 #              Toggle: SPEC_N=<n> sets depth; SPEC_N=0 (or SPEC=off) disables
@@ -75,7 +75,7 @@
 
 services:
   llama-cpp-deepseek-flash:
-    image: ${LLAMACPP_IMAGE:-ghcr.io/ggml-org/llama.cpp:server-cuda-b10236}
+    image: ${LLAMACPP_IMAGE:-ghcr.io/ggml-org/llama.cpp@sha256:52192a23c7b258044463aebba78826cdff39a7393b713edc313324b343a7b836}
     container_name: "${ESTATE_CONTAINER:-llama-cpp-deepseek-flash-iq2}"
     restart: unless-stopped
     ports:
@@ -199,7 +199,19 @@ services:
       - '-b'
       - '4096'
       - '--cache-prompt'
-      - '--no-mmap'
+      # ⚠️ `--load-mode none`, NOT `--no-mmap` (#1370). Mainline REMOVED --no-mmap,
+      # and the pin this slug runs (llama-cpp-local, b10920, bumped 2026-09-12)
+      # rejects it outright — `error: invalid argument: --no-mmap` — so this slug
+      # could not boot at all between that bump and 2026-09-21. `none` is the
+      # faithful replacement: upstream documents it as "no special loading mode",
+      # i.e. no mmap, which is what the host-RAM gate above assumes.
+      # ⚠️ The club3090 / prism forks still ACCEPT --no-mmap, with a DEPRECATED
+      # warning — they are on a borrowed timeline, not a different design. All of
+      # them accept --load-mode none today (verified against every locally pinned
+      # llama.cpp image, 2026-09-21), so the rest of the family can migrate when
+      # someone decides to; that is 31 more composes and is NOT done here.
+      - '--load-mode'
+      - 'none'
       # q8_0 KV on the IQ2 tier ONLY: measured to free ~300 MiB/card, which clears
       # this tier's 1840 MiB bundle. On Q8 (3264 MiB bundle) it buys nothing, so we
       # do not take the quality reduction there. At our stated KV serving floor.

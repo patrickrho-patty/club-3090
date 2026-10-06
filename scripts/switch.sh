@@ -10,24 +10,38 @@
 #   bash scripts/switch.sh <variant>            # switch + tail until ready
 #   bash scripts/switch.sh <variant> --no-wait  # switch and return immediately
 #   bash scripts/switch.sh --force <variant>    # skip hardware/free-VRAM preflight
-#   bash scripts/switch.sh --owui <variant>     # after ready, also register it in Open WebUI (no-op if OWUI down)
+#   bash scripts/switch.sh <variant>            # OWUI picker is synced automatically once ready (no-op if OWUI down)
+#   bash scripts/switch.sh --no-owui <variant>  # ...unless you opt out
 #   bash scripts/switch.sh --list               # actionable variants on THIS machine (deprecated hidden) + defaults
 #   bash scripts/switch.sh --list --all         # every variant — all GPU counts + deprecated
 #   bash scripts/switch.sh --list-all           # alias for --list --all
 #   bash scripts/switch.sh --local              # only models YOU registered (local layer)
 #   bash scripts/switch.sh --defaults           # just the per-model defaults view
 #   bash scripts/switch.sh --down               # just bring down whatever's up
-#   bash scripts/switch.sh --set-default <slug>  # pin <slug> as YOUR default for its model (.env)
+#   bash scripts/switch.sh --set-default <slug>  # pin <slug> as YOUR default for its model (saved in club3090.env)
 #   bash scripts/switch.sh --clear-default <model>  # remove your pinned default for <model>
-#   bash scripts/switch.sh --explain <slug>      # one slug's full story: registry row + engine/model/hardware/drafter facts + kv-calc fit verdict + measured BENCHMARKS row
+#   bash scripts/switch.sh --set <slug> KEY=VALUE...  # save launch settings for ONE slug (slugs.json), e.g.
+#                                                # --set sgl/qwen38-27b-dual-fast KV_OFFLOAD_GB=64 REASONING_EFFORT=medium
+#   bash scripts/switch.sh --unset <slug> KEY...  # remove launch settings saved for <slug>
+#   bash scripts/switch.sh --explain <slug>      # one slug's full story: registry row + engine/model/hardware/drafter facts + kv-calc fit verdict + measured BENCHMARKS row + its launch settings and their sources
 #   bash scripts/switch.sh --explain <slug> --json  # same, as a structured JSON object
+#
+# Launch settings (#1465) are the catalogued knobs in scripts/lib/profiles/launch-knobs.json
+# (KV_OFFLOAD_GB, KV_OFFLOAD_DISK, KV_OFFLOAD_DISK_GB, ENABLE_THINKING, REASONING_EFFORT, SPEC_N).
+# For each knob the slug's compose reads, the value comes from the first of:
+#   your shell (exported for this launch) > this slug (--set) > the model's thinking pin
+#   (ENABLE_THINKING only) > your global settings (club3090.env > secrets.env > repo .env)
+#   > the compose's own default.
+# A bad value, an unmet dependency (KV_OFFLOAD_DISK=1 without KV_OFFLOAD_GB) or a RAM tier
+# the host can't hold is refused BEFORE the running slug is taken down. Settings apply at
+# the next launch; `--explain <slug>` shows each value and where it comes from.
 #
 # `<…>/default` tokens auto-resolve to a concrete slug (design §13.1):
 #   <engine>/default        e.g. vllm/default — the maintainer's recommended
 #                           config for that engine on the detected topology.
 #   <engine>/<topo>/default e.g. vllm/dual/default — force the topology.
 #   <model>/default         e.g. qwen3.6-27b/default — YOUR preferred config:
-#                           your `.env` pin if set, else the curated pick
+#                           your saved pin (--set-default) if set, else the curated pick
 #                           (ENGINE_PREFERENCE walk) for the detected topology.
 #
 # Variant names are derived from the compose registry (the single source of
@@ -64,7 +78,9 @@
 #
 # Env overrides (rarely needed):
 #   COMPOSE_BIN     Default: "docker compose" (set to e.g. "podman compose" if needed)
-#   CLUB3090_GPU    Single-card GPU index override, e.g. "1" on a hetero rig
+#   CLUB3090_GPU    Single-card GPU index override, e.g. "1" on a hetero rig. Pins the card
+#                   (by UUID) on every single-card slug, --force included; ignored on
+#                   dual/multi slugs (use launch.sh --gpus there)
 #   FORCE           Set to 1 to skip hardware/free-VRAM preflight
 #   READY_URL       Default: http://localhost:8020/v1/models
 #   READY_TIMEOUT   Default: 600 (seconds — longer for cold cudagraph capture)
@@ -74,9 +90,11 @@
 #                 port is bound, and warms the moe-cache expert pool (allocated
 #                 on first inference). Set 0 to skip.
 #   READY_PROBE_TIMEOUT  Default: 90 (seconds) — hard cap on that one probe.
-#   CLUB3090_THINKING_<MODEL>  .env pin (on|off|inherit) → ENABLE_THINKING at
-#                 launch (#1014 follow-up; set it from the serve-confirm [T]).
-#                 An ENABLE_THINKING exported in the shell wins over the pin.
+#   CLUB3090_THINKING_<MODEL>  saved pin (on|off|inherit) → ENABLE_THINKING=true|false
+#                 at launch, on the slugs of that model whose compose reads it (#1014
+#                 follow-up; set it from the serve-confirm [T]). An ENABLE_THINKING exported
+#                 in the shell or saved for the slug wins over the pin; the pin wins over a
+#                 global ENABLE_THINKING.
 
 set -euo pipefail
 
@@ -94,31 +112,18 @@ COMPOSE_BIN="${COMPOSE_BIN:-docker compose}"
 READY_TIMEOUT="${READY_TIMEOUT:-600}"
 LAUNCH_PROFILE="${LAUNCH_PROFILE:-${ROOT_DIR}/scripts/lib/profiles/launch_compat.py}"
 
-# Load .env if present, so PORT / MODEL_DIR / etc. flow through to docker
-# compose AND to the ready-URL probe below.
-#
-# Precedence matches docker compose (and launch.sh): a variable already set in
-# the shell environment WINS over the .env file — so `export MODEL_DIR=…` is no
-# longer clobbered by a stale .env entry (#425). We parse line-by-line instead
-# of `source` (a) to honour that precedence per-variable and (b) to tolerate
-# CRLF line endings from Windows editors (#187). Values are taken literally
-# (no shell expansion), matching docker compose's own .env semantics.
-if [[ -f "${ROOT_DIR}/.env" ]]; then
-  while IFS= read -r _env_line || [[ -n "$_env_line" ]]; do
-    _env_line="${_env_line#"${_env_line%%[![:space:]]*}"}"   # strip leading whitespace
-    _env_line="${_env_line%$'\r'}"                           # strip trailing CR (CRLF .env)
-    [[ -z "$_env_line" || "$_env_line" == '#'* ]] && continue
-    _env_line="${_env_line#export }"
-    _env_key="${_env_line%%=*}"
-    [[ "$_env_key" == "$_env_line" || -z "$_env_key" ]] && continue   # no '=' on the line
-    [[ -n "${!_env_key+x}" ]] && continue                    # already set in env → shell wins
-    _env_val="${_env_line#*=}"
-    _env_val="${_env_val#\"}"; _env_val="${_env_val%\"}"     # strip surrounding double quotes
-    _env_val="${_env_val#\'}"; _env_val="${_env_val%\'}"     # strip surrounding single quotes
-    export "${_env_key}=${_env_val}"
-  done < "${ROOT_DIR}/.env"
-  unset _env_line _env_key _env_val
-fi
+# Load settings so PORT / MODEL_DIR / etc. flow through to docker compose AND to
+# the ready-URL probe below — through the ONE loader (club-3090#1466): your
+# club-3090 config (~/.config/club-3090/club3090.env + secrets.env), then the repo
+# .env as a fallback. A variable already set in the shell wins, values are taken
+# literally, CRLF and `export ` are tolerated.
+# shellcheck source=lib/club-config.sh
+source "${ROOT_DIR}/scripts/lib/club-config.sh"
+club_config_load "${ROOT_DIR}"
+# shellcheck source=lib/engine-cache.sh
+source "${ROOT_DIR}/scripts/lib/engine-cache.sh"
+# shellcheck source=lib/slug-label.sh
+source "${ROOT_DIR}/scripts/lib/slug-label.sh"
 # #632 — surface a user engine-image pin (ik-llama / llama.cpp images are NOT
 # profile-injected, so a .env/shell pin is the only override path; echo it so a
 # wrong-image boot is never silent).  Fires only when actually set.
@@ -126,7 +131,7 @@ fi
 [[ -n "${LLAMACPP_IMAGE:-}" ]] && echo "[switch] llama.cpp image pinned: ${LLAMACPP_IMAGE}"
 
 # Surface the resolved MODEL_DIR + its source so the precedence is unambiguous
-# (the exact confusion behind #425 / #187). Unset → the compose's built-in
+# (the exact confusion fixed in 9a27de83 / #187). Unset → the compose's built-in
 # default applies; preflight_compose_deps notes that case.
 #
 # Routing: normally stdout (unchanged). But on the new `--explain … --json`
@@ -182,6 +187,35 @@ switch_gpu_profile_spec() {
 
 PRIMARY_MODEL="${PRIMARY_MODEL:-qwen3.6-27b}"
 
+# apply_club3090_gpu_pin <slug> — CLUB3090_GPU pins a SINGLE-card slug to one host GPU.
+# It used to be read only inside preflight_compose_hardware, which runs for vLLM slugs only,
+# returns early on a compose without Requires-* metadata, and is skipped under --force. So the
+# advertised override did nothing on every 🧪 slug (they need --force) and every non-vLLM
+# single-card slug, which then landed on GPU 0. Applied here, once, before anything reads the
+# GPU selection: the index is resolved to a UUID and exported as CUDA_/NVIDIA_VISIBLE_DEVICES,
+# the same thing launch.sh --gpus does (#610). Multi-card slugs pick cards with launch.sh --gpus.
+apply_club3090_gpu_pin() {
+  local v="$1" eng dir file topo
+  [[ -n "${CLUB3090_GPU:-}" ]] || return 0
+  [[ -n "${VARIANTS[$v]:-}" ]] || return 0   # unknown slug: check_variant reports it
+  IFS='|' read -r eng dir file <<< "${VARIANTS[$v]}"
+  topo="${file%%/*}"
+  case "$topo" in
+    dual|multi*)
+      echo "[switch] CLUB3090_GPU=${CLUB3090_GPU} ignored: ${v} is a ${topo}-card slug, and CLUB3090_GPU pins single-card slugs. Pick cards with: bash scripts/launch.sh --variant ${v} --gpus <a,b>" >&2
+      return 0 ;;
+  esac
+  case "$CLUB3090_GPU" in
+    ""|*[!0-9]*)
+      echo "[switch] ERROR: CLUB3090_GPU='${CLUB3090_GPU}' must be one GPU index as nvidia-smi numbers them, e.g. 1" >&2
+      exit 1 ;;
+  esac
+  # shellcheck source=lib/gpu-select.sh
+  source "${ROOT_DIR}/scripts/lib/gpu-select.sh"
+  gpu_select_export "$CLUB3090_GPU" "switch"
+  echo "[switch] CLUB3090_GPU=${CLUB3090_GPU}: ${v} pinned to ${CUDA_VISIBLE_DEVICES}" >&2
+}
+
 switch_topology_from_gpus() {
   local selector="${NVIDIA_VISIBLE_DEVICES:-${CUDA_VISIBLE_DEVICES:-}}" count=0
   if [[ -n "$selector" && "$selector" != "all" && "$selector" != "void" ]]; then
@@ -210,7 +244,7 @@ resolve_default_variant() {
   #   <engine>/<topology>/default  → engine-recommendation, explicit topology
   #   <X>/default                  → dispatch on X: engine name → engine
   #                                   recommendation; model-id → the user's
-  #                                   model default (.env pin ‖ curated walk)
+  #                                   model default (saved pin ‖ curated walk)
   #   anything else                → passthrough (already a concrete slug)
   local variant="$1" engine topology target
   if [[ "$variant" =~ ^([^/]+)/(single|dual|multi[0-9]+)/default$ ]]; then
@@ -239,8 +273,12 @@ usage() {
   exit 0
 }
 
-# --- PR-B: user-pinnable model defaults (.env) -------------------------------
-ENV_FILE="${ROOT_DIR}/.env"
+# --- PR-B: user-pinnable model defaults ---------------------------------------
+# Pins are saved through the ONE writer (club_config_set, club-3090#1466) in your
+# club-3090 settings — club3090.env in $(club_config_dir), which every checkout
+# reads — not in this checkout's .env any more. A pin still sitting in the repo .env
+# is read (it is the lowest-precedence file), and --clear-default removes it from
+# there too, so a cleared pin can't come back from an old copy.
 
 # Derive (model, pin-key) from a slug, or fail with a message. Echoes
 # "<model>\t<pin-key>".
@@ -264,30 +302,31 @@ PY_SLUGINFO
   printf '%s' "$out"
 }
 
-# Write KEY=VALUE into .env, replacing any existing line for KEY (round-trips
-# with --clear-default). Preserves all other lines + ordering.
-env_set_key() {
-  local key="$1" value="$2" tmp
-  tmp="$(mktemp)"
-  if [[ -f "$ENV_FILE" ]]; then
-    # Drop any existing assignment for KEY (with or without `export`).
-    grep -vE "^[[:space:]]*(export[[:space:]]+)?${key}=" "$ENV_FILE" > "$tmp" || true
-  fi
-  printf '%s=%s\n' "$key" "$value" >> "$tmp"
-  mv "$tmp" "$ENV_FILE"
+# switch_saved_source KEY → the settings FILE holding KEY (club3090.env, secrets.env or
+# repo .env), ignoring the environment; empty when no file does. club_config_load
+# exported every saved value at startup, so the environment alone can't tell.
+# (awk reads to the end rather than `exit`: an early exit can SIGPIPE the writer,
+# which pipefail + set -e would turn into a silent exit.)
+switch_saved_source() {
+  ( unset "$1"; club_config_resolve "$ROOT_DIR" ) | awk -F'\t' -v k="$1" '$1 == k && !n++ { print $2 }'
 }
 
-# Remove any assignment for KEY from .env (no-op if .env or the key is absent).
-env_clear_key() {
-  local key="$1" tmp
-  [[ -f "$ENV_FILE" ]] || return 0
-  tmp="$(mktemp)"
-  grep -vE "^[[:space:]]*(export[[:space:]]+)?${key}=" "$ENV_FILE" > "$tmp" || true
-  mv "$tmp" "$ENV_FILE"
+# switch_setting_source KEY → where the value switch.sh sees for KEY comes from: the
+# settings file that holds that same value, else "your environment" (exported in the
+# shell, which beats every file).
+switch_setting_source() {
+  local key="$1" line rest
+  line="$( (unset "$key"; club_config_resolve "$ROOT_DIR") | awk -F'\t' -v k="$key" '$1 == k && !n++ { print }')"
+  rest="${line#*$'\t'}"
+  if [[ -n "$line" && "${rest#*$'\t'}" == "${!key-}" ]]; then
+    printf '%s' "${rest%%$'\t'*}"
+  else
+    printf 'your environment'
+  fi
 }
 
 set_default() {
-  local slug="$1" info model key
+  local slug="$1" info model key out
   if [[ -z "${VARIANTS[$slug]:-}" ]]; then
     echo "[switch] ERROR: '${slug}' is not a known variant — can't pin it." >&2
     echo "[switch]        Run: bash scripts/switch.sh --list" >&2
@@ -297,15 +336,21 @@ set_default() {
     exit 1
   fi
   IFS=$'\t' read -r model key <<< "$info"
-  env_set_key "$key" "$slug"
-  echo "[switch] pinned '${slug}' as your default for ${model} (${key} in .env)."
+  # The writer says where it saved ("[config] saved KEY to …/club3090.env"); on failure its
+  # last line says why (a refused value, or an unwritable settings dir).
+  if ! out="$(club_config_set "${key}=${slug}" 2>&1)"; then
+    echo "[switch] ERROR: your default for ${model} was NOT pinned: $(printf '%s\n' "$out" | tail -n 1)" >&2
+    exit 1
+  fi
+  printf '%s\n' "$out"
+  echo "[switch] pinned '${slug}' as your default for ${model} (${key} in club3090.env)."
   echo "[switch] bare 'launch.sh' / '${model%%/*}…' resolves there now; clear it with:"
   echo "[switch]   bash scripts/switch.sh --clear-default ${model}"
   exit 0
 }
 
 clear_default() {
-  local model="$1" key
+  local model="$1" key left out
   key="$(python3 - "$ROOT_DIR" "$model" <<'PY_CLEARKEY'
 import sys
 from pathlib import Path
@@ -314,75 +359,98 @@ from scripts.lib.profiles.compose_registry import model_default_pin_key  # noqa:
 print(model_default_pin_key(sys.argv[2]))
 PY_CLEARKEY
 )"
-  if [[ -f "$ENV_FILE" ]] && grep -qE "^[[:space:]]*(export[[:space:]]+)?${key}=" "$ENV_FILE"; then
-    env_clear_key "$key"
-    echo "[switch] cleared your pinned default for ${model} (removed ${key} from .env)."
-  else
-    echo "[switch] no pinned default set for ${model} (${key} not in .env) — nothing to clear."
+  if [[ -z "$(switch_saved_source "$key")" ]]; then
+    echo "[switch] no pinned default saved for ${model} (${key} is in neither $(club_config_dir)/club3090.env nor the repo .env) — nothing to clear."
+    if [[ -n "${!key:-}" ]]; then
+      echo "[switch] note: ${key}=${!key} is set in your environment, which no saved setting overrides — unset it there."
+    fi
+    exit 0
   fi
+  # --root also removes it from this checkout's legacy .env; the writer says from where.
+  if ! out="$(club_config_unset --root "$ROOT_DIR" "$key" 2>&1)"; then
+    echo "[switch] ERROR: your pinned default for ${model} was NOT cleared: $(printf '%s\n' "$out" | tail -n 1)" >&2
+    exit 1
+  fi
+  printf '%s\n' "$out"
+  left="$(switch_saved_source "$key")"
+  if [[ -n "$left" ]]; then
+    echo "[switch] ERROR: ${key} is still set in ${left} — remove it there." >&2
+    exit 1
+  fi
+  echo "[switch] cleared your pinned default for ${model}."
   exit 0
 }
 
-# --- #1014 follow-up: persisted per-model THINKING pin (.env) ----------------
+# --- #1465: launch settings — per-slug store + the layered resolver ----------
 #
-# The serve-confirm modal's [T] persists the tri-state thinking choice as
-# CLUB3090_THINKING_<MODEL> in .env (same mechanism --set-default uses for
-# CLUB3090_DEFAULT_<MODEL>). This side makes that pin REAL: when resolving the
-# serve env for a launch we read it and inject ENABLE_THINKING accordingly.
+# The resolver is scripts/lib/launch_settings.py (the per-slug store is
+# scripts/lib/slug_settings.py): for each catalogued knob a slug's compose reads it
+# decides the effective value and its source — shell > this slug > model pin >
+# club3090.env > secrets.env > repo .env > compose default. This file only calls it:
+#   check_variant  → `check`   (refusals BEFORE the running slug is torn down)
+#   up_variant     → `exports` (the values are exported right before compose up)
+#   --explain      → `explain` · --set / --unset → `set` / `unset`
+# "Shell" means a key the settings loader did NOT export: club_config_load (top of this
+# script) records every key it exported in CLUB3090_CONFIG_SOURCE, passed as --loaded.
+# The per-model thinking pin (CLUB3090_THINKING_<MODEL>, #1014 follow-up) is one of the
+# layers: on → ENABLE_THINKING=true, off → false, inherit adds nothing.
+LAUNCH_SETTINGS_PY="${ROOT_DIR}/scripts/lib/launch_settings.py"
 
-# Echo the .env pin key for a model's thinking default — normalization identical
-# to model_default_pin_key (compose_registry.model_thinking_pin_key).
-thinking_pin_key_for() {
-  local model="$1"
-  python3 - "$ROOT_DIR" "$model" <<'PY_THINKKEY'
-import sys
-from pathlib import Path
-root = Path(sys.argv[1]); sys.path.insert(0, str(root))
-from scripts.lib.profiles.compose_registry import model_thinking_pin_key  # noqa: E402
-print(model_thinking_pin_key(sys.argv[2]))
-PY_THINKKEY
+_launch_settings() {  # <subcommand> [args…]
+  local cmd="$1" k
+  shift
+  local -a loaded=()
+  if declare -p CLUB3090_CONFIG_SOURCE >/dev/null 2>&1; then
+    for k in "${!CLUB3090_CONFIG_SOURCE[@]}"; do
+      loaded+=(--loaded "${k}=${CLUB3090_CONFIG_SOURCE[$k]}")
+    done
+  fi
+  python3 "$LAUNCH_SETTINGS_PY" "$cmd" --root "$ROOT_DIR" --prefix "[switch]" "${loaded[@]}" "$@"
 }
 
-# Resolve a model's persisted thinking state to on | off | inherit. Reads the
-# ALREADY-LOADED environment (switch.sh loads .env above; shell-env-wins per
-# #425). Unknown/empty values degrade to inherit (the entrypoint default).
-thinking_pin_state() {
-  local model="$1" key val
-  key="$(thinking_pin_key_for "$model")" || { printf 'inherit'; return 0; }
-  val="${!key:-}"
-  case "${val,,}" in
-    on)  printf 'on' ;;
-    off) printf 'off' ;;
-    *)   printf 'inherit' ;;
-  esac
+# Export the slug's resolved launch settings for `compose up`: every value from this
+# slug, the model pin or a settings file (overriding a global value the loader already
+# exported); a shell value is only logged — it is already in the environment and wins.
+apply_launch_settings() {
+  local v="$1" rec key val line
+  rec="$(mktemp)"
+  if ! _launch_settings exports --slug "$v" > "$rec"; then
+    rm -f "$rec"
+    echo "[switch] ERROR: could not resolve the launch settings for ${v}." >&2
+    exit 1
+  fi
+  while IFS= read -r -d '' key && IFS= read -r -d '' val && IFS= read -r -d '' line; do
+    [[ -n "$key" ]] && export "${key}=${val}"
+    echo "[switch] ${line}"
+  done < "$rec"
+  rm -f "$rec"
 }
 
-# Apply the persisted pin to the LAUNCH env right before compose up:
-#   on      → ENABLE_THINKING=true (explicit — beats the passthrough default)
-#   off     → ENABLE_THINKING=false (explicit, per the #1010 lesson)
-#   inherit → nothing injected.
-# An ENABLE_THINKING already present in the SHELL wins (#425 precedence): the
-# .env pin is file-tier defaulting, never a shell override.
-apply_thinking_pin_env() {
-  local variant="$1" eng dir file model state key
-  IFS='|' read -r eng dir file <<< "${VARIANTS[$variant]:-}"
-  # dir = models/<model>/<engine>/compose → model is field 2 (list_variants).
-  IFS=/ read -ra _tp <<< "${dir:-}"
-  model="${_tp[1]:-}"
-  [[ -n "$model" ]] || return 0
-  state="$(thinking_pin_state "$model")"
-  case "$state" in
-    on|off)
-      if [[ -n "${ENABLE_THINKING+x}" ]]; then
-        echo "[switch] thinking pin '${state}' for ${model} ignored — shell exported ENABLE_THINKING=${ENABLE_THINKING} wins (#425)."
-        return 0
-      fi
-      if [[ "$state" == on ]]; then ENABLE_THINKING=true; else ENABLE_THINKING=false; fi
-      export ENABLE_THINKING
-      key="$(thinking_pin_key_for "$model")"
-      echo "[switch] thinking pinned ${state} for ${model} (${key} in .env) → ENABLE_THINKING=${ENABLE_THINKING}."
-      ;;
-  esac
+# --set <slug> KEY=VALUE… / --unset <slug> KEY… are terminal: every word after the
+# slug is a setting, so a flag there is a mistake, not an option.
+_slug_settings_args_ok() {  # <flag> <slug> <args…>
+  local flag="$1" slug="$2" a
+  shift 2
+  [[ $# -gt 0 ]] || { echo "ERROR: ${flag} ${slug} needs at least one $([[ "$flag" == --set ]] && echo KEY=VALUE || echo KEY)." >&2; exit 1; }
+  for a in "$@"; do
+    [[ "$a" != -* ]] || { echo "ERROR: ${flag} takes only $([[ "$flag" == --set ]] && echo KEY=VALUE || echo KEY) after the slug; got '${a}'." >&2; exit 1; }
+  done
+}
+
+set_slug_settings() {  # <slug> KEY=VALUE…
+  _slug_settings_args_ok --set "$@"
+  local slug="$1"
+  shift
+  _launch_settings set --slug "$slug" "$@" || exit $?
+  exit 0
+}
+
+unset_slug_settings() {  # <slug> KEY…
+  _slug_settings_args_ok --unset "$@"
+  local slug="$1"
+  shift
+  _launch_settings unset --slug "$slug" "$@" || exit $?
+  exit 0
 }
 
 
@@ -621,14 +689,15 @@ list_variants() {
 
 # Discoverability (design §7): per model, what `<model>/default` resolves to on
 # the DETECTED topology, marked user-pin vs curated, with a hint to pin. Shared
-# between `--list` (appended) and `--defaults` (standalone). Reads the .env pin
-# straight from the loaded environment (callers load .env above).
+# between `--list` (appended) and `--defaults` (standalone). Reads the pin
+# straight from the environment club_config_load filled above; a pin that isn't
+# from club3090.env (the legacy repo .env, or your environment) is labelled so.
 show_defaults_view() {
   local topology
   topology="$(switch_topology_from_gpus)"
   echo "Defaults — what \`<model>/default\` resolves to on this rig (${topology}):"
-  echo "  (pin = your .env pin · curated = ENGINE_PREFERENCE walk · — = none for this topology)"
-  local models model pin_key pin_value resolved source note
+  echo "  (pin = your --set-default pin, saved in $(club_config_dir)/club3090.env · curated = ENGINE_PREFERENCE walk · — = none for this topology)"
+  local models model pin_key pin_value pin_from resolved source note
   models="$(python3 -c "import sys; sys.path.insert(0,'$ROOT_DIR'); from scripts.lib.profiles.compose_registry import model_set; print('\n'.join(sorted(model_set())))")"
   while IFS= read -r model; do
     [[ -n "$model" ]] || continue
@@ -638,6 +707,8 @@ show_defaults_view() {
     if resolved="$(model_default_target "$ROOT_DIR" "$model" "$topology" 2>/dev/null)"; then
       if [[ -n "$pin_value" && "$resolved" == "$pin_value" ]]; then
         source="pin"
+        pin_from="$(switch_setting_source "$pin_key")"
+        if [[ "$pin_from" != club3090.env ]]; then note="  (from ${pin_from})"; fi
       elif [[ -n "$pin_value" ]]; then
         source="curated"
         note="  (your pin ${pin_value} was ignored — invalid/mismatched; see warnings)"
@@ -667,7 +738,7 @@ defaults_view_standalone() {
 # data as a structured object; the default is a readable block.
 #
 # This is a READ-ONLY, terminal action — it never brings a container up/down,
-# never touches .env, and is strictly additive to the existing flag set.
+# never writes a setting, and is strictly additive to the existing flag set.
 
 # Map the local GPU (nvidia-smi name) to a hardware-profile id under
 # scripts/lib/profiles/hardware/<id>.yml, which is what kv-calc's `--fit --card`
@@ -682,6 +753,16 @@ explain_detect_card() {
   local name=""
   if command -v nvidia-smi >/dev/null 2>&1; then
     name="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || true)"
+  fi
+  # CMP 170HX: only the ~64 GB boards have a profile (launch_compat.py does the same);
+  # a stock 8 GB board takes the default below like any other unmapped card.
+  if [[ "$name" == *"CMP 170HX"* ]]; then
+    local mem_mib=""
+    mem_mib="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -dc '0-9' || true)"
+    if [[ -n "$mem_mib" ]] && (( mem_mib >= 61440 )); then
+      printf 'cmp-170hx-64gb'
+      return 0
+    fi
   fi
   case "$name" in
     *"RTX 3090 Ti"*) printf 'rtx-3090-ti' ;;
@@ -816,7 +897,12 @@ explain_assemble_json() {
   local serving
   serving="$(printf '%s' "$reg" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("serving_file",""))')"
   bench="$(explain_benchmarks_json "$root" "$serving")"
-  python3 - "$reg" "$fit" "$bench" "$card" <<'PY_EXPLAIN_ASSEMBLE'
+  # #1465: each launch knob the slug reads, its effective value and source. Never
+  # fails --explain: an unreadable settings file is reported inside the object.
+  local settings
+  settings="$(_launch_settings explain --slug "$slug" 2>/dev/null)" \
+    || settings='{"available": false, "reason": "launch_settings.py failed"}'
+  python3 - "$reg" "$fit" "$bench" "$card" "$settings" <<'PY_EXPLAIN_ASSEMBLE'
 import json
 import sys
 
@@ -824,6 +910,7 @@ reg = json.loads(sys.argv[1])
 fit = json.loads(sys.argv[2])
 bench = json.loads(sys.argv[3])
 card = sys.argv[4]
+settings = json.loads(sys.argv[5])
 
 out = {
     "slug": reg["slug"],
@@ -831,6 +918,7 @@ out = {
     "card": card,
     "fit": fit,
     "benchmarks": bench,
+    "launch_settings": settings,
 }
 print(json.dumps(out, indent=2))
 PY_EXPLAIN_ASSEMBLE
@@ -904,6 +992,35 @@ if not bench:
 else:
     for b in bench:
         print(f"    {b['row']}")
+
+# #1465 — launch settings: what the NEXT launch of this slug would use, and why.
+ls = obj.get("launch_settings") or {}
+print()
+if not ls.get("available"):
+    print("  Launch settings:")
+    print(f"    (unavailable — {ls.get('reason') or 'no data'})")
+else:
+    print("  Launch settings (next launch; " + " > ".join(ls.get("order") or []) + "):")
+    knobs = ls.get("knobs") or []
+    if not knobs:
+        print("    (this slug's compose reads no catalogued launch settings)")
+    for k in knobs:
+        src = k["source"] + (f" — {k['detail']}" if k.get("detail") else "")
+        over = "; ".join(f"{o['source']}={o['value']}" for o in k.get("overrides") or [])
+        print(f"    {k['knob']:<20} {k['value']:<14} {src}" + (f"   (overrides {over})" if over else ""))
+    unread = ls.get("unread") or []
+    if unread:
+        print("    Saved but not read by this slug (no effect here):")
+        for u in unread:
+            print(f"      {u['knob']}={u['value']}   ({u['source']})")
+    for w in ls.get("warnings") or []:
+        print(f"    ⚠ {w}")
+    errs = ls.get("errors") or []
+    if errs:
+        print("    ✗ the next launch would be REFUSED (before the running slug is taken down):")
+        for e in errs:
+            print(f"      - {e}")
+    print(f"    Change: bash scripts/switch.sh --set {obj['slug']} KEY=VALUE   ·   --unset {obj['slug']} KEY")
 PY_EXPLAIN_HUMAN
 }
 
@@ -950,13 +1067,40 @@ down_running() {
     local lbl_dir lbl_file
     lbl_dir=$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.project.working_dir"}}' "$c" 2>/dev/null || true)
     lbl_file=$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.project.config_files"}}' "$c" 2>/dev/null || true)
-    if [[ -n "$lbl_dir" && -n "$lbl_file" ]]; then
-      (cd "$lbl_dir" && ${COMPOSE_BIN} -f "$lbl_file" down --remove-orphans) || docker stop "$c" >/dev/null
+    # config_files is COMMA-JOINED when the container came up with more than one -f, which
+    # is every launch since #1498 (the club3090.slug label override). Passed whole as one
+    # -f it is a path that doesn't exist, so every teardown fell back to `docker stop` and
+    # left stopped containers, networks and orphans behind (#1515). One -f per file, and a
+    # file that is gone by now is dropped: the label override only adds labels, and a data
+    # dir that moved must not cost the down.
+    local -a cfg_args=() cfg_files=()
+    local cfg
+    IFS=',' read -ra cfg_files <<< "$lbl_file"
+    for cfg in "${cfg_files[@]}"; do
+      [[ -n "$cfg" ]] || continue
+      if [[ "$cfg" == /* ]]; then [[ -e "$cfg" ]] || continue
+      else [[ -e "${lbl_dir}/${cfg}" ]] || continue
+      fi
+      cfg_args+=(-f "$cfg")
+    done
+    if [[ -n "$lbl_dir" && ${#cfg_args[@]} -gt 0 ]]; then
+      (cd "$lbl_dir" && ${COMPOSE_BIN} "${cfg_args[@]}" down --remove-orphans) || docker stop "$c" >/dev/null
     else
       docker stop "$c" >/dev/null
     fi
   done
   [[ "$brought_down" -eq 1 ]] || echo "[switch] no club-3090 container running"
+  # Teardown must prune too, or `--down` leaves the OWUI picker advertising a
+  # model that is no longer serving — the same stale-entry class that let seven
+  # dead connections accumulate. Only club-owned ports are eligible, and it is a
+  # no-op when OWUI is not running, so this is safe on every teardown path.
+  if [[ "${OWUI_REGISTER:-1}" -eq 1 ]]; then
+    bash "$(dirname "$0")/lib/owui-register.sh" --prune-only || true
+  fi
+  # Same for the gateway: after a teardown its local routes point at ports that
+  # are no longer listening, which is the dead-route state this sync exists to
+  # prevent. Cloud routes are untouched.
+  bash "$(dirname "$0")/lib/litellm-sync.sh" --quiet || true
 }
 
 gpu_preflight() {
@@ -1027,9 +1171,29 @@ gpu_preflight() {
   fi
 }
 
+# ⚠️ CALLED TWICE on the launch.sh path (launch.sh:1473 exports, then execs
+# switch.sh, which exports again into the inherited env) -- and that is safe:
+# resolve-variant-pin OMITS any key whose env var is already set (the user-env
+# rule at launch_compat.py:217/311/355/401/506), so pass 2 receives an empty or
+# image-only result and re-exports nothing. Pass 1's values stand, and the
+# per-key "keeping your value" branches below stay silent instead of reporting
+# the launcher's own first-pass export as a user override. Guarded by the
+# double-invocation section of test-launch-compat.sh -- if the resolver ever
+# stops suppressing, that test reds before a user sees a doubled message.
 export_variant_engine_pin() {
   local variant="$1" output line key value gpu_spec
-  [[ "$variant" == vllm/* || "$variant" == beellama/* ]] || return 0
+  # #1365: NO engine-family prefix test. It used to read
+  #   [[ "$variant" == vllm/* || "$variant" == beellama/* ]] || return 0
+  # because resolve_engine_pin RAISED for every other engine, so the only way to
+  # keep the launcher working was to skip the call entirely -- which also skipped
+  # the #246 hardware-envelope exports riding along with it. 73 of 138 slugs got
+  # NO hardware injection at all (#1361). resolve_variant_pin is total now, so the
+  # call is safe for every slug and an empty result is a normal answer.
+  # Measured against origin/master before flipping: the effective image is
+  # BYTE-IDENTICAL for all 138 slugs; what changes is that 22-28 moe-cache slugs
+  # now receive their card-class MOE_RESERVE_MB (2048 on 5090, 3072 on A6000,
+  # 5120 on H100, 8192 on Spark) instead of the compose default. On 2x3090 and
+  # 1x4090 the flip is a no-op, so no bench baseline moves.
   gpu_spec="$(switch_gpu_profile_spec 2>/dev/null || true)"
   if ! output="$(python3 "$LAUNCH_PROFILE" resolve-variant-pin --variant "$variant" --format shell --gpu-spec "$gpu_spec" 2>&1)"; then
     echo "$output" >&2
@@ -1041,19 +1205,92 @@ export_variant_engine_pin() {
       VLLM_NIGHTLY_SHA) export VLLM_NIGHTLY_SHA="$value" ;;
       VLLM_IMAGE) export VLLM_IMAGE="$value" ;;
       BEELLAMA_IMAGE) export BEELLAMA_IMAGE="$value" ;;
+      # #1365: the remaining engines' image pins. resolve_engine_pin used to RAISE
+      # for these, so the launchers gated the whole call behind a vllm/beellama
+      # prefix test and 73 of 138 slugs got no hardware injection at all. Now that
+      # it returns the engine profile's own image_env, each var needs an arm here
+      # or the `*)` below turns it into exit 2. Caught by the #1363 matrix guard.
+      EXLLAMAV3_IMAGE) export EXLLAMAV3_IMAGE="$value" ;;
+      SGLANG_IMAGE) export SGLANG_IMAGE="$value" ;;
+      LLAMACPP_CLUB3090_IMAGE) export LLAMACPP_CLUB3090_IMAGE="$value" ;;
+      LLAMACPP_PRISM_IMAGE) export LLAMACPP_PRISM_IMAGE="$value" ;;
+      LLAMACPP_PRISM_MTP_IMAGE) export LLAMACPP_PRISM_MTP_IMAGE="$value" ;;
       # #246 arch-aware env (pilot slugs; hardware-profile balanced default)
-      KV_CACHE_DTYPE)
-        export KV_CACHE_DTYPE="$value"
-        echo "[switch] arch-aware KV dtype: ${value} (hardware-profile default for detected GPUs — #246)" ;;
+      # KV_CACHE_DTYPE) — arm REMOVED 2026-09-21 (#1371) along with the #246
+      # Phase 1 injector that emitted it. Nothing resolves it any more, so an arm
+      # here would be dead code implying the resolver still can. A user-set
+      # KV_CACHE_DTYPE is untouched either way: the composes read it as
+      # ${KV_CACHE_DTYPE:-…} and docker interpolates it from the environment,
+      # which never went through this case statement. scripts/arch-ab.sh still
+      # pins it explicitly per arm, and that path is unaffected.
       MAX_NUM_SEQS)
-        export MAX_NUM_SEQS="$value"
-        echo "[switch] memory-envelope concurrency: MAX_NUM_SEQS=${value} (measured for this card class — #246 Phase 2)" ;;
+        # #246 arch-aware default — but a value the USER set WINS, matching the .env
+        # precedence rule earlier in this script. An unconditional export silently
+        # clobbered an explicit `MAX_NUM_SEQS=… scripts/switch.sh …` with no override path
+        # (reported on Discord for MAX_NUM_SEQS, 2026-09-11).
+        if [[ -n "${MAX_NUM_SEQS:-}" ]]; then
+          echo "[switch] MAX_NUM_SEQS: keeping your value ${MAX_NUM_SEQS} (hardware profile suggested ${value})" >&2
+        else
+          export MAX_NUM_SEQS="$value"
+          echo "[switch] memory-envelope concurrency: MAX_NUM_SEQS=${value} (measured for this card class — #246 Phase 2)"
+        fi ;;
+      MAX_RUNNING_REQUESTS)
+        # SGLang's spelling of the same quantity (#1361). The envelope injector
+        # emits the engine family's own knob name; without this arm the `*)` below
+        # turns the first sglang envelope row into `exit 2`, i.e. an unlaunchable
+        # slug rather than a no-op. Caught by the #1363 matrix guard's static check.
+        if [[ -n "${MAX_RUNNING_REQUESTS:-}" ]]; then
+          echo "[switch] MAX_RUNNING_REQUESTS: keeping your value ${MAX_RUNNING_REQUESTS} (hardware profile suggested ${value})" >&2
+        else
+          export MAX_RUNNING_REQUESTS="$value"
+          echo "[switch] memory-envelope concurrency: MAX_RUNNING_REQUESTS=${value} (#246 Phase 2, sglang)"
+        fi ;;
       GPU_MEMORY_UTILIZATION)
-        export GPU_MEMORY_UTILIZATION="$value"
-        echo "[switch] memory-fraction floor: GPU_MEMORY_UTILIZATION=${value} (unified-memory card can't safely give the default — #246 Phase 2)" ;;
+        # #246 arch-aware default — but a value the USER set WINS, matching the .env
+        # precedence rule earlier in this script. An unconditional export silently
+        # clobbered an explicit `GPU_MEMORY_UTILIZATION=… scripts/switch.sh …` with no override path
+        # (reported on Discord for MAX_NUM_SEQS, 2026-09-11).
+        if [[ -n "${GPU_MEMORY_UTILIZATION:-}" ]]; then
+          echo "[switch] GPU_MEMORY_UTILIZATION: keeping your value ${GPU_MEMORY_UTILIZATION} (hardware profile suggested ${value})" >&2
+        else
+          export GPU_MEMORY_UTILIZATION="$value"
+          echo "[switch] memory-fraction floor: GPU_MEMORY_UTILIZATION=${value} (a unified-memory card in the GPU set shares its memory with the OS — #246 Phase 2; set GPU_MEMORY_UTILIZATION to override)"
+        fi ;;
+      MEM_FRACTION)
+        # SGLang's spelling of the memory-fraction floor (#1365). Same one-way
+        # DOWNWARD semantics as GPU_MEMORY_UTILIZATION above; the injector picks
+        # the name from the engine family, so sglang no longer receives vLLM's.
+        if [[ -n "${MEM_FRACTION:-}" ]]; then
+          echo "[switch] MEM_FRACTION: keeping your value ${MEM_FRACTION} (hardware profile suggested ${value})" >&2
+        else
+          export MEM_FRACTION="$value"
+          echo "[switch] memory-envelope floor: MEM_FRACTION=${value} (#246 Phase 2, sglang)"
+        fi ;;
+      MOE_RESERVE_MB)
+        # Expert-cache reserve floor, injected UPWARD only on cards larger than
+        # the 24 GB rig the compose default was tuned on. 28 composes read it.
+        # ⚠️ EVIDENCE SCOPE: measured on 24 GB Ampere only. On 32/96 GB cards the
+        # scaling is a SAFETY HEURISTIC, not a tuned optimum -- it preserves the
+        # reserve/VRAM ratio the reference rig validated. Erring high costs a few
+        # hundred pool slots; erring low measured ~11% slower on 24 GB. Sweep on
+        # WALL-CLOCK (cache hit rate improves as throughput regresses) and pin it.
+        if [[ -n "${MOE_RESERVE_MB:-}" ]]; then
+          echo "[switch] MOE_RESERVE_MB: keeping your value ${MOE_RESERVE_MB} (hardware profile suggested ${value})" >&2
+        else
+          export MOE_RESERVE_MB="$value"
+          echo "[switch] expert-cache reserve: MOE_RESERVE_MB=${value} (heuristic above 24 GB — sweep on wall-clock and pin)"
+        fi ;;
       VLLM_USE_DEEP_GEMM)
-        export VLLM_USE_DEEP_GEMM="$value"
-        echo "[switch] fp8 weights: VLLM_USE_DEEP_GEMM=${value} (consumer card has no DeepGEMM recipe — disc #571)" ;;
+        # #246 arch-aware default — but a value the USER set WINS, matching the .env
+        # precedence rule earlier in this script. An unconditional export silently
+        # clobbered an explicit `VLLM_USE_DEEP_GEMM=… scripts/switch.sh …` with no override path
+        # (reported on Discord for MAX_NUM_SEQS, 2026-09-11).
+        if [[ -n "${VLLM_USE_DEEP_GEMM:-}" ]]; then
+          echo "[switch] VLLM_USE_DEEP_GEMM: keeping your value ${VLLM_USE_DEEP_GEMM} (hardware profile suggested ${value})" >&2
+        else
+          export VLLM_USE_DEEP_GEMM="$value"
+          echo "[switch] fp8 weights: VLLM_USE_DEEP_GEMM=${value} (consumer card has no DeepGEMM recipe — disc #571)"
+        fi ;;
       VLLM_ATTENTION_BACKEND) export VLLM_ATTENTION_BACKEND="$value" ;;
       # #809 — the model's declared decode class. A block-diffusion (dLLM)
       # model has no measurable decode window on a single-canvas response,
@@ -1119,8 +1356,15 @@ status_gate() {
   esac
 }
 
-up_variant() {
-  local v="$1"
+# Every check that can refuse a launch WITHOUT needing the running slug's GPUs or
+# RAM back. main runs it BEFORE down_running, so a refused launch leaves the rig
+# serving what it was. It used to tear the running slug down first and refuse
+# afterwards — an experimental slug without --force, a mistyped slug, model files
+# missing on this host (a worktree without MODEL_DIR) — leaving nothing serving.
+# Checks that measure free VRAM or host RAM stay in up_variant, after the teardown
+# has freed them.
+check_variant() {
+  local v="$1" eng dir file full_dir
   if [[ -z "${VARIANTS[$v]:-}" ]]; then
     echo "ERROR: unknown variant '${v}'." >&2
     echo "Run: bash scripts/switch.sh --list" >&2
@@ -1128,18 +1372,23 @@ up_variant() {
   fi
   status_gate "$v"
   IFS='|' read -r eng dir file <<< "${VARIANTS[$v]}"
-  local full_dir="${ROOT_DIR}/${dir}"
+  full_dir="${ROOT_DIR}/${dir}"
   if [[ ! -f "${full_dir}/${file}" ]]; then
     echo "ERROR: compose file missing at ${full_dir}/${file}" >&2
     exit 1
   fi
-
-  # Pre-up sanity:
+  # #1465 launch settings: a value outside the slug's catalogued domain, an unmet
+  # dependency (KV_OFFLOAD_DISK=1 without KV_OFFLOAD_GB), a RAM tier this host can't
+  # hold, or an unreadable slugs.json. Warns about saved values this slug doesn't read.
+  local -a _ls_force=()
+  [[ "${FORCE:-0}" == "1" ]] && _ls_force=(--force)
+  _launch_settings check --slug "$v" "${_ls_force[@]}" || exit 1
   #  - repo_drift: warn if local HEAD is behind origin/master
   #  - compose_deps: HARD error if compose mounts a model dir that doesn't exist on host
   #    (catches the "you didn't WITH_DFLASH_DRAFT=1 then tried dual-dflash-noviz" case;
   #     see club-3090#37 — this is the canonical fix raphael / snoby asked for)
-  #  - kv_format_hint: soft warn if VRAM class needs --kv-cache-dtype override (#47)
+  #  - compose_hardware: GPU count / SM / total VRAM — the cards, not what is free on them
+  #  - offload_split_mode: reads only SPLIT_MODE, so it needs none of the resolvers below
   if [[ -f "${ROOT_DIR}/scripts/preflight.sh" ]]; then
     # shellcheck source=preflight.sh
     source "${ROOT_DIR}/scripts/preflight.sh"
@@ -1147,12 +1396,38 @@ up_variant() {
     preflight_compose_deps "${full_dir}/${file}" || exit 1
     if [[ "$eng" == "vllm" ]]; then
       preflight_compose_hardware "${full_dir}/${file}" "$v" "${FORCE:-0}" || exit 1
+    fi
+    preflight_offload_split_mode "${full_dir}/${file}" || exit 1
+  fi
+  # The engine-pin resolver can refuse a slug for this hardware (exit 2). Dry-run it
+  # in a subshell so a refusal lands here; its exports still happen in up_variant,
+  # where the preflights between have always run without them.
+  ( export_variant_engine_pin "$v" ) >/dev/null || exit $?
+}
+
+up_variant() {
+  local v="$1"
+  # check_variant has already vetted the slug, its status, compose file, model
+  # files and hardware — before the teardown. What is left needs freed resources.
+  IFS='|' read -r eng dir file <<< "${VARIANTS[$v]}"
+  local full_dir="${ROOT_DIR}/${dir}"
+
+  # Pre-up sanity that needs the old slug gone:
+  #  - kv_format_hint: soft warn if VRAM class needs --kv-cache-dtype override (#47)
+  if [[ -f "${ROOT_DIR}/scripts/preflight.sh" ]]; then
+    # shellcheck source=preflight.sh
+    source "${ROOT_DIR}/scripts/preflight.sh"
+    if [[ "$eng" == "vllm" ]]; then
       # Free-VRAM gate: fail fast (not a 600s restart-loop) when the GPUs don't have
       # room for this config's gpu_memory_utilization — e.g. a desktop/other scene
       # still holding VRAM after a switch (club-3090 #535). Runs AFTER down_running(),
       # so its settle-retry also covers the just-torn-down container's VRAM lag.
       preflight_compose_gpu_fit "${full_dir}/${file}" "${FORCE:-0}" || exit 1
     fi
+    # NVIDIA driver page-pool hint — WARN-only, runs even under --force, and BEFORE the
+    # host-RAM gates below: a just-stopped slug's CUDA VMM host memory stays in the
+    # driver's pool, outside MemAvailable, so those gates would read it as used.
+    preflight_nvidia_page_pool || true
     # LMCache host-RAM guard — runs even under --force (incubating LMCache slugs
     # launch WITH --force, yet over-sizing --l1-size-gb can OOM the host; #133).
     # No-op for composes without an LMCache-l1-gb metadata header.
@@ -1161,9 +1436,14 @@ up_variant() {
     # the guards must see the RESOLVED config, not the compose defaults.
     resolve_offload_residency "${full_dir}/${file}"
     resolve_offload_threads   "${full_dir}/${file}"
+    # exl3 CPU-MoE split, sized from DETECTED VRAM (#1366). Ordered with the two
+    # above and BEFORE the guards, so preflight_cpu_offload_ram prices the split we
+    # actually ship rather than the compose default -- and lowering it only ever
+    # LOWERS host RAM (the CPU worker holds the tail), so the two never fight.
+    # No-op on every compose without the CPU-MoE-* headers.
+    resolve_cpu_moe_split     "${full_dir}/${file}"
     # CPU-offload guards: marker-scoped, no-ops on non-offload composes (#deepseek-flash)
     preflight_cpu_offload_ram "${full_dir}/${file}" || exit 1
-    preflight_offload_split_mode "${full_dir}/${file}" || exit 1
     preflight_kv_format_hint "${full_dir}/${file}" || true
     # WARN-only first-token-latency hint; never blocks a boot.
     preflight_offload_thp "${full_dir}/${file}" || true
@@ -1172,12 +1452,26 @@ up_variant() {
     preflight_single_card_util "${full_dir}/${file}" "$v" || true
   fi
   gpu_preflight
+  # Orphaned engine shared-memory segments (ipc: host puts them in the HOST /dev/shm, where an unclean
+  # container stop leaves them resident — 65 GB on the reference rig 2026-09-25, incl. two 32 GiB
+  # KV-offload regions, vllm#57303). Only old, root-owned, engine-named, unmapped files; never fails
+  # the boot. CLUB3090_SHM_CLEANUP=0 disables.
+  bash "$(dirname "$0")/lib/shm-cleanup.sh" || true
 
   echo "[switch] bringing up: ${v}  (${dir}/${file})"
   export_variant_engine_pin "$v"
   preflight_ik_llama_image "$v"   # #633 — cu12 fallback on <13.2 drivers (unless pinned)
-  apply_thinking_pin_env "$v"     # #1014 follow-up — persisted CLUB3090_THINKING_<MODEL> → ENABLE_THINKING
-  (cd "${full_dir}" && ${COMPOSE_BIN} -f "${file}" up -d --remove-orphans)
+  apply_launch_settings "$v"      # #1465 — per-slug / thinking-pin / global launch settings → the compose env
+  # #1466 4a/4b — compile caches in ~/.cache/club-3090/<engine image>/, the KV disk tier in
+  # ~/.local/share/club-3090/kv-offload: created as you, keyed by the image this compose
+  # is about to run (so AFTER the engine pin and launch settings above). No-op for a
+  # compose that mounts neither; on any problem the compose keeps its in-repo default.
+  club_engine_cache_export "${full_dir}" "${file}" --root "${ROOT_DIR}" --compose-bin "${COMPOSE_BIN}"
+  # Label the container with the slug it runs (club3090.slug): two slugs can share one
+  # compose file, and measurement records / c3 need to know which one this is.
+  local label_override=""
+  label_override="$(club_slug_label_override "$v" "${full_dir}/${file}" "${ROOT_DIR}")"
+  (cd "${full_dir}" && ${COMPOSE_BIN} -f "${file}" ${label_override:+-f "$label_override"} up -d --remove-orphans)
 }
 
 resolve_ready_url() {
@@ -1283,6 +1577,45 @@ ready_probe() {
   esac
 }
 
+# #1462: an engine can take disable_custom_all_reduce=False, fail to build its custom
+# all-reduce, log a single warning and serve on NCCL. Nothing else in a launch says
+# so, and a custom-AR benchmark from that boot measures NCCL. Detection is the shared
+# classifier's (scripts/lib/p2p-state.sh), so report.sh, bench.sh and this agree.
+warn_if_custom_ar_setup_failed() {
+  local container="${VARIANT_CONTAINER[$VARIANT]:-}" log
+  [[ -n "$container" ]] || return 0
+  # shellcheck source=lib/p2p-state.sh
+  source "${ROOT_DIR}/scripts/lib/p2p-state.sh" 2>/dev/null || return 0
+  log="$(docker logs "$container" 2>&1 || true)"
+  [[ "$(printf '%s\n' "$log" | p2p_engine_log_evidence | p2p_classify_engagement 2>/dev/null)" == "nccl_only_failed" ]] || return 0
+  echo "[switch] ⚠️ custom all-reduce was requested but its SETUP FAILED — the engine fell back to NCCL, so the kernel is NOT running." >&2
+  printf '%s\n' "$log" | command grep -m1 -F "Setup Custom allreduce failed" | sed 's/^/[switch]   | /' >&2
+  echo "[switch]    Serving is unaffected; a custom-AR benchmark from this boot measures NCCL. See club-3090#1462." >&2
+}
+
+schedule_post_ready_sync() {
+  # #1522 — the gateway and OWUI syncs below the launch only run after a WAITED
+  # ready. With --no-wait, or a boot slower than READY_TIMEOUT, they never ran:
+  # the teardown sync had already rendered the old route away, so the gateway
+  # served no local route for a model that came up fine minutes later. Hand the
+  # same two steps to a detached waiter that runs them once the port answers.
+  local container="$1" port log_dir log
+  port="${READY_URL#*://}"; port="${port#*:}"; port="${port%%/*}"
+  if [[ -z "$container" ]]; then
+    echo "[switch] once :${port} answers, sync the gateway with:  bash scripts/lib/litellm-sync.sh"
+    return 0
+  fi
+  log_dir="$(club_config_data_dir)/logs"
+  mkdir -p "$log_dir" 2>/dev/null || log_dir="${TMPDIR:-/tmp}"
+  log="${log_dir}/post-ready-sync-${container}.log"
+  local -a args=(--url "$READY_URL" --container "$container" --port "$port")
+  [[ "$OWUI_REGISTER" -eq 1 ]] && args+=(--owui)
+  nohup bash "${ROOT_DIR}/scripts/lib/post-ready-sync.sh" "${args[@]}" </dev/null >>"$log" 2>&1 &
+  disown 2>/dev/null || true
+  echo "[switch] the gateway$([[ "$OWUI_REGISTER" -eq 1 ]] && echo ' and Open WebUI') will be synced in the background once :${port} answers"
+  echo "[switch]   (no generation check on that path; log: ${log})"
+}
+
 wait_ready() {
   # Find the container we just brought up so we can detect crashes mid-boot
   # AND surface stage progress markers from its logs while we wait.
@@ -1360,14 +1693,19 @@ wait_ready() {
     if [[ $elapsed -ge $READY_TIMEOUT ]]; then
       echo "[switch] timeout — server not ready after ${READY_TIMEOUT}s" >&2
       echo "[switch] tail logs:  docker logs --tail 100 ${container}" >&2
+      # The crash checks above passed this round, so the container is still
+      # booting, not broken: a slow boot must not leave the gateway empty
+      # (#1522). Still exit 1, because nothing has answered yet.
+      echo "[switch] the container is still booting (raise READY_TIMEOUT to wait longer)." >&2
+      schedule_post_ready_sync "$container" >&2
       exit 1
     fi
   done
 
   # F3 (CLI parity with c3's serving card): print the USABLE endpoint — the LAN
   # URL an agent/client should point at, the served model id, and the auth
-  # status. LANIP's source of truth is the repo .env (#512, loaded above; shell
-  # env wins); fall back to the shared c3_lan_ip helper in a SUBSHELL
+  # status. LANIP comes from your saved settings (#512: club3090.env, or the legacy
+  # repo .env; loaded above; shell env wins); fall back to the shared c3_lan_ip helper in a SUBSHELL
   # (comfyui-paths.sh sets studio paths at source time — keep that contained),
   # then localhost.
   local _lanip _served _port
@@ -1379,8 +1717,8 @@ wait_ready() {
   _port="${READY_URL#*://}"; _port="${_port#*:}"; _port="${_port%%/*}"
   # Resolved BEFORE the ready line now: the generation probe needs the served id
   # too, and it must come from the endpoint — never a hardcoded name.
-  _served="$(curl -sf --max-time 3 "${READY_URL}" \
-    | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"][0]["id"])' 2>/dev/null || true)"
+  source "${ROOT_DIR}/scripts/lib/served-model.sh"   # #1360: TabbyAPI-aware served id
+  _served="$(CLUB_MODEL_ID_TIMEOUT_S=3 club_served_model_id "${READY_URL}")"
 
   # #1100 — prove generation works (and warm the moe-cache expert pool) before
   # claiming ready. Only a dead/erroring server fails here; see ready_probe().
@@ -1397,7 +1735,13 @@ VARIANT=""
 LIST_REQUESTED=0
 LIST_ALL=0
 LIST_LOCAL=0
-OWUI_REGISTER=0
+# Default ON (2026-09-18). It was opt-in via --owui, which meant the common case
+# — launch a slug, open the picker — silently showed nothing, while the endpoints
+# that HAD been registered stayed forever because the helper was append-only.
+# Syncing on every launch is what makes "whatever is running is what you see"
+# true. Still safe to leave on: owui-register.sh is a no-op when OWUI is not
+# running, and it only ever prunes ports this repo owns.
+OWUI_REGISTER=1
 EXPLAIN_REQUESTED=0
 EXPLAIN_SLUG=""
 EXPLAIN_JSON=0
@@ -1438,10 +1782,21 @@ while [[ $# -gt 0 ]]; do
       [[ -n "${2:-}" ]] || { echo "ERROR: --clear-default needs a <model> (e.g. qwen3.6-27b)." >&2; exit 1; }
       clear_default "$2"
       ;;
+    # #1465 — per-slug launch settings. Terminal actions: everything after the slug
+    # is the KEY=VALUE (--set) or KEY (--unset) list.
+    --set)
+      [[ -n "${2:-}" && "$2" != --* ]] || { echo "ERROR: --set needs <slug> KEY=VALUE... (e.g. --set sgl/qwen38-27b-dual-fast KV_OFFLOAD_GB=64)." >&2; exit 1; }
+      set_slug_settings "${@:2}"
+      ;;
+    --unset)
+      [[ -n "${2:-}" && "$2" != --* ]] || { echo "ERROR: --unset needs <slug> KEY... (e.g. --unset sgl/qwen38-27b-dual-fast KV_OFFLOAD_GB)." >&2; exit 1; }
+      unset_slug_settings "${@:2}"
+      ;;
     --down) down_running; exit 0 ;;
     --no-wait) WAIT=0 ;;
     --force) FORCE=1 ;;
-    --owui) OWUI_REGISTER=1 ;;
+    --owui) OWUI_REGISTER=1 ;;          # back-compat: now the default
+    --no-owui) OWUI_REGISTER=0 ;;       # skip OWUI sync entirely
     --*) echo "Unknown flag: $1"; exit 1 ;;
     *)
       if [[ -n "$VARIANT" ]]; then
@@ -1488,19 +1843,38 @@ fi
 
 [[ -n "$VARIANT" ]] || usage
 VARIANT="$(resolve_default_variant "$VARIANT")"
+# Before anything reads the GPU selection (the arch warning, the engine pin, the preflights).
+apply_club3090_gpu_pin "$VARIANT"
 # Explicit selection / pin of an off-arch default (e.g. beellama/dflash on a
 # 4090) still launches — but warn loudly (#693). The curated default already
 # steered away; this catches the deliberate-or-pinned case.
 warn_if_default_arch_gated "$ROOT_DIR" "$VARIANT" "$(primary_sm_from_gpu_spec "$(switch_gpu_profile_spec 2>/dev/null || true)")"
 
 resolve_ready_url "${VARIANT}"
+# #1466 — settings still in this checkout (repo .env, gateway files): say once how to
+# move them to ~/.config/club-3090. They keep working either way.
+club_config_migrate_notice "${ROOT_DIR}" "[switch]"
+check_variant "${VARIANT}"   # every refusal that doesn't need freed resources, BEFORE the teardown
 down_running
 up_variant "${VARIANT}"
 [[ $WAIT -eq 1 ]] && wait_ready
-# --owui: optionally surface the just-launched endpoint in Open WebUI's model
-# picker (no-op if OWUI isn't running). Only meaningful once the server is ready.
+[[ $WAIT -eq 1 ]] && warn_if_custom_ar_setup_failed
+# --no-wait: the syncs below are skipped, so a detached waiter runs them (#1522).
+[[ $WAIT -eq 0 ]] && schedule_post_ready_sync "${VARIANT_CONTAINER[$VARIANT]:-}"
+# OWUI sync (default on; --no-owui to skip): surface the just-launched endpoint in
+# Open WebUI's model picker AND prune club-owned connections that are no longer
+# serving, so the picker matches reality. No-op if OWUI isn't running. Only
+# meaningful once the server is ready — a not-yet-listening port would be pruned
+# by its own liveness probe.
 if [[ "$OWUI_REGISTER" -eq 1 && "$WAIT" -eq 1 ]]; then
   _owui_port="${READY_URL##*:}"; _owui_port="${_owui_port%%/*}"
   bash "$(dirname "$0")/lib/owui-register.sh" "$_owui_port" || true
+fi
+# Gateway sync: the LiteLLM route set follows what is serving, same contract as
+# the OWUI picker above. Independent of OWUI — API clients (aider/opencode/
+# agents) and the AI Studio path reach models through :4000, not the picker.
+# Never fails a launch: the model is already up and serving by this point.
+if [[ "$WAIT" -eq 1 ]]; then
+  bash "$(dirname "$0")/lib/litellm-sync.sh" --quiet || true
 fi
 echo "[switch] done. Try:  curl -s ${READY_URL%/v1/models}/v1/models | jq ."

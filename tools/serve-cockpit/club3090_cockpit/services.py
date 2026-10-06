@@ -14,6 +14,8 @@ Contracts wrapped (all READ-only, safe to call live):
   - ``scripts/gpu-mode.sh --list-modes --json``        → estate_state (scene catalog)
   - ``scripts/health.sh`` (text)                       → estate_state (Doctor read)
   - core ``detect_endpoint`` / ``get_gpu_info``        → estate_state / containers / reconcile
+  - ``scripts/lib/launch_settings.py`` (in-process)     → launch_settings (the form's rows)
+    + ``docker ps`` / ``docker inspect`` (knob env only) → what a running container got
 
 WRITES (serve / scene_switch / set_default / clear_default / estate_down /
 container_action) are WIRED as ``ActionPlan`` builders + an ``execute_action``
@@ -34,7 +36,7 @@ import subprocess
 import time
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Awaitable, Callable, Optional, Protocol
 
 from club3090_tui_core.detect import (
@@ -47,6 +49,8 @@ from club3090_tui_core.detect import (
 from club3090_tui_core.registry import VariantRow, parse_variant_rows
 from club3090_tui_core.runner import CoreRunState, SubprocessRunner
 
+from . import launch_settings_store as _launch
+from . import settings_store as _settings
 from .data import (
     ActionPlan,
     ArtifactInventory,
@@ -124,8 +128,9 @@ DEFAULT_CARD = "rtx-3090"
 # (``<root>/<subdir>``), the SAME convention setup.sh uses for ``${MODEL_DIR}``
 # (NO extra ``huggingface`` segment appended by us).  On this rig that's
 # ``/mnt/models/huggingface`` (``/mnt/models`` is the volume; ``/mnt/models/gguf``
-# is a back-compat symlink → ``huggingface``).  Resolution prefers the repo .env
-# (the shared config setup.sh reads) over this default — see weights_model_dir.
+# is a back-compat symlink → ``huggingface``).  Resolution prefers the club-3090
+# settings (MODEL_DIR, the value setup.sh / switch.sh read) over this default —
+# see weights_model_dir.
 # SAFE to surface (it's the model dir, not a secret).
 MODEL_DIR = "/mnt/models/huggingface"
 
@@ -185,6 +190,19 @@ STUDIO_VOICE_GPU_NEED_MIB = 14000
 # The director container — placement-aware (STUDIO_DIRECTOR_DEVICE); a Containers-pane
 # start must honor that knob, not the GPU0 compose default. See director_compose_env.
 STUDIO_DIRECTOR_CONTAINER = "studio-director"
+
+# `docker compose --env-file <this>` in a plan's cmd stands for the resolved
+# club-3090 settings (club-3090#1466). A plan is built when it is shown and may
+# never run, so the file is written only when the command starts
+# (_start_raw_logged): a 0600 temp file from the loader, removed when the run
+# ends — or the flag is dropped when nothing is configured, as gpu-mode.sh does.
+SETTINGS_ENV_FILE = "<club-3090-settings>"
+# `env CLUB3090_LITELLM_ROUTE_KEYS=<this>` before the gateway's compose stands for a
+# 0600 file of the keys this rig's own gateway routes use (scripts/lib/litellm_local.py:
+# only those, not all of secrets.env). Written when the command starts and removed
+# when it ends, like SETTINGS_ENV_FILE; dropped when no route needs a saved key.
+ROUTE_KEYS_VAR = "CLUB3090_LITELLM_ROUTE_KEYS"
+ROUTE_KEYS_FILE = "<club-3090-gateway-route-keys>"
 
 # Nested studio sidecars: container-name → services/studio/<subdir> basename. The
 # container suffix usually equals the subdir, EXCEPT the director (container
@@ -525,6 +543,12 @@ class CockpitData:
         # own READY_TIMEOUT is already 600s, so a TTL near that would prune a
         # still-booting claim; keep it well above a worst-case boot.
         self._claim_ttl = 1800.0  # seconds
+        # True once c3 itself put the saved HF token into os.environ (launch or
+        # Settings), so a later Settings save may replace it; a token the user's
+        # shell exported is never overridden (the shell wins, as in every script).
+        self._hf_token_injected = False
+        # Removal tasks for the settings env files handed to docker compose.
+        self._env_file_tasks: set = set()
 
     def set_logging_enabled(self, enabled: bool) -> None:
         """Apply the master switch to read and non-download write runners."""
@@ -546,8 +570,13 @@ class CockpitData:
         """Start a non-download stream, teeing it when master logging is on.
 
         Callback values are never serialized.  In particular, ``env`` is passed
-        to the child only and is intentionally absent from the log.
+        to the child only and is intentionally absent from the log.  A
+        :data:`SETTINGS_ENV_FILE` placeholder in ``cmd`` becomes the settings
+        env file here (its path is logged, never its contents).
         """
+        cmd, env_file = self._materialize_settings_env_file(cmd)
+        cmd, keys_file = self._materialize_route_keys_file(cmd)
+        temp_files = [p for p in (env_file, keys_file) if p is not None]
         existing_event = getattr(runner, "_on_event", None)
         existing_line = getattr(runner, "_on_line", None)
         existing_complete = getattr(runner, "_on_complete", None)
@@ -584,14 +613,86 @@ class CockpitData:
                 on_complete=complete,
             )
         try:
-            return await runner.start_raw(cmd, env=env, run_type=run_type, parser=parser)
-        except Exception:
+            state = await runner.start_raw(cmd, env=env, run_type=run_type, parser=parser)
+        except BaseException:
             runner.set_callbacks(
                 on_event=existing_event,
                 on_line=existing_line,
                 on_complete=existing_complete,
             )
+            for path in temp_files:
+                self._remove_env_file(path)
             raise
+        for path in temp_files:
+            task = asyncio.create_task(self._remove_env_file_when_done(path, state))
+            self._env_file_tasks.add(task)
+            task.add_done_callback(self._env_file_tasks.discard)
+        return state
+
+    # ── the settings env file for `docker compose --env-file` (#1466) ───────────
+
+    def _materialize_settings_env_file(self, cmd: list[str]) -> tuple[list[str], Optional[Path]]:
+        """Replace the :data:`SETTINGS_ENV_FILE` placeholder with a fresh 0600
+        file of the resolved settings (the loader's ``write_compose_env_file``),
+        or drop it with its ``--env-file`` flag when nothing is configured or the
+        file can't be written — docker compose then reads the compose dir's own
+        ``.env``, as it would have without c3."""
+        if SETTINGS_ENV_FILE not in cmd:
+            return list(cmd), None
+        out = list(cmd)
+        i = out.index(SETTINGS_ENV_FILE)
+        try:
+            path = _settings.compose_env_file(self.repo_root)
+        except Exception:
+            path = None
+        if path is None:
+            del out[i - 1 if i > 0 and out[i - 1] == "--env-file" else i:i + 1]
+        else:
+            out[i] = str(path)
+        return out, path
+
+    def _materialize_route_keys_file(self, cmd: list[str]) -> tuple[list[str], Optional[Path]]:
+        """Replace the :data:`ROUTE_KEYS_FILE` placeholder with a fresh 0600 file of
+        the keys this rig's own gateway routes use, or drop the assignment (and an
+        ``env`` it leaves bare) when no route needs a saved key or the file can't be
+        written — compose then loads only the older services/litellm/local.env."""
+        token = f"{ROUTE_KEYS_VAR}={ROUTE_KEYS_FILE}"
+        if token not in cmd:
+            return list(cmd), None
+        out = list(cmd)
+        i = out.index(token)
+        try:
+            path = _settings.route_keys_file(self.repo_root)
+        except Exception:
+            path = None
+        if path is None:
+            del out[i]
+            if out[:1] == ["env"] and len(out) > 1 and "=" not in out[1]:
+                del out[0]
+        else:
+            out[i] = f"{ROUTE_KEYS_VAR}={path}"
+        return out, path
+
+    @staticmethod
+    def _remove_env_file(path: Optional[Path]) -> None:
+        if path is not None:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+    async def _remove_env_file_when_done(self, path: Path, state: Any) -> None:
+        """Delete the settings env file once the command that reads it has
+        finished (it holds tokens). A state without a completion signal can't be
+        waited on, so its file goes at once; the claim TTL bounds the wait."""
+        done = getattr(state, "done", None)
+        try:
+            if done is not None and not getattr(state, "is_finished", False):
+                await asyncio.wait_for(done.wait(), timeout=self._claim_ttl)
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            self._remove_env_file(path)
 
     # ── small JSON helper ──────────────────────────────────────────────────────
 
@@ -737,6 +838,19 @@ class CockpitData:
         root = Path(model_dir or self.weights_model_dir())
         base = root / meta.subdir
         try:
+            # ABSENT must be probed at the directory the verify_glob ACTUALLY lives in,
+            # not at `subdir`. 9 of 87 weights entries carry a nested glob whose first
+            # segment is the variant dir under a SHARED parent -- e.g.
+            # subdir=glm-5.3-flash-gguf + verify_glob=UD-IQ4_XS/*.gguf, with sibling
+            # variants (devquasar-q2k, dflash2, mmproj) in that same parent. Probing
+            # `subdir` there left `base.is_dir()` true for as long as ANY sibling was on
+            # disk, so ABSENT was UNREACHABLE and a cleanly deleted variant reported
+            # PARTIAL forever -- offering "Download resumes it" for a 100-250 GB fresh
+            # pull with nothing to resume. For a flat glob PurePosixPath("*.gguf").parent
+            # is "." so probe == base and the other 78 entries are unaffected.
+            probe = base / PurePosixPath(meta.verify_glob or "").parent
+            if not probe.is_dir():
+                return WEIGHTS_ABSENT, meta
             if not base.is_dir():
                 return WEIGHTS_ABSENT, meta
             if not any(base.glob(meta.verify_glob)):
@@ -812,9 +926,10 @@ class CockpitData:
                 "  fix: run `bash scripts/setup.sh` once in a terminal (it offers an isolated install),",
                 "  or:  pipx install 'huggingface-hub[hf_transfer]' && pipx ensurepath",
             ]
-        if not os.environ.get("HF_TOKEN") and not self._hf_token_file().exists():
+        if not self.hf_token() and not self._hf_token_file().exists():
             notes.append(
-                "ℹ preflight: no HF token found (env HF_TOKEN / ~/.cache/huggingface/token) — "
+                "ℹ preflight: no HF token found (HF_TOKEN in the shell or your club-3090 "
+                "settings, or ~/.cache/huggingface/token) — "
                 "gated repos will fail with 401; set one in [S] Settings."
             )
         return blockers, notes
@@ -882,6 +997,7 @@ class CockpitData:
         # now uses).  This is the cockpit↔scripts single-source-of-truth seam.
         root = self.weights_model_dir()
         env["MODEL_DIR"] = root
+        self._apply_hf_token(env)
         comp_keys = [c if ":" in c else f"{model}:{c}" for c in (companions or []) if c]
         if comp_keys:
             env["WEIGHT_EXTRA_KEYS"] = " ".join(comp_keys)
@@ -915,6 +1031,7 @@ class CockpitData:
         env = dict(os.environ)
         env["MODEL_DIR"] = self.weights_model_dir()
         env["COMFYUI_MODELS_DIR"] = self.comfyui_models_dir()
+        self._apply_hf_token(env)
         env.setdefault("HF_HOME", str(Path(self.weights_model_dir()) / ".cache" / "huggingface"))
         log = DownloadLog("studio", plan.cmd)
         emit = self._tee(on_line, log)
@@ -934,40 +1051,117 @@ class CockpitData:
         except Exception:
             pass
 
-    def _dotenv_model_dir(self) -> str:
-        """``MODEL_DIR`` from the repo ``.env`` — the SHARED config setup.sh reads.
+    # ── settings (club-3090#1466) ────────────────────────────────────────────────
+    # Every setting c3 reads or writes goes through the ONE loader
+    # (scripts/lib/club_config.py, via settings_store): the shell > club3090.env >
+    # secrets.env > the repo .env — the values switch.sh, setup.sh and gpu-mode
+    # resolve. c3 no longer parses or rewrites the repo .env itself.
 
-        Reading it here lets the cockpit resolve the SAME weights root as the
-        scripts (the single-source-of-truth goal) without re-implementing the
-        convention.  ``""`` if the file is absent / unreadable / has no MODEL_DIR."""
-        try:
-            envf = self.repo_root / ".env"
-            if not envf.is_file():
-                return ""
-            for raw in envf.read_text(encoding="utf-8", errors="replace").splitlines():
-                s = raw.strip()
-                if s.startswith("MODEL_DIR=") and not s.startswith("#"):
-                    return s.split("=", 1)[1].strip().strip('"').strip("'")
-        except OSError:
-            return ""
-        return ""
+    def setting(self, key: str) -> Optional[str]:
+        """One setting's effective value (the shell wins), or None."""
+        return _settings.get(key, self.repo_root)
+
+    def setting_source(self, key: str) -> Optional[str]:
+        """Where :meth:`setting` comes from — ``shell``, ``club3090.env``,
+        ``secrets.env`` or ``repo .env`` — or None when nothing sets it."""
+        return _settings.source(key, self.repo_root)
+
+    def saved_setting_source(self, key: str) -> str:
+        """The FILE a setting is saved in (club3090.env / secrets.env / repo
+        .env), ignoring the shell — "" when no file sets it."""
+        hit = _settings.stored(key, self.repo_root)
+        return hit[0] if hit else ""
+
+    def store_settings(self, values: dict[str, str], *, secret: bool = False) -> Path:
+        """WRITE — store settings in club3090.env (``secret`` → secrets.env, mode
+        0600) through the one writer; returns the file. The repo .env is left
+        alone: it is read last, so the stored value wins over an old copy there.
+        Raises ``settings_store.SettingsError`` (names the key, never the value)."""
+        return _settings.save(values, secret=secret)
+
+    # ── launch settings (club-3090#1465, phase 3d) ───────────────────────────────
+    # The per-slug launch knobs through the ONE resolver (scripts/lib/
+    # launch_settings.py, via launch_settings_store) — the values, sources and
+    # refusals of `switch.sh --explain / --set / --unset`. The resolver runs in a
+    # worker thread (it reads the registry and asks engine-kind.sh); the running
+    # container is read with docker ps / docker inspect through the READ runner.
+
+    def loaded_settings(self) -> dict[str, str]:
+        """{key: file} for every setting c3 itself put into its environment —
+        the resolver's ``loaded`` (switch.sh passes CLUB3090_CONFIG_SOURCE), so
+        such a key counts as its file's and not as the shell's. Today that is
+        only the saved HF token applied at start-up / from Settings."""
+        out: dict[str, str] = {}
+        if self._hf_token_injected:
+            hit = _settings.stored("HF_TOKEN", self.repo_root)
+            if hit and os.environ.get("HF_TOKEN") == hit[1]:
+                out["HF_TOKEN"] = hit[0]
+        return out
+
+    async def launch_settings(self, slug: str) -> "_launch.LaunchView":
+        """READ — the slug's launch settings for its next launch, and what a
+        running container of the slug was started with (docker, read-only)."""
+        view = await asyncio.to_thread(
+            _launch.view, slug, self.repo_root, None, self.loaded_settings()
+        )
+        if view.available and view.knobs:
+            await self._attach_running_launch_settings(view)
+        return view
+
+    async def _attach_running_launch_settings(self, view: "_launch.LaunchView") -> None:
+        res = await self._runner.run(
+            ["docker", "ps", "--format", _launch.PS_FORMAT],
+            cwd=str(self.repo_root), timeout=10.0,
+        )
+        if not res.ok:
+            view.running_error = "docker ps failed — can't tell whether the slug is running"
+            return
+        checkable = [k.knob for k in view.knobs if k.in_container_env]
+        for name in _launch.containers_for(view.compose_path, res.stdout, view.slug):
+            if not checkable:
+                view.running.append(_launch.running_state(view, name, ""))
+                continue
+            got = await self._runner.run(
+                ["docker", "inspect", name, "--format", _launch.inspect_format(checkable)],
+                cwd=str(self.repo_root), timeout=10.0,
+            )
+            if not got.ok:
+                view.running.append(_launch.RunningContainer(
+                    name=name, error="docker inspect failed — its settings can't be read"))
+                continue
+            view.running.append(_launch.running_state(view, name, got.stdout))
+
+    async def save_launch_settings(self, slug: str, values: dict[str, str]) -> "_launch.Change":
+        """WRITE — save KEY=VALUE for this slug (slugs.json), exactly as
+        ``switch.sh --set <slug> KEY=VALUE``: the resolver checks every value and
+        refuses in its own words (``Change.problems``). Raises
+        ``launch_settings_store.LaunchSettingsError`` when it can't run at all."""
+        return await asyncio.to_thread(_launch.save, slug, values, self.repo_root)
+
+    async def remove_launch_settings(self, slug: str, keys: list[str]) -> "_launch.Change":
+        """WRITE — remove this slug's own saved values (``switch.sh --unset``)."""
+        return await asyncio.to_thread(_launch.remove, slug, keys, self.repo_root)
+
+    def hf_token(self) -> str:
+        """The effective HF token — the shell's HF_TOKEN (or the saved one c3
+        applied at launch), else the saved settings; "" when none. Passed to
+        download children only; never logged or shown."""
+        return (self.setting("HF_TOKEN") or "").strip()
+
+    def _apply_hf_token(self, env: dict) -> None:
+        """Give a download child the effective HF token (setup.sh, pull.sh and
+        hf_fetch.py read it from their environment)."""
+        tok = self.hf_token()
+        if tok:
+            env["HF_TOKEN"] = tok
 
     def director_device(self) -> str:
-        """The studio director's placement — ``STUDIO_DIRECTOR_DEVICE`` from the repo
-        ``.env`` (``gpu0`` | ``gpu1`` | ``cpu``; default ``gpu0``).  Read by gpu-mode's
-        ``start_studio_director``; the Settings screen edits it via :meth:`set_repo_env_var`."""
-        try:
-            envf = self.repo_root / ".env"
-            if envf.is_file():
-                for raw in envf.read_text(encoding="utf-8", errors="replace").splitlines():
-                    s = raw.strip()
-                    if s.startswith("STUDIO_DIRECTOR_DEVICE=") and not s.startswith("#"):
-                        v = s.split("=", 1)[1].strip().strip('"').strip("'")
-                        if v in ("gpu0", "gpu1", "cpu"):
-                            return v
-        except OSError:
-            pass
-        return "gpu0"
+        """The studio director's placement — ``STUDIO_DIRECTOR_DEVICE`` (``gpu0`` |
+        ``gpu1`` | ``cpu``; default ``gpu0``), resolved like every setting.  Read by
+        gpu-mode's ``start_studio_director``; the Settings screen stores it via
+        :meth:`store_settings`."""
+        v = (self.setting("STUDIO_DIRECTOR_DEVICE") or "").strip()
+        return v if v in ("gpu0", "gpu1", "cpu") else "gpu0"
 
     def director_compose_env(self) -> dict[str, str]:
         """Translate the director placement (:meth:`director_device`) into the compose
@@ -988,55 +1182,22 @@ class CockpitData:
         return {"DIRECTOR_NGL": "99", "STUDIO_DIRECTOR_CUDA": "0",
                 "STUDIO_DIRECTOR_GPU": "0", "DIRECTOR_THINK_ARGS": ""}
 
-    def set_repo_env_var(self, key: str, value: str) -> bool:
-        """WRITE — upsert ``key=value`` in the repo ``.env`` (the SHARED config gpu-mode
-        and the composes read), preserving every other line.  Updates the first
-        uncommented ``key=`` line in place, else appends; creates the file if absent.
-        Returns True on a successful write."""
-        try:
-            envf = self.repo_root / ".env"
-            lines = (
-                envf.read_text(encoding="utf-8", errors="replace").splitlines()
-                if envf.is_file() else []
-            )
-            out: list[str] = []
-            done = False
-            for raw in lines:
-                st = raw.strip()
-                if st.startswith(f"{key}=") and not st.startswith("#"):
-                    out.append(f"{key}={value}")
-                    done = True
-                else:
-                    out.append(raw)
-            if not done:
-                out.append(f"{key}={value}")
-            envf.write_text("\n".join(out) + "\n", encoding="utf-8")
-            return True
-        except OSError:
-            return False
-
     def weights_model_dir(self) -> str:
         """The WEIGHTS ROOT — the dir that DIRECTLY holds the model subdirs
         (``<root>/<subdir>``), the SAME convention setup.sh uses (no extra
         ``huggingface`` segment — that double-append was the cockpit↔scripts
         divergence this resolves).
 
-        Precedence (highest first): an in-app / persisted value (``_model_dir``,
-        set at launch by ``apply_persisted_settings`` from the ``$MODEL_DIR`` env
-        var or the saved settings, or live by the Settings screen) > the
-        ``$MODEL_DIR`` env var (also covers a bare ``CockpitData`` built outside
-        ``__main__`` — tests / embedding) > ``MODEL_DIR`` in the repo ``.env`` (so
-        the cockpit and setup.sh land on the SAME root) > the bundled default."""
+        Precedence (highest first): an explicit ``_model_dir`` (tests / embedding,
+        or a pre-#1466 c3-settings.json value the store refused, see
+        ``settings_store.fold_in_c3_settings``) > ``MODEL_DIR`` resolved by the
+        loader — the shell, club3090.env, secrets.env, the repo .env, exactly
+        what switch.sh and setup.sh use, so c3 never reports weights they can't
+        find (#1466) > the bundled default."""
         configured = getattr(self, "_model_dir", None)
         if configured:
             return configured
-        env_dir = (os.environ.get("MODEL_DIR") or "").strip()
-        if env_dir:
-            return env_dir
-        dotenv = self._dotenv_model_dir()
-        if dotenv:
-            return dotenv
-        return MODEL_DIR
+        return (self.setting("MODEL_DIR") or "").strip() or MODEL_DIR
 
     # Backup / cruft a user leaves in the model dir when swapping weights (rename
     # the old GGUF to *.bak, etc.).  EXCLUDED from the byte count — otherwise a
@@ -1044,31 +1205,60 @@ class CockpitData:
     # hf's in-progress ``*.incomplete`` staging files are deliberately NOT excluded
     # (they ARE the live download — counting them is what makes the % move).
     _BACKUP_SUFFIXES = (".bak", ".old", ".orig", ".disabled", ".save")
+    # `hf download --local-dir <subdir>` (what setup.sh runs) stages each file as
+    # <subdir>/.cache/huggingface/download/<path>.<etag>.incomplete and moves it into
+    # place when done; older layouts leave <path>.incomplete beside the final file.
+    _HF_STAGING = Path(".cache") / "huggingface" / "download"
 
-    def weights_bytes_on_disk(self, meta: WeightsMeta, *, model_dir: Optional[str] = None) -> int:
-        """Total bytes currently under ``<model_dir>/huggingface/<subdir>`` — the
-        download-progress signal.  0 when the dir is absent.  Backup/cruft files
-        (``*.bak`` / ``*.old`` / ``*.orig`` / ``foo~`` …) are skipped so a leftover
-        old-quant copy can't inflate the count; hf's ``*.incomplete`` staging IS
-        counted so live progress tracks the transfer."""
+    def _weights_globs(self, meta: WeightsMeta, base: Path) -> list[tuple[Path, str]]:
+        g = meta.verify_glob
+        stage = base / self._HF_STAGING
+        return [(base, g), (base, g + ".incomplete"), (base, g + ".*.incomplete"),
+                (stage, g + ".incomplete"), (stage, g + ".*.incomplete")]
+
+    def weights_files_on_disk(
+        self, meta: WeightsMeta, *, model_dir: Optional[str] = None, staging_only: bool = False
+    ) -> set[Path]:
+        """The files that belong to ``meta``: its ``verify_glob`` matches under its subdir
+        plus their in-flight ``*.incomplete`` staging, never the whole subdir (#1508).
+        Variants can share a parent bucket — subdir=glm-5.3-flash-gguf with
+        verify_glob=UD-IQ4_XS/*.gguf, beside the dflash2/ and mmproj/ companions and
+        other quants — and an rglob of the bucket counted all of them, companions twice
+        once the set was summed. Backup/cruft (``*.bak`` / ``*.old`` / ``foo~`` …) is
+        skipped so a leftover old-quant copy can't inflate the count."""
         base = Path(model_dir or self.weights_model_dir()) / meta.subdir
-        if not base.is_dir():
-            return 0
-        total = 0
-        try:
-            for f in base.rglob("*"):
-                try:
-                    if not f.is_file():
-                        continue
+        if not base.is_dir() or not meta.verify_glob:
+            return set()
+        out: set[Path] = set()
+        for root, pattern in self._weights_globs(meta, base):
+            if staging_only and not pattern.endswith(".incomplete"):
+                continue
+            try:
+                for f in root.glob(pattern):
                     name = f.name.lower()
                     if name.endswith(self._BACKUP_SUFFIXES) or name.endswith("~"):
                         continue
-                    total += f.stat().st_size
-                except OSError:
-                    continue
-        except OSError:
-            return 0
+                    if f.is_file():
+                        out.add(f.resolve())
+            except (OSError, ValueError):
+                continue
+        return out
+
+    @staticmethod
+    def _bytes_of(files) -> int:
+        total = 0
+        for f in files:
+            try:
+                total += f.stat().st_size
+            except OSError:
+                continue
         return total
+
+    def weights_bytes_on_disk(self, meta: WeightsMeta, *, model_dir: Optional[str] = None) -> int:
+        """Bytes of ``meta``'s own files on disk (``weights_files_on_disk``) — the
+        download-progress signal.  0 when the dir is absent.  hf's ``*.incomplete``
+        staging IS counted so live progress tracks the transfer."""
+        return self._bytes_of(self.weights_files_on_disk(meta, model_dir=model_dir))
 
     def weights_download_progress(
         self, meta: WeightsMeta, *, model_dir: Optional[str] = None
@@ -1102,17 +1292,50 @@ class CockpitData:
                 metas.append(cm)
         return metas
 
-    def weights_download_progress_set(
+    # An artifact counts as already on disk when its files reach this share of its
+    # size_gb: slack for size_gb rounding (and the GB/GiB mix-ups the registry has had).
+    _COMPLETE_SHARE = 0.97
+
+    def download_complete_at_start(
         self, metas: list[WeightsMeta], *, model_dir: Optional[str] = None
+    ) -> frozenset[tuple[str, str]]:
+        """The (model, variant) of each artifact in the set that is ALREADY on disk when
+        a download starts. ``weights_download_progress_set`` leaves them out of the %,
+        so a slug whose 157 GB core is present shows its 1.8 GB of companions moving
+        0 → 99 instead of a bar frozen at 98-99 % of 158.8 GB (#1508)."""
+        done = set()
+        for m in metas:
+            if m.size_gb and m.size_gb > 0 and self.weights_bytes_on_disk(m, model_dir=model_dir) \
+                    >= self._COMPLETE_SHARE * float(m.size_gb) * 1e9:
+                done.add((m.model, m.variant))
+        return frozenset(done)
+
+    def weights_download_progress_set(
+        self,
+        metas: list[WeightsMeta],
+        *,
+        model_dir: Optional[str] = None,
+        complete_at_start: frozenset = frozenset(),
     ) -> Optional[int]:
-        """Aggregate download progress across a set (core + companions): total
-        bytes-on-disk / total ``size_gb``, capped at 99.  ``None`` when no size is
-        known.  This is the value the cockpit shows for an in-flight download so
-        the % MOVES as each artifact lands (vs the core-only static-99 trap)."""
-        total_size = sum(float(m.size_gb) for m in metas if m.size_gb)
+        """Aggregate download progress across a set (core + companions): bytes of the
+        set's DISTINCT files / total ``size_gb``, capped at 99.  ``None`` when no size
+        is known.  This is the value the cockpit shows for an in-flight download so
+        the % MOVES as each artifact lands (vs the core-only static-99 trap).
+        ``complete_at_start`` (from ``download_complete_at_start``) drops artifacts that
+        were already on disk, unless a re-fetch of one shows up in staging; when that
+        leaves nothing, the whole set counts."""
+        active = [m for m in metas
+                  if (m.model, m.variant) not in complete_at_start
+                  or self.weights_files_on_disk(m, model_dir=model_dir, staging_only=True)]
+        if not active:
+            active = list(metas)
+        total_size = sum(float(m.size_gb) for m in active if m.size_gb)
         if total_size <= 0:
             return None
-        got = sum(self.weights_bytes_on_disk(m, model_dir=model_dir) for m in metas)
+        files: set[Path] = set()
+        for m in active:
+            files |= self.weights_files_on_disk(m, model_dir=model_dir)
+        got = self._bytes_of(files)
         return max(0, min(99, int(got / (total_size * 1e9) * 100)))
 
     def weights_fits_disk(
@@ -1299,26 +1522,16 @@ class CockpitData:
 
     def lan_ip(self) -> str:
         """The rig's LAN IP for user-facing endpoint URLs (F3) — the SAME
-        derivation as the launchers (layer rule, #512 precedence): env LANIP →
-        repo .env `LANIP=` → the shared `c3_lan_ip` helper (subshell-contained;
-        comfyui-paths.sh sets studio paths at source time) → localhost.
+        derivation as the launchers (layer rule, #512 precedence): ``LANIP`` from
+        the shell or the club-3090 settings (the one loader, #1466) → the shared
+        `c3_lan_ip` helper (subshell-contained; comfyui-paths.sh sets studio
+        paths at source time) → localhost.
         Cached for the session (the LAN IP doesn't move under a running TUI)."""
         cached = getattr(self, "_lan_ip_cache", "")
         if cached:
             return cached
-        import os
-        import re
         import subprocess
-        ip = (os.environ.get("LANIP") or "").strip()
-        if not ip:
-            try:
-                m = re.search(
-                    r"^LANIP=(.+)$", (self.repo_root / ".env").read_text(), re.M
-                )
-                if m:
-                    ip = m.group(1).strip()
-            except OSError:
-                pass
+        ip = (self.setting("LANIP") or "").strip()
         if not ip:
             helper = self.repo_root / "services" / "comfyui" / "comfyui-paths.sh"
             if helper.is_file():
@@ -1461,6 +1674,7 @@ class CockpitData:
         (conftest blocks the real spawn)."""
         env = dict(os.environ)
         env.setdefault("HF_HOME", str(self._bring_hf_home()))
+        self._apply_hf_token(env)
         self._last_swap_compose = ""
         log = DownloadLog(f"bring-{repo.rsplit('/', 1)[-1]}", ["(bring)", repo])
 
@@ -1846,7 +2060,7 @@ class CockpitData:
                 s = _spec(await asyncio.to_thread(
                     _deriver.gguf_facts_from_repo,
                     repo, str(files[0]), _deriver.default_probe_fetcher(),
-                    os.environ.get("HF_TOKEN") or None,
+                    self.hf_token() or None,
                     model_id=repo, weight_gb=size_gb,
                 ))
                 if s:
@@ -3468,6 +3682,7 @@ class CockpitData:
         for k, v in (overrides or {}).items():
             if v is not None and str(v) != "":
                 env[k] = str(v)
+        env.update(self._engine_cache_env(compose_path, env))   # #1466 4a/4b
         return ActionPlan(
             kind="serve",
             cmd=["docker", "compose", "-f", compose_path, "up", "-d"],
@@ -3477,12 +3692,35 @@ class CockpitData:
             env=env,
         )
 
+    def _engine_cache_env(self, compose_path: str, plan_env: dict[str, str]) -> dict[str, str]:
+        """#1466 4a/4b — a generated or brought compose that mounts the shared compile
+        cache or the KV disk tier (a clone of a vLLM sibling does) gets the same per-user
+        directories ``switch.sh`` would give it: created now, as you, keyed by the image
+        it will run (scripts/lib/engine_cache.py). Rendered in the environment the serve
+        runs with (os.environ + the plan env); the directories honour the saved settings.
+        Never pulls — this runs when the plan is built — so an image that isn't on the
+        machine yet keeps the compose's in-repo default for this serve. {} on any problem."""
+        try:
+            p = Path(compose_path)
+            if not p.is_absolute():
+                p = self.repo_root / p
+            if not p.is_file():
+                return {}
+            from scripts.lib import engine_cache
+            render_env = {**os.environ, **plan_env}
+            resolve_env = dict(render_env)
+            _settings.loader().load(self.repo_root, resolve_env, warn=False)
+            return engine_cache.prepare([p], env=resolve_env, render_env=render_env, pull=False,
+                                        repo_root=self.repo_root)
+        except Exception:
+            return {}
+
     def set_default(self, slug: str) -> ActionPlan:
         return ActionPlan(
             kind="set_default",
             cmd=["bash", "scripts/switch.sh", "--set-default", slug],
             description=f"switch.sh --set-default {slug}",
-            requires_reconcile=False,   # .env pin write — no GPU contention
+            requires_reconcile=False,   # settings pin write (switch.sh) — no GPU contention
         )
 
     def clear_default(self, model: str) -> ActionPlan:
@@ -3604,8 +3842,10 @@ class CockpitData:
             CREATE a second container with the same ``container_name`` → "name
             already in use", which is exactly why comfyui/qdrant/searxng wouldn't
             start.
-          - ``--env-file .env`` (when present) resolves repo vars like
-            ``${MODEL_DIR}`` / ``${HF_TOKEN}`` that some composes (comfyui) need.
+          - ``--env-file`` hands compose the resolved club-3090 settings (the
+            :data:`SETTINGS_ENV_FILE` placeholder, written when the command runs
+            and removed after — #1466), so ``${MODEL_DIR}`` / ``${HF_TOKEN}`` that
+            some composes (comfyui) need resolve exactly as for gpu-mode.
 
         Reconcile-gated for GPU-holding services only (ComfyUI / Step-Audio) so
         they can't silently collide with whatever holds the cards; non-GPU web
@@ -3616,16 +3856,18 @@ class CockpitData:
             f"services/{name}/docker-compose.yml",
             name,
         )
-        cmd = ["docker", "compose"]
-        if (self.repo_root / ".env").is_file():
-            cmd += ["--env-file", ".env"]
-        cmd += ["-f", rel, "-p", project, "up", "-d"]
+        cmd = ["docker", "compose", "--env-file", SETTINGS_ENV_FILE,
+               "-f", rel, "-p", project, "up", "-d"]
         # The director is placement-aware: prefix the compose with the same env gpu-mode
         # derives from STUDIO_DIRECTOR_DEVICE (NGL / CUDA / GPU / THINK_ARGS) so a Containers
         # start honors the c3 Setting (and CPU no-think) instead of the GPU0 compose default.
         # `env K=V …` (process env) wins over --env-file for compose interpolation.
         if name == STUDIO_DIRECTOR_CONTAINER:
             cmd = ["env", *(f"{k}={v}" for k, v in self.director_compose_env().items()), *cmd]
+        # The gateway also gets the keys its own routes use, as gpu-mode starts it
+        # (ROUTE_KEYS_FILE, written when the command runs — #1466).
+        if name == "litellm":
+            cmd = ["env", f"{ROUTE_KEYS_VAR}={ROUTE_KEYS_FILE}", *cmd]
         # Reconcile-gated for GPU-holding services only: they can't silently
         # collide with whatever holds the cards; non-GPU web services clear
         # the gate immediately.
@@ -5608,6 +5850,10 @@ def _variant_row_from_dict(d: dict[str, Any]) -> VariantRow:
         # Weight-offload backend (catalog offload column) — same pattern;
         # "" when the contract didn't carry it (resident/older emit) → shows "—".
         object.__setattr__(row, "offload", str(d.get("offload") or ""))
+        # KV-cache offload tier the compose exposes ("opt-in" / "") — a different
+        # axis from `offload`; the offload column shows it only when the slug's
+        # weights are resident.
+        object.__setattr__(row, "kv_offload", str(d.get("kv_offload") or ""))
         # DYNAMIC expert-cache axis, orthogonal to `offload` (which is the
         # residency-capability axis). The offload COLUMN renders static/dynamic
         # from this; without it every CPU-offload slug reads "static".

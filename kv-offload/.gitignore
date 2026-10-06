@@ -1,0 +1,7 @@
+# KV offload disk tier (gitignored runtime data - KV blocks, can grow to hundreds of GB).
+# The launchers no longer use this folder (#1466): they put the tier (KV_OFFLOAD_DISK=1) in
+# ${CLUB3090_DATA_DIR:-~/.local/share/club-3090}/kv-offload unless KV_OFFLOAD_DIR is set.
+# It stays as what a plain `docker compose up` with nothing set mounts at /kv-offload.
+# `bash scripts/settings.sh caches` shows what is left in it and can remove it.
+*
+!.gitignore

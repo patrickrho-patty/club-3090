@@ -19,25 +19,45 @@ _compose_meta_trim() {
   printf '%s' "$value"
 }
 
+# _compose_meta_norm_key_to <out-var> <key> — trim, '_'/' ' → '-', lowercase,
+# assigned to OUT-VAR IN-PROCESS. ⚠️ Keep key normalisation free of $( ) and
+# `tr`: compose_meta_get applies it (inlined) to every comment line, the
+# CPU-offload composes carry 500+ of them, and the setup.sh picker fit-checks
+# dozens of composes. The old `$(...) | tr` form forked ~4 processes per line —
+# ~2.4 s for ONE header-less compose, ~100 s for the picker on a VM (#1382).
+_compose_meta_norm_key_to() {
+  local _cmn_k="$2"
+  _cmn_k="${_cmn_k#"${_cmn_k%%[![:space:]]*}"}"
+  _cmn_k="${_cmn_k%"${_cmn_k##*[![:space:]]}"}"
+  _cmn_k="${_cmn_k//_/-}"
+  _cmn_k="${_cmn_k// /-}"
+  printf -v "$1" '%s' "${_cmn_k,,}"
+}
+
 _compose_meta_norm_key() {
-  local key="$1"
-  key="$(_compose_meta_trim "$key")"
-  key="${key//_/-}"
-  key="${key// /-}"
-  printf '%s' "$key" | tr '[:upper:]' '[:lower:]'
+  local out
+  _compose_meta_norm_key_to out "$1"
+  printf '%s' "$out"
+}
+
+# _compose_meta_canon_field_to <out-var> <field> — normalised REQUESTED key,
+# with the short aliases (min-vram-gb, tp, …) expanded.
+_compose_meta_canon_field_to() {
+  local _cmc_f
+  _compose_meta_norm_key_to _cmc_f "$2"
+  case "$_cmc_f" in
+    min-vram-gb) _cmc_f="requires-min-vram-gb" ;;
+    min-gpu-count) _cmc_f="requires-min-gpu-count" ;;
+    tp) _cmc_f="tensor-parallel" ;;
+    sm) _cmc_f="requires-sm" ;;
+  esac
+  printf -v "$1" '%s' "$_cmc_f"
 }
 
 _compose_meta_wants_key() {
-  local requested="$(_compose_meta_norm_key "$1")"
-  local candidate="$(_compose_meta_norm_key "$2")"
-
-  case "$requested" in
-    min-vram-gb) requested="requires-min-vram-gb" ;;
-    min-gpu-count) requested="requires-min-gpu-count" ;;
-    tp) requested="tensor-parallel" ;;
-    sm) requested="requires-sm" ;;
-  esac
-
+  local requested candidate
+  _compose_meta_canon_field_to requested "$1"
+  _compose_meta_norm_key_to candidate "$2"
   [[ "$candidate" == "$requested" ]]
 }
 
@@ -47,15 +67,39 @@ compose_meta_get() {
 
   [[ -f "$compose_file" ]] || return 1
 
-  local line key value
+  # The requested key is normalised ONCE, not once per line. Per line: trim the
+  # candidate, then reject on length before paying for the rest — '_'/' ' → '-'
+  # and lowercasing are 1:1 per character, so a length mismatch can never
+  # normalise into a match. (Same result as _compose_meta_wants_key, inlined:
+  # a function call per line is most of the cost on a 500-line header.)
+  local want line key
+  _compose_meta_canon_field_to want "$field"
+
+  # Exact NEGATIVE prefilter — one C-level regex over the whole (lowercased)
+  # file: if the key cannot occur anywhere, no line can match, so skip the
+  # line walk. The header-less offload composes run to ~700 lines and are the
+  # common miss (glm-5.3-flash alone ships 18). Plain [a-z0-9-] keys only —
+  # every real field is one; anything else just takes the full walk.
+  # (Don't "simplify" this to ${text//_/-}: that is quadratic in bash — ~115 ms
+  # on one 45 KB compose.)
+  if [[ "$want" =~ ^[a-z0-9-]+$ ]]; then
+    local text re="${want//-/[-_ ]}"
+    IFS= read -r -d '' text < "$compose_file" || true
+    [[ "${text,,}" =~ $re ]] || return 1
+  fi
+
   while IFS= read -r line; do
     [[ "$line" =~ ^[[:space:]]*# ]] || continue
     line="${line#*\#}"
     [[ "$line" == *:* ]] || continue
     key="${line%%:*}"
-    value="${line#*:}"
-    if _compose_meta_wants_key "$field" "$key"; then
-      _compose_meta_trim "$value"
+    key="${key#"${key%%[![:space:]]*}"}"
+    key="${key%"${key##*[![:space:]]}"}"
+    (( ${#key} == ${#want} )) || continue
+    key="${key//_/-}"
+    key="${key// /-}"
+    if [[ "${key,,}" == "$want" ]]; then
+      _compose_meta_trim "${line#*:}"
       return 0
     fi
   done < "$compose_file"
@@ -263,16 +307,19 @@ compose_hw_requirement_text() {
 
 compose_hw_compose_status() {
   local compose_file="$1"
-  local min_vram_gb min_gpu_count requires_sm
+  local min_vram_gb="" min_gpu_count="" requires_sm=""
 
+  # Bail on the first missing required field: a header-less compose is
+  # `unknown` either way, and each lookup is a full-file scan (the setup.sh
+  # picker walks dozens of header-less composes — #1382).
   min_vram_gb="$(compose_meta_get "$compose_file" requires-min-vram-gb || true)"
-  min_gpu_count="$(compose_meta_get "$compose_file" requires-min-gpu-count || true)"
-  requires_sm="$(compose_meta_get "$compose_file" requires-sm || true)"
-
+  [[ -n "$min_vram_gb" ]] \
+    && min_gpu_count="$(compose_meta_get "$compose_file" requires-min-gpu-count || true)"
   if [[ -z "$min_vram_gb" || -z "$min_gpu_count" ]]; then
     printf 'unknown|metadata unavailable'
     return 2
   fi
+  requires_sm="$(compose_meta_get "$compose_file" requires-sm || true)"
 
   requires_sm="${requires_sm:-0.0}"
   local required_sm_int
@@ -509,6 +556,138 @@ _offload_rule_layer_count() {
   printf '%s' "${#lays[@]}"
 }
 
+# --- exl3 CPU-MoE split, sized as a VRAM FIT (#1366 / #1361 step 7) ----------
+# Same shape and the same override contract as resolve_offload_residency above:
+# a fit, not a fraction. A target CPU-resident fraction is the OUTPUT of a fit,
+# never an input -- it still cannot say whether the result fits, and the optimum
+# is always "as few experts off-GPU as fit at the shipped CTX / KV". Shipping a
+# fraction just relocates the hardcoded number, which is what #1360 hit: a
+# 2x32 GB rig ran the 2x24 GB expert count and left ~16 GB of VRAM unused.
+#
+#   resident(split) = floor + (E - split) * L * b        [b = MiB per expert per layer]
+#   split           = ceil( (E*L*b - SUM_i max(0, free_i - reserve_i)) / (L*b) ) + safety
+#
+# ⚠️ `reserve` here is NOT the `--autosplit-reserve` flag (512). exl3's autosplit
+# does not obey that number -- it leaves FAR more idle (~6 GB at 204800/Q4/split
+# 160 per the compose's own caveat), and free-VRAM arithmetic overstates what is
+# reclaimable: 205 experts failed with `Insufficient VRAM in split` despite
+# ~6.4 GiB apparently free (learnings/exllamav3-engine.md). This reserve is a
+# per-card CALIBRATED constant absorbing everything that is not a CPU-offloadable
+# expert: non-expert weights, KV at the shipped ctx, activations, and the
+# headroom autosplit refuses to use. It also absorbs the ENGINE-PIN PACKING TERM,
+# which is real and measured -- exl3 1.5.0 fits at split 144 where 1.5.1 needs
+# 160 at the SAME total VRAM (44,214 vs 44,112 MiB), so the fit is not a pure
+# function of bytes and the constant must be re-calibrated on a pin bump.
+#
+# ⚠️ A BAD FIT IS INVISIBLE. "Insufficient VRAM in split" crash-loops while
+# TabbyAPI's port binds during load, so the endpoint answers the whole time.
+# `RestartCount` is the only honest signal -- this injector is trustworthy only
+# alongside the restart guard (#1354).
+#
+# Lowering the split never fights the host-RAM preflight: the CPU worker holds
+# only the tail, so fewer CPU-resident experts is strictly LESS host RAM.
+resolve_cpu_moe_split() {
+  local compose_file="$1"
+  [[ -f "$compose_file" ]] || return 0
+  command -v nvidia-smi >/dev/null 2>&1 || return 0
+
+  # No engine-specific constants in bash: every number comes from the compose.
+  local experts; experts="$(compose_meta_get "$compose_file" cpu-moe-experts-per-layer || true)"
+  [[ "$experts" =~ ^[0-9]+$ ]] || return 0          # not a cpu-moe-split compose
+  local layers; layers="$(compose_meta_get "$compose_file" cpu-moe-layers || true)"
+  [[ "$layers" =~ ^[0-9]+$ ]] || return 0
+  # KiB per expert PER LAYER -- integer, and read from the safetensors tensor
+  # table rather than computed from the quant name. Trellis codebook quants carry
+  # scale/codebook overhead the nominal bpw understates (3.05bpw measures 1857
+  # KiB where bpw x params predicts 1830).
+  local ekib; ekib="$(compose_meta_get "$compose_file" cpu-moe-expert-kib || true)"
+  [[ "$ekib" =~ ^[0-9]+$ ]] || return 0
+  local reserve; reserve="$(compose_meta_get "$compose_file" cpu-moe-gpu-reserve-mib || true)"
+  [[ "$reserve" =~ ^[0-9]+$ ]] || return 0
+  local safety; safety="$(compose_meta_get "$compose_file" cpu-moe-split-safety-experts || true)"
+  [[ "$safety" =~ ^[0-9]+$ ]] || safety=8
+  local var; var="$(compose_meta_get "$compose_file" cpu-moe-split-env || true)"
+  [[ "$var" =~ ^[A-Z][A-Z0-9_]*$ ]] || var="MOE_SPLIT"
+  # The rig the reserve constant was fitted on. ONE point per tier today, so any
+  # other rig is an EXTRAPOLATION -- and the risky direction is DOWNWARD (a bigger
+  # card gets a smaller split, and a split that is too small crash-loops with
+  # `Insufficient VRAM in split` while the port stays open). Say so instead of
+  # presenting an extrapolated number as if it were measured.
+  local cal_free; cal_free="$(compose_meta_get "$compose_file" cpu-moe-calibrated-free-mib || true)"
+  [[ "$cal_free" =~ ^[0-9]+$ ]] || cal_free=0
+  local cal_cards; cal_cards="$(compose_meta_get "$compose_file" cpu-moe-calibrated-cards || true)"
+  [[ "$cal_cards" =~ ^[0-9]+$ ]] || cal_cards=0
+
+  # Test seam: the guard reproduces the calibration points without a GPU.
+  local -a frees=()
+  if [[ -n "${CPU_MOE_FREE_MIB:-}" ]]; then
+    local f; for f in ${CPU_MOE_FREE_MIB}; do [[ "$f" =~ ^[0-9]+$ ]] && frees+=("$f"); done
+  else
+    while read -r m; do [[ "$m" =~ ^[0-9]+$ ]] && frees+=("$m"); done \
+      < <(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null)
+  fi
+  (( ${#frees[@]} >= 1 )) || return 0
+
+  # An explicit pin ALWAYS wins and is never clobbered -- same contract as
+  # THREADS and OT_G<i>. Say so, and still print the fit we would have chosen,
+  # because "my pin vs what the rig can hold" is the whole diagnostic.
+  local pinned="${!var:-}"
+
+  local bt=$(( layers * ekib ))                      # KiB per expert, ALL layers
+  local avail_kib=0 i per
+  for (( i=0; i<${#frees[@]}; i++ )); do
+    per=$(( frees[i] > reserve ? frees[i] - reserve : 0 ))
+    avail_kib=$(( avail_kib + per * 1024 ))
+  done
+  local need_kib=$(( experts * bt ))
+  local split=0
+  if (( need_kib > avail_kib )); then
+    split=$(( ( (need_kib - avail_kib) + bt - 1 ) / bt ))   # ceil
+  fi
+  split=$(( split + safety ))
+  (( split < 0 )) && split=0
+  (( split > experts )) && split=$experts
+
+  local pct=$(( split * 100 / experts ))
+  local gib=$(( (avail_kib / 1024) / 1024 ))
+  if [[ -n "$pinned" ]]; then
+    echo "[cpu-moe] ${var}=${pinned} (YOUR pin, kept). The VRAM fit for this rig would be ${split}" >&2
+    echo "          (${pct}% of ${experts} experts CPU-resident; ~${gib} GiB usable across ${#frees[@]} card(s))." >&2
+  else
+    export "${var}=${split}"
+    echo "[cpu-moe] ${var}=${split} — VRAM fit: ${split}/${experts} experts CPU-resident (${pct}%), ~${gib} GiB" >&2
+    echo "          usable across ${#frees[@]} card(s) after a ${reserve} MiB/card reserve, +${safety} safety experts." >&2
+  fi
+  # How far is this rig from the one the constant was fitted on?
+  if (( cal_free > 0 )); then
+    local dev=$(( (frees[0] * 100 / cal_free) - 100 ))
+    (( dev < 0 )) && dev=$(( -dev ))
+    if (( dev > 10 || (cal_cards > 0 && ${#frees[@]} != cal_cards) )); then
+      echo "[cpu-moe] ⚠️  EXTRAPOLATED: the reserve constant was calibrated on ${cal_cards}x${cal_free} MiB free," >&2
+      echo "          this rig is ${#frees[@]}x${frees[0]}. The fit scales linearly in expert bytes, but the" >&2
+      echo "          reserve absorbs KV + activations + autosplit headroom + engine packing, none of" >&2
+      echo "          which are strictly per-card. If the server crash-loops with \`Insufficient VRAM" >&2
+      echo "          in split\` (the port STAYS OPEN — watch RestartCount, not /health), raise" >&2
+      echo "          ${var} until it holds and please report the value on #1366." >&2
+    fi
+  fi
+  # The engine profile's own selection rule, at the moment it matters. Nothing
+  # told you that you were at the threshold before this line existed.
+  local shown=$(( ${pinned:-$split} ))
+  local shown_pct=$(( shown * 100 / experts ))
+  if (( shown_pct > 50 )); then
+    echo "[cpu-moe] ⚠️  ${shown_pct}% of experts are CPU-resident. exllamav3.yml's selection rule:" >&2
+    echo "          over ~50% the model belongs on an engine with a REAL EXPERT CACHE — \`-mcs\` splits" >&2
+    echo "          by expert INDEX (tail-N to CPU) with a slow rebalancing sweep, so it cannot win" >&2
+    echo "          where most experts live off-card. GLM-5.3-Flash was rejected on exactly this" >&2
+    echo "          basis at 80% (10.9 TPS, cards 5-8% utilised). Consider a smaller quant, more" >&2
+    echo "          VRAM, or an llamacpp-club3090 moe-cache slug." >&2
+  elif (( shown_pct == 50 )); then
+    echo "[cpu-moe] ⚠️  exactly 50% CPU-resident — ON exllamav3.yml's threshold, not past it." >&2
+  fi
+  return 0
+}
+
 resolve_offload_residency() {
   local compose_file="$1"
   [[ -f "$compose_file" ]] || return 0
@@ -531,6 +710,14 @@ resolve_offload_residency() {
   # compose that does not declare it. Overridable for A/B via RESIDENCY_DRAFT_MB.
   local draft; draft="$(compose_meta_get "$compose_file" cpu-offload-draft-reserve-mib || true)"
   [[ "$draft" =~ ^[0-9]+$ ]] || draft=0
+  # WHICH card actually pays it (#1233). A drafter pinned with `-devd CUDA<n>` costs
+  # VRAM on THAT card only, but `draft` used to be charged to every card -- so card 0
+  # was reserved for a cost it never incurred and came back a bundle short. Unset =>
+  # -1 => charge EVERY card, i.e. byte-for-byte today's behaviour for every compose
+  # that does not declare it (the #931 calibration points are untouched).
+  local draft_card; draft_card="$(compose_meta_get "$compose_file" cpu-offload-draft-card || true)"
+  [[ "$draft_card" =~ ^[0-9]+$ ]] || draft_card=-1
+  if [[ "${RESIDENCY_DRAFT_CARD:-}" =~ ^-?[0-9]+$ ]]; then draft_card="$RESIDENCY_DRAFT_CARD"; fi
   # ⚠️ plain `if`, NOT `[[ ]] && assign`: the latter returns non-zero when the
   # condition is false, and every caller runs under `set -e` — that aborts the
   # launcher mid-resolve. Same trap documented in preflight.sh.
@@ -545,7 +732,7 @@ resolve_offload_residency() {
   local per_card=$(( layers / n ))
   local i fit rule var applied="" res_i
   for (( i=0; i<n; i++ )); do
-    res_i=$(( reserve + draft + (i == 0 ? extra : 0) ))
+    res_i=$(( reserve + ( (draft_card < 0 || i == draft_card) ? draft : 0 ) + (i == 0 ? extra : 0) ))
     # An explicit OT_G<i> from the user/env ALWAYS WINS and is never clobbered —
     # same contract as THREADS (resolve_offload_threads). This is the supported
     # way to pin more residency than the sizer grants (the grant is deliberately
@@ -625,6 +812,14 @@ offload_residency_grant_mib() {
   # compose that does not declare it. Overridable for A/B via RESIDENCY_DRAFT_MB.
   local draft; draft="$(compose_meta_get "$compose_file" cpu-offload-draft-reserve-mib || true)"
   [[ "$draft" =~ ^[0-9]+$ ]] || draft=0
+  # WHICH card actually pays it (#1233). A drafter pinned with `-devd CUDA<n>` costs
+  # VRAM on THAT card only, but `draft` used to be charged to every card -- so card 0
+  # was reserved for a cost it never incurred and came back a bundle short. Unset =>
+  # -1 => charge EVERY card, i.e. byte-for-byte today's behaviour for every compose
+  # that does not declare it (the #931 calibration points are untouched).
+  local draft_card; draft_card="$(compose_meta_get "$compose_file" cpu-offload-draft-card || true)"
+  [[ "$draft_card" =~ ^[0-9]+$ ]] || draft_card=-1
+  if [[ "${RESIDENCY_DRAFT_CARD:-}" =~ ^-?[0-9]+$ ]]; then draft_card="$RESIDENCY_DRAFT_CARD"; fi
   # ⚠️ plain `if`, NOT `[[ ]] && assign`: the latter returns non-zero when the
   # condition is false, and every caller runs under `set -e` — that aborts the
   # launcher mid-resolve. Same trap documented in preflight.sh.
@@ -641,7 +836,7 @@ offload_residency_grant_mib() {
   local i fit rule total_mib=0 var ucount res_i
   local -a lays
   for (( i=0; i<n; i++ )); do
-    res_i=$(( reserve + draft + (i == 0 ? extra : 0) ))
+    res_i=$(( reserve + ( (draft_card < 0 || i == draft_card) ? draft : 0 ) + (i == 0 ? extra : 0) ))
     # A user-set OT_G<i> is what will ACTUALLY be pinned (the injector never
     # clobbers it) — price ITS layer count, not the auto fit, so the gate and
     # the boot describe the same config. First hit in the wild: a 123 GB box

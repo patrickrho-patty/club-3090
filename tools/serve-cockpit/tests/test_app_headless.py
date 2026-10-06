@@ -1326,41 +1326,50 @@ class TestNavNodesExist:
 
     def test_thinking_persist_writes_pin_and_upserts(self, tmp_path):
         """#1014 follow-up: [T] persists the CURRENT choice as
-        CLUB3090_THINKING_<MODEL> in <repo>/.env through the --set-default
-        write semantics (upsert — any existing assignment for the key, with or
-        without an `export` prefix, is replaced; every other line survives),
-        and the card's persisted line reads the value back."""
+        CLUB3090_THINKING_<MODEL> in the club-3090 settings (club3090.env, the
+        one writer — #1466: upsert, any existing assignment for the key, with or
+        without an `export` prefix, is replaced; every other line survives), and
+        the card's persisted line reads the value back.  The repo .env is never
+        written."""
+        import os
+
+        store = Path(os.environ["CLUB3090_CONFIG_DIR"]) / "club3090.env"
+        store.parent.mkdir(parents=True, exist_ok=True)
         m = self._thinking_modal(tmp_path=tmp_path)
-        (tmp_path / ".env").write_text("FOO=bar\nKEEP=1\n", encoding="utf-8")
+        store.write_text("FOO=bar\nKEEP=1\n", encoding="utf-8")
         assert m.check_action("persist_thinking", ()) is False   # inherit: nothing to save
         m.action_cycle_thinking()                                # → on
         assert m.check_action("persist_thinking", ()) is True
         m.action_persist_thinking()
-        text = (tmp_path / ".env").read_text(encoding="utf-8")
+        text = store.read_text(encoding="utf-8")
         assert "FOO=bar\n" in text and "KEEP=1\n" in text
         assert "CLUB3090_THINKING_QWEN3_8_27B=on\n" in text, text
-        assert "persisted default: on (CLUB3090_THINKING_QWEN3_8_27B)" \
+        assert "persisted default: on (CLUB3090_THINKING_QWEN3_8_27B) from club3090.env" \
             in "\n".join(m._thinking_card_lines())
+        assert not (tmp_path / ".env").exists()
 
         # Re-persist at a different state → upsert, never duplicate lines.
         m.action_cycle_thinking()                                # → off
         m.action_persist_thinking()
-        text = (tmp_path / ".env").read_text(encoding="utf-8")
+        text = store.read_text(encoding="utf-8")
         assert text.count("CLUB3090_THINKING_QWEN3_8_27B=") == 1
         assert "CLUB3090_THINKING_QWEN3_8_27B=off\n" in text, text
 
-        # An `export `-prefixed pin (switch.sh loader tolerance) is replaced too.
-        (tmp_path / ".env").write_text(
+        # An `export `-prefixed pin (loader tolerance) is replaced too.
+        store.write_text(
             "export CLUB3090_THINKING_QWEN3_8_27B=on\nKEEP=1\n", encoding="utf-8"
         )
         m.action_persist_thinking()                              # still off
-        text = (tmp_path / ".env").read_text(encoding="utf-8")
+        text = store.read_text(encoding="utf-8")
         assert "export CLUB3090_THINKING" not in text
         assert "CLUB3090_THINKING_QWEN3_8_27B=off" in text and "KEEP=1" in text
 
     def test_thinking_persist_inherit_neither_writes_nor_removes(self, tmp_path):
         """#1014 follow-up acceptance: at inherit the persist action writes
-        nothing AND removes nothing — .env stays byte-identical."""
+        nothing AND removes nothing — the repo .env stays byte-identical and no
+        settings file is created."""
+        import os
+
         m = self._thinking_modal(tmp_path=tmp_path)
         envf = tmp_path / ".env"
         envf.write_text("export CLUB3090_THINKING_QWEN3_8_27B=on\nKEEP=1\n", encoding="utf-8")
@@ -1369,6 +1378,7 @@ class TestNavNodesExist:
         assert m.check_action("persist_thinking", ()) is False
         m.action_persist_thinking()          # gated no-op
         assert envf.read_text(encoding="utf-8") == before
+        assert not (Path(os.environ["CLUB3090_CONFIG_DIR"]) / "club3090.env").exists()
 
     def test_thinking_persist_gates_and_card_surfaces_pin(self, tmp_path):
         """[T] is offered only where [t] is AND a choice exists (start + profile
@@ -1634,8 +1644,15 @@ class TestCatalogWired:
                 [present, absent, partial, unknown, downloading, dep_absent], None
             )
 
-            # OFF by default — the catalog still answers "what COULD I run?".
-            assert pane._downloaded_only is False
+            # ON by default since 2026-10-05 (no saved pref on a directly-
+            # constructed app) — only the known-missing row goes.
+            assert pane._downloaded_only is True
+            got = {e.slug for e in pane._filtered_entries()}
+            assert got == {"v/present", "v/partial", "v/unknown", "v/downloading"}
+            assert pane._absent_hidden_count() == 1
+
+            # OFF — the catalog answers "what COULD I run?" again...
+            pane.toggle_downloaded_only()
             assert "v/absent" in {e.slug for e in pane._filtered_entries()}
             assert pane._absent_hidden_count() == 0
             # ...but the count is still reported while OFF, because that is what
@@ -1644,7 +1661,7 @@ class TestCatalogWired:
             # [w] with nothing on screen cannot be learned about at all.
             assert pane._absent_count_in_pool() == 1   # v/absent (dep-absent is [h]-hidden)
 
-            # ON — only the known-missing row goes.
+            # back ON — only the known-missing row goes.
             pane.toggle_downloaded_only()
             got = {e.slug for e in pane._filtered_entries()}
             assert got == {"v/present", "v/partial", "v/unknown", "v/downloading"}
@@ -1667,6 +1684,151 @@ class TestCatalogWired:
             assert len(pane._filtered_entries()) == 5   # dep-absent hidden by [h]
             assert pane._absent_hidden_count() == 0     # hiding nothing again
             assert pane._absent_count_in_pool() == 1    # ...but still advertised
+
+    @staticmethod
+    def _topo_entry(slug: str, topo: str, *, weights: str = "present", status: str = "production"):
+        from club3090_cockpit.data import CatalogEntry as _CE
+        from club3090_tui_core import VariantRow as _VR
+
+        cp = f"models/m/vllm/compose/{topo}/q/base.yml"
+        return _CE(
+            row=_VR(
+                slug=slug, switch_engine="vllm", launch_engine="vllm",
+                compose_dir=cp.rsplit("/", 1)[0], file="base.yml", port=8000,
+                model="m", engine="vllm-stable", kvcalc_key="m:x",
+                container="c", compose_path=cp, status=status,
+                ctx_label="262K", status_note="",
+            ),
+            weights_state=weights,
+        )
+
+    @pytest.mark.asyncio
+    async def test_catalog_downloaded_only_nothing_on_disk_shows_all(self):
+        """[w] defaults ON, but a rig with NOTHING downloaded (a fresh install)
+        must not open on an empty catalog: everything shows, nothing counts as
+        hidden, and the status line says why."""
+        from club3090_cockpit.data import WEIGHTS_ABSENT
+
+        a = self._topo_entry("v/a", "dual", weights=WEIGHTS_ABSENT)
+        b = self._topo_entry("v/b", "single", weights=WEIGHTS_ABSENT)
+        app, _, _ = make_app()
+        async with app.run_test(size=(160, 40)) as pilot:
+            await _settle(pilot)
+            pane = app.query_one("#catalog-pane", CatalogPane)
+            pane.populate([a, b], None)
+            assert pane._downloaded_only is True
+            assert pane._downloaded_fallback() is True
+            assert {e.slug for e in pane._filtered_entries()} == {"v/a", "v/b"}
+            assert pane._absent_hidden_count() == 0
+            pane._render_rows()
+            status = str(app.query_one("#catalog-status", Label).render())
+            assert "nothing downloaded yet" in status
+            # One downloaded slug is enough: the filter applies again.
+            from club3090_cockpit.data import WEIGHTS_PRESENT
+            c = self._topo_entry("v/c", "dual", weights=WEIGHTS_PRESENT)
+            pane.populate([a, b, c], None)
+            assert pane._downloaded_fallback() is False
+            assert {e.slug for e in pane._filtered_entries()} == {"v/c"}
+
+    @pytest.mark.asyncio
+    async def test_catalog_downloaded_only_persists(self):
+        """[w] saves "catalog_downloaded_only" to c3-settings.json and the next
+        launch opens with it; an absent or malformed value means ON."""
+        from club3090_cockpit import __main__ as M
+
+        app, _, _ = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _settle(pilot)
+            pane = app.query_one("#catalog-pane", CatalogPane)
+            assert pane._downloaded_only is True
+            pane.toggle_downloaded_only()
+        assert M.load_settings()["catalog_downloaded_only"] is False
+
+        app2, _, _ = make_app()
+        M.apply_persisted_settings(app2, {})
+        async with app2.run_test(size=(120, 40)):
+            assert app2.query_one("#catalog-pane", CatalogPane)._downloaded_only is False
+
+        s = M.load_settings()
+        s["catalog_downloaded_only"] = "yes"   # not a bool → ignored → default ON
+        M.save_settings(s)
+        app3, _, _ = make_app()
+        M.apply_persisted_settings(app3, {})
+        async with app3.run_test(size=(120, 40)):
+            assert app3.query_one("#catalog-pane", CatalogPane)._downloaded_only is True
+
+    @pytest.mark.asyncio
+    async def test_catalog_hides_slugs_needing_more_gpus(self, monkeypatch):
+        """On a 2-GPU rig, multi4 / multi8 slugs join the [h] bucket — hidden by
+        default (as `switch.sh --list` does), counted in the hint, revealed by
+        [h]. An unknown GPU count hides nothing (never hide on a guess)."""
+        single = self._topo_entry("v/single", "single")
+        dual = self._topo_entry("v/dual", "dual")
+        m4 = self._topo_entry("v/m4", "multi4")
+        m8 = self._topo_entry("v/m8", "multi8")
+        m4_dep = self._topo_entry("v/m4-dep", "multi4", status="deprecated")
+        app, _, _ = make_app()
+        async with app.run_test(size=(160, 40)) as pilot:
+            await _settle(pilot)
+            pane = app.query_one("#catalog-pane", CatalogPane)
+            pane.populate([single, dual, m4, m8, m4_dep], None)
+
+            monkeypatch.setattr(app, "_known_gpu_count", lambda: None)
+            assert {e.slug for e in pane._filtered_entries()} == {"v/single", "v/dual", "v/m4", "v/m8"}
+            assert pane._gpu_hidden_count() == 0
+
+            monkeypatch.setattr(app, "_known_gpu_count", lambda: 2)
+            assert {e.slug for e in pane._filtered_entries()} == {"v/single", "v/dual"}
+            # the deprecated multi4 is counted ONCE, as deprecated
+            assert pane._gpu_hidden_count() == 2
+            assert pane._deprecated_hidden_count() == 1
+            pane._render_rows()
+            status = str(app.query_one("#catalog-status", Label).render())
+            assert "+2 need more GPUs" in status
+
+            pane.toggle_deprecated()   # [h] reveals the whole bucket
+            assert {e.slug for e in pane._filtered_entries()} == {
+                "v/single", "v/dual", "v/m4", "v/m8", "v/m4-dep"}
+            assert pane._gpu_hidden_count() == 0
+
+            pane.toggle_deprecated()
+            monkeypatch.setattr(app, "_known_gpu_count", lambda: 8)
+            assert {e.slug for e in pane._filtered_entries()} == {"v/single", "v/dual", "v/m4", "v/m8"}
+
+    @pytest.mark.asyncio
+    async def test_catalog_gpu_count_from_fast_read_before_estate_poll(self):
+        """#1552 follow-up: the first estate poll lands ~20 s after launch, and the
+        needs-more-GPUs filter waited for it — a 2-GPU rig showed every multi4/8
+        slug for those 20 s (measured on the reference rig: 42 rows until t+22 s).
+        The fast docker-free nvidia-smi read (_refresh_gpu_bars) must supply the
+        count on its own, with NO estate state, and re-render the catalog."""
+        from club3090_tui_core.detect import GpuInfo
+
+        single = self._topo_entry("v/single", "single")
+        dual = self._topo_entry("v/dual", "dual")
+        m4 = self._topo_entry("v/m4", "multi4")
+        app, _, _ = make_app()
+
+        async def _two_gpus():
+            return [GpuInfo(index=0), GpuInfo(index=1)]
+
+        async with app.run_test(size=(160, 40)) as pilot:
+            await _settle(pilot)
+            pane = app.query_one("#catalog-pane", CatalogPane)
+            app._last_estate_state = None          # the estate poll has not landed
+            app._fast_gpu_count = None
+            app._catalog_gpu_count_seen = None
+            app._data._get_gpu_info = _two_gpus
+            pane.populate([single, dual, m4], None)
+            assert "v/m4" in {e.slug for e in pane._filtered_entries()}   # count unknown yet
+
+            app._refresh_gpu_bars()
+            for _ in range(5):
+                await pilot.pause()
+            assert app._last_estate_state is None
+            assert app._known_gpu_count() == 2
+            assert app._catalog_gpu_count_seen == 2
+            assert {e.slug for e in pane._filtered_entries()} == {"v/single", "v/dual"}
 
     @pytest.mark.asyncio
     async def test_catalog_multiword_filter_is_and(self):
@@ -1841,6 +2003,33 @@ class TestCatalogWired:
         assert _spec_label(self._label_entry("fp8", drafter="")) == "—"
         assert _spec_token("") == ""
         assert _spec_token("some-future-ngram-drafter") == "ngram"
+
+    def test_spec_token_drafterless_matches_drafter_vocabulary(self):
+        """A built-in speculation head needs NO external drafter artifact, so its
+        slug keeps ``drafter: null`` and the method arrives on ``spec_method``.
+        That branch must render the SAME token the drafter branch would, or the
+        column spells one method two ways depending on which field carries it.
+
+        Regression (2026-09-18): the branch returned the raw registry token
+        (``sm.split("-")[0]``), so ``drafter=null`` + ``spec_method="mtp"``
+        printed lowercase "mtp" on three rows — bucko-vllm/qwen3.8-flash-next-ple
+        and both exllamav3/…-cpumoe slugs — against ~130 core rows printing "MTP".
+        """
+        from club3090_cockpit.app import _spec_token
+
+        for spec_method, want in {
+            "mtp": "MTP",
+            "mtp_assistant": "MTP·asst",
+            "ngram-mod": "ngram",
+            "dflash": "DFlash",
+            "dflash2": "DFlash2",
+            "dspark": "DSpark",
+        }.items():
+            assert _spec_token("", spec_method) == want, spec_method
+        # Drafter still wins when both are set, and an unknown method degrades
+        # to its leading token rather than inventing a label.
+        assert _spec_token("anbeeld-qwen-dflash", "mtp") == "DFlash"
+        assert _spec_token("", "") == ""
 
     def test_byo_result_route_c_reframes_as_servable(self):
         """A Route-C swap (curated-arch fine-tune) reframes the engine's
@@ -12919,9 +13108,25 @@ class TestProfileTemplateDerivation:
         except (OSError, _sp.TimeoutExpired):
             pass
         core_opts = [o for o in opts if o.slug not in _local]
-        assert len(core_opts) == 10, (
-            f"expected 10 curated reps, got {len(core_opts)}: "
+        # DERIVED, not hard-coded. This was `== 10`, bumped by hand as groups appeared
+        # (7 → 8 → 10); the SGLang tier (#1237: dual / multi4 / multi8) and the
+        # ExLlamaV3 dual slug took it to 14 and it sat red on master for weeks, so the
+        # tripwire had stopped being read. What it guards is "exactly one rep per
+        # curated (family, topology) group, none missing" — count the groups the
+        # registry actually has, with the same helpers profile_templates groups by.
+        from club3090_cockpit.app import _canon_engine_family, _variant_topology
+        curated_groups = {
+            (_canon_engine_family(v.engine) or v.engine, _variant_topology(v) or "—")
+            for v in variants if v.slug and v.slug not in _local
+        }
+        assert len(core_opts) == len(curated_groups), (
+            f"expected one curated rep per (family, topology) group "
+            f"({len(curated_groups)}: {sorted(curated_groups)}), got {len(core_opts)}: "
             f"{[o.slug for o in core_opts]} (local: {sorted(_local)})"
+        )
+        assert len(curated_groups) >= 10, (
+            f"only {len(curated_groups)} curated groups — the registry emit lost engines "
+            f"or topologies (there were 10 by 2026-08-29): {sorted(curated_groups)}"
         )
 
         # The 1-card rig default must be FUNCTIONAL + non-incubating — ideally the
@@ -14470,22 +14675,26 @@ class TestSettings:
 
     @pytest.mark.asyncio
     async def test_apply_settings_persists_and_applies(self):
+        """MODEL_DIR → club3090.env, HF_TOKEN → secrets.env (the settings
+        switch.sh reads, #1466); the logging switch stays c3's own."""
         import os
         from club3090_cockpit import __main__ as M
+        cfg = Path(os.environ["CLUB3090_CONFIG_DIR"])
         app, _, _ = make_app()
         async with app.run_test(size=(120, 40)) as pilot:
             await _settle(pilot)
             app.apply_settings(
-                model_dir="/tmp/my-models",
+                model_dir="/data/my-models",
                 hf_token="hf_secret123",
                 log_enabled=True,
             )
             await _settle(pilot)
-            assert app._data.weights_model_dir() == "/tmp/my-models"
+            assert app._data.weights_model_dir() == "/data/my-models"
             assert os.environ.get("HF_TOKEN") == "hf_secret123"
+            assert "MODEL_DIR=/data/my-models\n" in (cfg / "club3090.env").read_text()
+            assert "HF_TOKEN=hf_secret123\n" in (cfg / "secrets.env").read_text()
             s = M.load_settings()
-            assert s.get("model_dir") == "/tmp/my-models"
-            assert s.get("hf_token") == "hf_secret123"
+            assert "model_dir" not in s and "hf_token" not in s
             assert s.get("logging_enabled") is True
 
     @pytest.mark.asyncio
@@ -14503,22 +14712,25 @@ class TestSettings:
             assert os.environ.get("HF_TOKEN") == "hf_first"
 
     @pytest.mark.asyncio
-    async def test_director_placement_persists_to_repo_env(self, tmp_path):
+    async def test_director_placement_persists_to_the_settings(self, tmp_path):
         """Director placement (CPU/GPU0/GPU1) persists to STUDIO_DIRECTOR_DEVICE in
-        the repo .env — what gpu-mode reads on the next ai-studio start."""
+        club3090.env (#1466) — what gpu-mode reads on the next ai-studio start."""
+        import os
+        store = Path(os.environ["CLUB3090_CONFIG_DIR"]) / "club3090.env"
         app, _, _ = make_app()
         async with app.run_test(size=(120, 40)) as pilot:
             await _settle(pilot)
-            app._data.repo_root = tmp_path                 # write the .env to a temp dir
+            app._data.repo_root = tmp_path                 # a checkout with no .env
             assert app._data.director_device() == "gpu0"
             app.apply_settings(model_dir="", hf_token="", director_device="cpu")
             await _settle(pilot)
             assert app._data.director_device() == "cpu"
-            assert "STUDIO_DIRECTOR_DEVICE=cpu" in (tmp_path / ".env").read_text()
+            assert "STUDIO_DIRECTOR_DEVICE=cpu" in store.read_text()
+            assert not (tmp_path / ".env").exists()
             # re-applying the same value is a no-op (no duplicate line)
             app.apply_settings(model_dir="", hf_token="", director_device="cpu")
             await _settle(pilot)
-            assert (tmp_path / ".env").read_text().count("STUDIO_DIRECTOR_DEVICE=") == 1
+            assert store.read_text().count("STUDIO_DIRECTOR_DEVICE=") == 1
 
     @pytest.mark.asyncio
     async def test_apply_persisted_settings_on_fresh_app(self):

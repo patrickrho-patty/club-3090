@@ -45,6 +45,7 @@
 #       entrypoint grew no sampler-mode logic. Single-row models (qwen3.6
 #       family) must stay byte-identical in behavior.
 set -euo pipefail
+export CLUB3090_CONFIG_DIR=/nonexistent/club-3090-test-config   # tests never read your real settings (#1466)
 
 # Force Python's UTF-8 mode (PEP 540) for every python3 this script runs.
 # Repo sources are full of unicode (— × → ⚠), and without this a rig on a real
@@ -234,9 +235,17 @@ def argv_under(text, env):
         etc = dp / "etc" / "club3090"
         etc.mkdir(parents=True, exist_ok=True)
         (etc / "detect_nvlink.sh").write_text("_NVLINK_ENABLED=0\n")
+        # FA2 installer exports library paths; this test stubs CUDA installation.
+        (etc / "fa2-runtime.env").write_text("", encoding="utf-8")
         for sub in set(re.findall(r"/etc/club3090/([\w.-]+)/install\.sh", body)):
             (etc / sub).mkdir(parents=True, exist_ok=True)
             (etc / sub / "install.sh").write_text("#!/bin/bash\nexit 0\n")
+        # #1358: the fa2 envelope helper is sourced, not an installer — ship the
+        # REAL one, so the entrypoint runs it exactly as the container would.
+        if "/etc/club3090/fa2/envelope.sh" in body:
+            (etc / "fa2").mkdir(parents=True, exist_ok=True)
+            (etc / "fa2" / "envelope.sh").write_text(pathlib.Path(
+                "models/qwen3.8-27b/vllm/patches/fa2-fp8kv-sm86/envelope.sh").read_text(encoding="utf-8"))
         script = dp / "ep.sh"
         script.write_text(body.replace("$$", "$")
                           .replace("/etc/club3090", str(etc))
@@ -319,11 +328,16 @@ vllm_with = {k for k in with_profiles if k.startswith("vllm/")}
 check(len(vllm_with) >= 20,
       f"qwen3.8-27b vLLM entries expose sampler_profiles (got {len(vllm_with)})")
 check(llama_with == {"llamacpp/qwen38-27b-single-iq4xs",
-                     "llamacpp/qwen38-27b-dual-q8kxl"},
-      f"both llama.cpp qwen3.8 slugs gained sampler_profiles (got {sorted(llama_with)})")
-check(all(k.split("/", 1)[1].startswith(("qwen38-27b-", "qwen38-flash-next-"))
+                     "llamacpp/qwen38-27b-dual-q8kxl",
+                     # 2026-09-22: MiMo-V2.6-9B publishes per-mode rows too (instruct
+                     # row from the Qwen3.5-9B card, thinking row from MiMo's own
+                     # generation_config.json), so it belongs in the coupled set
+                     # rather than holding a third private copy in its entrypoint.
+                     "llamacpp/mimo9b-single-vision"},
+      f"the llama.cpp per-mode-sampler slugs carry sampler_profiles (got {sorted(llama_with)})")
+check(all(k.split("/", 1)[1].startswith(("qwen38-27b-", "thinkingcap38-27b-", "qwen38-flash-next-", "mimo9b-"))
           for k in with_profiles),
-      "only qwen3.8-27b / qwen3.8-flash-next slugs carry sampler_profiles today")
+      "only qwen3.8-27b (+ its ThinkingCap replicas) / qwen3.8-flash-next / mimo9b slugs carry sampler_profiles today")
 
 for slug, entry in sorted(with_profiles.items()):
     profiles = entry["sampler_profiles"]

@@ -36,6 +36,7 @@ except Exception:
     yaml = None
 if os.environ.get("CLUB3090_EMIT_NO_YAML") == "1":
     yaml = None
+_YAML_LOADER = (getattr(yaml, "CSafeLoader", None) or yaml.SafeLoader) if yaml else None
 
 # Non-UTF-8 locales (LC_ALL=C VMs, #599/#584) also break the WRITE side: a
 # piped stdout defaults to the locale codec → UnicodeEncodeError printing the
@@ -92,7 +93,10 @@ def container_name(compose_path: str) -> str:
         m = _CONTAINER_RX.search(text)
         return _unwrap_env_default(m.group(2).strip()) if m else ""
     try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        # libyaml's CSafeLoader when PyYAML was built with it (same safe
+        # schema, same objects): this parses EVERY registered compose, and the
+        # pure-Python SafeLoader made it ~1.5 s of the ~2.2 s --json emit (#1382).
+        data = yaml.load(path.read_text(encoding="utf-8"), Loader=_YAML_LOADER) or {}
     except Exception as exc:
         raise RuntimeError(f"could not parse compose yaml: {exc}") from exc
     services = data.get("services") or {}
@@ -578,6 +582,20 @@ from scripts.lib.profiles.compose_registry import DEFAULTS, get_registry  # noqa
 # C4-rev: merged view (core + local layer); pristine checkout ⇒ identical output.
 REG = get_registry()
 from scripts.lib.profiles.launch_compat import ProfileError, resolve_variant_pin  # noqa: E402
+from scripts.lib.profiles.launch_knobs import CatalogueError, SlugKnobs  # noqa: E402
+
+# Launch knobs (#1465 phase 3a): which catalogued launch settings each slug's compose
+# actually READS, scanned from the compose text (stdlib, launch_knobs.py). The compose
+# is the source of truth; scripts/tests/test-launch-knobs.sh proves every claim through
+# `docker compose config`. A malformed catalogue must not blank the whole c3 catalog,
+# so it degrades to knobs=None (unknown — distinct from [] = reads none) with the
+# reason on stderr; the guard test fails on it hard.
+try:
+    _KNOBS = SlugKnobs(root)
+except CatalogueError as _exc:
+    print(f"[registry-emit] WARN: launch-knob catalogue unusable, emitting knobs=null: {_exc}",
+          file=sys.stderr)
+    _KNOBS = None
 
 _tab_path = os.environ.get("REGISTRY_TAB_FILE", "")
 tab = Path(_tab_path).read_text(encoding="utf-8") if _tab_path and Path(_tab_path).exists() else ""
@@ -644,7 +662,9 @@ def _current_pin(slug: str, compose_path: str):
         exports = resolve_variant_pin(profiles, slug)
         # Nightly pins export a bare SHA (VLLM_NIGHTLY_SHA) — not comparable to
         # an image string; fall through to the compose default for those.
-        if "VLLM_NIGHTLY_SHA" not in exports:
+        # empty == this engine exposes no single injectable image var (#1365);
+        # that is a normal answer now, not a raise -- fall through to the compose default.
+        if exports and "VLLM_NIGHTLY_SHA" not in exports:
             return next(iter(exports.values()))
     except ProfileError:
         pass
@@ -693,7 +713,18 @@ def _weights_meta(model: str, variant: str):
     global _WFMT
     if _WFMT is None:
         _WFMT = {}
-        for _p in sorted((root / "scripts/lib/profiles/models").glob("*.yml")):
+        # ⚠️ BOTH LAYERS. Globbing only the core `models/` dir left every
+        # LOCAL-layer slug resolving to (None, None), so c3 rendered its weights
+        # / provider columns blank no matter what the local model profile said —
+        # measured 2026-09-18: 1 of 138 emit rows had weights_format=None and it
+        # was the only local entry. get_registry() merges the two layers, so the
+        # emit that feeds the cockpit must read both too or the local layer is
+        # half-visible: status and kv_format arrive, weights facts do not.
+        # Core is globbed LAST so a core id always wins on a key collision.
+        _model_dirs = [root / "scripts/lib/profiles-local/models.d",
+                       root / "scripts/lib/profiles/models"]
+        for _p in [q for _d in _model_dirs if _d.is_dir()
+                   for q in sorted(_d.glob("*.yml"))]:
             # NOTE: _yaml (this block's alias), NOT yaml — a bare `yaml` here is
             # a NameError that a blanket except would silently eat to an empty
             # map (the exact swallowed-failure class #599 warned about).
@@ -760,6 +791,10 @@ for vr in _tui_registry.parse_variant_rows(tab):
             # Minimum HOST RAM (GB) for weight-offload slugs — a HARD GATE, surfaced so
             # c3 can show it BEFORE selection rather than at launch refusal.
             "host_ram_gb": (REG.get(d["slug"], {}) or {}).get("host_ram_gb"),
+            # KV-cache offload tier the compose exposes — None (not wired) / "opt-in"
+            # (KV_OFFLOAD_GB knob, off by default). A different axis from `offload`
+            # (weight placement); c3 shows it as "kv opt" in the same column.
+            "kv_offload": (REG.get(d["slug"], {}) or {}).get("kv_offload"),
             # Weights quant_label + FORMAT from the model profile (catalog
             # Weights column fallbacks) — see _weights_meta() above.
             "weights_quant_label": _weights_meta(
@@ -815,6 +850,10 @@ for vr in _tui_registry.parse_variant_rows(tab):
             # ONLY measured-display source for consumers (replaces the c3-side
             # BENCHMARKS.md scrape).  None when the slug has no accepted row.
             "baseline": _baseline_for(d["slug"], d["compose_path"]),
+            # Catalogued launch settings (scripts/lib/profiles/launch-knobs.json)
+            # this slug's compose reads — sorted names, [] for none, None when
+            # unknown. Value domains live in the catalogue, not here (#1465).
+            "knobs": _KNOBS.for_compose(d["compose_path"]) if _KNOBS else None,
         }
     )
 

@@ -27,6 +27,14 @@
 # processes and nested scripts inherit it. Guarded by test-locale-utf8.sh.
 export PYTHONUTF8="${PYTHONUTF8:-1}"
 [[ -n "${_PREFLIGHT_LOADED:-}" ]] && return 0
+# shellcheck source=lib/club-containers.sh
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib/club-containers.sh"
+# shellcheck source=lib/served-model.sh
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib/served-model.sh"
+# #1247: the canonical engine-family resolver. preflight_compose_deps used to
+# carry its own image regex and was blind to our own fork's image name.
+# shellcheck source=scripts/lib/engine-kind.sh
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib/engine-kind.sh"
 _PREFLIGHT_LOADED=1
 _PREFLIGHT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -66,7 +74,7 @@ preflight_gpu() {
   local gpu_lines
   gpu_lines=$(nvidia-smi -L 2>/dev/null || true)
   local gpu_count
-  gpu_count=$(echo "$gpu_lines" | grep -c '^GPU ' || true)
+  gpu_count=$(echo "$gpu_lines" | command grep -c '^GPU ' || true)
   if [[ "$gpu_count" -lt "$min_count" ]]; then
     echo "[preflight] ERROR: needs ${min_count} GPU(s), found ${gpu_count}." >&2
     if [[ "$gpu_count" -eq 0 ]]; then
@@ -119,14 +127,14 @@ preflight_gpu() {
   # detected. Composes run cross-rig but per-class gotchas (ctx derate,
   # VRAM envelope, SM-gated kernels) live in the FAQ — easier to catch
   # the hint here than for a user to discover it after a confusing run.
-  if echo "$gpu_lines" | grep -qE "RTX 4090"; then
+  if echo "$gpu_lines" | command grep -qE "RTX 4090"; then
     echo "[preflight] note:    4090 detected → docs/FAQ.md#can-i-use-a-4090-instead-of-a-3090 (ctx ceiling ~15–20% lower than headless 3090)"
   fi
-  if echo "$gpu_lines" | grep -qE "RTX 5090"; then
+  if echo "$gpu_lines" | command grep -qE "RTX 5090"; then
     echo "[preflight] note:    5090 detected → docs/FAQ.md#can-i-use-a-5090 (32 GB envelope unlocks single-card configs)"
   fi
   # nvidia-container-toolkit check — needed for docker GPU access.
-  if ! docker info 2>/dev/null | grep -qi 'Runtimes:.*nvidia'; then
+  if ! docker info 2>/dev/null | command grep -qi 'Runtimes:.*nvidia'; then
     echo "[preflight] WARN:  Docker doesn't list the 'nvidia' runtime. If 'docker compose up' fails" >&2
     echo "                   with 'unknown runtime' or 'could not select device driver', install:" >&2
     echo "                   https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/" >&2
@@ -487,7 +495,7 @@ preflight_compose_hardware() {
   # (live-validated 2x3090 sm_86, 2026-07-11); on a MIXED pair the faster rank
   # takes the native activation path and the slower one cannot follow.
   local sel_sm_count
-  sel_sm_count="$(printf '%s\n' ${sel_sm_list} | grep -c . || true)"
+  sel_sm_count="$(printf '%s\n' ${sel_sm_list} | command grep -c . || true)"
   if (( tp > 1 && sel_sm_count > 1 )); then
     if [[ "${requires_homog_arch,,}" == "true" || "${requires_homog_arch,,}" == "yes" ]]; then
       echo "[preflight] ERROR: ${variant:-compose} requires a HOMOGENEOUS GPU architecture for TP=${tp}." >&2
@@ -568,7 +576,7 @@ preflight_lmcache_ram() {
 
   # Soft: SHM must be >= l1 or LMCache silently falls back to slow pickle serialization.
   local shm_gb
-  shm_gb="$(grep -oE 'shm_size:[[:space:]]*"?[0-9]+' "$compose_file" | grep -oE '[0-9]+' | head -1 || true)"
+  shm_gb="$(command grep -oE 'shm_size:[[:space:]]*"?[0-9]+' "$compose_file" | command grep -oE '[0-9]+' | head -1 || true)"
   if [[ -n "$shm_gb" ]] && (( shm_gb < l1 )); then
     echo "[preflight] WARN:  shm_size (${shm_gb}g) < LMCACHE_L1_GB (${l1}) — LMCache SHM will fall back to slow pickle." >&2
     echo "            Fix: raise shm_size in the compose to >= ${l1}g." >&2
@@ -662,14 +670,14 @@ preflight_compose_gpu_fit() {
   # Effective util: an env GPU_MEMORY_UTILIZATION override wins over the compose default
   # (`${GPU_MEMORY_UTILIZATION:-<X>}`), so the gate matches what vLLM will actually use.
   local util_default util
-  util_default=$(grep -oE 'GPU_MEMORY_UTILIZATION:-[0-9.]+' "$compose" | head -1 | sed 's/.*-//')
+  util_default=$(command grep -oE 'GPU_MEMORY_UTILIZATION:-[0-9.]+' "$compose" | head -1 | sed 's/.*-//')
   util="${GPU_MEMORY_UTILIZATION:-$util_default}"
   case "$util" in ''|*[!0-9.]*) return 0 ;; esac   # unknown / non-numeric → can't gate
 
   # Cards this compose uses (TP / min-gpu-count header; default 1).
   local need_cards
-  need_cards=$(grep -oiE '#[[:space:]]*(Tensor-parallel|Requires-min-gpu-count):[[:space:]]*[0-9]+' "$compose" \
-               | grep -oE '[0-9]+' | sort -rn | head -1)
+  need_cards=$(command grep -oiE '#[[:space:]]*(Tensor-parallel|Requires-min-gpu-count):[[:space:]]*[0-9]+' "$compose" \
+               | command grep -oE '[0-9]+' | sort -rn | head -1)
   [[ -z "$need_cards" ]] && need_cards=1
 
   # Settle window (~10s): a just-`down`ed scene's VRAM lags docker's return.
@@ -721,7 +729,7 @@ preflight_compose_gpu_fit() {
 preflight_running() {
   command -v docker >/dev/null 2>&1 || return 0
   local running
-  running=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^(vllm-qwen36-27b|llama-cpp-qwen36-27b|ik-llama-qwen36-27b|vllm-gemma-4-31b)' || true)
+  running=$(docker ps --format '{{.Names}}' 2>/dev/null | command grep -E '^(vllm-qwen36-27b|llama-cpp-qwen36-27b|ik-llama-qwen36-27b|vllm-gemma-4-31b)' || true)
   if [[ -n "$running" ]]; then
     echo "[preflight] note:    a club-3090 container is already running:"
     echo "$running" | sed 's/^/[preflight]            /'
@@ -748,7 +756,7 @@ preflight_repo_drift() {
 
   # Fast bail-outs — silent.
   [[ "${PREFLIGHT_NO_FETCH:-0}" == "1" ]] && return 0
-  [[ -d "${repo_root}/.git" ]] || return 0
+  [[ -e "${repo_root}/.git" ]] || return 0   # -e: a worktree's .git is a file
   command -v git >/dev/null 2>&1 || return 0
 
   # Only check on master — on a feature branch, "behind master" is expected
@@ -814,7 +822,7 @@ preflight_hf_token() {
     echo "[preflight]          Fix: visit https://huggingface.co/settings/tokens, create a read token," >&2
     echo "[preflight]               accept the model T&C at https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct" >&2
     echo "[preflight]               (and any other Qwen3-Next variant you'll use)," >&2
-    echo "[preflight]               then export HF_TOKEN=hf_... in your shell or .env file." >&2
+    echo "[preflight]               then save it: bash scripts/settings.sh set HF_TOKEN=hf_...   (goes to secrets.env, 0600)" >&2
     return 0
   fi
   # Sanity check token format — HF tokens start with hf_ and are 30+ chars
@@ -911,7 +919,7 @@ _preflight_compose_flag_paths() {
   [[ $# -gt 0 ]] || return 0
 
   # (a) inline — flag and value on the same line.
-  grep -hoE -- "(^|[[:space:]])(${flags})[[:space:]]+/models/[^[:space:]]+" "$@" 2>/dev/null \
+  command grep -hoE -- "(^|[[:space:]])(${flags})[[:space:]]+/models/[^[:space:]]+" "$@" 2>/dev/null \
     | awk '{print $NF}' || true
 
   # (b) YAML list — the value is the NEXT list item after the flag item.
@@ -1221,7 +1229,7 @@ preflight_compose_deps() {
     [[ -n "$extends_file" ]] || continue
     [[ "$extends_file" == /* ]] || extends_file="${compose_dir}/${extends_file}"
     [[ -f "$extends_file" ]] && compose_files+=("$extends_file")
-  done < <(grep -hE '^[[:space:]]*file:[[:space:]]*[^#[:space:]]+' "$compose_file" \
+  done < <(command grep -hE '^[[:space:]]*file:[[:space:]]*[^#[:space:]]+' "$compose_file" \
     | sed -E 's/^[[:space:]]*file:[[:space:]]*//' || true)
 
   local missing=()
@@ -1241,9 +1249,23 @@ preflight_compose_deps() {
   # llama.cpp-family server: it mounts ${MODEL_DIR}:/models and passes
   # `-m /models/<path>` (+ `--spec-draft-model /models/<path>` for DFlash/MTP),
   # so it belongs on the GGUF presence path, NOT the vLLM HF-cache path.
-  if grep -qhE 'image:.*(ggml-org/llama\.cpp|ikawrakow/ik-llama|beellama)' "${compose_files[@]}"; then
-    is_llamacpp=1
-  fi
+  # ⚠️ This used to be a PRIVATE image regex:
+  #     image:.*(ggml-org/llama\.cpp|ikawrakow/ik-llama|beellama)
+  # which did not know our OWN fork's image name, ghcr.io/noonghunna/llamacpp-club3090.
+  # All 28 llamacpp-club3090/* slugs therefore skipped this whole block and fell to
+  # the vLLM HF-cache path, which found nothing to complain about and returned 0 —
+  # so the check that exists to catch a missing drafter never ran for them. A user
+  # with no DFlash2 drafter on disk got a CRASH-LOOP instead of one clear line
+  # (#1247). A check that passes because it measured nothing.
+  # Now delegated to the canonical resolver (#1282) — it classifies every image we
+  # ship, including the forks, and adding an engine means adding arms THERE only.
+  local _img _kind
+  while IFS= read -r _img; do
+    [[ -n "$_img" ]] || continue
+    _kind="$(engine_kind_from_image "$_img")"
+    if [[ "$_kind" == "llamacpp" ]]; then is_llamacpp=1; break; fi
+  done < <(command grep -hE '^[[:space:]]*image:' "${compose_files[@]}" \
+             | sed -E 's/^[[:space:]]*image:[[:space:]]*//; s/^["'"'"']//; s/["'"'"']$//' || true)
 
   if [[ $is_llamacpp -eq 1 ]]; then
     local gguf_paths=()
@@ -1330,7 +1352,7 @@ preflight_compose_deps() {
     # could resolve the `:-default`, causing a false "missing" (the gemma-4-12b
     # MODEL_SUBDIR/SPEC_MODEL_SUBDIR composes). Stop only at real delimiters
     # (quote / whitespace / comma); the `${VAR:-default}` resolver runs downstream.
-    done < <(grep -hv '^[[:space:]]*#' "${compose_files[@]}" 2>/dev/null | grep -oE '/root/\.cache/huggingface/[^"'\''[:space:],]+' || true)
+    done < <(command grep -hv '^[[:space:]]*#' "${compose_files[@]}" 2>/dev/null | command grep -oE '/root/\.cache/huggingface/[^"'\''\\[:space:],]+' || true)
 
     # Experimental SGLang composes mount individual MODEL_DIR subdirectories to
     # /models/target and /models/drafter instead of using the HF cache mount.
@@ -1343,7 +1365,7 @@ preflight_compose_deps() {
       elif [[ -d "${model_dir}/${path}" ]]; then
         shard_dirs+=("${model_dir}/${path}")
       fi
-    done < <(grep -hoE '\$\{MODEL_DIR[^}]*\}/[^"[:space:]]+' "${compose_files[@]}" || true)
+    done < <(command grep -hoE '\$\{MODEL_DIR[^}]*\}/[^"[:space:]]+' "${compose_files[@]}" || true)
   fi
 
   # Present on the host, unreachable from the container. Reported SEPARATELY from
@@ -1506,7 +1528,8 @@ preflight_autodetect_endpoint() {
   fi
 
   # Detect a running inference container by its ENGINE-INTERNAL port mapping
-  # (vLLM 8000 / llama.cpp 8080 / sglang 30000), NOT a hardcoded model-name
+  # (vLLM 8000 / llama.cpp 8080 / sglang 30000 / TabbyAPI 5000 — the last only
+  # for a container that is ours by name, see club_engine_port_lines), NOT a hardcoded model-name
   # allowlist — so any compose is found regardless of model: gemma-4-12b,
   # qwen-35b-a3b, beellama, a BYO container, etc. (#310: the old allowlist only
   # knew qwen36-27b / gemma-4-31b, so everything else silently fell back to 8020).
@@ -1519,16 +1542,16 @@ preflight_autodetect_endpoint() {
   # before its own "endpoint not responding" path. Empty = the no-container case.
   local engine_lines found_line
   engine_lines=$(docker ps --format '{{.Names}}|{{.Ports}}' 2>/dev/null \
-    | grep -E '([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]+->(8000|8080|30000)/tcp' || true)
+    | club_engine_port_lines || true)
   if [[ -z "$engine_lines" ]]; then
     return 0   # nothing serving on an engine port; defaults stand
   fi
   # Prefer a recognised club-3090 engine-family prefix when several match.
   found_line=$(printf '%s\n' "$engine_lines" \
-    | grep -E '^(vllm-|llama-cpp-|ik-llama-|sglang-|beellama-)' | head -1 || true)
+    | command grep -E "$(club_container_re_loose)" | head -1 || true)
   [[ -z "$found_line" ]] && found_line=$(printf '%s\n' "$engine_lines" | head -1)
   # Several inference containers up → we picked one; tell the user how to override.
-  if [[ "$(printf '%s\n' "$engine_lines" | grep -c .)" -gt 1 ]]; then
+  if [[ "$(printf '%s\n' "$engine_lines" | command grep -c .)" -gt 1 ]]; then
     echo "[autodetect] multiple inference containers running; picked '${found_line%%|*}' — set CONTAINER=/URL= to override" >&2
   fi
 
@@ -1536,9 +1559,10 @@ preflight_autodetect_endpoint() {
   detected_name="${found_line%%|*}"
   # Extract host port from "0.0.0.0:8011->8000/tcp", "[::]:8011->8000/tcp",
   # or "127.0.0.1:8011->8000/tcp" forms (BIND_HOST=127.0.0.1 produces the last).
-  # llama-cpp container maps to internal 8080, vllm to 8000, sglang to 30000.
+  # llama-cpp container maps to internal 8080, vllm to 8000, sglang to 30000,
+  # TabbyAPI (exllamav3) to 5000.
   detected_port=$(echo "${found_line#*|}" \
-    | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]+->(8000|8080|30000)/tcp' \
+    | command grep -oE "([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]+->(${CLUB_ENGINE_PORTS_ANY})/tcp" \
     | head -1 \
     | sed -E 's|^[^:]+:([0-9]+)->.*|\1|')
 
@@ -1555,7 +1579,11 @@ preflight_autodetect_endpoint() {
     local note=""
     [[ -z "$explicit_container" ]] && note="container=${CONTAINER}"
     [[ -z "$explicit_url" ]] && note="${note:+$note }url=${URL}"
-    echo "[autodetect] using running ${note}  (skip: PREFLIGHT_NO_AUTODETECT=1)" >&2
+    echo "[autodetect] using running ${note}  (override with CONTAINER=/URL=, or PREFLIGHT_NO_AUTODETECT=1 to disable)" >&2
+    # #1330: remember that WE chose this endpoint. preflight_resolve_model_or_fail
+    # refuses the last-resort literal when we know which container is up but cannot
+    # read its model -- a guess is only reasonable when we know nothing.
+    PREFLIGHT_ENDPOINT_AUTODETECTED=1
   fi
   return 0
 }
@@ -1580,23 +1608,108 @@ preflight_autodetect_endpoint() {
 # reachability check then surfaces the real outage). Callers keep their own
 # last-resort literal after this, so behaviour is unchanged when detection no-ops.
 preflight_autodetect_model() {
-  [[ -n "${MODEL:-}" ]] && return 0
+  # #1330: every exit path now SAYS something. The old version printed only on
+  # success, so the one component that failed was the silent one -- a slow boot
+  # read as "8 checks failed" against a config that was fine.
+  PREFLIGHT_MODEL_UNRESOLVED=""
+  if [[ -n "${MODEL:-}" ]]; then
+    return 0        # explicit value always wins; silent because it is the normal case
+  fi
   local url="${1:-${URL:-}}"
-  [[ -n "$url" ]] || return 0
-  command -v curl >/dev/null 2>&1 || return 0
-  command -v python3 >/dev/null 2>&1 || return 0
-  local detected
-  detected="$(curl -sf -m 5 "${url%/}/v1/models" 2>/dev/null \
-    | python3 -c "import json,sys
-try:
-    d = json.load(sys.stdin).get('data', [])
-    print(d[0]['id'] if d else '')
-except Exception:
-    print('')" 2>/dev/null || true)"
+  if [[ -z "$url" ]]; then
+    echo "[autodetect] no URL to query — MODEL not autodetected" >&2
+    PREFLIGHT_MODEL_UNRESOLVED="no-url"; return 0
+  fi
+  if ! command -v curl >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
+    echo "[autodetect] curl/python3 unavailable — MODEL not autodetected" >&2
+    PREFLIGHT_MODEL_UNRESOLVED="no-tools"; return 0
+  fi
+
+  # The overwhelmingly common failure is a server still loading, so give it a
+  # bounded wait instead of resolving the wrong thing. Only costs time when the
+  # endpoint is down, which is exactly when nobody minds.
+  local wait_s="${PREFLIGHT_MODEL_WAIT_S:-10}"
+  local deadline=$(( SECONDS + wait_s )) detected="" body="" announced=0
+  while :; do
+    body="$(curl -sf -m 5 "${url%/}/v1/models" 2>/dev/null || true)"
+    if [[ -n "$body" ]]; then
+      # #1360: TabbyAPI (exllamav3) lists EVERY folder in its model directory on
+      # /v1/models, so the first entry is whichever folder the filesystem
+      # returns first (a report got 'modules'). club_served_model_id prefers
+      # its /v1/model (the LOADED model); other engines 404 there and get the
+      # first /v1/models entry, exactly as before.
+      detected="$(club_served_model_id "$url")"
+      break
+    fi
+    (( SECONDS >= deadline )) && break
+    if (( ! announced )); then
+      echo "[autodetect] ${url%/}/v1/models not answering yet — waiting up to ${wait_s}s (PREFLIGHT_MODEL_WAIT_S=0 to skip)" >&2
+      announced=1
+    fi
+    sleep 1
+  done
+
   if [[ -n "$detected" ]]; then
     MODEL="$detected"
-    echo "[autodetect] served model='${MODEL}' (from ${url%/}/v1/models; set MODEL= to override)" >&2
+    echo "[autodetect] served model='${MODEL}' (from ${url%/}/v1/model[s]; set MODEL= to override)" >&2
+    return 0
   fi
+  if [[ -z "$body" ]]; then
+    echo "[autodetect] ⚠ ${url%/}/v1/models UNREACHABLE — could not resolve MODEL" >&2
+    PREFLIGHT_MODEL_UNRESOLVED="unreachable"
+  else
+    echo "[autodetect] ⚠ ${url%/}/v1/models answered but reported NO model — could not resolve MODEL" >&2
+    PREFLIGHT_MODEL_UNRESOLVED="no-models"
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# #1330: the last-resort literal, with the one case where it must NOT be used.
+#
+# Callers used to write `MODEL="${MODEL:-qwen3.6-27b}"` unconditionally right
+# after autodetect. Against a still-booting server that serves something else,
+# every request then 404s, and the output is indistinguishable from the thing
+# under test being broken. That cost a real detour: verify-full reported rc=8,
+# 8/8 failed, on a compose that passed 10/10 once the engine had loaded.
+#
+# The rule: a literal is a reasonable GUESS when we know nothing, and is never
+# right when we know better.
+#   endpoint UNREACHABLE  -> refuse. Nothing can work; say THAT instead of
+#                            inventing a model name to fail against.
+#   answered, no model, and we AUTODETECTED the container -> refuse. We know
+#                            which container is up; an unrelated literal is a
+#                            worse answer than an honest stop.
+#   answered, no model, user-supplied URL -> warn loudly, use the literal. Keeps
+#                            the BYO / llama.cpp case working (llama.cpp ignores
+#                            the request's model field entirely, #371).
+preflight_resolve_model_or_fail() {
+  local fallback="${1:?preflight_resolve_model_or_fail needs a fallback literal}"
+  [[ -n "${MODEL:-}" ]] && return 0
+  local why="${PREFLIGHT_MODEL_UNRESOLVED:-}"
+  if [[ "$why" == "unreachable" || ( "$why" == "no-models" && -n "${PREFLIGHT_ENDPOINT_AUTODETECTED:-}" ) ]]; then
+    echo "" >&2
+    echo "ERROR: could not resolve which model to request, and guessing would be worse." >&2
+    echo "  endpoint : ${URL:-<unset>}${CONTAINER:+  (container ${CONTAINER})}" >&2
+    if [[ "$why" == "unreachable" ]]; then
+      echo "  reason   : /v1/models is not answering — the server is still loading, or is not up." >&2
+      echo "  ⚠ This is NOT a failure of whatever you are testing. Falling back to" >&2
+      echo "    '${fallback}' here would 404 every request and look exactly like one (#1330)." >&2
+      echo "  fix      : wait for the engine to finish loading, then re-run. Watch it with" >&2
+      echo "               docker logs -f ${CONTAINER:-<container>}" >&2
+      echo "             A boot-time crash-loop shows up as a climbing RestartCount:" >&2
+      echo "               docker inspect ${CONTAINER:-<container>} --format '{{.RestartCount}}'" >&2
+    else
+      echo "  reason   : /v1/models answered but listed no model." >&2
+    fi
+    echo "  override : MODEL=<served-name> $(basename "${BASH_SOURCE[-1]:-this script}") …" >&2
+    echo "" >&2
+    return 1
+  fi
+  if [[ -n "$why" ]]; then
+    echo "[autodetect] falling back to MODEL='${fallback}' (${why}) — pin MODEL= if that is wrong" >&2
+  fi
+  MODEL="$fallback"
   return 0
 }
 
@@ -1838,13 +1951,15 @@ preflight_detect_thinking_control() {
             if [[ -z "${THINK_EFFORT_OFF_VALUE:-}" ]]; then
               THINK_CONTROL="none"
             else
-              # ⚠️ THE BAR MUST MATCH THE CONSUMER'S. verify-full [7] fails a level
-              # whose reasoning is <50 chars ("suspiciously short"). An earlier
+              # ⚠️ THE PROBE MUST NOT BE LOOSER THAN THE CONSUMER. An earlier
               # revision accepted ANY non-zero reasoning, so the ladder blessed
-              # GLM's `high` on ~11 chars and [7] then REJECTED the value the probe
-              # had just chosen — probe and check disagreeing about what "thinking
-              # is on" means. 50 is that consumer's threshold; the probe budget
-              # above is sized to clear it comfortably (96 tok >> 50 chars).
+              # GLM's `high` on ~11 chars and verify-full [7], which then failed
+              # reasoning under 50 chars, REJECTED the value the probe had just
+              # chosen. [7] now passes short-but-present reasoning (2026-09-26:
+              # concise thinkers such as ThinkingCap were failing healthy boots), so
+              # this 50-char bar is the stricter of the two, which is the safe
+              # direction: the ladder still climbs to a level where thinking really
+              # engages. The probe budget above clears it comfortably (96 tok >> 50).
               local _min_reasoning=50 _rlen
               for _lvl in high xhigh max; do
                 _rlen="$(_preflight_probe_thinking_reasoning "$url" "$model" "{\"reasoning_effort\": \"${_lvl}\"}")"
@@ -2013,8 +2128,8 @@ _cuda_ge() {
 # Driver's max supported CUDA (major.minor), or "" if undetectable.
 _driver_cuda_version() {
   local v
-  v="$(nvidia-smi --query 2>/dev/null | grep -m1 -oE 'CUDA Version[[:space:]]*:[[:space:]]*[0-9]+\.[0-9]+' | grep -oE '[0-9]+\.[0-9]+' || true)"
-  [[ -z "$v" ]] && v="$(nvidia-smi 2>/dev/null | grep -m1 -oE 'CUDA Version:?[[:space:]]*[0-9]+\.[0-9]+' | grep -oE '[0-9]+\.[0-9]+' || true)"
+  v="$(nvidia-smi --query 2>/dev/null | command grep -m1 -oE 'CUDA Version[[:space:]]*:[[:space:]]*[0-9]+\.[0-9]+' | command grep -oE '[0-9]+\.[0-9]+' || true)"
+  [[ -z "$v" ]] && v="$(nvidia-smi 2>/dev/null | command grep -m1 -oE 'CUDA Version:?[[:space:]]*[0-9]+\.[0-9]+' | command grep -oE '[0-9]+\.[0-9]+' || true)"
   printf '%s' "$v"
 }
 
@@ -2208,6 +2323,67 @@ preflight_offload_thp() {
   return 0
 }
 
+# preflight_nvidia_page_pool
+# WARN-only hint: host RAM parked in the NVIDIA open driver's system-memory page pool.
+#
+# OpenRM keeps freed system-memory pages in per-NUMA-node pools to speed up
+# reallocation (NVreg_EnableSystemMemoryPools, default 0x211 = 4K/64K/2M pages;
+# kernel-open/nvidia/nv-vm.c). A slug that keeps tens of GB of host memory through
+# CUDA VMM (cuMemCreate on a host NUMA node) leaves that much in the pool after it
+# stops. Those pages show in no /proc/meminfo category and are NOT in MemAvailable,
+# so the host-RAM gates below read them as used: on the reference rig a ~58 GiB pool
+# made available RAM read 160 GB against ~166 GB needed (2026-10-06). The pool has a
+# kernel shrinker, so `echo 2 > /proc/sys/vm/drop_caches` hands it back (measured
+# 17.4 -> 1.2 GiB) — no module reload.
+#
+# ⚠️ The gap (MemTotal minus every category) is NOT the pool size: a still-running
+#    process's VMM host memory sits there too, and so does the ZFS ARC (subtracted
+#    below). So this only HINTS, never blocks, and stays quiet unless the driver has
+#    pools enabled. Ordinary pinned memory (cudaHostAlloc, torch pin_memory, the
+#    llama.cpp / exl3 offload paths) does not fill the pool.
+#
+# Fixture overrides for tests: NV_POOL_MEMINFO, NV_POOL_PARAMS, NV_POOL_ARCSTATS.
+preflight_nvidia_page_pool() {
+  local meminfo="${NV_POOL_MEMINFO:-/proc/meminfo}"
+  local params="${NV_POOL_PARAMS:-/proc/driver/nvidia/params}"
+  local arcstats="${NV_POOL_ARCSTATS:-/proc/spl/kstat/zfs/arcstats}"
+  [[ -r "$meminfo" && -r "$params" ]] || return 0
+  local pools
+  pools="$(awk -F': *' '$1 == "EnableSystemMemoryPools" { print $2; exit }' "$params")"
+  [[ "$pools" =~ ^[0-9]+$ ]] && (( pools != 0 )) || return 0   # no pools -> nothing to hint
+
+  local gap_kb arc_kb=0
+  gap_kb="$(awk '
+    { v[$1] = $2 }
+    END {
+      if (!("MemTotal:" in v) || !("MemFree:" in v)) exit
+      hp = ("Hugetlb:" in v) ? v["Hugetlb:"] : v["HugePages_Total:"] * v["Hugepagesize:"]
+      known = v["MemFree:"] + v["Buffers:"] + v["Cached:"] + v["AnonPages:"] + v["Slab:"] \
+            + v["KernelStack:"] + v["PageTables:"] + v["SecPageTables:"] + v["VmallocUsed:"] \
+            + v["Percpu:"] + v["Zswap:"] + hp
+      printf "%d\n", v["MemTotal:"] - known
+    }' "$meminfo")"
+  [[ "$gap_kb" =~ ^-?[0-9]+$ ]] || return 0
+  if [[ -r "$arcstats" ]]; then
+    arc_kb="$(awk '$1 == "size" { printf "%d\n", $3 / 1024; exit }' "$arcstats")"
+    [[ "$arc_kb" =~ ^[0-9]+$ ]] || arc_kb=0
+  fi
+  gap_kb=$(( gap_kb - arc_kb ))
+  # 4 GiB: a freshly loaded driver leaves ~0.5-1.5 GiB unaccounted on the reference rig and the
+  # non-VMM offload engines add under 1 GiB; only a VMM host pool reaches tens of GB.
+  (( gap_kb >= 4 * 1024 * 1024 )) || return 0
+
+  local gap_gb=$(( gap_kb * 1024 / 1000000000 ))
+  echo "[preflight] NOTE: ~${gap_gb} GB of host RAM is held outside every /proc/meminfo category and" >&2
+  echo "            does not count as available. With no other GPU program running, this is" >&2
+  echo "            usually the NVIDIA driver's page pool, left by a slug that kept host memory" >&2
+  echo "            through CUDA VMM. The kernel can reclaim it; to free it now:" >&2
+  echo "              sync; echo 2 | sudo tee /proc/sys/vm/drop_caches" >&2
+  echo "            (drops only reclaimable kernel caches; cached model files stay. Relaunching" >&2
+  echo "            the slug that filled the pool reuses it, so skip it then.)" >&2
+  return 0
+}
+
 # preflight_cpu_offload_ram <compose_file>
 # Guards an offload compose against a host that cannot hold the experts.
 #
@@ -2259,8 +2435,15 @@ preflight_cpu_offload_ram() {
     return 0
   fi
   local kb total_gb avail_gb
-  kb="$(awk '/^MemTotal:/{print $2}' /proc/meminfo)";     total_gb=$(( kb / 1024 / 1024 ))
-  kb="$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)"; avail_gb=$(( kb / 1024 / 1024 ))
+  # ⚠️ DECIMAL GB, because the header key is `CPU-Offload-Host-RAM-GB` and every
+  # value authored against it is decimal GB (weights sizes, `size_gb`, the
+  # measured cgroup figures). This used to be `kb / 1024 / 1024`, i.e. GiB
+  # compared against a GB budget — the gate was ~7% STRICTER than its own
+  # documented contract on every offload slug, silently. /proc/meminfo is in KiB,
+  # so bytes = kb * 1024, and GB = bytes / 1e9. (241 GB reads as 224 in GiB: on a
+  # 135 GB slug that is the difference between "fits with room" and a refusal.)
+  kb="$(awk '/^MemTotal:/{print $2}' /proc/meminfo)";     total_gb=$(( kb * 1024 / 1000000000 ))
+  kb="$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)"; avail_gb=$(( kb * 1024 / 1000000000 ))
 
   if (( total_gb < need_gb )); then
     echo "[preflight] ERROR: this compose offloads experts to host RAM and needs ~${need_gb} GB" >&2

@@ -92,13 +92,15 @@ _LOCAL_FORCED_STATUS = "incubating"
 # core must be present, or the core catalog is untouchable.
 _CORE_GATE_ENV = "C3_ALLOW_CORE_PROMOTE"
 
-# #1142: repo-root .env support. Kept as a dual import so this file works both as
-# a script (`python3 scripts/lib/profiles/promote.py` — own dir on sys.path) and
-# as a package module (`from scripts.lib.profiles import promote`, as the tests do).
+# #1142 / #1466: settings (club-3090 config, then the repo-root .env) through the ONE
+# loader. Dual import so this file works both as a script (`python3
+# scripts/lib/profiles/promote.py` — own dir on sys.path) and as a package module
+# (`from scripts.lib.profiles import promote`, as the tests do).
 try:  # package context
-    from scripts.lib.profiles.repo_dotenv import apply_dotenv
+    from scripts.lib.club_config import load as load_config
 except ImportError:  # direct-script context
-    from repo_dotenv import apply_dotenv
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from club_config import load as load_config
 
 
 _MODEL_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
@@ -497,14 +499,28 @@ def validate_spec(spec: Any, root: Path, layer: str) -> dict:
     if os.environ.get(_CORE_GATE_ENV) != "1":
         raise Refusal(
             f"core-catalog writes are maintainer-gated: re-run with --layer core "
-            f"AND {_CORE_GATE_ENV}=1 — exported in the shell OR set in the "
-            f"repo-root .env (both are read; the environment wins). Community "
+            f"AND {_CORE_GATE_ENV}=1 — exported in the shell OR saved with "
+            f"`bash scripts/settings.sh set {_CORE_GATE_ENV}=1` (the shell wins). Community "
             f"users: use the default --layer local"
         )
     if slug.startswith(_LOCAL_SLUG_PREFIX):
         raise Refusal(
             f"the {_LOCAL_SLUG_PREFIX!r} namespace belongs to the LOCAL layer — "
             "core slugs are <engine>/<name>"
+        )
+    # ── Symmetric to the LOCAL containment check above (#1205 follow-up) ─────
+    # LOCAL writes may not leave the layer; CORE writes may not reach INTO it.
+    # `profiles-local/` is GITIGNORED, so a curated row whose compose_path points
+    # there would reference a file that exists on the maintainer's disk and
+    # nowhere else — the registry would ship pointing at nothing. This used to be
+    # unreachable by accident: every local-layer spec also carried a `local/`
+    # slug, so the namespace check above refused first. #1205 removed that
+    # namespace and with it the only thing standing in front of this.
+    if Path(cpath).is_relative_to(Path(_LOCAL_DIR_REL)):
+        raise Refusal(
+            f"compose.path {cpath!r} is inside the LOCAL layer ({_LOCAL_DIR_REL}/), "
+            f"which is gitignored — a curated entry must not point there. Move the "
+            f"compose under models/{mid}/ for a core write, or use --layer local."
         )
     profile_path = root / _MODELS_DIR_REL / f"{mid}.yml"
     if profile_path.exists():
@@ -691,13 +707,14 @@ def main(argv: Optional[list[str]] = None) -> int:
             return EXIT_COLLISION
 
     root = Path(args.root).resolve()
-    # #1142: the shell launchers source <root>/.env, but these tools are invoked
-    # directly (no wrapper in scripts/ runs them), so a gate parked there used to
-    # be a SILENT no-op — no error, no effect. Fill UNSET keys from it, and say so
-    # when the maintainer gate is one of them: .env stops being silent BOTH ways.
-    _from_dotenv = apply_dotenv(root)
-    if _CORE_GATE_ENV in _from_dotenv:
-        print(f"[promote] {_CORE_GATE_ENV} read from {root}/.env "
+    # #1142: these tools are invoked directly (no wrapper in scripts/ runs them),
+    # so a gate parked in the settings used to be a SILENT no-op — no error, no
+    # effect. Fill UNSET keys through the one loader (#1466), and say so when the
+    # maintainer gate is one of them: settings stop being silent BOTH ways.
+    _from_config = load_config(root)
+    if _CORE_GATE_ENV in _from_config:
+        _where = f"{root}/.env" if _from_config[_CORE_GATE_ENV] == "repo .env" else _from_config[_CORE_GATE_ENV]
+        print(f"[promote] {_CORE_GATE_ENV} read from {_where} "
               f"(export it in the shell to override)", file=sys.stderr)
     try:
         if args.spec_env:

@@ -26,6 +26,8 @@
 #   0 — already up-to-date or successfully updated
 #   1 — dirty tree / wrong branch / missing dep / git pull failed / setup.sh failed
 
+# shellcheck source=lib/club-containers.sh
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib/club-containers.sh"
 set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -58,7 +60,8 @@ run() {
 
 # --- 1. dep checks ---
 command -v git >/dev/null 2>&1 || { echo "[update] ERROR: 'git' not found in PATH." >&2; exit 1; }
-[[ -d "${ROOT_DIR}/.git" ]] || { echo "[update] ERROR: ${ROOT_DIR} is not a git repo." >&2; exit 1; }
+# -e, not -d: in a git worktree .git is a file, so -d called a worktree "not a git repo".
+[[ -e "${ROOT_DIR}/.git" ]] || { echo "[update] ERROR: ${ROOT_DIR} is not a git repo." >&2; exit 1; }
 
 # --- 2. branch check ---
 current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
@@ -132,7 +135,13 @@ run bash "${ROOT_DIR}/scripts/setup.sh" "$MODEL"
 echo ""
 echo "[update] ✓ done."
 echo ""
-running=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^(vllm-qwen36-27b|llama-cpp-qwen36-27b)' | head -1 || true)
+# "Is a club container running?" — registry-derived. This asked the question
+# with a TWO-NAME list (vllm-qwen36-27b|llama-cpp-qwen36-27b), so it stayed
+# silent for every other model and engine on the stack, not just the new ones.
+# ⚠️ Not caught by test-engine-kind-resolver arm 5: that arm polices the ENGINE
+# prefix alternation, and a model-specific name is legitimate elsewhere (report.sh
+# deliberately prefers `name=vllm-qwen36` before falling back to the full set).
+running=$(docker ps --format '{{.Names}}' 2>/dev/null | command grep -E "$(club_container_re)" | head -1 || true)
 if [[ -n "$running" ]]; then
   echo "[update] A club-3090 container is currently running: ${running}"
   echo "[update] To pick up the latest config, restart it:"
@@ -140,4 +149,18 @@ if [[ -n "$running" ]]; then
   echo "[update] (Use 'bash scripts/switch.sh --list' to see available variants.)"
 else
   echo "[update] Next:  bash scripts/launch.sh   (or bash scripts/switch.sh <variant>)"
+fi
+
+# Support services (Open WebUI, LiteLLM, Qdrant, SearXNG, spark-dashboard): a pull
+# can bump a service's pinned image, but nothing already running moves to it —
+# switch.sh, reboots and `docker restart` all keep the old image. Report drift
+# (only when there is some) and point at the one command that applies it.
+# Read-only; SVC_SUDO_FLAGS=-n so this never stops to prompt for a password.
+if [[ $DRY_RUN -eq 0 ]] && command -v docker >/dev/null 2>&1; then
+  svc_report=$(SVC_SUDO_FLAGS=-n bash "${ROOT_DIR}/scripts/gpu-mode.sh" service-images 2>/dev/null || true)
+  if [[ "$svc_report" == *"gpu-mode upgrade"* ]]; then
+    echo ""
+    echo "[update] Some running support services are behind their pinned image:"
+    echo "$svc_report"
+  fi
 fi

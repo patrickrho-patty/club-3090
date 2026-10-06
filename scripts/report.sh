@@ -7,15 +7,17 @@
 # issue or discussion.
 #
 # Usage:
-#   bash scripts/report.sh                   # default: hardware + stack + boot log highlights (~2 sec)
+#   bash scripts/report.sh                   # default: hardware + stack + settings + boot log highlights (~2 sec)
 #   bash scripts/report.sh --verify          # adds verify-full.sh output (~1-2 min)
 #   bash scripts/report.sh --stress          # adds verify-stress.sh 7/7 output (~5-10 min)
 #   bash scripts/report.sh --soak            # adds SOAK_MODE=continuous summary (~25 min) — catches Cliff 2b
 #   bash scripts/report.sh --bench           # adds bench.sh output (~3 min)
 #   bash scripts/report.sh --agentic         # adds bench-agentic.sh curve-shape output (~8 min estimate)
+#   bash scripts/report.sh --kv-agentic      # adds the agentic KV offload probe (#1419: real agent workload for the KV offload tier; needs a slug booted with KV_OFFLOAD_GB, ~15 min estimate on 2x 3090 dual-fast, RAM mode)
 #   bash scripts/report.sh --full            # ALL five: verify + stress + soak + bench + agentic (~43 min estimate, the canonical "everything" pass for cross-rig contributions)
 #   bash scripts/report.sh --studio          # adds AI Studio container log tails (ComfyUI + director + …) — for image/video/audio generation bugs (~2 sec)
-#   bash scripts/report.sh --no-redact       # disable path/host/user redaction
+#   bash scripts/report.sh --engine-args     # adds the engine's FULL startup dump to the resolved-config section (~8 KB on SGLang)
+#   bash scripts/report.sh --no-redact       # disable path/host/user redaction (the engine-env ALLOWLIST still applies)
 #   bash scripts/report.sh --container NAME  # override container auto-detection
 #   bash scripts/report.sh --full-calibration  # kv-calc matrix for ALL models (default: only the running model; skipped on llama.cpp/ik_llama)
 #   bash scripts/report.sh > my-rig.md       # capture for paste
@@ -55,7 +57,14 @@ DO_STRESS=0
 DO_SOAK=0
 DO_BENCH=0
 DO_AGENTIC=0
+# Opt-in like --studio: needs the slug booted with KV_OFFLOAD_GB, and it is deliberately
+# NOT folded into --full (a ~15 min agent workload with its own boot requirement).
+DO_KV_AGENTIC=0
 DO_STUDIO=0
+# club-3090#1265: the engine's own startup dump is ~8 KB on one line for SGLang,
+# and reports already bump against issue-body limits — so it is opt-in, and
+# deliberately NOT folded into --full.
+DO_ENGINE_ARGS=0
 REDACT=1
 CONTAINER="${CONTAINER:-}"
 # KV-calc calibration is scoped to the running model by default (#168). Set to 1
@@ -77,7 +86,9 @@ while [[ $# -gt 0 ]]; do
     --soak) DO_SOAK=1; shift ;;
     --bench) DO_BENCH=1; shift ;;
     --agentic) DO_AGENTIC=1; shift ;;
+    --kv-agentic) DO_KV_AGENTIC=1; shift ;;
     --studio) DO_STUDIO=1; shift ;;
+    --engine-args) DO_ENGINE_ARGS=1; shift ;;
     --full) DO_VERIFY=1; DO_STRESS=1; DO_SOAK=1; DO_BENCH=1; DO_AGENTIC=1; shift ;;
     --no-redact) REDACT=0; shift ;;
     --container) CONTAINER="${2:-}"; shift 2 ;;
@@ -95,27 +106,52 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 # KV-calc calibration helpers (engine/model detection + per-model filter, #168).
+# Canonical engine classification (club-3090#1282) — single source of truth.
+# shellcheck source=lib/engine-kind.sh
+source "$REPO_ROOT/scripts/lib/engine-kind.sh"
+# shellcheck source=lib/club-containers.sh
+source "$REPO_ROOT/scripts/lib/club-containers.sh"
 source "$REPO_ROOT/scripts/lib/report_calib.sh"
 # shellcheck source=lib/p2p-state.sh
 source "$REPO_ROOT/scripts/lib/p2p-state.sh"
 
-# Pick up a saved MODEL_DIR (and other config) from the repo .env — same as
-# launch.sh / switch.sh, and what setup.sh writes there. An explicit exported
-# MODEL_DIR still wins. This makes the Disk section report the user's real
-# models path instead of falling back to the hardcoded mount below.
-if [[ -z "${MODEL_DIR:-}" && -f "${REPO_ROOT}/.env" ]]; then
-  # shellcheck disable=SC1091
-  source "${REPO_ROOT}/.env"
+# Pick up a saved MODEL_DIR (and other settings) through the ONE loader, as
+# launch.sh / switch.sh do (club-3090#1466): your club-3090 config, then the repo
+# .env. An exported value still wins. This makes the Disk section report the
+# user's real models path instead of falling back to the hardcoded mount below.
+# shellcheck source=lib/club-config.sh
+source "${REPO_ROOT}/scripts/lib/club-config.sh"
+# The "Settings" section (#1466) is taken HERE, before club_config_load exports
+# every saved setting into this shell: after that, every key would read as coming
+# from "shell". It is printed further down, through redact(). The loader hides
+# every secret value itself, whatever --no-redact says.
+if SETTINGS_SECTION="$(python3 "${REPO_ROOT}/scripts/lib/club_config.py" settings-report --root "${REPO_ROOT}" 2>&1)"; then
+  :
+else
+  SETTINGS_SECTION="- _Settings could not be read: $(tail -n 1 <<<"$SETTINGS_SECTION")_"
 fi
+club_config_load "${REPO_ROOT}"
 
 HOST_SHORT="$(hostname -s 2>/dev/null || echo unknown)"
 USER_NAME="${USER:-$(whoami 2>/dev/null || echo unknown)}"
+
+# strip_ansi — drop terminal escape sequences (colour, cursor, charset, OSC titles).
+# The report is Markdown for a file or an issue, but the tools it embeds (verify-*,
+# soak, bench, `nvidia-smi topo`, coloured container logs) colour their output even
+# when piped, so pasted reports carried 37-39 raw sequences each and read as
+# "[32m✓[0m" (#1427). redact() runs it on every embedded block, redacted or not.
+# ⚠️ LC_ALL=C: under a UTF-8 locale GNU sed reads [@-~] in collation order and it no
+# longer contains "m", so not one colour code matched. Bytewise is safe here: every
+# pattern is ASCII, and multibyte characters (✓ — ×) pass through untouched.
+strip_ansi() {
+  LC_ALL=C sed -E -e 's|\x1b\[[0-9;?]*[ -/]*[@-~]||g' -e 's|\x1b\][^\x07]*\x07||g' -e 's|\x1b[()][A-Za-z0-9]||g'
+}
 
 redact() {
   if [[ $REDACT -eq 1 ]]; then
     # Mask the literal MODEL_DIR value first (if exported) so an arbitrary models
     # path — /data/..., /srv/... — is caught before the prefix rules below.
-    { if [[ -n "${MODEL_DIR:-}" ]]; then sed -e "s|${MODEL_DIR}|<MODEL_DIR>|g"; else cat; fi; } | sed \
+    { if [[ -n "${MODEL_DIR:-}" ]]; then sed -e "s|${MODEL_DIR}|<MODEL_DIR>|g"; else cat; fi; } | strip_ansi | sed \
       -e "s|/home/${USER_NAME}|~|g" \
       -e "s|/root|~|g" \
       -e "s|${HOST_SHORT}|<HOST>|g" \
@@ -128,7 +164,7 @@ redact() {
       -e 's|/mnt/[a-z]/Users/[^ /]*|/mnt/<DRIVE>/Users/<REDACTED>|g' \
       -e 's|/mnt/models|<MODELS>|g'
   else
-    cat
+    strip_ansi
   fi
 }
 
@@ -143,6 +179,29 @@ details() {
 }
 
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# gpu_power_caps — one "idx|limit_w|default_w|percent" row per GPU whose power
+# limit is BELOW its factory default. Empty output when nothing is capped.
+#
+# ⚠️ Empty is NOT proof of "at stock power": it is also what an absent
+# nvidia-smi, an unreadable query (driver/library mismatch, no permission) or a
+# non-numeric [N/A] field produce. The GPU hardware section states that case
+# explicitly; do not re-interpret emptiness here as a clean bill of health.
+gpu_power_caps() {
+  have nvidia-smi || return 0
+  nvidia-smi --query-gpu=index,power.limit,power.default_limit \
+    --format=csv,noheader,nounits 2>/dev/null \
+    | while IFS=, read -r _cap_idx _cap_lim _cap_def; do
+        _cap_idx="${_cap_idx// /}"; _cap_lim="${_cap_lim// /}"; _cap_def="${_cap_def// /}"
+        # nounits still yields "230.00"; drop the fraction before integer tests.
+        _cap_lim="${_cap_lim%.*}"; _cap_def="${_cap_def%.*}"
+        [[ "$_cap_idx" =~ ^[0-9]+$ ]] || continue
+        [[ "$_cap_lim" =~ ^[0-9]+$ && "$_cap_def" =~ ^[0-9]+$ ]] || continue
+        [[ "$_cap_def" -gt 0 && "$_cap_lim" -lt "$_cap_def" ]] || continue
+        printf '%s|%s|%s|%s\n' "$_cap_idx" "$_cap_lim" "$_cap_def" \
+          "$(( _cap_lim * 100 / _cap_def ))"
+      done
+}
 
 # ---------------------------------------------------------------------------
 # Header
@@ -179,6 +238,33 @@ if [[ $EUID -ne 0 ]] && ! sudo -n true 2>/dev/null; then
     printf '>\n> For a complete report re-run with sudo:\n>\n> ```bash\n> sudo bash scripts/report.sh %s\n> ```\n' "${REPORT_ARGS:-}"
     printf '>\n> Worth doing before filing a CPU-offload issue: memory channels and speed are the\n> variables that set throughput on those configs, and they cannot be read without root.\n'
   fi
+fi
+
+# GPU power cap — warn UP FRONT, for the same reason the root-gated block above
+# does: reports get truncated from the bottom, and a reader scanning a paste
+# will not go hunting for a nested bullet in the GPU section.
+#
+# This exists because a run on this stack measured ~40% below its own recorded
+# baseline, with a signature that read as an upstream speculative-decoding
+# regression (spec_n=1 and spec_n=2 producing identical throughput while draft
+# acceptance stayed healthy). An upstream bug report was nearly filed. The cause
+# was a persistent 230 W cap against 370/420 W factory defaults, applied at boot
+# by a systemd unit and found only by manually reading power.limit.
+#
+# The generalisation is what matters for a *shared* report: a cap applied at
+# boot is nobody's per-run decision, so the reporter does not know to mention
+# it, and every throughput number in the report is silently power-dependent.
+# The percentage is deliberate — a triager reading someone else's rig has no
+# idea what that card's stock TDP is, so a bare "limit=230 W" reads as normal.
+_pwr_caps="$(gpu_power_caps)"
+if [[ -n "$_pwr_caps" ]]; then
+  printf '\n> ⚠️ **GPU power cap active — the throughput numbers in this report are NOT at stock power.**\n'
+  while IFS='|' read -r _pc_idx _pc_lim _pc_def _pc_pct; do
+    [[ -n "$_pc_idx" ]] || continue
+    printf '> - GPU %s capped to %s W of %s W default (%s%%)\n' \
+      "$_pc_idx" "$_pc_lim" "$_pc_def" "$_pc_pct"
+  done <<< "$_pwr_caps"
+  printf '>\n> Treat every benchmark below as power-limited: it is not comparable to a baseline\n> taken at stock power, and a deep cap can look like an engine or speculative-decoding\n> regression rather than a power one. Caps commonly survive reboots (a systemd unit or\n> startup script running `nvidia-smi -pl`), so a rig can boot capped without anyone\n> choosing it for this run. Check and clear before comparing against any baseline:\n>\n> ```bash\n> nvidia-smi --query-gpu=index,power.limit,power.default_limit,enforced.power.limit --format=csv\n> ```\n'
 fi
 
 # ---------------------------------------------------------------------------
@@ -246,62 +332,19 @@ section "System"
 # This rig read 3200 MT/s both before and after a DIMM went missing, while real
 # STREAM Triad fell ~100 -> 59.9 GB/s (2026-08-07). The spec number is exactly
 # the one that cannot detect the problem; the measured one is the only witness.
-# Our own learnings already say "the bandwidth number must be MEASURED, not spec"
-# — this implements it.
 #
-# Cheap and honest: ~1.5 GB, a few hundred ms, skipped when RAM is tight or no
-# compiler exists, and it SAYS SO rather than omitting the line (a missing row
-# reads as "nothing to report"). Disable with REPORT_NO_BANDWIDTH=1.
+# The probe (scripts/lib/membw_probe.c, driven by scripts/lib/membw.sh) is built to
+# read the same on any rig: non-temporal stores on x86, one pinned thread per
+# physical core, a 1/4 - 1/2 - all-cores sweep, arrays >= 4x L3. The first probe here
+# read ~90 GB/s on an 8-channel EPYC that does ~160. With the DIMMs' channels and
+# speed from dmidecode ($1) it also prints the rated peak and the percentage.
+# A few seconds; skipped with a reason when no compiler or too little free memory
+# (a missing row reads as "nothing to report"). Disable with REPORT_NO_BANDWIDTH=1.
 _report_mem_bandwidth() {
   [[ "${REPORT_NO_BANDWIDTH:-0}" == "1" ]] && return 0
-  local cc=""
-  for c in cc gcc clang; do command -v "$c" >/dev/null 2>&1 && { cc="$c"; break; }; done
-  if [[ -z "$cc" ]]; then
-    echo "- **Memory bandwidth:** not measured (no C compiler) — install \`gcc\` for a STREAM Triad figure"
-    return 0
-  fi
-  local free_mb; free_mb=$(free -m 2>/dev/null | awk '/^Mem:/{print $7}')
-  if [[ -n "$free_mb" && "$free_mb" -lt 4096 ]]; then
-    echo "- **Memory bandwidth:** not measured (only ${free_mb} MiB available; probe needs ~1.5 GB)"
-    return 0
-  fi
-  local d; d="$(mktemp -d 2>/dev/null)" || return 0
-  cat > "$d/t.c" <<'CEOF'
-#include <stdio.h>
-#include <stdlib.h>
-#include <pthread.h>
-#include <time.h>
-#define N (64L*1024*1024)          /* 3 x 512 MiB */
-static double *a,*b,*c; static int NT;
-static void *w(void *p){ long id=(long)p, lo=N*id/NT, hi=N*(id+1)/NT;
-  for(long i=lo;i<hi;i++) c[i]=a[i]+3.0*b[i]; return 0; }
-int main(int argc,char**argv){
-  NT=atoi(argv[1]); if(NT<1)NT=1;
-  a=malloc(N*8); b=malloc(N*8); c=malloc(N*8);
-  if(!a||!b||!c){ printf("0\n"); return 1; }
-  for(long i=0;i<N;i++){a[i]=1.0;b[i]=2.0;c[i]=0.0;}
-  double best=0; pthread_t th[512];
-  for(int r=0;r<3;r++){
-    struct timespec s,e; clock_gettime(CLOCK_MONOTONIC,&s);
-    for(long i=0;i<NT;i++) pthread_create(&th[i],0,w,(void*)i);
-    for(long i=0;i<NT;i++) pthread_join(th[i],0);
-    clock_gettime(CLOCK_MONOTONIC,&e);
-    double dt=(e.tv_sec-s.tv_sec)+(e.tv_nsec-s.tv_nsec)/1e9;
-    double gbs=(3.0*N*8)/dt/1e9; if(gbs>best) best=gbs;
-  }
-  printf("%.1f\n",best); return 0;
-}
-CEOF
-  local gbs=""
-  if "$cc" -O2 -o "$d/t" "$d/t.c" -lpthread >/dev/null 2>&1; then
-    gbs="$("$d/t" "$(nproc 2>/dev/null || echo 4)" 2>/dev/null)"
-  fi
-  rm -rf "$d"
-  if [[ -n "$gbs" && "$gbs" != "0" ]]; then
-    echo "- **Memory bandwidth (measured):** ${gbs} GB/s STREAM Triad — *this*, not the rated MT/s above, is what sets CPU-offload decode throughput"
-  else
-    echo "- **Memory bandwidth:** probe failed to build/run — rated speed above is NOT a substitute"
-  fi
+  # shellcheck source=lib/membw.sh
+  source "${REPO_ROOT}/scripts/lib/membw.sh"
+  club_membw_lines "${1:-}"
 }
 
 # ---------------------------------------------------------------------------
@@ -320,7 +363,7 @@ section "CPU + RAM"
     # LC_ALL=C — lscpu TRANSLATES its field labels, so every lookup below would
     # silently return empty on a non-English locale (same class as #779).
     _lscpu="$(LC_ALL=C lscpu 2>/dev/null)"
-    _lscpu_f() { printf '%s\n' "$_lscpu" | grep -m1 -E "^$1:" | sed -E 's/^[^:]*:[[:space:]]*//'; }
+    _lscpu_f() { printf '%s\n' "$_lscpu" | command grep -m1 -E "^$1:" | sed -E 's/^[^:]*:[[:space:]]*//'; }
 
     cpu_model="$(_lscpu_f 'Model name')"
     cpu_threads="$(_lscpu_f 'CPU\(s\)')"
@@ -405,7 +448,7 @@ section "CPU + RAM"
         if (nfull < nch)
           print "  - ⚠️ _An unpopulated channel forces a coarser interleave. Measured on this stack: losing ONE of eight channels cost ~**30% of bandwidth** (~100 → 69.8 GB/s idle; 59.9 under load) — 2.4× worse than the 12.5% a naive share implies._"
       }'
-    _report_mem_bandwidth
+    _report_mem_bandwidth "$_dmi"
   elif have dmidecode; then
     echo "- **Memory config:** not collected (needs root) — run \`sudo dmidecode -t memory\` for DIMM count / size / configured speed"
     _report_mem_bandwidth
@@ -479,9 +522,36 @@ if ! have nvidia-smi; then
   echo "_nvidia-smi not available — no NVIDIA GPU detected or driver not installed_"
 else
   {
-    nvidia-smi --query-gpu=index,name,memory.total,driver_version,vbios_version,persistence_mode,power.limit,power.default_limit,power.max_limit,power.draw,pci.bus_id,pcie.link.gen.current,pcie.link.gen.max,pcie.link.width.current,pcie.link.width.max \
-      --format=csv,noheader 2>/dev/null \
-      | while IFS=, read -r idx name memtotal driver vbios persistence pwr_limit pwr_default pwr_max pwr_draw bus_id pcie_gen_cur pcie_gen_max pcie_width_cur pcie_width_max; do
+    # Captured into a variable rather than piped straight into `while read`:
+    # nvidia-smi can be installed and STILL fail this query (driver/library
+    # version mismatch, a container started without --gpus, permission denial).
+    # A failed query piped into the loop yields zero iterations, so this whole
+    # section used to render as a heading with nothing whatsoever under it — and
+    # a reader cannot distinguish "no power cap" from "power was never read".
+    # The power limit is precisely the field that failure mode hides, so the
+    # empty case now says so out loud instead of looking complete.
+    _gpu_fields='index,name,memory.total,driver_version,vbios_version,persistence_mode,power.limit,power.default_limit,power.max_limit,power.draw,pci.bus_id,pcie.link.gen.current,pcie.link.gen.max,pcie.link.width.current,pcie.link.width.max'
+
+    # enforced.power.limit is APPENDED and then fallen back from, never assumed.
+    # An nvidia-smi that does not recognise a field prints
+    #   Field "enforced.power.limit" is not a valid field to query.
+    # to STDOUT and exits non-zero — so a non-empty test would score that error
+    # text as a GPU row and parse it as one card. Gate on the EXIT CODE, and on
+    # failure retry the field set every driver has, so a report from an older
+    # driver loses one optional column instead of the whole GPU section.
+    _gpu_rows="$(nvidia-smi --query-gpu="${_gpu_fields},enforced.power.limit" --format=csv,noheader 2>/dev/null)"
+    _gpu_rows_rc=$?
+    if [[ "$_gpu_rows_rc" -ne 0 ]]; then
+      _gpu_rows="$(nvidia-smi --query-gpu="${_gpu_fields}" --format=csv,noheader 2>/dev/null)"
+      _gpu_rows_rc=$?
+    fi
+    if [[ "$_gpu_rows_rc" -ne 0 || -z "${_gpu_rows//[[:space:]]/}" ]]; then
+      echo "- ⚠️ **GPU fields unreadable** — \`nvidia-smi\` is installed but \`--query-gpu\` returned no rows (exit ${_gpu_rows_rc})."
+      echo "  - **Power limit: NOT READ.** The absence of a power-cap warning in this report does *not* mean these cards are at their default power limit."
+      echo "  - Usual causes: driver/library version mismatch, a container without \`--gpus\`, or insufficient permission. Confirm by hand with \`nvidia-smi --query-gpu=index,power.limit,power.default_limit --format=csv\`."
+    else
+    printf '%s\n' "$_gpu_rows" \
+      | while IFS=, read -r idx name memtotal driver vbios persistence pwr_limit pwr_default pwr_max pwr_draw bus_id pcie_gen_cur pcie_gen_max pcie_width_cur pcie_width_max pwr_enforced; do
           # trim leading spaces from CSV fields
           idx="${idx# }"; name="${name# }"; memtotal="${memtotal# }"
           driver="${driver# }"; vbios="${vbios# }"; persistence="${persistence# }"
@@ -489,17 +559,38 @@ else
           pwr_max="${pwr_max# }"; pwr_draw="${pwr_draw# }"
           bus_id="${bus_id# }"; pcie_gen_cur="${pcie_gen_cur# }"; pcie_gen_max="${pcie_gen_max# }"
           pcie_width_cur="${pcie_width_cur# }"; pcie_width_max="${pcie_width_max# }"
+          pwr_enforced="${pwr_enforced# }"
 
-          # Flag if user has capped below default
+          # Flag if user has capped below default.
+          #
+          # State the cap as a PERCENTAGE of the card's own default, not just as
+          # a wattage: whoever triages this report has no idea what that card's
+          # stock TDP is, so "limit=230.00 W" reads as an ordinary number while
+          # "62% of 370.00 W default" does not. The uncapped rendering is left
+          # byte-for-byte as it was, so a healthy report gains nothing.
           power_note=""
+          power_envelope=""
           pwr_limit_w="${pwr_limit% W}"; pwr_limit_w="${pwr_limit_w%.*}"
           pwr_default_w="${pwr_default% W}"; pwr_default_w="${pwr_default_w%.*}"
           if [[ "$pwr_limit_w" =~ ^[0-9]+$ ]] && [[ "$pwr_default_w" =~ ^[0-9]+$ ]]; then
-            if [[ "$pwr_limit_w" -lt "$pwr_default_w" ]]; then
-              power_note=" ⚠ user-capped below default"
+            if [[ "$pwr_limit_w" -lt "$pwr_default_w" ]] && [[ "$pwr_default_w" -gt 0 ]]; then
+              power_envelope=" ($(( pwr_limit_w * 100 / pwr_default_w ))% of ${pwr_default} default, max=${pwr_max})"
+              power_note=" ⚠ **CAPPED BELOW DEFAULT** — throughput on this card is power-limited, not comparable to a stock-power baseline"
             elif [[ "$pwr_limit_w" -gt "$pwr_default_w" ]]; then
               power_note=" (overclocked above default)"
             fi
+          fi
+          [[ -n "$power_envelope" ]] || power_envelope=" (default=${pwr_default}, max=${pwr_max})"
+
+          # enforced.power.limit is what the driver is ACTUALLY clamping to; it
+          # diverges from power.limit under thermal or hardware slowdown, and
+          # nothing else in this report would reveal it. Emitted only when the
+          # two differ, so the common case costs zero bytes.
+          pwr_enforced_note=""
+          pwr_enforced_w="${pwr_enforced% W}"; pwr_enforced_w="${pwr_enforced_w%.*}"
+          if [[ "$pwr_enforced_w" =~ ^[0-9]+$ ]] && [[ "$pwr_limit_w" =~ ^[0-9]+$ ]] \
+             && [[ "$pwr_enforced_w" -ne "$pwr_limit_w" ]]; then
+            pwr_enforced_note=" | enforced=${pwr_enforced} ⚠ driver is clamping below the set limit (thermal / HW slowdown)"
           fi
 
           # Flag if PCIe lane width is below max — that's hardware-level (slot
@@ -514,11 +605,12 @@ else
           fi
 
           echo "- **GPU $idx:** $name | $memtotal | driver $driver | VBIOS $vbios | persistence=$persistence"
-          echo "  - **Power:** limit=${pwr_limit} (default=${pwr_default}, max=${pwr_max}) | current_draw=${pwr_draw}${power_note}"
+          echo "  - **Power:** limit=${pwr_limit}${power_envelope} | current_draw=${pwr_draw}${pwr_enforced_note}${power_note}"
           echo "  - **PCIe:** x${pcie_width_cur} lanes negotiated (GPU max x${pcie_width_max}, Gen up to ${pcie_gen_max}) | bus ${bus_id}${pcie_note}"
         done
+    fi
 
-    cuda_ver=$(nvidia-smi 2>/dev/null | grep -oE 'CUDA Version: [0-9.]+' | head -1 | awk '{print $3}')
+    cuda_ver=$(nvidia-smi 2>/dev/null | command grep -oE 'CUDA Version: [0-9.]+' | head -1 | awk '{print $3}')
     [[ -n "$cuda_ver" ]] && echo "- **CUDA Runtime (per driver):** $cuda_ver"
 
     # Persistence mode + ECC summary
@@ -527,7 +619,7 @@ else
   } | redact
 
   subsection "NVLink"
-  if nvidia-smi nvlink --status -i 0 2>/dev/null | grep -qE 'Link [0-9]+:'; then
+  if nvidia-smi nvlink --status -i 0 2>/dev/null | command grep -qE 'Link [0-9]+:'; then
     nvidia-smi nvlink --status 2>&1 | redact | details "NVLink link status"
   else
     echo "_No NVLink detected (PCIe-only)_"
@@ -609,7 +701,7 @@ else
         local slot="$1" label="$2"
         echo "# lspci -vvv -s ${slot}  (${label}: LnkCap/LnkSta/ACSCap/ACSCtl)"
         "${LSPCI_CMD[@]}" -vvv -s "$slot" 2>/dev/null \
-          | grep -E '^[[:space:]]*(LnkCap|LnkSta|ACSCap|ACSCtl):' \
+          | command grep -E '^[[:space:]]*(LnkCap|LnkSta|ACSCap|ACSCtl):' \
           || echo "  (no matching LnkCap/LnkSta/ACSCap/ACSCtl lines)"
         echo
       }
@@ -627,10 +719,10 @@ else
           echo "  (could not resolve upstream bridge for ${slot} — ACS state for P2P may be elsewhere in the tree)"
           echo
         fi
-      done < <(lspci -D 2>/dev/null | grep -iE 'VGA compatible controller.*NVIDIA|3D controller.*NVIDIA')
+      done < <(lspci -D 2>/dev/null | command grep -iE 'VGA compatible controller.*NVIDIA|3D controller.*NVIDIA')
 
       echo "# lspci -nnk | grep -A3 -i nvidia  (driver binding + device IDs)"
-      lspci -nnk 2>/dev/null | grep -A3 -i nvidia 2>/dev/null \
+      lspci -nnk 2>/dev/null | command grep -A3 -i nvidia 2>/dev/null \
         || echo "  (no NVIDIA functions found)"
     } 2>&1 | redact | details "lspci PCIe/P2P detail (LnkSta / ACS / topology)"
   fi
@@ -669,7 +761,7 @@ section "Display / desktop state"
     # NB: top-level (not in a function) — plain assignment, not `local`.
     our_container=""
     if have docker && docker info >/dev/null 2>&1; then
-      our_container=$(docker ps --format '{{.Names}}' --filter 'name=vllm-' --filter 'name=llama-cpp-' --filter 'name=beellama-' --filter 'name=club3090-' --filter 'name=ik-llama-' 2>/dev/null | head -1)
+      our_container=$(club_running_container)
     fi
     nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits 2>/dev/null \
       | while IFS=, read -r idx used; do
@@ -727,7 +819,9 @@ section "Container runtime"
 
 section "Stack version"
 {
-  if [[ -d .git ]]; then
+  # -e, not -d: in a git worktree (or a submodule) .git is a FILE pointing at the real git
+  # dir, and a report run from a worktree said "not a git repo".
+  if [[ -e .git ]]; then
     # Prefer `git describe` for a human-readable version (e.g. v0.6.2-3-ge299e70,
     # "3 commits past v0.6.2 at SHA e299e70"). Falls back to raw SHA if no tags
     # are reachable (shallow clone, fresh repo).
@@ -744,7 +838,7 @@ section "Stack version"
 
   if [[ -f scripts/setup.sh ]]; then
     # Parse `GENESIS_PIN="${GENESIS_PIN:-<default>}"` — extract just the default value
-    genesis_pin=$(grep -E '^GENESIS_PIN=' scripts/setup.sh 2>/dev/null | head -1 \
+    genesis_pin=$(command grep -E '^GENESIS_PIN=' scripts/setup.sh 2>/dev/null | head -1 \
       | sed -E 's/.*:-([^}]+)\}.*/\1/; t; s/.*=//' \
       | tr -d '"' | tr -d "'")
     [[ -n "$genesis_pin" ]] && echo "- **GENESIS_PIN default:** \`$genesis_pin\` (per scripts/setup.sh)"
@@ -762,6 +856,17 @@ section "Stack version"
     fi
   fi
 } | redact
+
+# ---------------------------------------------------------------------------
+# Settings
+# ---------------------------------------------------------------------------
+# Every configured setting, its effective value and where it comes from — the
+# same view as `bash scripts/settings.sh show` (#1466). Taken at the top, before
+# club_config_load; secret values were already hidden by the loader, and redact()
+# scrubs paths, host and user here exactly as in every other section.
+
+section "Settings"
+printf '%s\n' "$SETTINGS_SECTION" | redact
 
 # ---------------------------------------------------------------------------
 # Profile state
@@ -786,7 +891,7 @@ fi
 # then map it to a kv-calc engine family + model id via scripts/lib/report_calib.sh.
 _calib_container="${CONTAINER:-}"
 if [[ -z "$_calib_container" ]] && have docker && docker info >/dev/null 2>&1; then
-  _calib_container=$(docker ps --format '{{.Names}}' --filter 'name=vllm-' --filter 'name=llama-cpp-' --filter 'name=beellama-' --filter 'name=club3090-' --filter 'name=ik-llama-' 2>/dev/null | head -1)
+  _calib_container=$(club_running_container)
 fi
 CALIB_ENGINE_KIND="${ENGINE_KIND:-$(calib_engine_for_container "$_calib_container")}"
 CALIB_MODEL_ID="$(calib_model_for_container "$_calib_container")"
@@ -809,15 +914,30 @@ if have python3 && [[ -f tools/kv-calc.py ]]; then
       echo "- _Scoped to the running model \`${CALIB_MODEL_ID}\` — pass \`--full-calibration\` for all calibrated models._"
     fi
     calib_output=$(python3 tools/kv-calc.py --calibration 2>&1 | calib_filter_model_section "$calib_scope" || true)
-    overall=$(echo "$calib_output" | grep -E '^Overall:' | head -1)
-    fail_rows=$(echo "$calib_output" | grep -E '\bFAIL\b' || true)
+    # #1076: the scoped model may have NO calibration section (no measured
+    # BENCHMARKS anchor yet). The global Overall line must NOT be reported as
+    # this model's verdict then -- that is a clean-looking result for a model
+    # nothing was checked against. Reported by foureight84.
+    calib_no_section=0
+    if echo "$calib_output" | command grep -q "__CALIB_NO_SECTION__"; then
+      calib_no_section=1
+      calib_output=$(echo "$calib_output" | command grep -v "__CALIB_NO_SECTION__")
+    fi
+    overall=$(echo "$calib_output" | command grep -E '^Overall:' | head -1)
+    fail_rows=$(echo "$calib_output" | command grep -E '\bFAIL\b' || true)
     {
-      if [[ -n "$overall" ]]; then
+      if [[ "$calib_no_section" == "1" ]]; then
+        echo "- ⚠ **NOT CALIBRATED for \`${calib_scope}\`** -- kv-calc has no calibration rows for this model, so there is no verdict to report. This is NOT a pass."
+        echo "- A model gets rows once it has a measured BENCHMARKS.md anchor; until then kv-calc projections for it are unvalidated."
+        echo "- \`--full-calibration\` shows the catalog-wide matrix (OTHER models) -- do not read it as covering this one."
+      elif [[ -n "$overall" ]]; then
         echo "- ${overall}"
       else
         echo "- _kv-calc --calibration produced no Overall line; see output below._"
       fi
-      if [[ -n "$fail_rows" ]]; then
+      if [[ "$calib_no_section" == "1" ]]; then
+        :
+      elif [[ -n "$fail_rows" ]]; then
         echo "- ⚠ Failing rows:"
         echo '```'
         echo "$fail_rows"
@@ -918,30 +1038,26 @@ section "Active container"
 # with CONTAINER=... env var for non-standard naming (microk8s deployments,
 # host engine builds via CONTAINER=none, etc.).
 if [[ -z "$CONTAINER" ]] && have docker && docker info >/dev/null 2>&1; then
+  # Prefer the stack default if it happens to be up, then ANY container the
+  # registry knows. The ladder used to be five hardcoded prefixes, which meant a
+  # rig serving exl3 (tabbyapi-*) or SGLang reported "no engine container" over a
+  # healthy server — silently, since "not found" reads the same as "not there".
   CONTAINER=$(docker ps --format '{{.Names}}' --filter 'name=vllm-qwen36' 2>/dev/null | head -1)
-  [[ -z "$CONTAINER" ]] && CONTAINER=$(docker ps --format '{{.Names}}' --filter 'name=vllm-' 2>/dev/null | head -1)
-  [[ -z "$CONTAINER" ]] && CONTAINER=$(docker ps --format '{{.Names}}' --filter 'name=llama-cpp-' 2>/dev/null | head -1)
-  [[ -z "$CONTAINER" ]] && CONTAINER=$(docker ps --format '{{.Names}}' --filter 'name=beellama-' 2>/dev/null | head -1)
-  [[ -z "$CONTAINER" ]] && CONTAINER=$(docker ps --format '{{.Names}}' --filter 'name=club3090-' 2>/dev/null | head -1)
+  [[ -z "$CONTAINER" ]] && CONTAINER=$(club_running_container)
 fi
 
 # Engine class — drives which probes run inside the container body. Inferred
-# from container name; user can override with ENGINE_KIND=vllm|llamacpp env var.
+# from container name; user can override with ENGINE_KIND=<engine-family> env var.
 case "${ENGINE_KIND:-}" in
-  vllm|llamacpp|unknown) ;;  # respect user override
+  vllm|llamacpp|sglang|exllamav3|unknown) ;;  # respect user override (sglang: club-3090#1261)
   *)
-    case "$CONTAINER" in
-      vllm-*)      ENGINE_KIND="vllm" ;;
-      llama-cpp-*) ENGINE_KIND="llamacpp" ;;
-      club3090-*)
-        container_image=$(docker ps --filter "name=$CONTAINER" --format '{{.Image}}' 2>/dev/null | head -1)
-        case "$container_image" in
-          *llama.cpp*|*llama-cpp*) ENGINE_KIND="llamacpp" ;;
-          *vllm*)                  ENGINE_KIND="vllm" ;;
-          *)                       ENGINE_KIND="unknown" ;;
-        esac ;;
-      *)           ENGINE_KIND="unknown" ;;
-    esac ;;
+    # Prefix arms live in scripts/lib/engine-kind.sh (club-3090#1282).
+    ENGINE_KIND="$(engine_kind_from_container "$CONTAINER")"
+    if [[ "$ENGINE_KIND" == "unknown" ]]; then
+      # club3090-* and any other non-conventional name: fall back to the image.
+      container_image=$(docker ps --filter "name=$CONTAINER" --format '{{.Image}}' 2>/dev/null | head -1)
+      ENGINE_KIND="$(engine_kind_from_image "$container_image")"
+    fi ;;
 esac
 
 if [[ "$CONTAINER" == "none" ]]; then
@@ -964,6 +1080,19 @@ else
     image_source=$(docker inspect "$CONTAINER" --format '{{ index .Config.Labels "org.opencontainers.image.source" }}' 2>/dev/null)
     echo "- **Name:** \`$CONTAINER\`"
     echo "- **Engine:** \`${ENGINE_KIND}\`"
+    # #1542: on exl3 CPU-MoE, whether the experts sit on 2 MiB pages is ~19% of decode, and the
+    # THP lines under "CPU + RAM" can't tell (system AnonHugePages is the parent's heap; the
+    # default arena is anonymous, not Shmem). Read the arena's own workers instead.
+    if [[ "$ENGINE_KIND" == "exllamav3" ]]; then
+      # shellcheck source=lib/exl3-arena.sh
+      . "${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}/lib/exl3-arena.sh" 2>/dev/null || true
+      if declare -F exl3_arena_state >/dev/null 2>&1; then
+        _arena="$(exl3_arena_state "$CONTAINER" || true)"
+        if [[ -n "$_arena" && "$_arena" != *verdict=none* ]]; then
+          echo "- **exl3 expert arena:** \`${_arena}\` — $(exl3_arena_explain "$_arena")"
+        fi
+      fi
+    fi
     echo "- **Status:** ${status:-unknown}"
     echo "- **Ports:** ${ports:-unknown}"
     echo "- **Image:** \`${image:-unknown}\`"
@@ -988,7 +1117,7 @@ else
       # llama-server prints its version + build flags on startup. Grep the
       # boot log for the version banner instead of trying to docker exec
       # (the llama-cpp image doesn't ship interactive shell utilities).
-      llama_version=$(docker logs "$CONTAINER" 2>&1 | grep -E '^build_info:|^version:|^system_info:' | head -3)
+      llama_version=$(docker logs "$CONTAINER" 2>&1 | command grep -E '^build_info:|^version:|^system_info:' | head -3)
       if [[ -n "$llama_version" ]]; then
         echo "**llama-server version + build:**"
         echo '```'
@@ -998,7 +1127,7 @@ else
       fi
 
       # Loaded model + ctx + KV type — surfaces model identity from boot log.
-      model_loaded=$(docker logs "$CONTAINER" 2>&1 | grep -E 'load_model:|llama_model_load_from_file_impl:|llama_kv_cache_init:|llama_init_from_model:' | head -8)
+      model_loaded=$(docker logs "$CONTAINER" 2>&1 | command grep -E 'load_model:|llama_model_load_from_file_impl:|llama_kv_cache_init:|llama_init_from_model:' | head -8)
       if [[ -n "$model_loaded" ]]; then
         echo "**Model load + KV cache init:**"
         echo '```'
@@ -1009,7 +1138,7 @@ else
 
       # llama.cpp doesn't have Genesis / vLLM SpecDecoding metrics. Skip
       # those grep patterns. Capture warnings/errors only.
-      boot_errors=$(docker logs "$CONTAINER" 2>&1 | grep -iE '^(warn|error|fatal|abort)|panic|core dumped' | tail -5)
+      boot_errors=$(docker logs "$CONTAINER" 2>&1 | command grep -iE '^(warn|error|fatal|abort)|panic|core dumped' | tail -5)
       if [[ -n "$boot_errors" ]]; then
         echo "**Recent warnings/errors (last 5):**"
         echo '```'
@@ -1065,28 +1194,36 @@ else
     # head -200) so a late line on a 3-4 GPU boot isn't missed, and fall back to
     # the live container env. ALWAYS prints something so a reviewer never has to
     # guess whether P2P was engaged (the gap that forced asks on #446 / #488).
-    nvlink_boot=$(docker logs "$CONTAINER" 2>&1 | grep -E '\[nvlink\]' | head -8)
-    p2p_env=$(docker exec "$CONTAINER" env 2>/dev/null | grep -E '^(NCCL_P2P|NVLINK_MODE|NCCL_CUMEM)=' | sort)
-    # vLLM's runtime custom-AR veto (world>2 without NVLink — its gate never
-    # consults peer access). Fed to the classifier so the verdict can't claim
-    # "custom all-reduce ON" that vLLM already vetoed (#786).
-    vllm_ar_gate=$(docker logs "$CONTAINER" 2>&1 | grep -m1 'Custom allreduce is disabled' || true)
+    # Displayed to the user AND fed to the classifier. head -8 would drop the
+    # STATE line on a restarted container (several boots of trail in one log),
+    # silently downgrading classification to the legacy prose path. The shared
+    # normalizer also emits a compact SGLang BOOT marker for the same isolation.
+    _p2p_class_stream="$(docker logs "$CONTAINER" 2>&1 | p2p_engine_log_evidence || true)"
+    nvlink_boot="$(printf '%s\n' "$_p2p_class_stream" | command grep -F '[nvlink]' | tail -8)"
+    p2p_env="$(docker exec "$CONTAINER" env 2>/dev/null | command grep -E '^(NCCL_P2P|NVLINK_MODE|NCCL_CUMEM)=' | sort)"
+    engine_ar_runtime="$(printf '%s\n' "$_p2p_class_stream" | command grep -E 'Custom allreduce is disabled|CustomAllreduce is disabled|CustomAllReduceV2 is disabled|disable_custom_all_reduce=True|\[sglang\]|sglang is using nccl==|All Reduce config:|Setup Custom allreduce failed| cuda graph addresses' || true)"
     echo "**Interconnect / P2P engagement:**"
-    if [[ -n "$nvlink_boot" || -n "$p2p_env" || -n "$vllm_ar_gate" ]]; then
+    if [[ -n "$nvlink_boot" || -n "$p2p_env" || -n "$engine_ar_runtime" ]]; then
       echo '```'
       [[ -n "$nvlink_boot" ]] && echo "$nvlink_boot"
-      [[ -n "$vllm_ar_gate" ]] && { echo "# vLLM runtime:"; echo "$vllm_ar_gate"; }
+      [[ -n "$engine_ar_runtime" ]] && { echo "# engine runtime:"; echo "$engine_ar_runtime"; }
       [[ -n "$p2p_env" ]] && { echo "# resolved container env:"; echo "$p2p_env"; }
       echo '```'
     else
-      echo "_No \`[nvlink]\` boot line or NCCL_P2P/NVLINK_MODE env found — P2P engagement undetermined (single-GPU, a non-NCCL engine like llama.cpp, or an entrypoint predating detect_nvlink.sh)._"
+      echo "_No \`[nvlink]\` boot line, engine all-reduce line, or NCCL_P2P/NVLINK_MODE env found — P2P engagement undetermined (single-GPU, a non-NCCL engine like llama.cpp, or an entrypoint predating detect_nvlink.sh)._"
     fi
     # Cross-referenced VERDICT (capability x engagement — the #488/#158 matrix).
     # Silent on single-GPU / no-capability rigs so the OK/WARN/INFO line is
-    # always signal, never boilerplate.
-    _p2p_verdict_line="$(p2p_verdict "$(p2p_gpu_count)" "$(p2p_host_capability)" \
-      "$(printf '%s\n%s\n%s' "$nvlink_boot" "$vllm_ar_gate" "$p2p_env" | p2p_classify_engagement)")"
-    [[ -n "$_p2p_verdict_line" ]] && { echo; echo "**Interconnect verdict:** ${_p2p_verdict_line}"; }
+    # always signal, never boilerplate. The normalized stream remains ordered,
+    # so the classifier can isolate the current vLLM or SGLang boot.
+    if [[ "$ENGINE_KIND" == "exllamav3" ]]; then
+      echo
+      echo "**Interconnect verdict:** ℹ driver P2P capability is reported above; ExLlamaV3 layer-split transport does not use NCCL/custom all-reduce, so the shared engagement verdict is not applicable."
+    else
+      _p2p_verdict_line="$(p2p_verdict "$(p2p_gpu_count)" "$(p2p_host_capability)" \
+        "$(printf '%s\n%s' "$_p2p_class_stream" "$p2p_env" | p2p_classify_engagement)")"
+      [[ -n "$_p2p_verdict_line" ]] && { echo; echo "**Interconnect verdict:** ${_p2p_verdict_line}"; }
+    fi
     # Kernel-module flavor — the WHY behind a P2P result on GeForce cards. A
     # proprietary (closed) module refuses P2P; the open modules can grant it, with
     # `topo -p2p rw` above the functional proof. Only meaningful multi-GPU.
@@ -1119,7 +1256,7 @@ else
     fi
     echo
 
-    genesis_results=$(docker logs "$CONTAINER" 2>&1 | grep -E '\[INFO:genesis\.apply_all\] (Genesis|✅) Results' | tail -1)
+    genesis_results=$(docker logs "$CONTAINER" 2>&1 | command grep -E '\[INFO:genesis\.apply_all\] (Genesis|✅) Results' | tail -1)
     if [[ -n "$genesis_results" ]]; then
       echo "**Genesis patches applied:**"
       echo '```'
@@ -1128,7 +1265,7 @@ else
       echo
     fi
 
-    sidecar_status=$(docker logs "$CONTAINER" 2>&1 | grep -E '^\[(tolist_cudagraph_fix|inputs_embeds_optional|workspace_lock_disable|pn25_genesis_register_fix|pn30_dst_shaped_temp_fix|fa_max_seqlen_clamp|pn12_ffn_pool_anchor|pn12_compile_safe_custom_op)\]' | head -10)
+    sidecar_status=$(docker logs "$CONTAINER" 2>&1 | command grep -E '^\[(tolist_cudagraph_fix|inputs_embeds_optional|workspace_lock_disable|pn25_genesis_register_fix|pn30_dst_shaped_temp_fix|fa_max_seqlen_clamp|pn12_ffn_pool_anchor|pn12_compile_safe_custom_op)\]' | head -10)
     if [[ -n "$sidecar_status" ]]; then
       echo "**Local sidecar application:**"
       echo '```'
@@ -1137,18 +1274,55 @@ else
       echo
     fi
 
-    kv_pool=$(docker logs "$CONTAINER" 2>&1 | grep -E 'Available KV cache memory|GPU KV cache size:|Maximum concurrency for' | tail -3)
-    if [[ -n "$kv_pool" ]]; then
-      echo "**KV pool sizing:**"
+    # ⚠️ The first three patterns are vLLM's. SGLang words every one of them
+    # differently ("KV Cache is allocated. ... #tokens: N"), so this block was
+    # silently EMPTY on every SGLang report — which is why no community report
+    # has ever carried a pool figure for an SGLang slug (club-3090#1319).
+    #
+    # ⭐ `Mamba Cache is allocated. max_mamba_cache_size: N` is the load-bearing
+    # one for hybrid GDN models (Qwen3.8 et al). Each running request LOCKS 3 of
+    # those slots, so the usable warm-prefix count is
+    #     max_mamba_cache_size - 1 - 3 x max_running_requests
+    # and it is the binding constraint on concurrency for these models — NOT the
+    # KV byte pool. It is topology- and tier-dependent and we cannot measure
+    # multi4/multi8 on a 2-GPU rig, so capturing it here is how those numbers
+    # reach us at all.
+    # ⚠️ Allocation lines are printed ONCE at boot and the "Memory pool end"
+    # line repeats per rank, so a plain `tail` drops the mamba line — which is
+    # the one that matters. Take allocation from the HEAD of the log and the
+    # effective-limits line from the TAIL, rather than tailing the union.
+    kv_pool=$(docker logs "$CONTAINER" 2>&1 | command grep -E 'Available KV cache memory|GPU KV cache size:|Maximum concurrency for|Mamba Cache is allocated|KV Cache is allocated' | head -6)
+    # ⭐ The EFFECTIVE limits, which are not the requested ones: SGLang CLAMPS
+    # max_running_requests to what the pool supports. Measured 2026-09-14 on the
+    # reference rig: the DFlash2 tier was asked for 8 and resolved to 6, while
+    # the MTP tier got all 8. `server_args` echoes the REQUEST, so it cannot be
+    # used to tell what the server is actually running — this line can.
+    kv_limits=$(docker logs "$CONTAINER" 2>&1 | command grep -E 'max_total_num_tokens=' | tail -1)
+    if [[ -n "$kv_pool" || -n "$kv_limits" ]]; then
+      echo "**KV / state pool sizing (and EFFECTIVE limits):**"
       echo '```'
-      echo "$kv_pool"
+      if [[ -n "$kv_pool" ]]; then echo "$kv_pool"; fi
+      if [[ -n "$kv_limits" ]]; then echo "$kv_limits"; fi
+      echo '```'
+      echo
+    fi
+
+    # SGLang scheduler steady state: the concurrency actually reached and what it
+    # cost in state slots. `#running-req` is STREAMS (never spec-dec depth), and
+    # `mamba usage` is the fraction of the state pool locked — together they say
+    # whether --max-running-requests is a real ceiling or an inherited default.
+    sgl_batch=$(docker logs "$CONTAINER" 2>&1 | command grep -E 'Decode batch.*#running-req' | tail -3)
+    if [[ -n "$sgl_batch" ]]; then
+      echo "**Scheduler steady state (concurrency + state-slot usage):**"
+      echo '```'
+      echo "$sgl_batch"
       echo '```'
       echo
     fi
 
     # Engine config — the line containing "non-default args" or "Initializing a V1 LLM engine"
     # captures every important CLI flag (max_model_len, mem_util, kv dtype, spec config, etc.)
-    engine_config=$(docker logs "$CONTAINER" 2>&1 | grep -E 'non-default args:|Initializing a V1 LLM engine' | head -2)
+    engine_config=$(docker logs "$CONTAINER" 2>&1 | command grep -E 'non-default args:|Initializing a V1 LLM engine' | head -2)
     if [[ -n "$engine_config" ]]; then
       echo "**Engine config (CLI flags + engine init):**"
       echo '```'
@@ -1157,7 +1331,7 @@ else
       echo
     fi
 
-    boot_errors=$(docker logs "$CONTAINER" 2>&1 | grep -E '^(WARNING|ERROR|CRITICAL)' | tail -5)
+    boot_errors=$(docker logs "$CONTAINER" 2>&1 | command grep -E '^(WARNING|ERROR|CRITICAL)' | tail -5)
     if [[ -n "$boot_errors" ]]; then
       echo "**Recent warnings/errors (last 5):**"
       echo '```'
@@ -1172,13 +1346,58 @@ else
 fi  # end of "if no container running"
 
 # ---------------------------------------------------------------------------
+# Engine configuration (resolved)  — club-3090#1265
+# ---------------------------------------------------------------------------
+# Everything above says what the RIG is. This says what the ENGINE RAN, and
+# whether it was a shipped recipe.
+#
+# ⛔ Deliberately NOT a compose dump. A compose is a TEMPLATE (${VAR:-default}),
+#    so its text shows defaults rather than what ran; and the launchers resolve
+#    the engine image from scripts/lib/profiles/engines/<engine>.yml and INJECT
+#    it, overriding the compose's own `image:` line — so a compose dump would
+#    report the WRONG engine image in every report. The reasoning, and the
+#    measured proof of the interpolation/escape rules this relies on, are in
+#    scripts/lib/resolved_config.py's module docstring.
+#
+# The renderer is python3 STDLIB-ONLY on purpose: it reads the catalog through
+# compose_registry.py, not registry-emit.sh --json, because the emit path may
+# need PyYAML and a community rig without it is exactly the rig whose report we
+# most need (#584).
+section "Engine configuration (resolved)"
+if ! have python3; then
+  echo "_python3 not available — cannot resolve the engine configuration._"
+elif ! have docker; then
+  echo "_docker not available — the engine configuration is captured from \`docker inspect\`, so nothing to report._"
+elif ! docker info >/dev/null 2>&1; then
+  echo "_docker daemon unreachable — the engine configuration is captured from \`docker inspect\`, so nothing to report._"
+else
+  _rc_args=(section --root "$REPO_ROOT" --container "${CONTAINER:-}" --engine-kind "${ENGINE_KIND:-unknown}")
+  # `if`, not `A && B`: at statement level a false AND-list is a non-zero exit,
+  # which an errexit shell would treat as a failure (the repo's own idiom).
+  if [[ $DO_ENGINE_ARGS -eq 1 ]]; then _rc_args+=(--engine-args); fi
+  # stderr is folded in on purpose: a traceback here must be VISIBLE in the
+  # report, not swallowed into an empty-looking section (#584's lesson).
+  if ! python3 "$REPO_ROOT/scripts/lib/resolved_config.py" "${_rc_args[@]}" 2>&1 | redact; then
+    echo
+    echo "_⚠️ The resolved-config renderer failed (output above). Engine configuration NOT captured._"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 # Recent failed boot attempts
 # ---------------------------------------------------------------------------
 # Capture exited vLLM/llama.cpp containers from the last 24h. Most valuable
 # diagnostic data for boot-failure scenarios — without this, contributors hit
 # "no container running" and have to manually paste docker logs ad-hoc.
 # Engine-agnostic: matches both vllm-* and llama-cpp-* container patterns.
-
+#
+# Exit code 0 is NOT a failed boot, and used to be reported as one (#1525):
+# one-shot setup steps exit 0 by design once their job is done (the FA2 fp8-KV
+# kernel check is a `restart: "no"` service the engine waits on), and an engine
+# that was stopped exits 0 too. Those go in a short "exited cleanly" list,
+# without logs; every non-zero exit is reported exactly as before. A function
+# so scripts/tests/test-report-recent-exits.sh can run it against stub docker.
+report_recent_exits() {
 section "Recent failed boot attempts"
 if ! have docker; then
   echo "_docker not available — skipping._"
@@ -1190,12 +1409,13 @@ else
   exited_lines=$(docker ps -a \
     --format '{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.ID}}' \
     --filter 'status=exited' 2>/dev/null \
-    | grep -E '^(vllm-|llama-cpp-)' || true)
+    | command grep -E "$(club_container_re_loose)" || true)
 
   if [[ -z "$exited_lines" ]]; then
     echo "_No recently-exited vLLM or llama.cpp containers found._"
   else
-    found_recent=0
+    found_recent=0 found_failed=0
+    local -a clean_exits=()
     while IFS=$'\t' read -r ex_name ex_image ex_status ex_id; do
       [[ -z "$ex_name" ]] && continue
       # Cutoff: last 24h. docker inspect gives ISO-8601 FinishedAt.
@@ -1220,6 +1440,19 @@ else
         relative_label="${hrs_ago}h ${rem_mins}min ago"
       fi
 
+      if [[ "$exit_code" == "0" ]]; then
+        local policy what
+        policy=$(docker inspect "$ex_id" --format '{{.HostConfig.RestartPolicy.Name}}' 2>/dev/null || echo "")
+        if [[ "$policy" == "no" ]]; then
+          what="one-shot setup step (\`restart: no\`), finished"
+        else
+          what="stopped${policy:+ (restart policy \`$policy\`)}"
+        fi
+        clean_exits+=("- \`$ex_name\` — exited $relative_label, code 0: $what")
+        continue
+      fi
+
+      found_failed=1
       subsection "\`$ex_name\` — exited $relative_label (code $exit_code)"
       {
         echo "- **Name:** \`$ex_name\`"
@@ -1234,9 +1467,17 @@ else
 
     if [[ "$found_recent" == "0" ]]; then
       echo "_Exited vLLM/llama.cpp containers exist but all >24h old — likely not relevant to current investigation._"
+    elif [[ "$found_failed" == "0" ]]; then
+      echo "_No failed boots in the last 24h._"
+    fi
+    if [[ ${#clean_exits[@]} -gt 0 ]]; then
+      subsection "Exited cleanly (code 0) — not boot failures"
+      printf '%s\n' "${clean_exits[@]}" | redact
     fi
   fi
 fi
+}
+report_recent_exits
 
 # ---------------------------------------------------------------------------
 # Stage gating + engine liveness (#830)
@@ -1353,13 +1594,14 @@ stage_label() {
     soak)    echo "soak-test.sh" ;;
     bench)   echo "bench.sh" ;;
     agentic) echo "bench-agentic.sh" ;;
+    kv_agentic) echo "kv-offload-agentic-probe.py" ;;
     *)       echo "$1" ;;
   esac
 }
 
 # Resolve the engine endpoint the same way preflight.sh / soak-test.sh do: by
 # the container's ENGINE-INTERNAL port mapping (vLLM 8000 / llama.cpp 8080 /
-# sglang 30000), never a model-name allowlist. Mirrors, rather than sources,
+# sglang 30000 / TabbyAPI 5000), never a model-name allowlist. Mirrors, rather than sources,
 # preflight.sh — that file executes checks at source time.
 resolve_stage_endpoint() {
   if [[ -n "${URL:-}" ]]; then printf '%s\n' "${URL%/}"; return 0; fi
@@ -1367,7 +1609,7 @@ resolve_stage_endpoint() {
   have docker || return 0
   [[ -n "$CONTAINER" ]] || return 0
   local internal mapped port
-  for internal in 8000 8080 30000; do
+  for internal in 8000 8080 30000 5000; do   # 5000 = TabbyAPI (exllamav3), #1360
     mapped="$(docker port "$CONTAINER" "${internal}/tcp" 2>/dev/null | head -1 || true)"
     if [[ -n "$mapped" ]]; then
       port="${mapped##*:}"
@@ -1525,6 +1767,20 @@ if [[ $DO_AGENTIC -eq 1 ]]; then
   fi
 fi
 
+# KV-offload agentic probe (--kv-agentic, #1419) — the "real agent workload with the tier on":
+# several long agentic conversations switched between, evicted, then proven to come back warm
+# from the tier. The slug must be booted with KV_OFFLOAD_GB for this to mean anything; without
+# the tier on, expect FAIL — that IS the signal the tier is off.
+if [[ $DO_KV_AGENTIC -eq 1 ]]; then
+  section "kv-offload-agentic-probe output"
+  if [[ ! -f scripts/kv-offload-agentic-probe.py ]]; then
+    echo "_scripts/kv-offload-agentic-probe.py not found_"
+  elif stage_guard kv_agentic; then
+    python3 scripts/kv-offload-agentic-probe.py 2>&1 | tee "${STAGE_RAW_DIR}/kv_agentic" | redact | details "agentic KV offload probe (3 conversations x 15 turns, switched between, RAM mode; ~15 min on 2x 3090 dual-fast)"
+    stage_record kv_agentic "${PIPESTATUS[0]}" "${STAGE_RAW_DIR}/kv_agentic"
+  fi
+fi
+
 # ---------------------------------------------------------------------------
 # AI Studio container logs (--studio) — opt-in: the ComfyUI / director / orchestrator
 # log tails that diagnose an image/video/audio GENERATION failure (e.g. a "ComfyUI
@@ -1537,12 +1793,12 @@ if [[ $DO_STUDIO -eq 1 ]]; then
   _studio_found=0
   # ComfyUI first (the generation engine — longest tail), then the studio sidecars.
   for c in comfyui studio-director studio-orchestrator studio-image-shim studio-tts studio-step-voice studio-gallery; do
-    if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$c"; then
+    if docker ps -a --format '{{.Names}}' 2>/dev/null | command grep -qx "$c"; then
       _studio_found=1
       _tail=200; [[ "$c" == comfyui ]] && _tail=400
       _running=$(docker ps --filter "name=^${c}$" --format '{{.Status}}' 2>/dev/null | head -1)
-      # strip ANSI colour codes (ComfyUI logs are coloured) so the pasted block reads cleanly
-      docker logs --tail "$_tail" "$c" 2>&1 | sed -E 's/\x1b\[[0-9;]*[mK]//g' | redact \
+      # ComfyUI logs are coloured; redact() strips the codes (strip_ansi)
+      docker logs --tail "$_tail" "$c" 2>&1 | redact \
         | details "$c — ${_running:-not running} (last $_tail lines)"
     fi
   done
@@ -1616,7 +1872,7 @@ cat <<'EOF'
 
 ---
 
-_Generated by `bash scripts/report.sh`. Flags: `--verify` (verify-full), `--stress` (verify-stress 7/7 incl. Cliff 2 needles), `--soak` (SOAK_MODE=continuous, catches Cliff 2b), `--bench` (canonical TPS), `--agentic` (multi-turn TTFT/decode curve-shape, ~8 min estimate), `--studio` (AI Studio / ComfyUI container log tails — for generation bugs), `--full` (all five, ~43 min estimate). Use `--no-redact` to disable redaction (internal sharing only). Exit code: 0 all-clear · 2 advisory-only · 1 hard failure._
+_Generated by `bash scripts/report.sh`. Flags: `--verify` (verify-full), `--stress` (verify-stress 7/7 incl. Cliff 2 needles), `--soak` (SOAK_MODE=continuous, catches Cliff 2b), `--bench` (canonical TPS), `--agentic` (multi-turn TTFT/decode curve-shape, ~8 min estimate), `--kv-agentic` (real agent workload for the KV offload tier — needs a slug booted with KV_OFFLOAD_GB, ~15 min estimate on 2x 3090 dual-fast, RAM mode), `--studio` (AI Studio / ComfyUI container log tails — for generation bugs), `--full` (all five, ~43 min estimate). Use `--no-redact` to disable redaction (internal sharing only). Exit code: 0 all-clear · 2 advisory-only · 1 hard failure._
 EOF
 
 exit "$STAGE_WORST"

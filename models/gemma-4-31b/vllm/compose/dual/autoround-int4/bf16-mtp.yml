@@ -69,6 +69,7 @@ services:
   vllm-gemma-4-31b-mtp:
     image: ${VLLM_IMAGE:-vllm/vllm-openai:v0.22.0}
     container_name: "${ESTATE_CONTAINER:-vllm-gemma-4-31b-mtp}"
+    user: "0:${DOCKER_GID:-1000}"
     restart: ${CLUB3090_RESTART:-unless-stopped}
     ports:
       - "${BIND_HOST:-0.0.0.0}:${ESTATE_PORT:-${PORT:-8030}}:8000"
@@ -79,8 +80,8 @@ services:
       - ../../../patches/google-canonical-chat-template/chat_template.jinja:/etc/club3090/gemma-canonical-template.jinja:ro
       # torch.compile + Triton kernel caches — first boot warms (~5-7 min);
       # subsequent boots reuse cached graphs (~3 min). Pattern from dual-turbo.yml.
-      - ../../../cache/torch_compile:/root/.cache/vllm/torch_compile_cache
-      - ../../../cache/triton:/root/.triton/cache
+      - ${CLUB3090_ENGINE_CACHE_DIR:-../../../cache}/torch_compile:/root/.cache/vllm/torch_compile_cache
+      - ${CLUB3090_ENGINE_CACHE_DIR:-../../../cache}/triton:/root/.triton/cache
       # PR #41745 overlay dropped 2026-05-08: merged upstream + nightly contains it.
       # vLLM PR #42006 — Gemma 4 MTP streaming multi-tool-call fix (lean diff-apply).
       # Stock v0.22.0 drops the args of all-but-the-last tool call in a STREAMED
@@ -106,6 +107,7 @@ services:
       - TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-${OFFLINE:-0}}
       - VLLM_WORKER_MULTIPROC_METHOD=spawn
       - NVLINK_MODE=${NVLINK_MODE:-auto}
+      - DISABLE_CUSTOM_ALL_REDUCE=${DISABLE_CUSTOM_ALL_REDUCE:-0}
       # Opt-in transfer check: VLLM_SKIP_P2P_CHECK=0 makes vLLM PROVE peer access by
       # moving bytes (report.sh reads the cache). Bare passthrough — absent unless set.
       # docs/PCIE_P2P.md §7.
@@ -157,7 +159,7 @@ services:
         else
           echo "[spec] drafter OFF (SPEC_N=0 / SPEC=off) - no speculative decoding" >&2
         fi
-        if [ "$${_NVLINK_ENABLED:-0}" = "1" ]; then
+        if [ "$${_CUSTOM_AR_ENABLED:-$${_NVLINK_ENABLED:-0}}" = "1" ]; then
           exec vllm serve "$$@" "$${SPEC_ARGS[@]}"
         else
           exec vllm serve --disable-custom-all-reduce "$$@" "$${SPEC_ARGS[@]}"

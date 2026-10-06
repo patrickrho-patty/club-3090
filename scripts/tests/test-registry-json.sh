@@ -8,6 +8,7 @@
 # still produces byte-identical tab output (the JSON path must be purely
 # additive).
 set -euo pipefail
+export CLUB3090_CONFIG_DIR=/nonexistent/club-3090-test-config   # tests never read your real settings (#1466)
 
 # Force Python's UTF-8 mode (PEP 540) for every python3 this script runs.
 # Repo sources are full of unicode (— × → ⚠), and without this a rig on a real
@@ -86,6 +87,9 @@ VARIANT_KEYS = {
     # c3 catalog offload column: weight-offload backend — None (resident, the
     # default) / "uva" / "residency" / "tensor-override" / "prefetch".
     "offload", "host_ram_gb",
+    # KV-cache offload tier the compose exposes: None / "opt-in" (shown as
+    # "kv opt" in the same c3 column; a different axis from weight offload).
+    "kv_offload",
     # Per-mode model-card sampler rows (#1014 L2→L3) — {"instruct": …,
     # "thinking": …} when the card publishes them (qwen38-27b today), else null.
     "sampler_profiles",
@@ -93,6 +97,10 @@ VARIANT_KEYS = {
     # as a first-class fact: registry override wins, else plain-text compose
     # parse, else None (llamacpp-family slugs).
     "served_name",
+    # Catalogued launch settings the slug's compose reads (#1465 phase 3a) —
+    # sorted list, [] for none; scanned from the compose by launch_knobs.py.
+    # Its per-slug correctness is guarded by test-launch-knobs.sh.
+    "knobs",
 }
 v0 = d["variants"][0]
 need(set(v0.keys()) == VARIANT_KEYS,
@@ -107,6 +115,12 @@ need(v0["source"] == "curated", f"variant.source default must be 'curated' (got 
 # configured_ctx is an int (or None) — the exact registry max_ctx behind ctx_label.
 need(v0["configured_ctx"] is None or isinstance(v0["configured_ctx"], int),
      f"variant.configured_ctx must be int|None (got {type(v0['configured_ctx']).__name__})")
+# knobs: a sorted list of strings on every variant (None only when the catalogue is
+# unusable, which the checked-in one never is).
+bad_knobs = [v["slug"] for v in d["variants"]
+             if not (isinstance(v["knobs"], list) and all(isinstance(k, str) for k in v["knobs"])
+                     and v["knobs"] == sorted(v["knobs"]))]
+need(not bad_knobs, f"variant.knobs must be a sorted list of names (bad: {bad_knobs[:5]})")
 
 # --- served_name: first-class emitted fact ------------------------------------
 # Precedence: a registry override (_entry served_name=) wins when set; otherwise

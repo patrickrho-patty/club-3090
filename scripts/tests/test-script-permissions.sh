@@ -14,6 +14,7 @@
 # A shebang there is decorative and +x buys nothing, so they are exempt BY NAME —
 # adding one is a conscious decision, not a silent exemption.
 set -euo pipefail
+export CLUB3090_CONFIG_DIR=/nonexistent/club-3090-test-config   # tests never read your real settings (#1466)
 
 export PYTHONUTF8="${PYTHONUTF8:-1}"
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -28,10 +29,12 @@ SOURCED_OK = {
     "scripts/lib/capture.sh",               # sourced by bench.sh
     "scripts/lib/card.sh",                  # sourced by bench.sh
     "scripts/lib/compose-meta.sh",          # sourced by preflight.sh
+    "scripts/lib/club-containers.sh",       # sourced by report/health/soak/gpu-mode/preflight
+    "scripts/lib/engine-restart-guard.sh", # sourced by quality-test.sh / bench.sh
     "scripts/lib/gpu-select.sh",            # sourced by launch.sh
     "scripts/lib/p2p-state.sh",             # sourced by preflight.sh
     "scripts/lib/report_calib.sh",          # sourced by test-report-calib.sh
-    "scripts/lib/profiles/repo_dotenv.py",  # imported by promote.py / export_pr.py
+    "scripts/lib/served-model.sh",          # sourced by preflight/quality-test/rebench/switch/bench-agentic
     "scripts/lib/profiles/weights.py",      # imported by the profile loaders
     "scripts/tests/fixtures/report-harness/report-env.sh",  # test fixture, sourced
     "scripts/tests/fixtures/soak-harness/soak-env.sh",      # test fixture, sourced

@@ -20,6 +20,7 @@
 #   OFFLOAD_MATRIX_TIER2=1 MODEL=/path/to/model.gguf LLAMA_SERVER=/path/to/llama-server \
 #     bash scripts/tests/tier2/test-offload-matrix-real.sh
 set -euo pipefail
+export CLUB3090_CONFIG_DIR=/nonexistent/club-3090-test-config   # tests never read your real settings (#1466)
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 SWEEP="$ROOT_DIR/scripts/offload-matrix.sh"
 REND="$ROOT_DIR/scripts/offload-matrix-render.py"
@@ -39,7 +40,16 @@ if pgrep -x llama-server >/dev/null; then
 fi
 
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
-PORT="${TEST_PORT:-8138}"
+# ⚠️⚠️ FIXTURE PORTS LIVE ABOVE THE PRODUCT PORT SPACE, ON PURPOSE.
+# The registry allocates real slug `default_port`s across 8010-8199, so a
+# fixture base inside that span silently collides: a slug parked on one of
+# these ports makes this guard fail WHENEVER THAT MODEL IS SERVING, and the
+# failure reads as a broken test rather than a port clash. Measured
+# 2026-09-18 on test-bench-capture, whose 8147 base overlapped ELEVEN
+# registry slugs; three suite failures were misdiagnosed as pre-existing
+# before the cause was found. 18xxx is clear — the product never allocates
+# above 8199. Keep the last three digits so the old base stays greppable.
+PORT="${TEST_PORT:-18138}"
 NGPU=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
 
 echo "  booting ONE short real arm (ctx 4096, 2 rounds) on $NGPU GPU(s) ..."

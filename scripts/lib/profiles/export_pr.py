@@ -136,9 +136,15 @@ def load_local_state(root: Path, mid: str) -> dict:
         )
     for e in entries:
         if str(e["slug"]).startswith(_LOCAL_SLUG_PREFIX):
+            # #1205 inverted this condition (the prefix went from REQUIRED to
+            # REFUSED) but left the old wording, so the message said "lacks the
+            # 'local/' namespace" about a slug that plainly had it. Say what
+            # actually happened, and name the fix.
             raise Refusal(
-                f"registry slug {e['slug']!r} lacks the {_LOCAL_SLUG_PREFIX!r} "
-                "namespace — not a LOCAL-layer entry"
+                f"registry slug {e['slug']!r} uses the {_LOCAL_SLUG_PREFIX!r} "
+                "namespace, which was removed — local slugs are '<engine>/<name>' "
+                f"(provenance is the 'origin' field). Re-register it as "
+                f"'<engine>/{str(e['slug'])[len(_LOCAL_SLUG_PREFIX):]}'."
             )
     return {
         "model_id": mid,
@@ -449,13 +455,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = ap.parse_args(argv)
 
     root = Path(args.root).resolve()
-    # #1142: same as promote.py — no shell wrapper sources .env for this tool, so
-    # honour it here too (real environment wins). Matters for --spec-env.
+    # #1142 / #1466: same as promote.py — no shell wrapper loads settings for this
+    # tool, so do it here through the one loader (real environment wins). Matters
+    # for --spec-env.
     try:  # package context
-        from scripts.lib.profiles.repo_dotenv import apply_dotenv
+        from scripts.lib.club_config import load as load_config
     except ImportError:  # direct-script context
-        from repo_dotenv import apply_dotenv
-    apply_dotenv(root)
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from club_config import load as load_config
+    load_config(root)
     out = Path(args.out).resolve()
     try:
         if args.spec_env:

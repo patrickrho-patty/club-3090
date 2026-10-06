@@ -74,41 +74,14 @@ SWITCH="${SWITCH:-${ROOT_DIR}/scripts/switch.sh}"
 VERIFY="${VERIFY:-${ROOT_DIR}/scripts/verify-full.sh}"
 LAUNCH_PROFILE="${LAUNCH_PROFILE:-${ROOT_DIR}/scripts/lib/profiles/launch_compat.py}"
 ESTATE_HELPER="${ESTATE_HELPER:-${ROOT_DIR}/scripts/lib/profiles/estate_cli.py}"
-if [[ -z "${MODEL_DIR:-}" && -f "${ROOT_DIR}/.env" ]]; then
-  set -a
-  # shellcheck source=/dev/null
-  source "${ROOT_DIR}/.env"
-  set +a
-fi
-# PR-B: the above only sources .env when MODEL_DIR is unset, so a user with
-# `export MODEL_DIR=…` in their shell would never see their `.env` model-default
-# pins (CLUB3090_DEFAULT_*). Load just those keys here, regardless — with
-# shell-env-wins precedence (matching switch.sh's loader / #425). Values are
-# taken literally (no shell expansion), CRLF-tolerant.
-if [[ -f "${ROOT_DIR}/.env" ]]; then
-  while IFS= read -r _env_line || [[ -n "$_env_line" ]]; do
-    _env_line="${_env_line#"${_env_line%%[![:space:]]*}"}"   # strip leading whitespace
-    _env_line="${_env_line%$'\r'}"                           # strip trailing CR
-    [[ "$_env_line" == "export "* ]] && _env_line="${_env_line#export }"
-    # #632 — pass model-default pins AND user engine-image overrides through to
-    # docker compose.  IK_LLAMA_IMAGE/LLAMACPP_IMAGE were silently dropped here
-    # (only CLUB3090_DEFAULT_* passed), so a .env cu12 pin never reached the
-    # ik-llama/llama.cpp composes.  Shell env still wins (checked below); the
-    # vllm/beellama images get profile-injected later regardless.
-    case "$_env_line" in
-      CLUB3090_DEFAULT_*|VLLM_IMAGE=*|BEELLAMA_IMAGE=*|IK_LLAMA_IMAGE=*|LLAMACPP_IMAGE=*|VLLM_NIGHTLY_SHA=*) ;;
-      *) continue ;;
-    esac
-    _env_key="${_env_line%%=*}"
-    [[ "$_env_key" == "$_env_line" || -z "$_env_key" ]] && continue
-    [[ -n "${!_env_key+x}" ]] && continue                    # already set in env → shell wins
-    _env_val="${_env_line#*=}"
-    _env_val="${_env_val#\"}"; _env_val="${_env_val%\"}"
-    _env_val="${_env_val#\'}"; _env_val="${_env_val%\'}"
-    export "${_env_key}=${_env_val}"
-  done < "${ROOT_DIR}/.env"
-  unset _env_line _env_key _env_val
-fi
+# Settings through the ONE loader (club-3090#1466): your club-3090 config
+# (~/.config/club-3090/), then the repo .env as a fallback. ⚠️ Behaviour change: this
+# used to `source` .env, which let it override your shell for every key unless
+# MODEL_DIR was exported (and then read only the pin/image keys). Now the shell wins
+# for every key, exactly as in switch.sh, and values are taken literally.
+# shellcheck source=lib/club-config.sh
+source "${ROOT_DIR}/scripts/lib/club-config.sh"
+club_config_load "${ROOT_DIR}"
 # #632 — surface a user engine-image pin (ik-llama / llama.cpp images are NOT
 # profile-injected, so a .env/shell pin is the only override path; echo it so a
 # wrong-image boot is never silent).  Fires only when actually set.
@@ -202,6 +175,10 @@ if [[ -n "$DOWN_ESTATE" ]]; then
   "${_estate_down_cmd[@]}"
   exit $?
 fi
+
+# #1466 — settings still in this checkout: say once how to move them (switch.sh says the
+# same; the stamp makes sure only the first of the two prints it).
+club_config_migrate_notice "${ROOT_DIR}" "[launch]"
 
 # --- pre-flight ---
 if [[ $SKIP_PREFLIGHT -eq 0 ]]; then
@@ -438,7 +415,7 @@ choose_model() {
       echo "[launch] ERROR: ${MODEL_NAME} is not installed under ${MODEL_DIR}." >&2
       echo "[launch]        Run: bash scripts/setup.sh ${MODEL_NAME}" >&2
       echo "[launch]        Already have weights elsewhere? Point MODEL_DIR at them, e.g.:" >&2
-      echo "[launch]          echo 'MODEL_DIR=/path/to/your/models' >> .env   # launch.sh, switch.sh + docker compose all read it" >&2
+      echo "[launch]          bash scripts/settings.sh set MODEL_DIR=/path/to/your/models   # saved in ~/.config/club-3090/; every launcher reads it" >&2
       exit 1
     fi
     return
@@ -447,7 +424,7 @@ choose_model() {
     echo "[launch] ERROR: no supported model weights found under ${MODEL_DIR}." >&2
     echo "[launch]        Run: bash scripts/setup.sh" >&2
     echo "[launch]        Already have weights elsewhere? Point MODEL_DIR at them, e.g.:" >&2
-    echo "[launch]          echo 'MODEL_DIR=/path/to/your/models' >> .env   # launch.sh, switch.sh + docker compose all read it" >&2
+    echo "[launch]          bash scripts/settings.sh set MODEL_DIR=/path/to/your/models   # saved in ~/.config/club-3090/; every launcher reads it" >&2
     exit 1
   fi
   if [[ "${#MODEL_ORDER[@]}" -eq 1 ]]; then
@@ -713,7 +690,12 @@ launch_nvlink_active() {
   (
     # shellcheck source=detect_nvlink.sh
     source "${ROOT_DIR}/scripts/detect_nvlink.sh" >/dev/null 2>&1 || true
-    printf '%s' "${_NVLINK_ENABLED:-0}"
+    # ⚠️ The TRANSPORT, not _NVLINK_ENABLED — that name now carries the custom
+    # all-reduce decision (#1332), so reading it here would report "no fast
+    # interconnect" on a perfectly good peer path whenever the operator has
+    # turned only the kernel off. detect_nvlink.sh exports NCCL_P2P_DISABLE=1
+    # exactly when the transport is down.
+    if [ "${NCCL_P2P_DISABLE:-0}" = "1" ]; then printf '0'; else printf '1'; fi
   )
 }
 
@@ -1185,9 +1167,29 @@ validate_selected_variant() {
   "${cmd[@]}"
 }
 
+# ⚠️ CALLED TWICE on the launch.sh path (launch.sh:1473 exports, then execs
+# switch.sh, which exports again into the inherited env) -- and that is safe:
+# resolve-variant-pin OMITS any key whose env var is already set (the user-env
+# rule at launch_compat.py:217/311/355/401/506), so pass 2 receives an empty or
+# image-only result and re-exports nothing. Pass 1's values stand, and the
+# per-key "keeping your value" branches below stay silent instead of reporting
+# the launcher's own first-pass export as a user override. Guarded by the
+# double-invocation section of test-launch-compat.sh -- if the resolver ever
+# stops suppressing, that test reds before a user sees a doubled message.
 export_variant_engine_pin() {
   local variant="$1" output line key value gpu_spec
-  [[ "$variant" == vllm/* || "$variant" == beellama/* ]] || return 0
+  # #1365: NO engine-family prefix test. It used to read
+  #   [[ "$variant" == vllm/* || "$variant" == beellama/* ]] || return 0
+  # because resolve_engine_pin RAISED for every other engine, so the only way to
+  # keep the launcher working was to skip the call entirely -- which also skipped
+  # the #246 hardware-envelope exports riding along with it. 73 of 138 slugs got
+  # NO hardware injection at all (#1361). resolve_variant_pin is total now, so the
+  # call is safe for every slug and an empty result is a normal answer.
+  # Measured against origin/master before flipping: the effective image is
+  # BYTE-IDENTICAL for all 138 slugs; what changes is that 22-28 moe-cache slugs
+  # now receive their card-class MOE_RESERVE_MB (2048 on 5090, 3072 on A6000,
+  # 5120 on H100, 8192 on Spark) instead of the compose default. On 2x3090 and
+  # 1x4090 the flip is a no-op, so no bench baseline moves.
   # detected-GPU spec enables the #246 arch-aware env for pilot variants;
   # empty (no selection yet / no nvidia-smi) -> pin exports only.
   gpu_spec="$(selected_gpu_profile_spec 2>/dev/null || true)"
@@ -1201,19 +1203,92 @@ export_variant_engine_pin() {
       VLLM_NIGHTLY_SHA) export VLLM_NIGHTLY_SHA="$value" ;;
       VLLM_IMAGE) export VLLM_IMAGE="$value" ;;
       BEELLAMA_IMAGE) export BEELLAMA_IMAGE="$value" ;;
+      # #1365: the remaining engines' image pins. resolve_engine_pin used to RAISE
+      # for these, so the launchers gated the whole call behind a vllm/beellama
+      # prefix test and 73 of 138 slugs got no hardware injection at all. Now that
+      # it returns the engine profile's own image_env, each var needs an arm here
+      # or the `*)` below turns it into exit 2. Caught by the #1363 matrix guard.
+      EXLLAMAV3_IMAGE) export EXLLAMAV3_IMAGE="$value" ;;
+      SGLANG_IMAGE) export SGLANG_IMAGE="$value" ;;
+      LLAMACPP_CLUB3090_IMAGE) export LLAMACPP_CLUB3090_IMAGE="$value" ;;
+      LLAMACPP_PRISM_IMAGE) export LLAMACPP_PRISM_IMAGE="$value" ;;
+      LLAMACPP_PRISM_MTP_IMAGE) export LLAMACPP_PRISM_MTP_IMAGE="$value" ;;
       # #246 arch-aware env (pilot slugs; hardware-profile balanced default)
-      KV_CACHE_DTYPE)
-        export KV_CACHE_DTYPE="$value"
-        echo "[launch] arch-aware KV dtype: ${value} (hardware-profile default for detected GPUs — #246)" ;;
+      # KV_CACHE_DTYPE) — arm REMOVED 2026-09-21 (#1371) along with the #246
+      # Phase 1 injector that emitted it. Nothing resolves it any more, so an arm
+      # here would be dead code implying the resolver still can. A user-set
+      # KV_CACHE_DTYPE is untouched either way: the composes read it as
+      # ${KV_CACHE_DTYPE:-…} and docker interpolates it from the environment,
+      # which never went through this case statement. scripts/arch-ab.sh still
+      # pins it explicitly per arm, and that path is unaffected.
       MAX_NUM_SEQS)
-        export MAX_NUM_SEQS="$value"
-        echo "[launch] memory-envelope concurrency: MAX_NUM_SEQS=${value} (measured for this card class — #246 Phase 2)" ;;
+        # #246 arch-aware default — but a value the USER set WINS, matching the .env
+        # precedence rule earlier in this script. An unconditional export silently
+        # clobbered an explicit `MAX_NUM_SEQS=… scripts/launch.sh …` with no override path
+        # (reported on Discord for MAX_NUM_SEQS, 2026-09-11).
+        if [[ -n "${MAX_NUM_SEQS:-}" ]]; then
+          echo "[launch] MAX_NUM_SEQS: keeping your value ${MAX_NUM_SEQS} (hardware profile suggested ${value})" >&2
+        else
+          export MAX_NUM_SEQS="$value"
+          echo "[launch] memory-envelope concurrency: MAX_NUM_SEQS=${value} (measured for this card class — #246 Phase 2)"
+        fi ;;
+      MAX_RUNNING_REQUESTS)
+        # SGLang's spelling of the same quantity (#1361). The envelope injector
+        # emits the engine family's own knob name; without this arm the `*)` below
+        # turns the first sglang envelope row into `exit 2`, i.e. an unlaunchable
+        # slug rather than a no-op. Caught by the #1363 matrix guard's static check.
+        if [[ -n "${MAX_RUNNING_REQUESTS:-}" ]]; then
+          echo "[launch] MAX_RUNNING_REQUESTS: keeping your value ${MAX_RUNNING_REQUESTS} (hardware profile suggested ${value})" >&2
+        else
+          export MAX_RUNNING_REQUESTS="$value"
+          echo "[launch] memory-envelope concurrency: MAX_RUNNING_REQUESTS=${value} (#246 Phase 2, sglang)"
+        fi ;;
       GPU_MEMORY_UTILIZATION)
-        export GPU_MEMORY_UTILIZATION="$value"
-        echo "[launch] memory-fraction floor: GPU_MEMORY_UTILIZATION=${value} (unified-memory card can't safely give the default — #246 Phase 2)" ;;
+        # #246 arch-aware default — but a value the USER set WINS, matching the .env
+        # precedence rule earlier in this script. An unconditional export silently
+        # clobbered an explicit `GPU_MEMORY_UTILIZATION=… scripts/launch.sh …` with no override path
+        # (reported on Discord for MAX_NUM_SEQS, 2026-09-11).
+        if [[ -n "${GPU_MEMORY_UTILIZATION:-}" ]]; then
+          echo "[launch] GPU_MEMORY_UTILIZATION: keeping your value ${GPU_MEMORY_UTILIZATION} (hardware profile suggested ${value})" >&2
+        else
+          export GPU_MEMORY_UTILIZATION="$value"
+          echo "[launch] memory-fraction floor: GPU_MEMORY_UTILIZATION=${value} (a unified-memory card in the GPU set shares its memory with the OS — #246 Phase 2; set GPU_MEMORY_UTILIZATION to override)"
+        fi ;;
+      MEM_FRACTION)
+        # SGLang's spelling of the memory-fraction floor (#1365). Same one-way
+        # DOWNWARD semantics as GPU_MEMORY_UTILIZATION above; the injector picks
+        # the name from the engine family, so sglang no longer receives vLLM's.
+        if [[ -n "${MEM_FRACTION:-}" ]]; then
+          echo "[launch] MEM_FRACTION: keeping your value ${MEM_FRACTION} (hardware profile suggested ${value})" >&2
+        else
+          export MEM_FRACTION="$value"
+          echo "[launch] memory-envelope floor: MEM_FRACTION=${value} (#246 Phase 2, sglang)"
+        fi ;;
+      MOE_RESERVE_MB)
+        # Expert-cache reserve floor, injected UPWARD only on cards larger than
+        # the 24 GB rig the compose default was tuned on. 28 composes read it.
+        # ⚠️ EVIDENCE SCOPE: measured on 24 GB Ampere only. On 32/96 GB cards the
+        # scaling is a SAFETY HEURISTIC, not a tuned optimum -- it preserves the
+        # reserve/VRAM ratio the reference rig validated. Erring high costs a few
+        # hundred pool slots; erring low measured ~11% slower on 24 GB. Sweep on
+        # WALL-CLOCK (cache hit rate improves as throughput regresses) and pin it.
+        if [[ -n "${MOE_RESERVE_MB:-}" ]]; then
+          echo "[launch] MOE_RESERVE_MB: keeping your value ${MOE_RESERVE_MB} (hardware profile suggested ${value})" >&2
+        else
+          export MOE_RESERVE_MB="$value"
+          echo "[launch] expert-cache reserve: MOE_RESERVE_MB=${value} (heuristic above 24 GB — sweep on wall-clock and pin)"
+        fi ;;
       VLLM_USE_DEEP_GEMM)
-        export VLLM_USE_DEEP_GEMM="$value"
-        echo "[launch] fp8 weights: VLLM_USE_DEEP_GEMM=${value} (consumer card has no DeepGEMM recipe — disc #571)" ;;
+        # #246 arch-aware default — but a value the USER set WINS, matching the .env
+        # precedence rule earlier in this script. An unconditional export silently
+        # clobbered an explicit `VLLM_USE_DEEP_GEMM=… scripts/launch.sh …` with no override path
+        # (reported on Discord for MAX_NUM_SEQS, 2026-09-11).
+        if [[ -n "${VLLM_USE_DEEP_GEMM:-}" ]]; then
+          echo "[launch] VLLM_USE_DEEP_GEMM: keeping your value ${VLLM_USE_DEEP_GEMM} (hardware profile suggested ${value})" >&2
+        else
+          export VLLM_USE_DEEP_GEMM="$value"
+          echo "[launch] fp8 weights: VLLM_USE_DEEP_GEMM=${value} (consumer card has no DeepGEMM recipe — disc #571)"
+        fi ;;
       VLLM_ATTENTION_BACKEND) export VLLM_ATTENTION_BACKEND="$value" ;;
       # #809 — the model's declared decode class. A block-diffusion (dLLM)
       # model has no measurable decode window on a single-canvas response,
@@ -1378,7 +1453,18 @@ if [[ -n "$PP_VALUE" ]]; then
   export PP="$PP_VALUE"
 fi
 export_variant_engine_pin "$VARIANT"
-"$SWITCH" "$VARIANT"
+# #1465: hand switch.sh the launch knobs as YOUR shell set them. club_config_load (top
+# of this script) exported every saved setting; a catalogued launch knob inherited that
+# way would reach switch.sh looking exported in the shell, and the shell beats the
+# slug's own saved value (shell > this slug > model pin > global). So the knobs the
+# loader exported are dropped from switch.sh's environment; switch.sh loads the same
+# files again and resolves them in the right order. A knob you exported yourself is
+# not in CLUB3090_CONFIG_SOURCE, so it still arrives, and still wins.
+_launch_knob_unsets=()
+while IFS= read -r _k; do
+  if [[ -n "$_k" && -n "${CLUB3090_CONFIG_SOURCE[$_k]+x}" ]]; then _launch_knob_unsets+=(-u "$_k"); fi
+done < <(python3 "${ROOT_DIR}/scripts/lib/launch_settings.py" knob-names)
+env "${_launch_knob_unsets[@]}" "$SWITCH" "$VARIANT"
 
 ENDPOINT_PORT="${PORT:-${LAUNCH_DEFAULT_PORT[$VARIANT]:-8020}}"
 ENDPOINT_URL="http://localhost:${ENDPOINT_PORT}"

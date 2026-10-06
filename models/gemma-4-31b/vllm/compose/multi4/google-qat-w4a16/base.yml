@@ -43,8 +43,9 @@
 # Tensor-parallel: 4
 services:
   vllm-gemma-4-31b-google-qat-w4a16-tp4:
-    image: ${VLLM_IMAGE:-vllm/vllm-openai:v0.27.1}
+    image: ${VLLM_IMAGE:-vllm/vllm-openai:v0.30.0}
     container_name: "${ESTATE_CONTAINER:-vllm-gemma-4-31b-google-qat-w4a16-tp4}"
+    user: "0:${DOCKER_GID:-1000}"
     restart: ${CLUB3090_RESTART:-unless-stopped}
     ports:
       - "${BIND_HOST:-0.0.0.0}:${ESTATE_PORT:-${PORT:-8034}}:8000"
@@ -55,8 +56,8 @@ services:
       - ../../../patches/google-canonical-chat-template/chat_template.jinja:/etc/club3090/gemma-canonical-template.jinja:ro
       # torch.compile + Triton kernel caches — first boot warms (~5-7 min);
       # subsequent boots reuse cached graphs (~3 min).
-      - ../../../cache/torch_compile_google_qat_w4a16:/root/.cache/vllm/torch_compile_cache
-      - ../../../cache/triton_google_qat_w4a16:/root/.triton/cache
+      - ${CLUB3090_ENGINE_CACHE_DIR:-../../../cache}/torch_compile_google_qat_w4a16:/root/.cache/vllm/torch_compile_cache
+      - ${CLUB3090_ENGINE_CACHE_DIR:-../../../cache}/triton_google_qat_w4a16:/root/.triton/cache
       # NVLink auto-detection — runs inside container at boot.
       - ../../../../../../scripts/detect_nvlink.sh:/etc/club3090/detect_nvlink.sh:ro
       # No overlay mounts: BF16 KV runs on the pinned stock vLLM image.
@@ -78,6 +79,7 @@ services:
       - TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-${OFFLINE:-0}}
       - VLLM_WORKER_MULTIPROC_METHOD=spawn
       - NVLINK_MODE=${NVLINK_MODE:-auto}
+      - DISABLE_CUSTOM_ALL_REDUCE=${DISABLE_CUSTOM_ALL_REDUCE:-0}
       # Opt-in transfer check: VLLM_SKIP_P2P_CHECK=0 makes vLLM PROVE peer access by
       # moving bytes (report.sh reads the cache). Bare passthrough — absent unless set.
       # docs/PCIE_P2P.md §7.
@@ -126,7 +128,7 @@ services:
         else
           echo "[spec] drafter OFF (SPEC_N=0 / SPEC=off) - no speculative decoding" >&2
         fi
-        if [ "$${_NVLINK_ENABLED:-0}" = "1" ]; then
+        if [ "$${_CUSTOM_AR_ENABLED:-$${_NVLINK_ENABLED:-0}}" = "1" ]; then
           exec vllm serve "$$@" "$${SPEC_ARGS[@]}"
         else
           exec vllm serve --disable-custom-all-reduce "$$@" "$${SPEC_ARGS[@]}"

@@ -20,9 +20,10 @@ Start here if you want to run a model.
 | [`LOCAL_AI_PRIMER.md`](LOCAL_AI_PRIMER.md) | New to local AI? Plain-English guide to hardware, engines and quantization before you pick anything. |
 | [`GLOSSARY.md`](GLOSSARY.md) | TPS, KV cache, MTP, TP, prefill vs decode — every term the other pages assume. |
 | [`WSL_SETUP.md`](WSL_SETUP.md) | Windows — running the stack on WSL2 from scratch. |
-| [`SINGLE_CARD.md`](SINGLE_CARD.md) | 1× RTX 3090 — workload → curated config → quick start. |
-| [`DUAL_CARD.md`](DUAL_CARD.md) | 2× RTX 3090 (PCIe / NVLink auto-detected) — workload → config → quick start. |
-| [`MULTI_CARD.md`](MULTI_CARD.md) | 3+ GPUs — TP scaling math, derivation from `dual.yml`, valid TP values. |
+| [`SINGLE_CARD.md`](SINGLE_CARD.md) | 1× RTX 3090 — every single-card slug (compose + announcement links), what to pick, what to watch for. Long form: [`SINGLE_CARD.history.md`](SINGLE_CARD.history.md). |
+| [`DUAL_CARD.md`](DUAL_CARD.md) | 2× RTX 3090 (PCIe / NVLink auto-detected) — every dual-card slug, what to pick, what to watch for. Long form: [`DUAL_CARD.history.md`](DUAL_CARD.history.md). |
+| [`MULTI_CARD.md`](MULTI_CARD.md) | 3+ GPUs — the 4- and 8-card slugs, several copies vs one split, which card counts work. Long form (scaling tables, TP=N recipe): [`MULTI_CARD.history.md`](MULTI_CARD.history.md). |
+| [`RUN_EVALS.md`](RUN_EVALS.md) | **Run the evals yourself** — the 8-pack and the health checks for any slug, per-engine thinking switches, and how to post results. |
 | [`PODS.md`](PODS.md) | Multiple models on one host — `pod.sh` + the c3 pod view/wizard, GPU pinning, placement, the estate file. |
 | [`PULL.md`](PULL.md) | Any HF safetensors repo — evaluate against the KV math, honest about confidence. |
 | [`BRING_YOUR_OWN.md`](BRING_YOUR_OWN.md) | Serve + tune + validate **your own** model/compose (any engine, single or dual) without touching the catalog. |
@@ -30,6 +31,8 @@ Start here if you want to run a model.
 | [`PCIE_P2P.md`](PCIE_P2P.md) | PCIe-only multi-GPU — read your `topo -m`, and optionally enable P2P over PCIe without NVLink. |
 | [`GLOSSARY.md`](GLOSSARY.md) | TPS / KV / MTP / TP and the rest of the vocabulary. |
 | [`FAQ.md`](FAQ.md) | Common setup and operational questions. |
+| [`CODING_AGENTS.md`](CODING_AGENTS.md) | Use the local models from a coding agent (omp, pi, Hermes Agent, Claude Code) through the LiteLLM gateway: one-command omp, pi and Hermes setup, the settings a local GPU needs (effort per role, compaction, concurrency, timeouts), and which slug to serve for agent work. |
+| [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md) | Generate a paste-ready report (`report.sh`), and boot a compose directly when the launcher won't. |
 | [`COMPARISONS.md`](COMPARISONS.md) | Self-host vs cloud APIs — cost crossover and when each wins. |
 | [`EMBEDDINGS.md`](EMBEDDINGS.md) | Embedding models on 3090 — which generative techniques transfer, skeleton compose. |
 | [`EXAMPLES.md`](EXAMPLES.md) | Worked end-to-end usage examples. |
@@ -82,6 +85,7 @@ These are cross-cutting references both tracks reach for.
 |---|---|
 | **`scripts/switch.sh --list`** *(runtime command, not a doc)* | **The authoritative compose × slug matrix.** Registry-derived from `scripts/lib/profiles/compose_registry.py`, so it's always current — every launchable slug with its topology, model, engine, KV format, and max ctx. Run this rather than trusting any hand-maintained table; the static lists in the per-topology docs are illustrative, this is the source of truth. |
 | [`engines/`](engines/) | Per-engine deep dives — [vLLM](engines/VLLM.md), [llama.cpp](engines/LLAMA_CPP.md), [ik_llama](engines/IK_LLAMA.md), [SGLang](engines/SGLANG.md), [llamacpp-club3090](engines/LLAMACPP_CLUB3090.md) 🧪 (MoE expert cache — @leloch's, unmerged upstream). |
+| [`ENGINE_FLAGS.md`](ENGINE_FLAGS.md) | **Flag inventory** — every engine flag our composes pass, what the engine's own docs say it does, how many slugs pass it and through which `${ENV:-default}`, and whether its value tracks the detected card or is a hand-tuned 24 GB constant. §2 separates the six hardware-gating mechanisms; §7 lists the flags that are hardware-dependent in reality but hard-coded in practice. |
 | [`INFERENCE_ENGINES.md`](INFERENCE_ENGINES.md) | Engine picker — which engine for which workload, and structural gaps. |
 | [`CLIFFS.md`](CLIFFS.md) | The accumulated-context / prefill failure modes (Cliff 2, Cliff 2b) and how to detect them. |
 | [`QUANTIZATION.md`](QUANTIZATION.md) | **Quant field guide** — GGUF ladder, the vLLM/safetensors schemes, KLD-by-fidelity (§4a), and the **fast/balanced/max tier trade-space** (§4b). The conceptual home the dtype/kernel matrices support. |

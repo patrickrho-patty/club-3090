@@ -22,12 +22,25 @@
 #                              and would adopt a production server's argv/env.
 #   PREFLIGHT_NO_AUTODETECT=1  bench.sh otherwise adopts whatever container is up.
 set -euo pipefail
+export CLUB3090_CONFIG_DIR=/nonexistent/club-3090-test-config   # tests never read your real settings (#1466)
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 export PYTHONUTF8="${PYTHONUTF8:-1}"   # repo rule: locale must not decide python decoding
 BENCH="$ROOT_DIR/scripts/bench.sh"
 LIB="$ROOT_DIR/scripts/lib/capture.sh"
 FIX="$ROOT_DIR/scripts/tests/fixtures/offload-matrix"
-PORT_BASE="${TEST_PORT:-8147}"
+# ⚠️⚠️ FIXTURE PORTS LIVE ABOVE THE PRODUCT'S PORT SPACE, ON PURPOSE.
+# This test binds fake servers across PORT_BASE..PORT_BASE+22. The registry
+# allocates real slug `default_port`s across 8010-8199, so a base inside that
+# span silently collides: any slug parked on one of these 23 ports makes this
+# guard fail WHENEVER THAT MODEL IS SERVING, and the failure reads as a broken
+# test rather than a port clash. Measured 2026-09-18: the old 8147 base overlapped
+# ELEVEN registry slugs (eight sgl/qwen38-27b-multi* on 8147-8154 plus three
+# newer ones), and three suite failures were misdiagnosed as pre-existing before
+# the cause was found. 18147+ is clear of the product space entirely.
+# ⚠️ Other fixtures still sit INSIDE 8010-8199 (test-bench-card 8171,
+# test-offload-matrix-mocked 8137, tier2/test-offload-matrix-real 8138) and carry
+# the same latent clash — not addressed here.
+PORT_BASE="${TEST_PORT:-18147}"
 fail() { echo "FAIL: $1" >&2; exit 1; }
 
 for f in "$BENCH" "$LIB" "$FIX/fake-llama-server" "$FIX/fake-nvidia-smi"; do
@@ -216,6 +229,46 @@ command grep -q 'enabled=1' <<<"$pd2" \
   || fail "the 'enabled:' banner must still be reported — that it prints in this state IS the #824 hole"
 echo "  ✓ #824: half-cached run reports devices=1 while pool_lines=2 and enabled=1"
 
+# --- pool lines are INVISIBLE below verbosity 4: absence is not "0 pools" ------
+# A stock moe-cache boot logs at verbosity 3, where every [moe-cache] line (pool lines
+# included) is dropped. The allocation check read that as "0 of N devices hold a pool"
+# and the run as HALF-CACHED / CACHE_DISABLED — on our own 2026-10-02 bench and on
+# community #1543/#1547, whose cards sat at full-minus-reserve, i.e. the pool HAD filled.
+cat > "$TMP/v3.log" <<'EOF'
+0.01.067.965 I cmn  common_param: common_params_print_info: verbosity = 3 (adjust with the `-lv N` CLI arg)
+0.01.654.334 I cmn  common_init_: MoE cache: mode=auto budget=free-minus-reserve; use -lv 4 for resolved backend state, actual pools, and statistics
+EOF
+cat > "$TMP/v4none.log" <<'EOF'
+0.01.067.965 I cmn  common_param: common_params_print_info: verbosity = 4 (adjust with the `-lv N` CLI arg)
+[moe-cache] enabled: reserve=1536 MiB admit=1/64
+[moe-cache] CUDA0 has no cache budget after 1536 MiB reserve
+[moe-cache] CUDA1 has no cache budget after 1536 MiB reserve
+EOF
+pdv3=$(cap_moe_parse pooldev "$TMP/v3.log") || fail "pooldev failed on a verbosity-3 log"
+command grep -q 'verbosity=3' <<<"$pdv3" || fail "pooldev must report the engine's verbosity, got: $pdv3"
+cap_pool_lines_hidden "$pdv3" "" || fail "verbosity 3 with no pool line must read as NOT VISIBLE, not as 0 pools"
+pdv4=$(cap_moe_parse pooldev "$TMP/v4none.log") || fail "pooldev failed on a verbosity-4 log"
+cap_pool_lines_hidden "$pdv4" "" && fail "verbosity 4 with no pool line is a REAL miss (no budget) — must not be hidden"
+cap_pool_lines_hidden "$pd2" "" && fail "a partial allocation (pool lines present) must never be hidden — that is the #824 state"
+# No verbosity line in the log: the env value decides, else llama.cpp's default 3.
+cap_pool_lines_hidden "devices=0 pool_lines=0 verbosity=-" "4" && fail "env verbosity 4 with no pool line must not be hidden"
+cap_pool_lines_hidden "devices=0 pool_lines=0 verbosity=-" "" || fail "no verbosity anywhere = default 3 = pool lines not visible"
+# bench.sh: the hidden branch must not flip CAP_CACHE_OK (that renders CACHE_DISABLED),
+# and the real-miss branch after it still must. Asserts the CODE, not the comments.
+python3 - "$ROOT_DIR/scripts/bench.sh" <<'PYEOF' || fail "bench.sh: the not-visible branch must leave CAP_CACHE_OK alone, and the real-miss branch must still clear it"
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+i = src.index("NOT VISIBLE at this log verbosity")
+start = src.rindex("cap_pool_lines_hidden", 0, i)
+elif_at = src.index("elif (( CAP_CACHE_WANTED ))", i)
+hidden_body = src[start:elif_at]
+live = lambda body: [l for l in body.splitlines() if "CAP_CACHE_OK=0" in l and not l.lstrip().startswith("#")]
+assert not live(hidden_body), live(hidden_body)
+miss_body = src[elif_at:src.index("HALF-CACHED path", elif_at)]
+assert live(miss_body), "the real-miss branch lost CAP_CACHE_OK=0"
+PYEOF
+echo "  ✓ pool lines below verbosity 4: NOT VISIBLE (status untouched); a real miss or a partial pool still warns"
+
 # --- marginal vs cumulative MUST disagree ------------------------------------
 cap_moe_parse counters "$TMP/start.log" > "$TMP/c0" || fail "counters scrape (start) failed"
 cap_moe_parse counters "$TMP/end.log"   > "$TMP/c1" || fail "counters scrape (end) failed"
@@ -375,6 +428,58 @@ command grep -q 'last=0.500' <<<"$acc2" || fail "last= must track the FINAL valu
 command grep -q 'mean=0.746' <<<"$acc2" || fail "mean= must average both values: $acc2"
 echo "  ✓ acceptance exposes last= (sweep) and mean= (bench) from one scrape"
 
+# --- acceptance across ALL FOUR ENGINES (club-3090-todo §D) -------------------
+# Each engine words acceptance differently, and an unrecognised wording reads as
+# "spec-dec OFF" rather than as a parser gap. That is not hypothetical: modern
+# vLLM's SpecDecoding block matched NOTHING until 2026-09-18, so our PRIMARY
+# engine silently reported no drafter on every bench while its log carried 26
+# acceptance lines. Pin one fixture per engine.
+
+# vLLM, MODERN wording. ⚠️ the rate is a PERCENT, not a [0,1] fraction.
+cat > "$TMP/acc-vllm.log" <<'EOF'
+(APIServer pid=1) INFO [metrics.py:120] SpecDecoding metrics: Mean acceptance length: 3.37, Accepted throughput: 7.10 tokens/s, Drafted throughput: 9.00 tokens/s, Accepted: 71 tokens, Drafted: 90 tokens, Per-position acceptance rate: 0.867, 0.767, 0.733, Avg Draft acceptance rate: 78.9%
+EOF
+a_v=$(cap_moe_parse acceptance "$TMP/acc-vllm.log")   || fail "vLLM SpecDecoding wording not parsed (reads as spec-dec OFF)"
+command grep -q 'mean=0.789' <<<"$a_v" || fail "vLLM percent rate must scale to [0,1]: $a_v"
+command grep -q 'accepted=71 drafted=90' <<<"$a_v" || fail "vLLM token counters lost: $a_v"
+command grep -q 'accept_len_mean=3.370' <<<"$a_v" || fail "vLLM acceptance LENGTH lost: $a_v"
+echo "  ✓ acceptance: vLLM modern SpecDecoding block"
+
+# exl3 / TabbyAPI: per-request accepted/drafted appended to the completion line.
+cat > "$TMP/acc-exl3.log" <<'EOF'
+INFO: #1 chat/completions (stream): 24 prompt tokens · 41.1 T/s · total 3.18 s · draft 108/173
+INFO: #2 chat/completions (stream): 24 prompt tokens · 42.0 T/s · total 3.02 s · draft 96/171
+EOF
+a_e=$(cap_moe_parse acceptance "$TMP/acc-exl3.log")   || fail "exl3 'draft N/M' wording not parsed (reads as spec-dec OFF)"
+command grep -q 'fired=2' <<<"$a_e" || fail "exl3 fire count wrong: $a_e"
+command grep -q 'accepted=204 drafted=344' <<<"$a_e" || fail "exl3 counters must accumulate: $a_e"
+echo "  ✓ acceptance: exl3 draft N/M"
+
+# SGLang: a LENGTH and a rate, in separate lists (averaging one into the other
+# yields a number that is neither).
+cat > "$TMP/acc-sgl.log" <<'EOF'
+[INFO] accept len: 3.71, accept rate: 0.67
+EOF
+a_s=$(cap_moe_parse acceptance "$TMP/acc-sgl.log") || fail "SGLang wording regressed"
+command grep -q 'accept_len_mean=3.710' <<<"$a_s" || fail "SGLang length lost: $a_s"
+echo "  ✓ acceptance: SGLang accept len/rate"
+
+# ⚠️ vLLM's "Drafted throughput: 9.00 tokens/s" must NOT be read as a ratio by
+# the exl3 arm. Guarded by the `continue` in capture.sh; assert it here so a
+# future edit that drops it fails loudly instead of inflating vLLM counters.
+command grep -q 'drafted=90' <<<"$a_v" || fail "vLLM drafted counter contaminated by the exl3 pattern: $a_v"
+echo "  ✓ acceptance: engine wordings do not cross-contaminate"
+
+# NEGATIVE CONTROL — a log with no drafter must still fail, not invent a rate.
+cat > "$TMP/acc-none.log" <<'EOF'
+INFO: serving on 0.0.0.0:8080
+INFO: request completed in 3.2s
+EOF
+if cap_moe_parse acceptance "$TMP/acc-none.log" >/dev/null 2>&1; then
+  fail "no-drafter log must NOT yield an acceptance figure"
+fi
+echo "  ✓ acceptance: no-drafter log correctly yields nothing"
+
 # --- timings: prefill and decode must not be confused; short runs filtered ----
 tim=$(cap_moe_parse timings "$TMP/end.log") || fail "timings scrape returned nothing"
 # The two prefill populations (short canonical prompts vs deep haystacks) differ by
@@ -398,12 +503,29 @@ for want in "kv=q8_0" "threads=24" "ngl=99" "split=1,1" "ubatch=2048"; do
   command grep -q -- "$want" <<<"$fp" || fail "argv fingerprint missing $want: $fp"
 done
 [[ "$(cap_kv_type "$ARGV")" == "q8_0 (source: argv)" ]] || fail "KV type not read from argv"
+cat > "$TMP/sglang-kv.log" <<'EOF'
+[old boot] server_args={'kv_cache_dtype': 'fp8_e5m2'}
+[old boot] KV Cache is allocated. dtype: torch.float8_e5m2, #tokens: 100
+[current boot] server_args={'tp_size': 2, 'kv_cache_dtype': 'fp8_e4m3'}
+EOF
+CAP_PROPS_TRIED=1; CAP_PROPS=""; CAP_LOG="$TMP/sglang-kv.log"
+v="$(cap_kv_type '' || true)"
+[[ "$v" == "fp8_e4m3 (source: SGLang server_args)" ]] \
+  || fail "SGLang KV type must come from the latest server_args boot, got: '$v'"
+printf '%s\n' '[boot] KV Cache is allocated. dtype: torch.float8_e4m3fn, #tokens: 177667' \
+  > "$TMP/sglang-kv-allocation.log"
+CAP_LOG="$TMP/sglang-kv-allocation.log"
+v="$(cap_kv_type '' || true)"
+[[ "$v" == "torch.float8_e4m3fn (source: SGLang allocation log)" ]] \
+  || fail "SGLang allocation-log KV dtype not captured, got: '$v'"
 # With no -ctk/-ctv the llama.cpp default is f16 — a fact the reader can act on,
 # where "unavailable" is not. Only inferred once the engine family is identified.
-CAP_LOG="$TMP/end.log" v="$(cap_kv_type 'llama-server -m /m/x.gguf -ngl 99' || true)"
+CAP_LOG="$TMP/end.log"
+v="$(cap_kv_type 'llama-server -m /m/x.gguf -ngl 99' || true)"
 [[ "$v" == "f16 (engine default; no -ctk/-ctv in argv)" ]] \
   || fail "a llama.cpp run with no KV flag should report the engine default, got: '$v'"
-CAP_LOG="" CAP_PROPS_TRIED=1 CAP_PROPS="" v="$(cap_kv_type '' 2>/dev/null || echo UNAVAILABLE)"
+CAP_LOG=""; CAP_PROPS_TRIED=1; CAP_PROPS=""
+v="$(cap_kv_type '' 2>/dev/null || echo UNAVAILABLE)"
 [[ "$v" == "UNAVAILABLE" ]] || fail "with no argv and no identifiable engine, KV must stay unavailable, got: '$v'"
 command grep -q 'argv -ot' <<<"$(cap_offload_detected "$ARGV")" || fail "-ot must trigger offload detection"
 command grep -q 'moe_cache_cap=8192' <<<"$(cap_moe_cache_config "$ARGV")" \
@@ -412,6 +534,9 @@ command grep -q 'moe_cache_cap=8192' <<<"$(cap_moe_cache_config "$ARGV")" \
 # third signal for a server whose argv we cannot read.
 command grep -q 'n-cpu-moe' <<<"$(cap_offload_detected 'llama-server --n-cpu-moe 20')" \
   || fail "--n-cpu-moe must trigger offload detection"
+# ExLlamaV3 uses a different spelling for its CPU-resident expert split.
+command grep -q 'cpu-moe-split-experts' <<<"$(cap_offload_detected 'python main.py --cpu-moe-split-experts 144')" \
+  || fail "--cpu-moe-split-experts must trigger offload detection"
 CAP_LOG="$TMP/end.log" && command grep -q 'CUDA_Host' <<<"$(cap_offload_detected '')" \
   || fail "a CUDA_Host model buffer line must trigger offload detection"
 echo "  ✓ argv/env fingerprint: KV type, offload signals (x3), moe-cache cap"
@@ -464,6 +589,38 @@ pp_case plausible 3950.40 0.0   9876   "PP fallback shape"
 [[ "$(CAP_PP_MAX_CV=1000 cap_pp_plausible 1127.30 171.9 90000; echo rc=$?)" == "rc=0" ]] \
   || fail "the CV condition is not what suppresses the windowed-in-prefill sample"
 echo "  ✓ PP gate: every figure pasted as data in #769/#822 is suppressed, with a reason"
+
+# --- BENCH_GPUS: every nvidia-smi read is limited to the selected cards --------
+# The VRAM triplet is a SUM. Beside a TP=2 server on GPU 0/1, a one-card run on
+# GPU 2 reported peak=68382 MiB while that card peaked at 23232 — the neighbours
+# were measured too. Three fake cards, the third nearly empty, so any leak of a
+# neighbour into the sum is a 20+ GiB error, not a rounding one.
+gq() {   # $1=BENCH_GPUS  $2=command — runs one capture call against 3 fake cards
+  PATH="$TMP/bin:$PATH" FAKE_NGPU=3 FAKE_VRAM_MIB=22000,22000,1000 BENCH_GPUS="$1" \
+    bash -c "source '$LIB'; $2" 2>/dev/null
+}
+[[ "$(gq '' cap_vram_used)" == "45000" ]] || fail "BENCH_GPUS unset must still sum every card"
+[[ "$(gq 2 cap_vram_used)" == "1000" ]] || fail "BENCH_GPUS=2 must sum GPU 2 only, got: $(gq 2 cap_vram_used)"
+[[ "$(gq 0,2 cap_vram_used)" == "23000" ]] || fail "BENCH_GPUS=0,2 must sum those two cards"
+[[ "$(gq GPU-fake00000002 cap_vram_used)" == "1000" ]] || fail "a GPU UUID must select like an index"
+[[ "$(gq 2 cap_gpu_count)" == "1" ]] || fail "cap_gpu_count must count the selected cards"
+# Labels keep the REAL index: BENCH_GPUS=2 is GPU2, not a renumbered GPU0.
+[[ "$(gq 2 cap_vram_per_device)" == "GPU2 1000" ]] \
+  || fail "per-device VRAM must carry the real index, got: $(gq 2 cap_vram_per_device)"
+[[ "$(gq '' cap_vram_per_device | paste -sd' ' -)" == "GPU0 22000 GPU1 22000 GPU2 1000" ]] \
+  || fail "per-device VRAM, unfiltered, must list every card by index"
+gq 2 cap_pcie_link | command grep -qx 'GPU2 gen=0/0 width=0/0' \
+  || fail "PCIe link state must carry the real index under BENCH_GPUS"
+_dm="$(gq 2 'f=$(mktemp); p=$(cap_dmon_start "$f"); sleep 1.5; kill $p; cat "$f"; rm -f "$f"')"
+awk '$2 !~ /^#/ && NF >= 10' <<<"$_dm" | awk '{print $2}' | sort -u | paste -sd, - \
+  | command grep -qx 2 || fail "dmon must stream the selected card only, got: $_dm"
+# A card that is not there, or a malformed list, must read as UNAVAILABLE. The
+# real nvidia-smi prints "No devices were found" on stdout, which a plain sum
+# turns into a fabricated 0.
+gq 9 cap_vram_used >/dev/null && fail "BENCH_GPUS naming an absent card must fail, not print 0"
+gq '2;x' cap_vram_used >/dev/null && fail "a malformed BENCH_GPUS must fail, not fall back to every card"
+gq '2;x' cap_gpus_valid && fail "cap_gpus_valid must reject '2;x'"
+echo "  ✓ BENCH_GPUS: sums, labels, dmon and link state follow the selection; absent/malformed = unavailable"
 
 # ===========================================================================
 # TIER 1b — end-to-end bench.sh against the fake server
@@ -703,7 +860,11 @@ echo "  ✓ prefill warm-up lands on its token target (word-count sizing would o
 command grep -q 'RAM BANDWIDTH CEILING' "$TMP/healthy.out" \
   && fail "the STREAM calibration must be OPT-IN (it is not free)"
 run_bench healthy "$((PORT_BASE+9))" "$TMP/stream.out" ONLY=narr RUNS=1 WARMUPS=0 STREAM_CALIB=1
-if command grep -q 'RAM BANDWIDTH CEILING' "$TMP/stream.out"; then
+# Branch on the triad VALUE line, not the "RAM BANDWIDTH CEILING" header: the
+# header is printed unconditionally when STREAM_CALIB=1 (bench.sh), so it cannot
+# tell a produced ceiling from a numpy-absent degradation. The value line is
+# printed only when a ceiling was actually measured.
+if command grep -q 'triad ceiling  :' "$TMP/stream.out"; then
   command grep -qE 'triad ceiling  : [0-9.]+ GB/s  \([0-9]+ concurrent workers' "$TMP/stream.out" \
     || fail "the triad ceiling must state its worker count — a single-threaded number is not a host ceiling"
   echo "  ✓ STREAM_CALIB=1 reports a multi-worker sustained ceiling (and is off by default)"
@@ -960,6 +1121,16 @@ for layer in 'layer 1  driver P2P grant :' 'layer 2  NCCL use         :' 'layer 
   command grep -qF "$layer" "$H" || fail "interconnect block is missing '$layer' — all THREE layers are the point"
 done
 # Layer 3 must degrade cleanly in host-mode / llama.cpp, per the issue's spec.
+# ⚠️ This assertion is only meaningful if the run actually reached the MULTI-GPU
+# branch. It previously passed while taking the single-card path: the fixture's
+# fake-nvidia-smi had no `-L` arm, so p2p_gpu_count saw 0 GPUs — and the OLD
+# p2p_gpu_count returned the two-line string "0\n0", making `[[ "0\n0" -lt 2 ]]`
+# a SHELL SYNTAX ERROR, so the single-card `if` went false and execution fell
+# through to the llama.cpp branch by accident (exposed by club-3090#1279).
+# Assert the precondition first, or a green here means nothing.
+if command grep -q 'single-card run' "$H"; then
+  fail "interconnect block took the SINGLE-CARD path — the custom-AR assertion below would pass vacuously. Check the fixture's nvidia-smi -L arm."
+fi
 command grep -qE 'layer 3  engine custom-AR : .*custom-AR n/a' "$H" \
   || { command grep -F 'layer 3' "$H" >&2; fail "a host-mode/llama.cpp run must read 'custom-AR n/a', never 'off' (there is no AR kernel to disable)"; }
 # ...and layers 1-2 must still report on that same run — degrading layer 3 must
@@ -977,5 +1148,20 @@ run_bench healthy "$((PORT_BASE+20))" "$TMP/icap0.out" CAPTURE=0
 command grep -q '=== Interconnect (three layers) ===' "$TMP/icap0.out" \
   || fail "CAPTURE=0 must keep the interconnect block (it is a footer fact, not a capture)"
 echo "  ✓ interconnect: three layers reported, layer 3 degrades to n/a in host mode, BENCH_MOCK untouched"
+
+# --- BENCH_GPUS end to end: the report names the selection and reads one card ---
+run_bench healthy "$((PORT_BASE+21))" "$TMP/gsel.out" BENCH_GPUS=1 FAKE_VRAM_MIB=20000,500
+G="$TMP/gsel.out"
+command grep -q 'GPUs measured  : 1 (1 card(s); BENCH_GPUS)' "$G" \
+  || fail "the fingerprint must name the BENCH_GPUS selection"
+command grep -q 'idle=500 MiB  peak=500 MiB  post=500 MiB' "$G" \
+  || fail "the VRAM triplet must read GPU 1 only: $(command grep -m1 'idle=' "$G")"
+command grep -q 'GPU1 500 MiB (post-run)' "$G" || fail "per-device VRAM must list GPU1"
+command grep -q 'GPU0 20000 MiB (post-run)' "$G" && fail "GPU0 must not be measured under BENCH_GPUS=1"
+run_bench healthy "$((PORT_BASE+22))" "$TMP/gbad.out" BENCH_GPUS=7
+command grep -q "BENCH_GPUS='7' selects no GPU" "$TMP/gbad.out.err" \
+  || fail "BENCH_GPUS naming an absent card must stop the run with a Fix: hint"
+command grep -q 'NARRATIVE' "$TMP/gbad.out" && fail "a bad BENCH_GPUS must stop before measuring"
+echo "  ✓ BENCH_GPUS end to end: fingerprint names it, VRAM reads the selected card, a bad one stops the run"
 
 echo "test-bench-capture: ok"

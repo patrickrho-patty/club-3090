@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# shellcheck source=lib/club-containers.sh
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib/club-containers.sh"
 #
 # rebench-full.sh — canonical rebench against the currently-running model
 # (a fail-fast verify-full preflight + 5 measured steps). Built to eliminate
@@ -86,13 +88,14 @@
 #                       --no-thinking, =on forces --enable-thinking — not by
 #                       this env var. #338.)
 #   THINKING_MAX_TOKENS
-#                       Optional thinking budget forwarded to the 8-pack
-#                       reasoning-ON pass (--with-8pack-thinking=on|both).
-#   MAX_TOKENS          Optional completion budget forwarded to BOTH 8-pack
-#                       passes (off + on) as quality-test.sh --max-tokens —
-#                       overrides the per-pack ~1024 default. Raise for verbose
-#                       models that self-truncate the deterministic packs
-#                       (finish_reason=length before the final answer).
+#                       Thinking budget forwarded to the 8-pack reasoning-ON
+#                       pass (--with-8pack-thinking=on|both). Unset, quality-
+#                       test.sh's default applies (16384).
+#   MAX_TOKENS          Completion budget forwarded to BOTH 8-pack passes (off
+#                       + on) as quality-test.sh --max-tokens. Unset, quality-
+#                       test.sh's default applies (4096, not benchlocal's
+#                       per-pack ~1024 — see docs/RUN_EVALS.md "Budgets: set
+#                       for you"); PACK_BUDGETS=1 restores the per-pack ones.
 #
 
 # Force Python's UTF-8 mode (PEP 540) for every python3 this script runs.
@@ -160,7 +163,7 @@ OPTIONS
 
 ENV OVERRIDES (rarely needed — preflight autodetects our composes)
   URL MODEL TAG OUT_DIR · SOAK_SESSIONS (10) · SOAK_TURNS (5)
-  MAX_TOKENS (both 8-pack passes) · THINKING_MAX_TOKENS (reasoning-ON pass)
+  MAX_TOKENS (both 8-pack passes, default 4096) · THINKING_MAX_TOKENS (reasoning-ON pass, 16384)
   SAMPLING_FROM_SERVER (inherit serving sampling; tags runs non-canonical)
   AGENTIC_SESSIONS (1) · AGENTIC_TURNS (12)
   CONCURRENCY_RUNGS ("1 2 4", auto-capped at the served slot count) ·
@@ -271,9 +274,8 @@ fi
 
 # Resolve actual served model id — eliminates MODEL=qwen vs MODEL=gemma
 # typos that produce HTTP 404 from served-model-name mismatch.
-DETECTED_MODEL=$(curl -sf -m 5 "$URL/v1/models" 2>/dev/null \
-  | python3 -c "import json,sys; print(json.load(sys.stdin)['data'][0]['id'])" 2>/dev/null \
-  || echo "")
+source "${ROOT_DIR}/scripts/lib/served-model.sh"   # #1360: TabbyAPI-aware served id
+DETECTED_MODEL="$(club_served_model_id "$URL")"
 if [[ -n "$DETECTED_MODEL" && -z "${MODEL:-}" ]]; then
   MODEL="$DETECTED_MODEL"
 fi
@@ -318,14 +320,14 @@ echo
 # preflight uses. Silently no-ops in endpoint-first mode (CONTAINER=none).
 if [[ "${CONTAINER:-}" != "none" ]] && command -v docker >/dev/null 2>&1; then
   CONTAINER_NAME=$(docker ps --format '{{.Names}}' 2>/dev/null \
-    | grep -E '^(vllm-|llama-cpp-|sglang-)' | head -1 || true)
+    | command grep -E "$(club_container_re)" | head -1 || true)
   if [[ -n "$CONTAINER_NAME" ]]; then
     docker inspect "$CONTAINER_NAME" > "$OUT_DIR/container-config.json" 2>/dev/null || true
     # Boot log: capture lines that the report parser needs (KV pool size,
     # max concurrency, model load footprint, MTP detection). Trimmed to keep
     # the file small; full container log is still available via `docker logs`.
     docker logs "$CONTAINER_NAME" 2>&1 \
-      | grep -E "GPU KV cache size|Maximum concurrency|Available KV cache memory|Model loading took|Detected MTP|kv_cache_dtype|num_speculative_tokens" \
+      | command grep -E "GPU KV cache size|Maximum concurrency|Available KV cache memory|Model loading took|Detected MTP|kv_cache_dtype|num_speculative_tokens" \
       > "$OUT_DIR/vllm-boot.log" 2>/dev/null || true
   fi
 fi
@@ -587,11 +589,16 @@ echo "  bash scripts/submit-bench.sh --tag $TAG"
 
 # --- measurement record + baseline-induction prompt (catalog-baselines slice 2) ---
 # Auto-emit the #249 measurement record into the per-rig corpus when the served
-# container EXACT-matches a registry slug (identity semantics — a port/substring
+# container is identified as a registry slug (identity semantics — a port/substring
 # match is a shape guess and must not stamp another slug's record; see the c3
 # detect layer). BYO/swap serves have no registry identity → skipped with a note.
+# The slug comes from the ONE resolver the per-step scripts use
+# (measurement_record.resolve_serving, #1477): core + local-layer slugs, pods, and a
+# guard that the container publishes the benchmarked URL's port. This used to be a
+# private core-only copy with no port guard, first match winning, so with two
+# models up a rebench could be recorded under the other one.
 if [[ -f "$OUT_DIR/bench.log" ]] && command -v python3 >/dev/null 2>&1; then
-  OUT_DIR="$OUT_DIR" TAG="$TAG" python3 - <<'PY_RECORD' || true
+  OUT_DIR="$OUT_DIR" TAG="$TAG" URL="$URL" python3 - <<'PY_RECORD' || true
 import json
 import os
 import re
@@ -602,9 +609,9 @@ from pathlib import Path
 root = Path(__file__).resolve().parent if "__file__" in dir() else Path.cwd()
 sys.path.insert(0, str(Path.cwd()))
 try:
-    from scripts.lib.profiles.compose_registry import COMPOSE_REGISTRY
+    from scripts.lib.profiles.compose_registry import get_registry
     from scripts.lib.profiles.measurement_record import (
-        build_record, parse_bench_output, write_record,
+        build_record, parse_bench_output, resolve_serving, write_record,
     )
 except Exception as exc:  # pragma: no cover - env without the profiles tree
     print(f"  record:      skipped (profiles unavailable: {exc})")
@@ -613,29 +620,17 @@ except Exception as exc:  # pragma: no cover - env without the profiles tree
 out_dir = Path(os.environ["OUT_DIR"])
 tag = os.environ["TAG"]
 
-# EXACT container -> slug (never port/substring).
+# The container that served the benchmarked URL -> its slug (identity, never
+# port/substring; the URL's port must be one the container publishes).
 slug = None
 try:
-    names = subprocess.run(
-        ["docker", "ps", "--format", "{{.Names}}"],
-        capture_output=True, text=True, timeout=10,
-    ).stdout.split()
-    norm = {n.replace("_", "-") for n in names}
-    for s, e in COMPOSE_REGISTRY.items():
-        # container name = the compose's container_name default
-        try:
-            txt = Path(e["compose_path"]).read_text(errors="replace")
-        except OSError:
-            continue
-        m = re.search(r'container_name:\s*"?(?:\$\{[^:}]*:-)?([A-Za-z0-9._-]+)\}?"?', txt)
-        if m and m.group(1).replace("_", "-") in norm:
-            slug = s
-            break
+    hit = resolve_serving(os.environ.get("URL"))
+    slug = hit[0] if hit else None
 except Exception:
     pass
 
 if not slug:
-    print("  record:      skipped — no running container exact-matches a registry slug")
+    print("  record:      skipped — no running container serving this URL matches a registry slug")
     raise SystemExit(0)
 
 
@@ -656,13 +651,14 @@ try:
     from scripts.lib.profiles.launch_compat import ProfileError, resolve_variant_pin
 
     exports = resolve_variant_pin(load_profiles(), slug)
-    if "VLLM_NIGHTLY_SHA" not in exports:
+    # empty pin == no single injectable image var (#1365) -> compose default below
+    if exports and "VLLM_NIGHTLY_SHA" not in exports:
         engine_pin = next(iter(exports.values()))
 except Exception:
     pass
 if not engine_pin:
     try:
-        txt = Path(COMPOSE_REGISTRY[slug]["compose_path"]).read_text(errors="replace")
+        txt = Path(get_registry()[slug]["compose_path"]).read_text(errors="replace")
         m = re.search(r'^\s*image:\s*["\x27]?(?:\$\{[A-Z_0-9]+:-)?([^\s}"\x27]+)\}?', txt, re.M)
         engine_pin = m.group(1) if m else None
     except OSError:

@@ -1,30 +1,43 @@
 # ===========================================================================
 # Profile (at-a-glance):
 #   Model:     Qwen3.8-27B (Frozenlock AutoRound INT4 — 4-bit, group 128, sym;
-#              ~18 GiB. Served W4A16 here: 16-bit activations, W4A8=0 default.
+#              ~18 GiB. Served W4A8 here (int8 activations, W4A8=0 for W4A16) —
+#              +46% prefill; measured table below.
 #              lm_head is bf16, which the DFlash2 drafter requires — it ships no
 #              embeddings/lm_head and shares the target's.)
 #   Topology:  Dual 3090 PCIe (TP=2, no NVLink; NVLINK_MODE=auto detects)
 #   Drafter:   DFlash2 EXTERNAL block-drafter n=7 (syv-ai W4A16, 1.2 GiB, method=dflash).
-#              vLLM PR#52816 backport, vendored. SPEC_N=<n> sets width; SPEC_N=0 off.
-#   KV:        bf16 — MANDATORY here. The DFlash2 drafter's block attention is
-#              non-causal and needs FLASH_ATTN; on Ampere (sm_86) FLASH_ATTN accepts
-#              ONLY bf16/fp16 KV (fp8-KV-in-kernel is FA3/Hopper-only). fp8 KV would
-#              force FlashInfer and cost ~40% decode.
+#              Native model classes since vLLM v0.29.0 (vllm#52816 merged 2026-08-21).
+#              SPEC_N=<n> sets width; SPEC_N=0 off.
+#   KV:        fp8 e4m3 — the shipped config since 2026-09-14 (#1274): the FA2 fp8-KV
+#              plugin registers an FP8 KV extension THROUGH the FLASH_ATTN API, lifting
+#              the sm_86 "bf16/fp16 KV only" constraint that made bf16 mandatory on this
+#              tier before it (without the plugin, fp8 KV forced FlashInfer, measured
+#              74/138 vs bf16/FA2's 132/227 — ~40% slower decode).
 #   Vision:    ✅ tower present (input-only, text out); untested on this tier.
 #   Template:  native + club-3090 alias — the model's own chat_template.jinja
-#              with `high` remapped to `medium` (patches/qwen38-reasoning-effort-template)
-#   Max ctx:   204800 (~200K) — MEASURED bf16/FA2 ceiling on 2×3090 @0.90 util
-#              (KV pool 212,977 tok; hard ceiling ~213K). NOT the 262K arch max:
-#              bf16 KV can't fit 262K here (needs ~10.93 GiB vs ~9.1 available).
+#              with `high` remapped to `xhigh` (patches/qwen38-reasoning-effort-template)
+#   Max ctx:   262144 — the ARCHITECTURAL ceiling, and the shipped default (fp8 KV pool
+#              421,970 tok = 1.61× concurrency @0.90 util). The pre-#1274 bf16/FA2
+#              config was capped at 204800 (~200K; pool 212,977 tok, hard ceiling ~213K)
+#              — see the history block below. MAX_MODEL_LEN still overrides for both.
 #   Genesis:   none
 #   Status:    🧪 Experimental
-# ⚠️ #1096 (accumulated-ctx decode cliff): in long multi-turn agentic, decode collapses to
-#    single-block emission — ~12k accumulated ctx for DFlash2 (SPEC_N depth does NOT move it,
-#    n=3≡n=7) / ~17-21k for MTP; SEVERE on Ampere (~4 tok/s), milder on Blackwell. Drafter TYPE,
-#    not depth, sets the floor. Interim: MTP tier (higher cliff) or SPEC_N=0 for sustained >~20k.
-#    Real fix pending upstream ReplaySSM (vllm#49887 GDN-spec / vllm#50172). NOT immune to this.
-#   Best for:  ⭐ ULTRAFAST decode — the throughput tier (~227 code / ~132 narr TPS).
+# ⛔⛔ #1096 RETRACTED 2026-09-08 — THERE IS NO ACCUMULATED-CTX DECODE CLIFF. The collapse
+#    figures came from OUR harness, not the engine: bench-agentic set TTFT on the first
+#    `content` delta, so a thinking model's entire reasoning phase was charged to prefill and
+#    the decode window fell under its 5%-of-wall "degenerate" rule. Fixed in #1218. That rule
+#    flags whatever has slow prefill relative to decode, which is also why the pattern looked
+#    hardware-dependent (Blackwell prefills fast -> "clean"; Ampere -> "collapsed").
+#    Re-test, both arms, same v0.27.1 pin, cross-checked against vLLM's OWN histograms:
+#    MTP n=3 -> 110.2 tok/s @ 21,443 ctx; DFlash2 n=7 -> 159.4 @ 12,275. Decode FLAT across
+#    1.2K->35.3K, zero degenerate turns, zero preemptions. ⛔ Do NOT set SPEC_N=0 or prefer the
+#    MTP tier for long contexts on this basis — that advice was wrong and costs you the drafter.
+# ⚠️ What DOES survive: vllm#35387 — a real spec tax that scales with drafter DEPTH, not
+#    context (29K: no-spec 57.0 -> n=1 40.6 / n=2 36.0 / n=3 32.7 tok/s), profiled to the
+#    cudagraph downgrade FULL_AND_PIECEWISE -> PIECEWISE. A steady tax, not a cliff.
+#   Best for:  ⭐ ULTRAFAST decode — the throughput tier (~220 code / ~123 narr TPS on
+#              the shipped fp8-KV config; ~227/~132 were the pre-#1274 bf16 figures).
 # ---------------------------------------------------------------------------
 # THE "ULTRAFAST" TIER — DFlash2 external drafter on the INT4 target.
 # vs the FAST tier (mtp.yml, built-in MTP n=4): DFlash2 ~doubles code decode
@@ -33,40 +46,84 @@
 # the Avuja checkpoint (#1052 / vllm#52873): the collapse soak ran clean to 21k gen
 # with zero crashes, where built-in MTP dies ~14.5k.
 #
-# ⭐ WHY bf16 KV + FLASH_ATTN (and why 200K, not 262K):
-#   syv-ai's card mandates FLASH_ATTN + bf16 KV (non-causal block attention). On
-#   Ampere sm_86 FLASH_ATTN supports ONLY bf16/fp16 KV — flash_attn_supports_kv_
-#   cache_dtype('fp8_e4m3') returns False (fp8-in-kernel is FA3/Hopper/Blackwell).
-#   fp8 KV therefore forces FlashInfer, measured at 74/138 vs bf16/FA2's 132/227
-#   (~40% slower). We keep FLASH_ATTN; the price is context — bf16 KV is 2× fp8, so
-#   the ceiling is ~213K tokens. This model is a GDN hybrid (only the few full-
-#   attention layers cache KV), which is why 200K fits on bf16 at all. For the full
-#   262K arch max, use the fast (MTP/fp8) tier.
+# HISTORY — why this tier was bf16 KV @ 200K (2026-08-20 → 2026-09-14):
+#   syv-ai's card mandates FLASH_ATTN (non-causal block attention). On Ampere sm_86
+#   stock FLASH_ATTN supports ONLY bf16/fp16 KV — flash_attn_supports_kv_cache_dtype
+#   ('fp8_e4m3') returns False (fp8-in-kernel is FA3/Hopper/Blackwell) — so fp8 KV
+#   forced FlashInfer, measured 74/138 vs bf16/FA2's 132/227 (~40% slower). And bf16
+#   KV is 2× fp8, so the pool capped at ~213K tokens (204800 shipped; this GDN hybrid
+#   caches KV on only the few full-attention layers, which is why 200K fit at all).
+#   The 2026-09-14 #1274 FA2 fp8-KV plugin (@AntonProkopyev) dissolved that trade:
+#   an FP8 KV extension THROUGH the FLASH_ATTN API (prebuilt sm_86 kernels,
+#   digest-pinned, extracted by the one-shot sidecar below) — so this file ships fp8
+#   KV + the full 262K arch max at 122.7/219.5 decode: the config in the block below.
 #
 # ⚠️ MAX_NUM_SEQS=1 (single-stream) — the drafter + 24 GB leaves no room for a
 #   second stream. For concurrency: SPEC_N=0 and raise MAX_NUM_SEQS.
 # ⚠️ GPU_MEMORY_UTILIZATION 0.90 is deliberate — higher shrinks the transient
 #   prefill-peak slack a long-context config needs most; do NOT raise it to squeeze
 #   more KV (makes prefill OOM MORE likely).
-# ⚠️ W4A8 is OFF here (W4A16). The FA2 numbers above are W4A16; W4A8=1 re-enables
-#   int8 activations, UNVALIDATED with the DFlash2 drafter on FA2.
+# ⭐ W4A8 vs W4A16 — MEASURED on the reference 2x3090, 2026-09-14. ONE boot per
+# arm, MAX_MODEL_LEN pinned to 204800 on both (the shipped default is 262144) so
+# the activation dtype is the only variable. Everything else is this file's
+# shipped config: fp8_e4m3 KV, FLASH_ATTN + the #1274 FA2 plugin, DFlash2 n=7.
+# bench.sh 3 warm + 5 measured for decode; 3 runs @10K and 1 @90K for prefill.
+#
+#                         W4A8=1    W4A16     delta    CV (A / B)
+#   prefill @10K  n=3     1862.9    1276.3    +46.0%   0.1% / 0.0%
+#   prefill @90K  n=1     1441.3    1051.1    +37.1%     n=1
+#   decode narrative n=5   117.9     125.4     -6.0%   4.1% / 4.3%
+#   decode code      n=5   226.9     226.2     +0.3%   5.3% / 6.5%
+#
+# ⭐ W4A8 SHIPS ON as of 2026-09-14 (maintainer decision on the run above). Both
+# prefill arms held CV <=0.1% and +46% / +37% dwarf the ~2.8% boot-to-boot spread,
+# so the prefill gain is real, and it costs nothing on code decode (+0.3%) — which
+# is what this tier is for. The gain narrows with depth (+46% @10K -> +37% @90K)
+# but stays large. Set W4A8=0 for the old W4A16 path.
+#
+# ⚠️ The DECODE deltas are NOT boot-confirmed — one boot per arm, and boot-to-boot
+# spread on this rig is ~2.8%. Read code (+0.3%) as "no change" and narrative
+# (-6.0%) as "indicative, possibly real": it is only ~2x the boot noise off a
+# single boot. The default was flipped ON knowing this — if you serve mostly long
+# NARRATIVE generation rather than code, W4A8=0 is the arm to try.
+#
+# ⭐ W4A8 does NOT harm the DFlash2 drafter, which is what the old "unvalidated
+# with this drafter on FA2" caveat feared. Decode-window acceptance was 6.37/6.33
+# (W4A8) and 6.65/6.40 (W4A16) against n=7, at 76-81% per-position. Each arm also
+# logs one `Mean acceptance length: 2.00` window — identical in both (Accepted: 1,
+# Drafted: 7, ~0.01 tok/s), i.e. a single draft step in an otherwise idle 60s
+# window during the 60-80s 90K prefill. That is an idle-window artifact of the
+# metric, not a drafter problem, and it is not arm-specific.
+#
+# ⚠️ These are vLLM numbers on THIS tier. The SGLang composes carry their own W4A8
+# figures from club-3090#1226/#1248 — a different engine; do not cross-quote.
+#
 # ⚠️ Spec-decode is exposed to OPEN vllm#50021 (GDN spec wild write) in principle,
 #   but the collapse soak was crash-free to 21k gen. Treat that as "not observed",
 #   not "immune"; SPEC_N=0 is the mitigation. docs/UPSTREAM.md.
 #
-# VALIDATED (TP=2, Frozenlock checkpoint, 2026-08-20):
-#   ✅ verify-full 9/9 · bench 132 narr / 227 code TPS (3 warm + 5) · collapse soak
-#      clean to 21k gen (0 crashes) · bf16/FA2 @200K boots + serves (KV pool
-#      212,977 tok, 20.4 GiB/card).
-#   ❌ No NIAH at 200K, no 8-pack, no n-sweep past the n=7 default. TP=4/8 unbooted
-#      (2-GPU rig — community-validated by design).
+# VALIDATED (TP=2, Frozenlock checkpoint):
+#   2026-08-20 (bf16/FA2 @200K): ✅ verify-full 9/9 · bench 132 narr / 227 code TPS
+#      (3 warm + 5) · collapse soak clean to 21k gen (0 crashes) · KV pool 212,977
+#      tok, 20.4 GiB/card. ❌ No NIAH at 200K, no 8-pack, no n-sweep past n=7.
+#      TP=4/8 unbooted (2-GPU rig — community-validated by design).
+#   2026-09-14 (shipped fp8-KV + FA2-plugin config @262144): FOUR alternating boots,
+#      each arm reproducing within 1% — bench 122.7 narr / 219.5 code (canonical
+#      sampler, 3 warm + 5), KV pool 421,970 tok (1.61×); @10K/@90K prefill arms in
+#      the W4A8 table above (both arms pinned at 204800 so KV dtype was the only
+#      variable).
 # ⚠️ Launch requires --force (experimental).
 # ===========================================================================
 services:
   vllm-qwen38-27b-dual-ultrafast:
-    image: ${VLLM_IMAGE:-vllm/vllm-openai:v0.27.1}
+    image: ${VLLM_IMAGE:-vllm/vllm-openai:v0.30.0}
     container_name: "${ESTATE_CONTAINER:-vllm-qwen38-27b-dual-ultrafast}"
     user: "0:${DOCKER_GID:-1000}"
+    # The kernel job must finish before serving starts; a failed extraction has to
+    # block the boot rather than silently leave the FP8 KV path unavailable.
+    depends_on:
+      vllm-qwen38-27b-dual-ultrafast-kernels:
+        condition: service_completed_successfully
     # Repo contract (test-compose-restart-policy): every shipped vLLM compose uses
     # the reboot-surviving knob so launch.sh-as-a-service returns after a reboot.
     # ⚠️ WHEN DEBUGGING A BOOT FAILURE SET CLUB3090_RESTART=no. Under
@@ -78,7 +135,7 @@ services:
     shm_size: "16gb"
     ipc: host
     ports:
-      - "${BIND_HOST:-0.0.0.0}:${PORT:-8101}:8000"
+      - "${BIND_HOST:-0.0.0.0}:${ESTATE_PORT:-${PORT:-8101}}:8000"
     deploy:
       resources:
         reservations:
@@ -88,42 +145,47 @@ services:
               capabilities: [gpu]
     volumes:
       - ${MODEL_DIR:-../../../../../../models-cache}:/root/.cache/huggingface
+      # Prebuilt FA2 fp8-KV kernels, extracted by the one-shot job below. Nothing
+      # is compiled at boot; install.sh verifies checksums, ABI and SM.
+      - fa2-kernels:/opt/club3090/fa2-artifacts:ro
+      - ../../../patches/fa2-fp8kv-sm86:/etc/club3090/fa2:ro
       # W4A8 int8-activation patches — NO-OP unless VLLM_MARLIN_INPUT_DTYPE=int8.
       - ../../../../../qwen3.6-27b/vllm/patches/w4a8-int8-act:/etc/club3090/w4a8:ro
       # Lets a spec-decode drafter attach on this hybrid (mamba/eagle block drop).
       - ../../../../../qwen3.6-27b/vllm/patches/vllm-pr48375-mamba-drop-eagle-block:/etc/club3090/pr48375:ro
-      # club-3090 GDN+MTP async spec-order fix — closes the async wild-write race
-      # (our #1052 / upstream #52873 + #50021 thread). Ours, not an upstream PR;
-      # validated 3/3 boots on the reference 2×3090. Anchor drift → boot refused.
-      - ../../../../../qwen3.6-27b/vllm/patches/vllm-gdn-mtp-async-spec-order:/etc/club3090/gdn-async-order:ro
       - ../../../patches/vllm-flashinfer-decode-pin:/etc/club3090/flashinfer-decode-pin:ro
-      # DFlash2 external-drafter support — vLLM PR#52816 backport (syv-ai). Adds
-      # DFlash2DraftModel; refuses boot on apply failure.
-      - ../../../patches/vllm-dflash2-backport:/etc/club3090/dflash2:ro
+      # DFlash2 model classes are NATIVE since vLLM v0.29.0 (vllm#52816, merged
+      # 2026-08-21) so the old dflash2 backport is gone. What is NOT upstream is
+      # vllm#51581 (OPEN): the fused-KV slice `a.qkv_proj.weight[a.q_size:]` has no
+      # quantization awareness, so a W4A16 drafter either AttributeErrors at load
+      # or — worse — slices packed rows and corrupts SILENTLY. This mount restores
+      # only that dequant fix. Anchor drift → boot refused.
+      - ../../../patches/vllm-51581-dflash-dense-kv:/etc/club3090/dflash-dense-kv:ro
       - ../../../../../../scripts/detect_nvlink.sh:/etc/club3090/detect_nvlink.sh:ro
       # Chat template: the model's OWN, plus seven lines mapping the standard
-      # OpenAI/Anthropic rung `high` onto `medium`. Qwen3.8's ladder is
+      # OpenAI/Anthropic rung `high` onto `xhigh`. Qwen3.8's ladder is
       # low/medium/xhigh with NO `high`, and the stock template
       # raise_exception()s on anything else, so a client sending the standard top
       # rung gets HTTP 500 while /v1/models still returns 200. Observed live via
       # /v1/messages?beta=true.
       # ⭐ MOUNTED OVER the checkpoint's own chat_template.jinja: vLLM auto-loads
-      # the template from the model dir, so this needs NO --chat-template arg
-      # (the same wiring style as the carnice override -- see patches.yml).
-      # That is deliberate, not incidental: upstream edits the args list
-      # constantly (11 commits touched these composes in the last 7 days), and
-      # every edit there collides with an inserted flag. The volumes block is
-      # quiet by comparison, so wiring here is what keeps this patch rebasable.
+      # the template from the model dir, so every endpoint renders it from here.
+      # The command ALSO names the same file with --chat-template, for vLLM's
+      # Anthropic /v1/messages — see the note there.
       # DATA-ONLY mount, not an engine-code overlay, so the engine's overlay-free
       # contract is unaffected. See patches.yml qwen38-reasoning-effort-template.
       - ../../../patches/qwen38-reasoning-effort-template/chat_template.jinja:/root/.cache/huggingface/qwen3.8-27b-autoround-int4/chat_template.jinja:ro
-      - ../../../cache/torch_compile:/root/.cache/vllm/torch_compile_cache
-      - ../../../cache/triton:/root/.triton/cache
+      - ${CLUB3090_ENGINE_CACHE_DIR:-../../../cache}/torch_compile:/root/.cache/vllm/torch_compile_cache
+      - ${CLUB3090_ENGINE_CACHE_DIR:-../../../cache}/triton:/root/.triton/cache
     environment:
+      - MAMBA_SSM_CACHE_DTYPE=${MAMBA_SSM_CACHE_DTYPE:-}
       # Drafter toggle — docker only forwards what is declared here. The DEFAULT
       # lives in the entrypoint, not in these lines, so it cannot drift.
       - SPEC_N=${SPEC_N:-}
       - SPEC=${SPEC:-}
+      # Draft sampling for the drafter (see SPEC_ARGS below). Bare on purpose:
+      # unset keeps the compose default instead of arriving EMPTY.
+      - DRAFT_SAMPLE_METHOD
       # Sampler env passthrough (#984/#1014): the ENTRYPOINT — not compose
       # interpolation, which has no if/else — derives --override-generation-config
       # from the model-card row matching ENABLE_THINKING, so these must reach the
@@ -135,13 +197,21 @@ services:
       - TOP_K=${TOP_K:-}
       - MIN_P=${MIN_P:-}
       - PRESENCE_PENALTY=${PRESENCE_PENALTY:-}
+      - REPEAT_PENALTY=${REPEAT_PENALTY:-}
       - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all}
       - CUDA_VISIBLE_DEVICES
       - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
       - HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-${OFFLINE:-0}}
       - TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-${OFFLINE:-0}}
       - VLLM_WORKER_MULTIPROC_METHOD=spawn
+      - FA2_ARTIFACT_ID=${FA2_ARTIFACT_ID:-731d1942112a7cf35be4f0add0919072c06cac47e3bad4f674ff0157edad0e3f}
       - NVLINK_MODE=${NVLINK_MODE:-auto}
+      # Orthogonal to NVLINK_MODE: keep the peer TRANSPORT, drop vLLM's custom
+      # all-reduce kernel (#922 mitigation, #1332). Interpolated rather than bare
+      # so it resolves from .env as well as the shell, and so the container never
+      # sees the EMPTY string — detect_nvlink.sh validates this against {0,1} and
+      # an empty value would hard-error every boot.
+      - DISABLE_CUSTOM_ALL_REDUCE=${DISABLE_CUSTOM_ALL_REDUCE:-0}
       - VLLM_SKIP_P2P_CHECK
       - NCCL_CUMEM_ENABLE=0
       - NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE:-1}
@@ -150,7 +220,9 @@ services:
       - OMP_NUM_THREADS=1
       - PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
       # ⭐ W4A8 (int8 activations) SHIPS ON — set W4A8=0 for the W4A16 path.
-      - W4A8=${W4A8:-0}
+      # ~+46% prefill @10K / ~+37% @90K at +0.3% code decode (measured table in
+      # the header). Matches the fast and superfast tiers, which also ship W4A8=1.
+      - W4A8=${W4A8:-1}
       # ⚠️⚠️ WHY A SEPARATE BOOLEAN INSTEAD OF `${VLLM_MARLIN_INPUT_DTYPE:-int8}`:
       # vLLM VALIDATES this variable against a closed set and raises on anything
       # else — INCLUDING THE EMPTY STRING:
@@ -191,12 +263,26 @@ services:
         fi
         bash /etc/club3090/w4a8/install.sh
         bash /etc/club3090/pr48375/install.sh || exit 1
-        bash /etc/club3090/gdn-async-order/install.sh || exit 1
+        bash /etc/club3090/dflash-dense-kv/install.sh || exit 1
         FI_PINQ_LIB_ALL="${FI_PINQ_LIB_ALL:-0}" bash /etc/club3090/flashinfer-decode-pin/install.sh || exit 1
-        bash /etc/club3090/dflash2/install.sh || exit 1
+        # FA2 fp8-KV plugin (#1274). Registers an FP8 extension through the
+        # FLASH_ATTN API, which is the backend this compose already selects.
+        bash /etc/club3090/fa2/install.sh
+        source /etc/club3090/fa2-runtime.env
+        # FA2 kernel envelope (#1358): with fp8 KV and more than one sequence, cap
+        # each request's prefill chunk at the kernel's max_q (2048); refuse a
+        # max-model-len past its max_k. A no-op for this file's shipped defaults.
+        source /etc/club3090/fa2/envelope.sh
+        fa2_envelope "$$@" || exit 1
+        set -- "$${FA2_ARGS[@]}"
         echo "[w4a8] VLLM_MARLIN_INPUT_DTYPE=$${VLLM_MARLIN_INPUT_DTYPE:-<unset -> W4A16>} (W4A8=$${W4A8:-1})"
         AR=""
-        [ "$${_NVLINK_ENABLED:-0}" = "1" ] || AR="--disable-custom-all-reduce"
+        # Gate on _CUSTOM_AR_ENABLED, not _NVLINK_ENABLED: the transport being up
+        # and the custom kernel running are two decisions, and DISABLE_CUSTOM_ALL_REDUCE=1
+        # keeps the first while dropping the second (#1332). Falls back to
+        # _NVLINK_ENABLED so the gate is correct even against a detect_nvlink.sh
+        # that predates the split.
+        [ "$${_CUSTOM_AR_ENABLED:-$${_NVLINK_ENABLED:-0}}" = "1" ] || AR="--disable-custom-all-reduce"
         # -- Drafter toggle: the same contract on every club-3090 compose --------
         #   SPEC_N=<n>  drafter depth (this compose defaults to 4); SPEC_N=0 disables
         #   SPEC=off    back-compat alias for SPEC_N=0
@@ -211,10 +297,33 @@ services:
           exit 1 ;;
         esac
         DRAFTER=/root/.cache/huggingface/qwen3.8-27b-dflash2-w4a16
+        # -- SSM state dtype (club-3090 #1406 follow-up, 2026-09-24) ----------------
+        #   MAMBA_SSM_CACHE_DTYPE  DEFAULT bfloat16. For Qwen3.5-family models vLLM copies the HF
+        #                          config's mamba_ssm_dtype (float32) into --mamba-ssm-cache-dtype
+        #                          whenever that is `auto`, so the SSM state is fp32 unless this is
+        #                          set. bf16 halves the per-request SSM state charged to the KV pool.
+        #                          Set float32 (or auto = the model's float32) to revert.
+        MAMBA_ARGS=()
+        _ssm_dt="$${MAMBA_SSM_CACHE_DTYPE:-bfloat16}"
+        if [ "$$_ssm_dt" != "auto" ]; then MAMBA_ARGS+=(--mamba-ssm-cache-dtype "$$_ssm_dt"); fi
+        echo "[mamba] ssm cache dtype $$_ssm_dt" >&2
+        # Draft sampling. `probabilistic` samples each draft token at the request's
+        # temperature and keeps the draft logits for the rejection test, so a draft
+        # is accepted with probability min(1, p/q) instead of p(draft): more tokens
+        # accepted per step whenever temperature > 0, with the same output
+        # distribution (the target model still decides). vLLM defaults to `greedy`.
+        # Checked in the v0.30.0 source: the V2 runner implements it for MTP and
+        # DFlash2. `greedy` reverts; it is also what a heterogeneous draft vocab
+        # requires.
+        _dsm="$${DRAFT_SAMPLE_METHOD:-probabilistic}"
+        case "$$_dsm" in
+          greedy|probabilistic) : ;;
+          *) echo "[spec] DRAFT_SAMPLE_METHOD='$$_dsm' must be greedy or probabilistic" >&2; exit 1 ;;
+        esac
         SPEC_ARGS=()
         if [ "$$_spec_n" -gt 0 ]; then
-          SPEC_ARGS=(--speculative-config "{\"method\":\"dflash\",\"model\":\"$$DRAFTER\",\"num_speculative_tokens\":$$_spec_n}")
-          echo "[spec] DFlash2 EXTERNAL drafter ON - n=$$_spec_n ($$DRAFTER)" >&2
+          SPEC_ARGS=(--speculative-config "{\"method\":\"dflash\",\"model\":\"$$DRAFTER\",\"num_speculative_tokens\":$$_spec_n,\"draft_sample_method\":\"$$_dsm\"}")
+          echo "[spec] DFlash2 EXTERNAL drafter ON - n=$$_spec_n ($$DRAFTER), draft sampling $$_dsm" >&2
         else
           echo "[spec] drafter OFF (SPEC_N=0 / SPEC=off)" >&2
         fi
@@ -225,6 +334,20 @@ services:
         # from .env or shell STILL WINS in both branches. top_k / min_p are
         # identical across the rows and stay mode-independent.
         _temp="$${TEMP:-}"
+        # ⚠️ presence_penalty IS SILENTLY DROPPED — it is in the JSON below for
+        # intent, but vLLM never applies it. get_diff_sampling_param()
+        # (config/model.py) filters --override-generation-config through a fixed
+        # allowlist — repetition_penalty, temperature, top_k, top_p, min_p,
+        # max_new_tokens — with no penalties in it, and ChatCompletionRequest
+        # declares `presence_penalty: float | None = 0.0`, a hard default that is
+        # always present in the request and therefore always wins. So the instruct
+        # row's presence_penalty=1.5 resolves to 0.0 server-side. SGLang has the
+        # identical gap (same allowlist, same hard default): presence_penalty is a
+        # CLIENT-SIDE parameter on BOTH engines. That is what the model card's own
+        # non-thinking example does, and what its "support for sampling parameters
+        # varies according to inference frameworks" note is warning about.
+        # Everything else in the row DOES land — verified 2026-09-11 by resolving a
+        # bare request through to_sampling_params() inside the pinned image.
         if [ "$${ENABLE_THINKING:-true}" = "true" ]; then
           : "$${_temp:=1.0}" "$${TOP_P:=0.95}" "$${PRESENCE_PENALTY:=0.0}"
           echo "[sampler] thinking row (ENABLE_THINKING=true): temp=$$_temp top_p=$${TOP_P} presence=$${PRESENCE_PENALTY}" >&2
@@ -232,12 +355,19 @@ services:
           : "$${_temp:=0.7}" "$${TOP_P:=0.80}" "$${PRESENCE_PENALTY:=1.5}"
           echo "[sampler] instruct row (default): temp=$$_temp top_p=$${TOP_P} presence=$${PRESENCE_PENALTY}" >&2
         fi
-        SAMPLER_ARGS=(--override-generation-config "{\"temperature\":$$_temp,\"top_p\":$${TOP_P},\"top_k\":$${TOP_K:-20},\"min_p\":$${MIN_P:-0.0},\"presence_penalty\":$${PRESENCE_PENALTY}}")
-        exec vllm serve $$AR "$$@" "$${SPEC_ARGS[@]}" "$${SAMPLER_ARGS[@]}"
+        SAMPLER_ARGS=(--override-generation-config "{\"temperature\":$$_temp,\"top_p\":$${TOP_P},\"top_k\":$${TOP_K:-20},\"min_p\":$${MIN_P:-0.0},\"presence_penalty\":$${PRESENCE_PENALTY},\"repetition_penalty\":$${REPEAT_PENALTY:-1.0}}")
+        exec vllm serve $$AR "$$@" "$${SPEC_ARGS[@]}" "$${MAMBA_ARGS[@]}" "$${SAMPLER_ARGS[@]}"
       - --
     command:
       - --model
       - /root/.cache/huggingface/qwen3.8-27b-autoround-int4
+      # Names the chat_template.jinja mounted over the model dir (volumes). vLLM v0.30.0's
+      # Anthropic /v1/messages checks only this flag to decide whether the template can
+      # take a system message mid-conversation; without it every such message is moved
+      # to the front, and Claude Code (one per turn) re-prefills the whole conversation
+      # each turn. vllm#58754 fixes the check — see docs/UPSTREAM.md.
+      - --chat-template
+      - /root/.cache/huggingface/qwen3.8-27b-autoround-int4/chat_template.jinja
       - --served-model-name
       - qwen3.8-27b
       - --quantization
@@ -247,7 +377,7 @@ services:
       - --tensor-parallel-size
       - "${TP:-2}"
       - --max-model-len
-      - "${MAX_MODEL_LEN:-204800}"
+      - "${MAX_MODEL_LEN:-262144}"
       - --gpu-memory-utilization
       - "${GPU_MEMORY_UTILIZATION:-0.90}"
       - --max-num-seqs
@@ -266,7 +396,7 @@ services:
       - --long-prefill-token-threshold
       - "${LONG_PREFILL_TOKEN_THRESHOLD:-4096}"
       - --kv-cache-dtype
-      - "${KV_CACHE_DTYPE:-bfloat16}"
+      - "${KV_CACHE_DTYPE:-fp8_e4m3}"
       - --attention-backend
       - "${ATTN_BACKEND:-FLASH_ATTN}"
       - --trust-remote-code
@@ -292,7 +422,7 @@ services:
       # which is what makes it slow and timeout-prone. REASONING_EFFORT=medium if
       # you want the model un-nudged rather than pushed toward brevity.
       # ⚠️ Valid values are xhigh | medium | low, plus `high`, which THIS REPO
-      # maps onto MEDIUM via the patched chat template mounted above. Upstream
+      # maps onto XHIGH via the patched chat template mounted above. Upstream
       # Qwen has no `high` rung and its stock template RAISES on it; the mapping
       # is the whole point of that mount. medium is the UN-NUDGED baseline (no
       # branch, no injected preamble), deliberately NOT xhigh — a client sending
@@ -304,7 +434,24 @@ services:
       # ENABLE_THINKING (THINKING by default since 2026-09-01; instruct when
       # false); explicit
       # TEMP/TOP_P/PRESENCE_PENALTY still win. Both rows: "SAMPLER" header above.
+      # prompt_tokens_details in the OpenAI `usage` block (#1246, @zhanmu-tw).
+      # Populates usage.prompt_tokens_details.cached_tokens — how much of the
+      # prompt the prefix cache served — instead of the `null` clients get by
+      # default. Pure response-shaping: _make_prompt_tokens_details() reads
+      # counters the engine already keeps, so it costs nothing in the inference
+      # path; it is off upstream only because vLLM defaults the flag to False.
+      # Opt out: PROMPT_TOKENS_DETAILS_ARG=--no-enable-prompt-tokens-details
+      - "${PROMPT_TOKENS_DETAILS_ARG:---enable-prompt-tokens-details}"
       - --host
       - 0.0.0.0
       - --port
       - "8000"
+
+  vllm-qwen38-27b-dual-ultrafast-kernels:
+    image: ${FA2_KERNEL_IMAGE:-ghcr.io/antonprokopyev/fa2-fp8kv-sm86@sha256:da040941fa048fd5fdfce520503341c0beda4ce41436a1c1fecaf3f8a99777c7}
+    restart: "no"
+    volumes:
+      - fa2-kernels:/export
+
+volumes:
+  fa2-kernels:

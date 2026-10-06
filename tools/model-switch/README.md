@@ -41,11 +41,11 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now club3090-model-switch.service
 ```
 
-## Config (env — systemd loads them from the repo-root `.env`)
+## Config (env, or the club-3090 settings — `~/.config/club-3090/`, then the repo-root `.env` — which the server loads itself at start; the environment wins)
 
 | Var | Default | Purpose |
 |---|---|---|
-| `CLUB3090_API_TOKEN` | — | Control-endpoint bearer token. Falls back to `VLLM_API_KEY`. If neither is set, the endpoint is **unauthenticated** (loopback only). |
+| `CLUB3090_API_TOKEN` | — | Control-endpoint bearer token. Falls back to `VLLM_API_KEY`. If neither is set, the endpoint is **unauthenticated** (loopback only). Save it with `bash scripts/settings.sh set CLUB3090_API_TOKEN=…`, which puts a token in the 0600 `secrets.env`. |
 | `MODEL_SWITCH_PORT` | `8099` | Listen port. |
 | `MODEL_SWITCH_BIND` | `127.0.0.1` | Bind address. Keep on loopback; expose via a VPN, not `0.0.0.0`. |
 | `PORT` | slug default | Model http port used for the `/health` readiness probe. |

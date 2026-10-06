@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export CLUB3090_CONFIG_DIR=/nonexistent/club-3090-test-config   # tests never read your real settings (#1466)
 
 # Force Python's UTF-8 mode (PEP 540) for every python3 this script runs.
 # Repo sources are full of unicode (— × → ⚠), and without this a rig on a real
@@ -32,15 +33,15 @@ run_test() {
 run_test "load_profiles parses all profile groups" <<'PY'
 from scripts.lib.profiles.compat import load_profiles
 p = load_profiles()
-assert len(p.hardware) == 11  # +dgx-spark (#576 follow-up), +rtx-a6000 (#948 thread)
+assert len(p.hardware) == 12  # +dgx-spark (#576 follow-up), +rtx-a6000 (#948 thread), +cmp-170hx-64gb
 _p = __import__("pathlib").Path
 _nloc = lambda d: len(list(_p(d).glob("*.yml"))) if _p(d).is_dir() else 0
-assert len(p.models) - _nloc("scripts/lib/profiles-local/models.d") == 21   # +inkling-small, +qwen3.8-27b, +glm-5.3-flash, +qwen3.8-flash-next, +deepseek-v4-flash-vision-exp
+assert len(p.models) - _nloc("scripts/lib/profiles-local/models.d") == 23   # +inkling-small, +qwen3.8-27b, +glm-5.3-flash, +qwen3.8-flash-next, +deepseek-v4-flash-vision-exp, +mimo-v2.6-9b, +thinkingcap-qwen3.8-27b
 assert len(p.workloads) == 5
 _p = __import__("pathlib").Path
 _nloc = lambda d: len(list(_p(d).glob("*.yml"))) if _p(d).is_dir() else 0
-assert len(p.engines) - _nloc("scripts/lib/profiles-local/engines.d") == 18   # +llamacpp-club3090-v1.1, -v1.5, -v1.6, +sglang-stable
-assert len(p.drafters) == 18  # +syvai-qwen38-dflash2, +anbeeld-glm53-dflash2
+assert len(p.engines) - _nloc("scripts/lib/profiles-local/engines.d") == 21   # +llamacpp-club3090-v1.1, -v1.5, -v1.6, +sglang-stable, +exllamav3, +llama-cpp-prism, +llama-cpp-prism-mtp
+assert len(p.drafters) == 20  # +syvai-qwen38-dflash2, +anbeeld-glm53-dflash2, +zlab-qwen38-dflash2, +prism-mtp-bundled
 assert len(p.calibration) == 6
 PY
 
@@ -158,6 +159,41 @@ bad_hw = replace(p.hardware["rtx-3090"], id="gtx-1080", sm=6.1)
 r = fits([bad_hw], p.models["qwen3.6-27b"], p.workloads["long-ctx-single"], p.engines["vllm-nightly-mtp"], kv_format="fp8_e5m2", tp=1, project_vram=False)
 assert not r.valid
 assert any(reason.startswith("C3:") for reason in r.reasons), r.reasons
+PY
+
+run_test "C3 exact architecture set rejects higher unsupported SMs" <<'PY'
+from scripts.lib.profiles.compat import load_profiles, fits
+p = load_profiles()
+kwargs = dict(model=p.models["qwen3.8-27b"], workload=p.workloads["long-ctx-single"],
+              engine=p.engines["vllm-stable"], tp=2, weights_variant="fp8",
+              kv_format="fp8_e4m3", required_sm=8.6, project_vram=False)
+for card, expected in [("rtx-3090", True), ("rtx-4090", False), ("rtx-5090", False)]:
+    hardware = [p.hardware[card]] * 2
+    result = fits(hardware, supported_sm=[8.6], **kwargs)
+    assert ("C3" in result.diagnostics["constraints_passed"]) == expected, result.reasons
+    floor_only = fits(hardware, **kwargs)
+    assert "C3" in floor_only.diagnostics["constraints_passed"], floor_only.reasons
+mixed = fits([p.hardware["rtx-3090"], p.hardware["rtx-4090"]], supported_sm=[8.6], **kwargs)
+assert "C3" in mixed.diagnostics["constraints_failed"], mixed.reasons
+explicit_ada = fits([p.hardware["rtx-4090"]] * 2, supported_sm=[8.6, 8.9], **kwargs)
+assert "C3" in explicit_ada.diagnostics["constraints_passed"], explicit_ada.reasons
+PY
+
+run_test "registry supported_sm rejects malformed capability sets" <<'PY'
+from scripts.lib.profiles.compose_registry import _entry
+kwargs = dict(model="qwen3.8-27b", weights_variant="fp8", workload="long-ctx-single",
+              engine="vllm-stable", drafter=None, kv_format="fp8_e4m3", tp=2,
+              max_ctx=262144, max_num_seqs=1, mem_util=None,
+              compose_path="models/example.yml", default_port=8110)
+assert "supported_sm" not in _entry(**kwargs)
+assert _entry(supported_sm=[8.6, 9], **kwargs)["supported_sm"] == [8.6, 9.0]
+for value in ([], "8.6", [True], [0], [-1], [float("nan")], [float("inf")], ["8.6"]):
+    try:
+        _entry(supported_sm=value, **kwargs)
+    except ValueError as error:
+        assert "supported_sm" in str(error)
+    else:
+        raise AssertionError(f"invalid supported_sm accepted: {value!r}")
 PY
 
 run_test "C4 engine KV support: llama.cpp rejects bf16 KV" <<'PY'
@@ -516,7 +552,7 @@ from scripts.lib.profiles.compat import load_profiles
 p = load_profiles()  # raises UnknownProfileKeyError on any unknown key
 _p = __import__("pathlib").Path
 _nloc = lambda d: len(list(_p(d).glob("*.yml"))) if _p(d).is_dir() else 0
-assert len(p.models) - _nloc("scripts/lib/profiles-local/models.d") == 21
+assert len(p.models) - _nloc("scripts/lib/profiles-local/models.d") == 23
 PY
 
 run_test "strict keys: typo'd top-level model key fails naming file + closest key" <<'PY'

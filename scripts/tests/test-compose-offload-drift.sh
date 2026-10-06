@@ -24,6 +24,7 @@
 # ⚠️ Deliberately checks the CONTRACT, not the flag: `-ot` is present on every
 # CPU-offload compose, so asserting on it distinguishes nothing.
 set -euo pipefail
+export CLUB3090_CONFIG_DIR=/nonexistent/club-3090-test-config   # tests never read your real settings (#1466)
 export PYTHONUTF8="${PYTHONUTF8:-1}"
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
@@ -47,10 +48,18 @@ def facts(text):
     slots = cmd[cmd.index("-ot") + 1].count("OT_G") if has_ot else 0
     has_ncm = any("n-cpu-moe" in c for c in cmd) or bool(
         re.search(r'--n-cpu-moe', text))
+    # exl3/TabbyAPI offloads by splitting EXPERT INDICES to the host, which it
+    # then COMPUTES there — no `-ot`, no residency bundles, no `--n-cpu-moe`.
+    # Without this arm those composes derive None ("not a CPU-offload compose"),
+    # which is both false and would quietly excuse them from the host-RAM guard.
+    has_mcs = any("cpu-moe-split-experts" in c for c in cmd) or bool(
+        re.search(r'--cpu-moe-split-experts', text))
     contract = bool(BUNDLE.search(text)) and bool(LAYERS.search(text))
-    return contract, has_ot, slots, has_ncm
+    return contract, has_ot, slots, has_ncm, has_mcs
 
-def expected(contract, has_ot, slots, has_ncm):
+def expected(contract, has_ot, slots, has_ncm, has_mcs=False):
+    if has_mcs and not has_ot:
+        return "cpu-moe-split"
     if has_ncm and not has_ot:
         return "n-cpu-moe"
     if contract and slots > 0:

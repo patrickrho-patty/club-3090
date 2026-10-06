@@ -96,18 +96,28 @@ def fmt_ttft(seconds):
 
 
 def parse_kv_tokens_text(txt):
-    """vLLM boot: 'GPU KV cache size: 210,000 tokens' (optional leading ~)."""
+    """KV pool size from a boot log: vLLM 'GPU KV cache size: 210,000 tokens' (optional
+    leading ~) or SGLang 'max_total_num_tokens=547147'. The last boot in the log wins."""
     if not txt:
         return None
-    matches = list(
-        re.finditer(r"GPU KV cache size:\s*~?([\d,]+)\s*tokens", txt, re.I)
-    )
+    matches = list(re.finditer(
+        r"GPU KV cache size:\s*~?([\d,]+)\s*tokens|max_total_num_tokens=(\d+)", txt, re.I))
     if not matches:
         return None
-    return int(matches[-1].group(1).replace(",", ""))
+    m = matches[-1]
+    return int((m.group(1) or m.group(2)).replace(",", ""))
 
 
-def detect_kv_tokens(container):
+def detect_kv_tokens(container, url=""):
+    """KV pool in tokens. SGLang reports it on its server info. Otherwise it's the boot log:
+    the tail first (the latest boot of a restarted container), then the head (#1537: on a
+    container that has served for a while the boot line has scrolled out of a --tail window,
+    and the card read "KV ?")."""
+    if url:
+        info = _sglang_info(url)
+        tok = (info or {}).get("max_total_num_tokens")
+        if isinstance(tok, int) and tok > 0:
+            return tok
     if not container:
         return None
     try:
@@ -121,8 +131,8 @@ def detect_kv_tokens(container):
         )
         txt = (out.stdout or "") + (out.stderr or "")
     except Exception:
-        return None
-    return parse_kv_tokens_text(txt)
+        txt = ""
+    return parse_kv_tokens_text(txt) or parse_kv_tokens_text(_docker_logs_head(container))
 
 
 def plan_matrix(
@@ -343,21 +353,217 @@ def engine_stats(container):
     return (run, wait, run_max, wait_max, hit)
 
 
-def vram_used_mb():
+# ── which container, and is a drafter on (#1537) ──────────────────────────────
+# The card's container and spec label used to come from a name heuristic (`vllm-(qwen|gemma)`) and
+# a grep of the container's Cmd. Both lied on #1537: an SGLang container was never found (card
+# listed every GPU on the host, spec "?"), and a vLLM compose that builds --speculative-config in
+# its entrypoint script from SPEC_N read "spec off" with MTP n=4 running. These read the truth:
+# the container publishing the probed URL's port, and the drafter the ENGINE says it loaded.
+def container_for_url(url, ps_lines=None):
+    """Name of the running container publishing ``url``'s host port, else ""."""
+    m = re.match(r"^[a-z]+://[^/:]+:(\d+)", url or "")
+    if not m:
+        return ""
+    port = m.group(1)
+    if ps_lines is None:
+        try:
+            out = subprocess.run(["docker", "ps", "--format", "{{.Names}}|{{.Ports}}"],
+                                 capture_output=True, text=True, encoding="utf-8", timeout=10)
+            ps_lines = out.stdout.splitlines()
+        except Exception:
+            return ""
+    pat = re.compile(r":" + port + r"->")
+    for line in ps_lines:
+        name, _, ports = line.partition("|")
+        if name and pat.search(ports):
+            return name.strip()
+    return ""
+
+
+def _docker_logs_head(container, max_lines=6000):
+    """The first ``max_lines`` lines of the container's log. The boot config lives there, and on
+    a container that has served for a while a --tail window has long scrolled past it."""
     try:
-        out = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-gpu=memory.used",
-                "--format=csv,noheader,nounits",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        ).stdout
-        return sum(int(x) for x in out.split())
+        proc = subprocess.Popen(["docker", "logs", container], stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, encoding="utf-8",
+                                errors="replace")
     except Exception:
-        return -1
+        return ""
+    lines = []
+    try:
+        for line in proc.stdout:
+            lines.append(line)
+            if len(lines) >= max_lines:
+                break
+    finally:
+        proc.kill()
+        proc.wait()
+    return "".join(lines)
+
+
+_SPEC_NAMES = {"mtp": "MTP", "dflash": "DFlash", "ngram": "ngram", "ngram_gpu": "ngram",
+               "eagle": "EAGLE", "eagle3": "EAGLE3", "draft_model": "draft model",
+               "nextn": "MTP", "standalone": "draft model"}
+
+
+def spec_label_from_vllm_log(txt):
+    """'MTP n=4' / 'spec off' from vLLM's engine-config line, or None when the log doesn't say.
+    The LAST boot in the log wins (a restarted container keeps its earlier boots' lines)."""
+    found = list(re.finditer(
+        r"speculative_config=(None|SpeculativeConfig\(method='([A-Za-z0-9_]+)'"
+        r"(?:[^)]*?num_spec_tokens=(\d+))?[^)]*\))", txt or ""))
+    if not found:
+        return None
+    m = found[-1]
+    if m.group(1) == "None":
+        return "spec off"
+    name = _SPEC_NAMES.get(m.group(2).lower(), m.group(2))
+    return f"{name} n={m.group(3)}" if m.group(3) else name
+
+
+def spec_label_from_sglang_info(info):
+    """Same, from SGLang's /get_server_info JSON, or None when it carries no spec fields."""
+    if not isinstance(info, dict) or "speculative_algorithm" not in info:
+        return None
+    algo = info.get("speculative_algorithm")
+    if not algo:
+        return "spec off"
+    a = str(algo).lower()
+    draft = info.get("speculative_draft_model_path")
+    if a == "eagle" and (not draft or draft == info.get("model_path")):
+        a = "mtp"   # EAGLE over the target's own checkpoint = its in-checkpoint MTP head
+    name = _SPEC_NAMES.get(a, str(algo))
+    steps = info.get("speculative_num_steps")
+    return f"{name} n={steps}" if isinstance(steps, int) and steps > 0 and name != "DFlash" else name
+
+
+def _sglang_info(url):
+    for path in ("/get_server_info", "/server_info"):
+        try:
+            with urllib.request.urlopen(url.rstrip("/") + path, timeout=5) as r:
+                info = json.loads(r.read().decode("utf-8", "replace"))
+            if isinstance(info, dict):
+                return info
+        except Exception:
+            continue
+    return None
+
+
+def served_max_len(url, container=""):
+    """The context one request may use, as the ENGINE reports it: SGLang's server-info
+    context_length, vLLM's /v1/models max_model_len, else vLLM's max_seq_len boot line. None
+    when none of them answers (the caller falls back to the container's flags). #1537: a Cmd
+    grep for `max-model-len N` read "?" for vLLM auto-fit (`--max-model-len -1`) and for every
+    SGLang compose (`--context-length`, set from CONTEXT_LENGTH in the entrypoint)."""
+    if url:
+        info = _sglang_info(url)
+        v = (info or {}).get("context_length")
+        if isinstance(v, int) and v > 0:
+            return v
+        try:
+            with urllib.request.urlopen(url.rstrip("/") + "/v1/models", timeout=5) as r:
+                data = json.loads(r.read().decode("utf-8", "replace")).get("data") or []
+            v = (data[0] or {}).get("max_model_len") if data else None
+            if isinstance(v, int) and v > 0:
+                return v
+        except Exception:
+            pass
+    if container:
+        found = list(re.finditer(r"max_seq_len=(\d+)", _docker_logs_head(container)))
+        if found:
+            return int(found[-1].group(1))
+    return None
+
+
+def spec_label(container, url):
+    """What the engine says it is running, or "" when it can't be read (the caller then falls
+    back to the container's flags)."""
+    if url:
+        info = _sglang_info(url)
+        lab = spec_label_from_sglang_info(info) if info else None
+        if lab:
+            return lab
+    if container:
+        lab = spec_label_from_vllm_log(_docker_logs_head(container))
+        if lab:
+            return lab
+    return ""
+
+
+# ── which GPUs the numbers cover (#1502) ──────────────────────────────────────
+# VRAM and the GPU label belong to the container under test, not to the machine. Summed rig-wide, a
+# neighbouring service's memory decided the leak gate (vram_ok) and a 12 GB card reported a 54 GB
+# peak under "4x RTX 3090". The container's GPUs come from `docker inspect`, read by
+# run_context.visible_gpu_selectors (DeviceRequests, then NVIDIA_VISIBLE_DEVICES, then
+# CUDA_VISIBLE_DEVICES) — the same reading quality-test.sh's run metadata uses.
+def container_gpus(container):
+    """(selectors, scope). selectors: the host GPU indices/UUIDs the container sees, or None for
+    every GPU on the host. scope: which GPUs the probe's numbers cover, in words."""
+    if not container:
+        return None, "every GPU on the host (rig-wide: no container to scope to)"
+    try:
+        out = subprocess.run(["docker", "inspect", container], capture_output=True, text=True,
+                             encoding="utf-8", timeout=10)
+        inspect = json.loads(out.stdout)[0]
+    except Exception:
+        return None, f"every GPU on the host (rig-wide: could not inspect container {container})"
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from run_context import visible_gpu_selectors
+        selectors = visible_gpu_selectors(inspect)
+    except Exception:
+        return None, "every GPU on the host (rig-wide: run_context.py unavailable)"
+    if selectors is None:
+        return None, f"every GPU on the host (container {container} sees them all)"
+    return selectors, f"GPU {', '.join(selectors)} (container {container})"
+
+
+def _smi_rows():
+    out = subprocess.run(
+        ["nvidia-smi", "--query-gpu=index,uuid,name,memory.used", "--format=csv,noheader,nounits"],
+        capture_output=True, text=True, encoding="utf-8", timeout=10,
+    ).stdout
+    rows = []
+    for line in out.strip().splitlines():
+        c = [x.strip() for x in line.split(",")]
+        if len(c) >= 4 and c[3].isdigit():
+            rows.append({"index": c[0], "uuid": c[1], "name": c[2], "mb": int(c[3])})
+    return rows
+
+
+def _scoped(rows, selectors):
+    if selectors is None:
+        return rows
+    by_key = {**{r["index"]: r for r in rows}, **{r["uuid"]: r for r in rows}}
+    return [by_key[s] for s in selectors if s in by_key]
+
+
+def vram_by_gpu(selectors=None):
+    """{GPU index: MB used} on the GPUs in scope; {} when nvidia-smi fails or none match."""
+    try:
+        return {r["index"]: r["mb"] for r in _scoped(_smi_rows(), selectors)}
+    except Exception:
+        return {}
+
+
+def vram_used_mb(selectors=None):
+    by = vram_by_gpu(selectors)
+    return sum(by.values()) if by else -1
+
+
+def gpu_label(selectors=None):
+    """'1× GeForce RTX 3060', '2× GeForce RTX 3090 + 1× GeForce RTX 3060', or '? GPU'."""
+    try:
+        rows = _scoped(_smi_rows(), selectors)
+    except Exception:
+        rows = []
+    if not rows:
+        return "? GPU"
+    names = {}
+    for r in rows:
+        name = re.sub(r"^NVIDIA ", "", r["name"])
+        names[name] = names.get(name, 0) + 1
+    return " + ".join(f"{n}× {name}" for name, n in names.items())
 
 
 def parse_result_line(line):
@@ -607,7 +813,10 @@ def run_probe():
         f"{'agg_t/s':>8} {'per-strm':>9} {'ttft_ms':>8} {'pf_t/s':>7}"
         f" {'ttft_p95':>9} {'tps_p05':>8} {'run/wait':>10} {'pfxhit':>6}"
     )
-    vram0 = vram_used_mb()
+    gpu_sel, gpu_scope = container_gpus(CONTAINER)
+    print(f"[probe] VRAM measured on: {gpu_scope}")
+    vram0 = vram_used_mb(gpu_sel)
+    peak_by_gpu = {}
     vram_by_round = []
     mtps_by_round = []
     agg_by_round = []
@@ -632,7 +841,10 @@ def run_probe():
         done = sum(1 for r in res if r["ok"])
         silent = sum(1 for r in res if r["silent"])
         errs = sum(1 for r in res if r["err"])
-        v = vram_used_mb()
+        by_gpu = vram_by_gpu(gpu_sel)
+        v = sum(by_gpu.values()) if by_gpu else -1
+        for gpu, mb in by_gpu.items():
+            peak_by_gpu[gpu] = max(peak_by_gpu.get(gpu, 0), mb)
         vram_by_round.append(v)
         agg = sum(r["toks"] for r in res) / wall if wall else 0
         tps_ok = [r["tps"] for r in res if r["ok"] and r["tps"] > 0]
@@ -723,6 +935,9 @@ def run_probe():
         f"-> final {vram_by_round[-1]} MB (post-warm growth {leak} MB / {GROWTH})  "
         f"peak {vram_peak} MB"
     )
+    if peak_by_gpu:
+        print("  VRAM peak per GPU: " + " · ".join(f"GPU {g} {mb} MB" for g, mb in peak_by_gpu.items())
+              + f"  ({gpu_scope})")
     print(
         f"  per-stream decode: {report_tps:.1f} tok/s (steady) · aggregate "
         f"{report_agg:.1f} tok/s "
@@ -796,6 +1011,9 @@ def run_probe():
         "retention": f"{retention:.3f}",
         "leak": leak,
         "vram_peak": vram_peak,
+        # #1502: which GPUs vram_peak covers ("all" = every GPU on the host) and each one's peak
+        "vram_gpus": ",".join(gpu_sel) if gpu_sel is not None else "all",
+        "vram_peak_gpus": ",".join(f"{g}:{mb}" for g, mb in peak_by_gpu.items()) or "-",
         "floor_ok": int(floor_ok),
         "ttft_ms": f"{steady_ttft * 1000:.0f}",
         "pf_tps": _fmt_num(steady_pf, 1),
@@ -1035,20 +1253,24 @@ def format_recommend(rec):
     slug = rec.get("slug") or "<slug>"
     engine = (rec.get("engine") or "").lower()
     lines = ["=== recommend ==="]
+    # The compose env knobs: SGLang composes take MAX_RUNNING_REQUESTS / CONTEXT_LENGTH, and
+    # ignore MAX_NUM_SEQS / MAX_MODEL_LEN (#1537's card told an SGLang user to set MAX_NUM_SEQS).
+    seq_knob, ctx_knob = (("MAX_RUNNING_REQUESTS", "CONTEXT_LENGTH") if engine == "sglang"
+                          else ("MAX_NUM_SEQS", "MAX_MODEL_LEN"))
 
     def knobs(n, ctx_keep, ctx_set=None):
-        launch = [f"MAX_NUM_SEQS={n}"]
+        launch = [f"{seq_knob}={n}"]
         if ctx_set is not None:
-            launch.append(f"MAX_MODEL_LEN={ctx_set}")
+            launch.append(f"{ctx_knob}={ctx_set}")
         launch.append(f"bash scripts/switch.sh {slug}")
         out = [
-            f"    MAX_NUM_SEQS={n}",
+            f"    {seq_knob}={n}",
         ]
         if ctx_set is not None:
-            out.append(f"    MAX_MODEL_LEN={ctx_set}")
+            out.append(f"    {ctx_knob}={ctx_set}")
         else:
             keep = fmt_ctx(ctx_keep) if ctx_keep else "compose default"
-            out.append(f"    MAX_MODEL_LEN=<keep {keep}>")
+            out.append(f"    {ctx_knob}=<keep {keep}>")
         out.append(f"    {' '.join(launch)}")
         if engine in ("llamacpp", "llama.cpp", "ik_llama", "ik-llama"):
             c = ctx_set if ctx_set is not None else ctx_keep
@@ -1065,7 +1287,8 @@ def format_recommend(rec):
         )
 
     served_s = fmt_ctx(served) if served else "compose default"
-    lines.append(f"  served max-model-len={served_s} (usually keep this)")
+    ctx_word = "context length" if engine == "sglang" else "max-model-len"
+    lines.append(f"  served {ctx_word}={served_s} (usually keep this)")
     lines.append("")
 
     if full:
@@ -1083,7 +1306,7 @@ def format_recommend(rec):
             lines.extend(knobs(peak["n"], served, ctx_set=peak["ctx"]))
             if served and peak["ctx"] < served:
                 lines.append(
-                    f"    do not drop MAX_MODEL_LEN unless traffic stays near {fmt_ctx(peak['ctx'])} — "
+                    f"    do not drop {ctx_knob} unless traffic stays near {fmt_ctx(peak['ctx'])} — "
                     f"raising slots to {peak['n']} at {served_s} will not reproduce {peak['agg']:.0f} tok/s"
                 )
         elif engine.startswith("vllm") or engine == "":
@@ -1127,10 +1350,37 @@ def main(argv=None):
     p.add_argument("--plan-tsv", action="store_true")
     p.add_argument("--card", action="store_true")
     p.add_argument("--detect-kv", action="store_true")
+    p.add_argument("--gpu-label", action="store_true",
+                   help="'N× <GPU name>' for the GPUs $CONTAINER sees (every GPU when it can't be resolved)")
+    p.add_argument("--container-for-url", action="store_true",
+                   help="name of the running container publishing $URL's port (empty when none)")
+    p.add_argument("--served-max-len", action="store_true",
+                   help="context length the engine at $URL / in $CONTAINER serves (empty when unreadable)")
+    p.add_argument("--spec-label", action="store_true",
+                   help="drafter the engine at $URL / in $CONTAINER says it runs (empty when unreadable)")
     args = p.parse_args(argv)
 
+    if args.container_for_url:
+        name = container_for_url(_env("URL"))
+        if name:
+            print(name)
+        return 0
+    if args.served_max_len:
+        n = served_max_len(_env("URL"), _env("CONTAINER"))
+        if n:
+            print(n)
+        return 0
+    if args.spec_label:
+        lab = spec_label(_env("CONTAINER"), _env("URL"))
+        if lab:
+            print(lab)
+        return 0
+
+    if args.gpu_label:
+        print(gpu_label(container_gpus(_env("CONTAINER"))[0]))
+        return 0
     if args.detect_kv:
-        tok = detect_kv_tokens(_env("CONTAINER"))
+        tok = detect_kv_tokens(_env("CONTAINER"), _env("URL"))
         if tok:
             print(tok)
         return 0

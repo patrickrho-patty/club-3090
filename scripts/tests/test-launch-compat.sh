@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export CLUB3090_CONFIG_DIR=/nonexistent/club-3090-test-config   # tests never read your real settings (#1466)
 
 # Force Python's UTF-8 mode (PEP 540) for every python3 this script runs.
 # Repo sources are full of unicode (— × → ⚠), and without this a rig on a real
@@ -105,51 +106,75 @@ assert_contains "$out" "Pass 2 fits()"
 out="$(python3 "$HELPER" resolve-engine-pin --engine-id vllm-nightly-mtp --format shell)"
 assert_contains "$out" "VLLM_NIGHTLY_SHA=${MTP_SHA}"
 
-if out="$(python3 "$HELPER" resolve-engine-pin --engine-id vllm-pip-baseline --format shell 2>&1)"; then
-  echo "ASSERTION FAILED: pip-only vllm-pip-baseline unexpectedly resolved as a docker nightly" >&2
-  echo "$out" >&2
-  exit 1
-fi
-assert_contains "$out" "install.spec is not a docker image"
+# #1365: a pip engine is NOT an image pin, and that is a normal state, not an
+# error. It used to RAISE, which made the whole slug unresolvable -- the reason
+# both launchers gated hardware injection behind a vllm/beellama prefix test and
+# 73 of 138 slugs got none. It now resolves to an EMPTY pin.
+out="$(python3 "$HELPER" resolve-engine-pin --engine-id vllm-pip-baseline --format shell 2>&1)" || {
+  echo "ASSERTION FAILED: pip engine must resolve to an EMPTY pin, not raise" >&2; echo "$out" >&2; exit 1; }
+[[ -z "$(printf '%s' "$out" | tr -d '[:space:]')" ]] || {
+  echo "ASSERTION FAILED: pip engine emitted an image pin: $out" >&2; exit 1; }
+# same for one engine id whose composes use TWO image vars (llama-cpp-local:
+# LLAMACPP_IMAGE vs IK_LLAMA_IMAGE) -- no single var, so no injection, never a guess.
+out="$(python3 "$HELPER" resolve-engine-pin --engine-id llama-cpp-local --format shell 2>&1)" || {
+  echo "ASSERTION FAILED: llama-cpp-local must resolve to an EMPTY pin, not raise" >&2; echo "$out" >&2; exit 1; }
+[[ -z "$(printf '%s' "$out" | tr -d '[:space:]')" ]] || {
+  echo "ASSERTION FAILED: llama-cpp-local emitted a pin despite two vars: $out" >&2; exit 1; }
+# a single-image non-vLLM engine DOES pin, from its profile image_env
+out="$(python3 "$HELPER" resolve-engine-pin --engine-id sglang-stable --format shell 2>&1)"
+assert_contains "$out" "SGLANG_IMAGE="
 
 out="$(python3 "$HELPER" resolve-variant-pin --variant vllm/dual --format shell)"
-assert_contains "$out" "VLLM_IMAGE=vllm/vllm-openai:v0.27.1"
+assert_contains "$out" "VLLM_IMAGE=vllm/vllm-openai:v0.30.0"
 
 
 out="$(python3 "$HELPER" resolve-variant-pin --variant vllm/gemma-int8-mtp --format shell)"
 assert_contains "$out" "VLLM_IMAGE=vllm/vllm-openai:v0.22.0"
 
-# --- #246 arch-aware KV injection matrix (resolve-variant-pin --gpu-spec) ----
+# --- #246 Phase 1 KV injection: RETIRED (#1371) -------------------------------
+# This block used to be eight `assert_not_contains KV_CACHE_DTYPE` cases against a
+# live injector. Every one of them passed for the wrong reason: the injector had
+# been inert on EVERY card since the composes migrated to fp8_e4m3, so the suite
+# was asserting a no-op it believed was a decision. That is the shape this repo
+# calls a false clean, and it is why the mechanism survived nine months unnoticed.
+#
+# The injector is gone. What must be guarded now is that it stays gone and that
+# removing it did not disturb the user's own knob.
 GPU_4090='0|NVIDIA GeForce RTX 4090|24564|8.9'
 GPU_5090X2='0|NVIDIA GeForce RTX 5090|32607|12.0;1|NVIDIA GeForce RTX 5090|32607|12.0'
 
-# ampere -> NOTHING injected (compose defaults; the no-op is data equality)
-out="$(python3 "$HELPER" resolve-variant-pin --variant vllm/dual --format shell --gpu-spec "$GPU_3090")"
-assert_not_contains "$out" "KV_CACHE_DTYPE"
-# vllm/dual + vllm/minimal are now fp8_e4m3-native on ALL arches (2026-07-14 KV switch): the
-# compose default already gives native fp8 on Ada/Blackwell, so there is nothing to swap -> no
-# injection. (#246's Qwen e5m2->e4m3 arch-swap is now vestigial for these slugs — see followup.)
-out="$(python3 "$HELPER" resolve-variant-pin --variant vllm/dual --format shell --gpu-spec "$GPU_4090")"
-assert_not_contains "$out" "KV_CACHE_DTYPE"
-out="$(python3 "$HELPER" resolve-variant-pin --variant vllm/minimal --format shell --gpu-spec "$GPU_5090X2")"
-assert_not_contains "$out" "KV_CACHE_DTYPE"
-# non-pilot slug (same kv_format) -> no injection until the #246 A/B expands the pilot
-out="$(python3 "$HELPER" resolve-variant-pin --variant vllm/qwen-27b-dual-fast --format shell --gpu-spec "$GPU_4090")"
-assert_not_contains "$out" "KV_CACHE_DTYPE"
-# quant-specific KV slug -> never overridden (compressed-tensors reject fp8 KV)
-out="$(python3 "$HELPER" resolve-variant-pin --variant vllm/gemma-int8-mtp --format shell --gpu-spec "$GPU_4090")"
-assert_not_contains "$out" "KV_CACHE_DTYPE"
-# explicit user env pin wins
+# 1. NOTHING resolves KV_CACHE_DTYPE, on any card, for any slug. A positive
+#    control rides along: the same call must still return the image pin, so an
+#    empty result cannot make this pass.
+for _spec in "$GPU_3090" "$GPU_4090" "$GPU_5090X2" "0|NVIDIA GB10|131072|12.1" "0|Weird GPU|8192|7.0"; do
+  for _v in vllm/dual vllm/minimal vllm/qwen-27b-dual-fast vllm/gemma-int8-mtp; do
+    out="$(python3 "$HELPER" resolve-variant-pin --variant "$_v" --format shell --gpu-spec "$_spec")"
+    assert_not_contains "$out" "KV_CACHE_DTYPE"
+    assert_contains "$out" "VLLM_IMAGE="
+  done
+done
+
+# 2. The symbols are gone from the resolver, not merely unreachable. A dormant
+#    map is what let this rot: it read as a feature in every review.
+if python3 -c "
+import sys; sys.path.insert(0, '.')
+import scripts.lib.profiles.launch_compat as m
+sys.exit(0 if any(hasattr(m, n) for n in ('ARCH_KV_PILOT_VARIANTS', '_ARCH_KV_ALLOWED', '_arch_aware_env')) else 1)
+"; then
+  echo "ASSERTION FAILED: the #246 Phase 1 KV injector is back. If that is deliberate," >&2
+  echo "  it needs a slug that actually declares the source kv_format (zero do today)" >&2
+  echo "  and it must not fight compat.py's _fp8w_ampere_kv routing rule — see #1371." >&2
+  exit 1
+fi
+
+# 3. A user's own KV_CACHE_DTYPE is untouched. It never travelled through the
+#    resolver or the launcher case arm — the composes read ${KV_CACHE_DTYPE:-…}
+#    and docker interpolates it — so removing both must change nothing here.
 out="$(KV_CACHE_DTYPE=fp8_e5m2 python3 "$HELPER" resolve-variant-pin --variant vllm/dual --format shell --gpu-spec "$GPU_4090")"
 assert_not_contains "$out" "KV_CACHE_DTYPE"
-# heterogeneous rig -> no single right answer -> no injection
-out="$(python3 "$HELPER" resolve-variant-pin --variant vllm/dual --format shell --gpu-spec "${GPU_3090};1|NVIDIA GeForce RTX 4090|24564|8.9")"
-assert_not_contains "$out" "KV_CACHE_DTYPE"
-# unmapped card -> degrade to compose defaults, never an error
-out="$(python3 "$HELPER" resolve-variant-pin --variant vllm/dual --format shell --gpu-spec "0|Weird GPU|8192|7.0")"
-assert_contains "$out" "VLLM_IMAGE=vllm/vllm-openai:v0.27.1"
-assert_not_contains "$out" "KV_CACHE_DTYPE"
-echo "  ok: #246 arch-aware KV injection matrix (8 cases)"
+assert_contains "$out" "VLLM_IMAGE="
+
+echo "  ok: #1371 Phase 1 KV injector stays retired (20 slug x card cases · symbols absent · user knob intact)"
 
 # --- detector: Blackwell family must not collapse to rtx-5090 (#576 wrinkle) --
 # The sm>=12 bucket used to map every Blackwell to rtx-5090, so a 96 GB PRO 6000
@@ -163,13 +188,44 @@ cases = [
     ("NVIDIA GB10",                  131072, 12.1, "dgx-spark"),
     ("NVIDIA GeForce RTX 5090",       32607, 12.0, "rtx-5090"),
     ("NVIDIA RTX 6000 Ada Generation",49140,  8.9, "rtx-4090"),                # 'pro 6000' must NOT catch Ada
+    # #1364: the sm_8.6 bucket returned rtx-3090 for ANY >=24 GB Ampere, so a
+    # 48 GB A6000 resolved to the 24 GB profile and the three rtx-a6000 envelope
+    # rows could never fire. Lock the split by NAME and by VRAM fallback.
+    ("NVIDIA RTX A6000",              49140,  8.6, "rtx-a6000"),
+    ("Unnamed Ampere 48GB",           49140,  8.6, "rtx-a6000"),
+    ("NVIDIA GeForce RTX 3090",       24576,  8.6, "rtx-3090"),
+    ("NVIDIA RTX A5000",              24564,  8.6, "rtx-a5000"),
+    # Deliberate under-promise: no exact profile, so fall to the largest SMALLER
+    # same-family profile. Safe direction; the reverse would not be.
+    ("NVIDIA A100-SXM4-80GB",         81920,  8.0, "a100-40gb"),
+    # CMP 170HX (GA100 mining board): the ~64 GB boards get their own profile and
+    # must NOT fall to the sm_8.0 A100 fallback (which assumes NVLink).
+    ("NVIDIA CMP 170HX",              65536,  8.0, "cmp-170hx-64gb"),
+    ("NVIDIA CMP 170HX",              64000,  8.0, "cmp-170hx-64gb"),
 ]
 bad = [f"{n}->{m(n,v,s)} want {e}" for n, v, s, e in cases if m(n, v, s) != e]
+# A stock 8 GB CMP 170HX has no profile: it must stay unmapped, never be read as
+# a larger card.
+from launch_compat import LaunchCompatError
+try:
+    got = m("NVIDIA CMP 170HX", 8192, 8.0)
+    bad.append(f"stock 8 GB CMP 170HX->{got} want no profile")
+except LaunchCompatError:
+    pass
+# A real mixed rig (xtj7, 2026-10-02): two 3090s around a 64 GB CMP 170HX. Each
+# card keeps its own profile.
+from launch_compat import _parse_gpu_specs
+sys.path.insert(0, ".")
+from scripts.lib.profiles.compat import load_profiles
+spec = "0|NVIDIA GeForce RTX 3090|24576|8.6;1|NVIDIA CMP 170HX|65536|8.0;2|NVIDIA GeForce RTX 3090|24576|8.6"
+ids = [getattr(h, "id", h) for h in _parse_gpu_specs(spec, load_profiles())]
+if ids != ["rtx-3090", "cmp-170hx-64gb", "rtx-3090"]:
+    bad.append(f"mixed 3090+CMP rig -> {ids}")
 print("FAIL: " + " | ".join(bad) if bad else "OK")
 PY
 )"
 [[ "$det" == "OK" ]] || { echo "  FAIL: detector: $det"; exit 1; }
-echo "  ok: Blackwell detector split (PRO 6000 / GB10 / 5090 / Ada — 5 cases)"
+echo "  ok: hardware detector split (PRO 6000 / GB10 / 5090 / Ada / A6000 / A5000 / 3090 / A100-80 / CMP 170HX 64 GB vs stock / mixed 3090+CMP rig)"
 
 # --- #246 Phase 2 mem-fraction floor (DOWNWARD only) --------------------------
 # A unified-memory card (Spark, mem_util_safe 0.85) can't safely give the 0.92
@@ -186,7 +242,53 @@ assert_contains "$out" "GPU_MEMORY_UTILIZATION=0.85"
 # explicit user pin wins
 out="$(GPU_MEMORY_UTILIZATION=0.7 python3 "$HELPER" resolve-variant-pin --variant vllm/dual --format shell --gpu-spec "$GPU_SPARK")"
 assert_not_contains "$out" "GPU_MEMORY_UTILIZATION=0.85"
-echo "  ok: #246 mem-fraction floor (Spark down · discrete no-raise · het-min · user-pin — 4 cases)"
+# #1516: only a UNIFIED-MEMORY card sets the floor. The RTX 3060's discrete 0.88
+# used to pull every 0.92 slug on a 3090+3060 rig down to 0.88, slugs that never
+# touch the 3060 included. Positive control first: the spec must map to the 3060
+# profile with a ceiling below the slug's default, or "nothing injected" below
+# would pass just as well for an unmapped card (which also injects nothing).
+GPU_3060='0|NVIDIA GeForce RTX 3060|12288|8.6'
+GPU_3090X2_3060="0|NVIDIA GeForce RTX 3090|24576|8.6;1|NVIDIA GeForce RTX 3090|24576|8.6;2|NVIDIA GeForce RTX 3060|12288|8.6"
+ctl="$(cd "$ROOT_DIR" && python3 - "$GPU_3090X2_3060" <<'PY'
+import sys
+sys.path.insert(0, ".")
+from scripts.lib.profiles.compat import load_profiles
+from scripts.lib.profiles.compose_registry import get_registry
+from scripts.lib.profiles.launch_compat import _parse_gpu_specs
+hw = _parse_gpu_specs(sys.argv[1], load_profiles())
+small = [h for h in hw if h.id == "rtx-3060-12gb"]
+default = get_registry()["vllm/dual"]["mem_util"]
+ok = len(hw) == 3 and len(small) == 1 and small[0].mem_util_safe < default and not small[0].unified_memory
+print("OK" if ok else f"FAIL: ids={[h.id for h in hw]} default={default}")
+PY
+)"
+[[ "$ctl" == "OK" ]] || { echo "  FAIL: #1516 control: $ctl"; exit 1; }
+out="$(python3 "$HELPER" resolve-variant-pin --variant vllm/dual --format shell --gpu-spec "$GPU_3090X2_3060")"
+assert_not_contains "$out" "GPU_MEMORY_UTILIZATION"
+out="$(python3 "$HELPER" resolve-variant-pin --variant vllm/minimal --format shell --gpu-spec "$GPU_3060")"
+assert_not_contains "$out" "GPU_MEMORY_UTILIZATION"
+# ...and a unified-memory card still forces a mixed rig down (Spark + 3090)
+out="$(python3 "$HELPER" resolve-variant-pin --variant vllm/dual --format shell --gpu-spec "${GPU_SPARK};1|NVIDIA GeForce RTX 3090|24576|8.6")"
+assert_contains "$out" "GPU_MEMORY_UTILIZATION=0.85"
+# #1365: the floor is now reachable on SGLang too, and it must arrive under
+# SGLang's OWN key. `--mem-fraction-static` is NOT `--gpu-memory-utilization`
+# (static weights+KV share vs total-VRAM budget, cudagraph capture comes from
+# the remainder), so emitting vLLM's name here would land on a var no sgl
+# compose reads -- silently inert. The VALUE is the card's safe ceiling, a
+# hardware property (Spark's LPDDR5X is shared with the Grace CPU/OS), not a
+# vLLM-tuned number, and it only ever moves DOWNWARD from the slug's own
+# registered default -- conservative under either engine's semantics.
+# ⚠️ Still UNVALIDATED on SGLang: no sgl soak at 0.85 on a unified-memory card.
+out="$(python3 "$HELPER" resolve-variant-pin --variant sgl/qwen38-27b-dual-fast --format shell --gpu-spec "$GPU_SPARK")"
+assert_contains "$out" "MEM_FRACTION=0.85"
+assert_not_contains "$out" "GPU_MEMORY_UTILIZATION"
+out="$(python3 "$HELPER" resolve-variant-pin --variant sgl/qwen38-27b-dual-fast --format shell --gpu-spec "$GPU_5090X2")"
+assert_not_contains "$out" "MEM_FRACTION"
+# llama.cpp has no fraction knob at all -> neither name, on any card
+out="$(python3 "$HELPER" resolve-variant-pin --variant llamacpp-club3090/glm53-flash-dual-iq4xs-moecache --format shell --gpu-spec "$GPU_SPARK")"
+assert_not_contains "$out" "MEM_FRACTION"
+assert_not_contains "$out" "GPU_MEMORY_UTILIZATION"
+echo "  ok: #246 mem-fraction floor (Spark down · discrete no-raise · het-min · user-pin · #1516 discrete-never-floors ×2 + Spark-mixed · sgl-own-key · llama.cpp-none — 10 cases)"
 
 # --- fp8/NVFP4-weights DeepGEMM disable on consumer cards (disc #571/#613) ---
 # DeepGEMM has no recipe on consumer Blackwell (sm_120/121, hard-fails) and is
@@ -214,7 +316,7 @@ echo "  ok: fp8/NVFP4 DeepGEMM disable (5090/Ada down · Hopper keep · non-fp8 
 
 if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
   out="$(VLLM_NIGHTLY_SHA="$CLEAN_SHA" docker compose -f "$ROOT_DIR/models/qwen3.6-27b/vllm/compose/dual/autoround-int4/fp8-mtp.yml" config 2>/dev/null)"
-  assert_contains "$out" "image: vllm/vllm-openai:v0.27.1"
+  assert_contains "$out" "image: vllm/vllm-openai:v0.30.0"
 
   out="$(VLLM_NIGHTLY_SHA="$CLEAN_SHA" VLLM_IMAGE=vllm/vllm-openai:latest docker compose -f "$ROOT_DIR/models/qwen3.6-27b/vllm/compose/dual/autoround-int4/fp8-mtp.yml" config 2>/dev/null)"
   assert_contains "$out" "image: vllm/vllm-openai:latest"
@@ -230,7 +332,7 @@ print(clean["VLLM_IMAGE"])
 print(gemma["VLLM_IMAGE"])
 PY
 )"
-assert_contains "$out" "vllm/vllm-openai:v0.27.1"   # clean (vllm/dual → vllm-stable) bumped to v0.27.1
+assert_contains "$out" "vllm/vllm-openai:v0.30.0"   # clean (vllm/dual → vllm-stable) bumped to v0.30.0
 assert_contains "$out" "vllm/vllm-openai:v0.22.0"   # gemma (vllm/gemma-int8-mtp → vllm-gemma-stable) stays v0.22.0
 
 # --- #809: decode_granularity travels from the profile YAML to the launchers --
@@ -248,9 +350,14 @@ out="$(python3 "$HELPER" resolve-variant-pin --variant vllm/diffusiongemma-dual 
 assert_contains "$out" "DECODE_GRANULARITY=canvas"
 # Every autoregressive slug's export set must be unchanged — the field defaults
 # to "token" and the emitter stays silent for it, so no other slug moves a byte.
-# (vLLM slugs only — resolve-variant-pin refuses a non-docker-image engine pin,
-# which is llamacpp's pre-existing behaviour and unrelated to this field.)
-for v in vllm/dual vllm/minimal vllm/gemma-int8-mtp; do
+# (#1365 corrected the note that used to sit here: it claimed resolve-variant-pin
+# "refuses a non-docker-image engine pin, which is llamacpp's pre-existing
+# behaviour". `llama-cpp-local` IS install.method: docker_image -- the raise was
+# for "no env-key mapping" wearing the wrong error text. It no longer raises, so
+# the sample below is vLLM slugs simply because DECODE_GRANULARITY is declared by
+# a vLLM-served model; a llama.cpp slug is asserted silent right after.)
+for v in vllm/dual vllm/minimal vllm/gemma-int8-mtp \
+         llamacpp/default sgl/qwen38-27b-dual-fast exllamav3/qwen38-flash-next-dual-exl3-305-cpumoe; do
   out="$(python3 "$HELPER" resolve-variant-pin --variant "$v" --format shell --gpu-spec "$GPU_3090")"
   assert_not_contains "$out" "DECODE_GRANULARITY"
 done
@@ -277,4 +384,60 @@ assert_contains "$out" "raised:"
 assert_not_contains "$out" "NO-RAISE"
 echo "  ✓ #809: decode_granularity reaches both launchers, only for the model that declares it"
 
+# --- #1365: the export path is invoked TWICE on a launch.sh run ---------------
+# launch.sh:1473 exports, then execs switch.sh, which exports again into the
+# inherited env. Now that the vllm/beellama prefix gate is gone this happens for
+# EVERY slug, so it has to be provably idempotent: pass 2 must not re-announce,
+# must not clobber, and must not report pass 1's own export as a user override.
+#
+# ⚠️ POSITIVE CONTROL FIRST. "pass 2 printed nothing" is worthless unless pass 1
+# printed something -- a harness that silently fails to call the function at all
+# would satisfy the negative half. So each launcher asserts BOTH halves.
+dbl_harness() { # dbl_harness <launcher> <slug> <gpu-spec> [PRESET=k=v]
+  local body; body="$(sed -n '/^export_variant_engine_pin() {/,/^}/p' "$1")"
+  SPEC="$3" LAUNCH_PROFILE="$HELPER" PRESET="${4:-}" SLUG="$2" COMPOSE_BIN=: bash -c '
+    set -uo pipefail
+    switch_gpu_profile_spec()   { printf "%s" "${SPEC}"; }   # switch.sh
+    selected_gpu_profile_spec() { printf "%s" "${SPEC}"; }   # launch.sh
+    '"$body"'
+    [[ -n "$PRESET" ]] && export "$PRESET"
+    echo "@@PASS1"; export_variant_engine_pin "$SLUG"
+    echo "@@PASS2"; export_variant_engine_pin "$SLUG"
+    echo "@@FINAL MOE_RESERVE_MB=${MOE_RESERVE_MB:-<unset>}"
+  ' 2>&1
+}
+# a moe-cache slug on a 5090 is the widest case the flip newly reaches: it was
+# behind the prefix gate until #1365 and it injects a non-image key.
+DBL_SLUG="llamacpp-club3090/glm53-flash-dual-iq4xs-moecache"
+DBL_SPEC="0|NVIDIA GeForce RTX 5090|32607|12.0;1|NVIDIA GeForce RTX 5090|32607|12.0"
+# ⚠️ Kept as an ARRAY, not `for _L in scripts/switch.sh scripts/launch.sh`:
+# that spelling matches test-tests-never-launch's EXEC regex (the `sh` of
+# switch.sh + a space + scripts/launch.sh reads as `sh …launch.sh`). It is a
+# false positive — nothing is executed here — but that guard is deliberately
+# dumb and broad, and a precise version of it once went blind to the exact
+# line it exists to catch. Satisfy it rather than argue with it.
+DBL_LAUNCHERS=("scripts/switch.sh" "scripts/launch.sh")
+for _L in "${DBL_LAUNCHERS[@]}"; do
+  _out="$(dbl_harness "$_L" "$DBL_SLUG" "$DBL_SPEC")"
+  _p1="$(printf '%s' "$_out" | sed -n '/@@PASS1/,/@@PASS2/p')"
+  # ⚠️ the @@FINAL line NAMES the key, so it must be excluded from the pass-2
+  # window or the "did pass 2 re-announce?" grep matches its own witness line.
+  _p2="$(printf '%s' "$_out" | sed -n '/@@PASS2/,/@@FINAL/{/@@FINAL/!p;}')"
+  grep -q "MOE_RESERVE_MB=2048" <<<"$_p1" \
+    || { echo "ASSERTION FAILED ($_L): pass 1 did not inject MOE_RESERVE_MB (positive control)" >&2
+         printf '%s\n' "$_out" >&2; exit 1; }
+  grep -q "MOE_RESERVE_MB" <<<"$_p2" \
+    && { echo "ASSERTION FAILED ($_L): pass 2 re-announced MOE_RESERVE_MB — double invocation is not idempotent" >&2
+         printf '%s\n' "$_out" >&2; exit 1; }
+  grep -q "keeping your value" <<<"$_out" \
+    && { echo "ASSERTION FAILED ($_L): the launcher reported its OWN export as a user override" >&2
+         printf '%s\n' "$_out" >&2; exit 1; }
+  grep -q "@@FINAL MOE_RESERVE_MB=2048" <<<"$_out" \
+    || { echo "ASSERTION FAILED ($_L): pass 2 clobbered the value" >&2; printf '%s\n' "$_out" >&2; exit 1; }
+  # a genuine user override survives both passes untouched
+  _ov="$(dbl_harness "$_L" "$DBL_SLUG" "$DBL_SPEC" "MOE_RESERVE_MB=999")"
+  grep -q "@@FINAL MOE_RESERVE_MB=999" <<<"$_ov" \
+    || { echo "ASSERTION FAILED ($_L): user MOE_RESERVE_MB=999 did not survive" >&2; printf '%s\n' "$_ov" >&2; exit 1; }
+done
+echo "  ✓ #1365: double invocation is idempotent in both launchers (inject-once · no re-announce · no false 'user override' · user value survives)"
 echo "test-launch-compat: ok"

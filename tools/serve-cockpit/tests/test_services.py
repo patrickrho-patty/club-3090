@@ -365,7 +365,7 @@ def full_runner(**overrides) -> FakeRunner:
 
 
 class TestScriptsImportable:
-    def test_init_puts_repo_root_on_sys_path(self, tmp_path):
+    def test_init_puts_repo_root_on_sys_path(self, tmp_path, monkeypatch):
         """route-G/C ② Serve emit does `from scripts.lib.profiles...`; c3 runs from
         tools/serve-cockpit/ so the repo root ISN'T on sys.path by default. __init__
         must add it, else serve dies "No module named 'scripts'" (2026-07-09).
@@ -377,6 +377,13 @@ class TestScriptsImportable:
         `scripts.lib.profiles.*` import (the full-suite contamination this test
         used to cause)."""
         import sys
+
+        # CockpitData inserts into sys.path in place: give it a copy that pytest puts
+        # back afterwards. Left in place, the seeded root below (a REGULAR
+        # scripts.lib.profiles package, first on the path) shadowed the real tree for
+        # every later test in the process — 11 failures whenever test_services.py ran
+        # on its own, hidden in the full suite, which imports the real package first.
+        monkeypatch.setattr(sys, "path", list(sys.path))
 
         seeded = tmp_path / "scripts" / "lib" / "profiles"
         seeded.mkdir(parents=True)
@@ -816,6 +823,24 @@ class TestLoadCatalog:
         assert getattr(bare, "vision") is False
         assert getattr(bare, "act_format") == ""  # older emit → column shows "—"
 
+    def test_kv_offload_facet_and_offload_column_label(self):
+        """The registry ``kv_offload`` facet ("opt-in" on the five Qwen3.8-family dual
+        MTP slugs) attaches to the row and renders "kv opt" in the offload column —
+        but only when the weights are resident: weight placement keeps priority."""
+        from types import SimpleNamespace
+        from club3090_cockpit.app import _offload_label
+
+        kv = _variant_row_from_dict({"slug": "vllm/qwen38-27b-dual-fast", "port": 8113,
+                                     "offload": None, "kv_offload": "opt-in"})
+        assert getattr(kv, "kv_offload") == "opt-in"
+        assert _offload_label(SimpleNamespace(row=kv)) == "kv opt"
+        bare = _variant_row_from_dict({"slug": "x/y", "port": 1})
+        assert getattr(bare, "kv_offload") == ""  # older emit / not wired
+        assert _offload_label(SimpleNamespace(row=bare)) == "—"
+        both = _variant_row_from_dict({"slug": "x/moe", "port": 2,
+                                       "offload": "residency", "kv_offload": "opt-in"})
+        assert _offload_label(SimpleNamespace(row=both)) == "static"
+
     def test_variant_row_from_dict_attaches_sampler_profiles(self):
         """#1014 L2→L3: the per-mode model-card sampler rows join at emit and
         attach to the row (same pattern as the facets above) — the serve-confirm
@@ -952,6 +977,62 @@ class TestLoadCatalog:
         await cd.enrich_weights([e], model_dir=str(tmp_path))
         assert e.weights_state == WEIGHTS_PRESENT
 
+    @pytest.mark.asyncio
+    async def test_weights_state_absent_when_nested_glob_variant_dir_removed(self, tmp_path):
+        """A variant whose verify_glob carries its own directory component (e.g.
+        subdir=glm-5.3-flash-gguf, verify_glob=UD-IQ4_XS/*.gguf) must read ABSENT once
+        that variant dir is deleted -- even while SIBLING variants keep the shared
+        parent on disk.
+
+        Regression: `base` was the shared PARENT, so `base.is_dir()` stayed true for as
+        long as any sibling existed and ABSENT was UNREACHABLE -- a cleanly deleted
+        variant reported PARTIAL forever, and the UI offered "Download resumes it" for
+        a 100-250 GB fresh pull with nothing to resume. Hit on glm-5.3-flash iq4xs /
+        iq3xxs; 9 of 87 weights entries carry a nested glob like this.
+        """
+        from club3090_cockpit.data import (
+            CatalogEntry, WEIGHTS_PRESENT, WEIGHTS_ABSENT,
+        )
+
+        listing = json.dumps([
+            {"model": "glm-5.3-flash", "variant": "unsloth-ud-iq4xs",
+             "subdir": "glm-5.3-flash-gguf", "hf_repo": "unsloth/x",
+             "size_gb": 100.0, "verify_glob": "UD-IQ4_XS/*.gguf",
+             "status": "experimental"},
+        ])
+        cd = CockpitData(ROOT, runner=full_runner(**{"weights.py list --json": ok(listing)}))
+        hf = tmp_path
+        parent = hf / "glm-5.3-flash-gguf"
+        variant = parent / "UD-IQ4_XS"
+        sibling = parent / "dflash2"          # a DIFFERENT variant sharing the parent
+        variant.mkdir(parents=True)
+        sibling.mkdir(parents=True)
+        (variant / "w.gguf").write_text("x")
+        (sibling / "d.gguf").write_text("x")
+
+        e = CatalogEntry(row=_variant_row_from_dict({
+            "slug": "llamacpp-club3090/glm53-flash-dual-iq4xs-moecache", "port": 8099,
+            "model": "glm-5.3-flash", "switch_engine": "llamacpp-club3090",
+            "launch_engine": "llamacpp-club3090", "engine": "llamacpp-club3090-v1.6",
+            "compose_dir": "models/glm-5.3-flash/llamacpp-club3090/compose/dual/unsloth-ud-iq4xs",
+            "file": "moecache.yml",
+            "compose_path": "models/glm-5.3-flash/llamacpp-club3090/compose/dual/unsloth-ud-iq4xs/moecache.yml",
+            "kvcalc_key": "SKIP", "container": "c", "status": "experimental",
+            "ctx_label": "", "status_note": "",
+        }))
+        await cd.enrich_weights([e], model_dir=str(tmp_path))
+        assert e.weights_state == WEIGHTS_PRESENT
+
+        # Delete ONLY this variant. The shared parent survives via the sibling.
+        (variant / "w.gguf").unlink()
+        variant.rmdir()
+        assert parent.is_dir() and sibling.is_dir()          # parent still populated
+        await cd.enrich_weights([e], model_dir=str(tmp_path))
+        assert e.weights_state == WEIGHTS_ABSENT, (
+            f"cleanly-deleted nested-glob variant read {e.weights_state!r}; "
+            "ABSENT must be reachable even when siblings keep the parent alive"
+        )
+
     def test_download_progress_aggregates_core_and_companion(self, tmp_path):
         """Live-progress regression: progress must aggregate bytes across the WHOLE
         set (core + companions) / total size — so a core-already-present slug shows
@@ -973,6 +1054,65 @@ class TestLoadCatalog:
         with open(hf / "comp" / "d.gguf", "wb") as fh:
             fh.truncate(1 * 10**9)                          # half the companion → (8+1)/10 = 90%
         assert cd.weights_download_progress_set([core, comp], model_dir=str(tmp_path)) == 90
+
+    def test_download_progress_shared_bucket_counts_each_file_once(self, tmp_path):
+        """#1508: the GLM layout. The core's subdir is the BUCKET (glm-5.3-flash-gguf,
+        verify_glob UD-IQ4_XS/*.gguf) and holds the dflash2/ and mmproj/ companions, a
+        sibling quant and hf's staging tree. An rglob of the bucket counted the
+        companions twice (once in the core, once each) plus everything else there, and
+        the present 157 GB core pinned the bar at 98-99 % for the whole tail."""
+        from club3090_cockpit.data import WeightsMeta
+        cd = CockpitData(ROOT, runner=full_runner())
+        core = WeightsMeta(model="glm", variant="iq4xs", subdir="glm-gguf", size_gb=157.0,
+                           verify_glob="UD-IQ4_XS/*.gguf")
+        draft = WeightsMeta(model="glm", variant="dflash2", subdir="glm-gguf/dflash2", size_gb=0.7,
+                            verify_glob="GLM-DFlash2-Q4_K_M.gguf")
+        mmproj = WeightsMeta(model="glm", variant="mmproj", subdir="glm-gguf/mmproj", size_gb=1.13,
+                             verify_glob="mmproj-F16.gguf")
+        bucket = tmp_path / "glm-gguf"
+
+        def put(rel, nbytes):
+            p = bucket / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with open(p, "wb") as fh:
+                fh.truncate(nbytes)
+
+        put("UD-IQ4_XS/GLM-00001-of-00002.gguf", 78 * 10**9)       # the core, on disk
+        put("UD-IQ4_XS/GLM-00002-of-00002.gguf", 79 * 10**9)
+        put("UD-IQ3_XXS/GLM-00001-of-00001.gguf", 120 * 10**9)     # another quant in the bucket
+        put(".cache/huggingface/download/UD-IQ4_XS/GLM-00001-of-00002.gguf.metadata", 200)
+        put("dflash2/GLM-DFlash2-Q8_0.gguf", 1_250_000_000)         # an undeclared neighbour
+        # The core counts only its own files: not the companions, the other quant or staging.
+        assert cd.weights_bytes_on_disk(core, model_dir=str(tmp_path)) == 157 * 10**9
+        metas = [core, draft, mmproj]
+        done = cd.download_complete_at_start(metas, model_dir=str(tmp_path))
+        assert done == frozenset({("glm", "iq4xs")})
+        # Companions absent: the % is over the 1.83 GB still to fetch, not 158.83 GB.
+        assert cd.weights_download_progress_set(metas, model_dir=str(tmp_path),
+                                                complete_at_start=done) == 0
+        # The draft arrives (0.7 GB of 1.83) and mmproj is half-staged under .cache.
+        put("dflash2/GLM-DFlash2-Q4_K_M.gguf", 700_000_000)
+        put("mmproj/.cache/huggingface/download/mmproj-F16.gguf.3f9a2c.incomplete", 565_000_000)
+        assert cd.weights_download_progress_set(metas, model_dir=str(tmp_path),
+                                                complete_at_start=done) == 69    # 1.265 / 1.83
+        # Without the start baseline the same disk reads 99 % — the frozen bar of the report.
+        assert cd.weights_download_progress_set(metas, model_dir=str(tmp_path)) == 99
+        # A present core that is being re-fetched (it shows up in staging) rejoins the %.
+        put(".cache/huggingface/download/UD-IQ4_XS/GLM-00002-of-00002.gguf.77aa.incomplete", 10**9)
+        assert cd.weights_download_progress_set(metas, model_dir=str(tmp_path),
+                                                complete_at_start=done) == 99
+
+    def test_download_progress_counts_staging_once_nested_companion(self, tmp_path):
+        """A companion nested under the core's subdir is counted once in the set, not
+        once by each (#1508): the set sums DISTINCT files."""
+        from club3090_cockpit.data import WeightsMeta
+        cd = CockpitData(ROOT, runner=full_runner())
+        core = WeightsMeta(model="m", variant="core", subdir="b", size_gb=8.0, verify_glob="*.gguf")
+        comp = WeightsMeta(model="m", variant="comp", subdir="b", size_gb=2.0, verify_glob="*.gguf")
+        (tmp_path / "b").mkdir()
+        with open(tmp_path / "b" / "x.gguf", "wb") as fh:
+            fh.truncate(5 * 10**9)
+        assert cd.weights_download_progress_set([core, comp], model_dir=str(tmp_path)) == 50
 
     @pytest.mark.asyncio
     async def test_download_set_metas_includes_companions(self):
@@ -1834,25 +1974,34 @@ class TestGpuServiceDisplay:
 
 class TestServiceStart:
     """service_start: bring a stopped supporting service up via compose, mirroring
-    gpu-mode's compose_at (project pinned to the dir name; --env-file when present)."""
+    gpu-mode's compose_at (project pinned to the dir name; --env-file with the
+    resolved settings — test_settings_store.py covers the file itself)."""
 
     def test_compose_up_plan(self, tmp_path):
+        from club3090_cockpit.services import ROUTE_KEYS_FILE, SETTINGS_ENV_FILE
+
         _seed_service_dirs(tmp_path, ["litellm"])
         plan = CockpitData(tmp_path).service_start("litellm")
         # -p pins the project to the dir name (match gpu-mode so it operates on the
-        # SAME container, not a duplicate); no .env in tmp_path → --env-file omitted.
+        # SAME container, not a duplicate).  The env file — and the gateway's route
+        # keys file — are placeholders until the command runs (#1466): the plan may
+        # never run.
         assert plan.cmd == [
-            "docker", "compose", "-f",
+            "env", f"CLUB3090_LITELLM_ROUTE_KEYS={ROUTE_KEYS_FILE}",
+            "docker", "compose", "--env-file", SETTINGS_ENV_FILE, "-f",
             "services/litellm/docker-compose.yml", "-p", "litellm", "up", "-d"]
         # litellm is a non-GPU web service → skips the reconcile gate
         assert plan.requires_reconcile is False
         assert plan.kind == "service-up"
 
-    def test_env_file_included_when_present(self, tmp_path):
+    def test_env_file_is_the_settings_placeholder_not_the_repo_env(self, tmp_path):
+        from club3090_cockpit.services import SETTINGS_ENV_FILE
+
         _seed_service_dirs(tmp_path, ["comfyui"])
         (tmp_path / ".env").write_text("MODEL_DIR=/x\n")
         plan = CockpitData(tmp_path).service_start("comfyui")
-        assert plan.cmd[:4] == ["docker", "compose", "--env-file", ".env"]
+        assert plan.cmd[:4] == ["docker", "compose", "--env-file", SETTINGS_ENV_FILE]
+        assert ".env" not in plan.cmd
         assert plan.cmd[-4:] == ["-p", "comfyui", "up", "-d"]
 
     def test_yaml_spelling_fallback(self, tmp_path):
@@ -4279,9 +4428,10 @@ def test_api_booting_false_when_no_engine_running():
 
 
 class TestDirectorPlacement:
-    """director_device() reads STUDIO_DIRECTOR_DEVICE from the repo .env (default
-    gpu0); set_repo_env_var() upserts a key IN PLACE, preserving the rest of the
-    file — the c3 Settings 'Director placement' lever (CPU / GPU0 / GPU1)."""
+    """director_device() resolves STUDIO_DIRECTOR_DEVICE through the loader (the
+    store, then the legacy repo .env; default gpu0); store_settings() writes it to
+    club3090.env IN PLACE, preserving the rest of the file — the c3 Settings
+    'Director placement' lever (CPU / GPU0 / GPU1)."""
 
     def test_default_gpu0_when_unset(self, tmp_path):
         (tmp_path / ".env").write_text("MODEL_DIR=/mnt/models/huggingface\n")
@@ -4292,24 +4442,29 @@ class TestDirectorPlacement:
         assert CockpitData(tmp_path, runner=full_runner()).director_device() == "gpu0"
 
     def test_set_and_read_roundtrip_preserves_file(self, tmp_path):
-        (tmp_path / ".env").write_text("MODEL_DIR=/x\n# comment\nFOO=bar\n")
+        store = Path(os.environ["CLUB3090_CONFIG_DIR"]) / "club3090.env"
+        store.parent.mkdir(parents=True, exist_ok=True)
+        store.write_text("MODEL_DIR=/x\n# comment\nFOO=bar\n")
+        (tmp_path / ".env").write_text("STUDIO_DIRECTOR_DEVICE=gpu1\n")
         cd = CockpitData(tmp_path, runner=full_runner())
-        assert cd.set_repo_env_var("STUDIO_DIRECTOR_DEVICE", "cpu") is True
-        assert cd.director_device() == "cpu"
-        cd.set_repo_env_var("STUDIO_DIRECTOR_DEVICE", "gpu1")   # update in place
+        assert cd.store_settings({"STUDIO_DIRECTOR_DEVICE": "cpu"}) == store
+        assert cd.director_device() == "cpu"                    # the store beats the repo .env
+        cd.store_settings({"STUDIO_DIRECTOR_DEVICE": "gpu1"})   # update in place
         assert cd.director_device() == "gpu1"
-        txt = (tmp_path / ".env").read_text()
+        txt = store.read_text()
         assert txt.count("STUDIO_DIRECTOR_DEVICE=") == 1        # no duplicate
-        assert "MODEL_DIR=/x" in txt and "FOO=bar" in txt       # other lines kept
+        assert "MODEL_DIR=/x" in txt and "# comment" in txt and "FOO=bar" in txt   # kept
+        assert (tmp_path / ".env").read_text() == "STUDIO_DIRECTOR_DEVICE=gpu1\n"  # untouched
 
     def test_invalid_value_falls_back_gpu0(self, tmp_path):
         (tmp_path / ".env").write_text("STUDIO_DIRECTOR_DEVICE=bogus\n")
         assert CockpitData(tmp_path, runner=full_runner()).director_device() == "gpu0"
 
-    def test_creates_env_when_absent(self, tmp_path):
+    def test_creates_the_store_when_absent_never_the_repo_env(self, tmp_path):
         cd = CockpitData(tmp_path, runner=full_runner())
-        assert cd.set_repo_env_var("STUDIO_DIRECTOR_DEVICE", "cpu") is True
-        assert (tmp_path / ".env").is_file()
+        path = cd.store_settings({"STUDIO_DIRECTOR_DEVICE": "cpu"})
+        assert path.is_file() and path.name == "club3090.env"
+        assert not (tmp_path / ".env").exists()
         assert cd.director_device() == "cpu"
 
     def test_commented_line_ignored(self, tmp_path):
@@ -4372,6 +4527,50 @@ class TestServeOverrides:
         assert plan.env["MODEL_DIR"]                     # pinned (HF mount resolves)
         # no overrides → only the pinned MODEL_DIR rides
         assert cd.serve_generated("/tmp/x.yml").env == {"MODEL_DIR": cd.weights_model_dir()}
+
+    def test_serve_generated_gives_a_shared_cache_compose_its_dirs(self, tmp_path, monkeypatch):
+        """#1466 4a/4b — a brought compose (a clone of a vLLM sibling) mounts the shared
+        compile cache and the KV disk tier. c3's raw `docker compose up` must get the
+        same per-user dirs switch.sh would, created before compose runs (docker would
+        create them root:root), keyed by the image — and never pull at plan time."""
+        import shutil
+        import subprocess
+        if shutil.which("docker") is None or subprocess.run(
+                ["docker", "compose", "version"], capture_output=True).returncode != 0:
+            pytest.skip("docker compose not available (the helper renders the compose with it)")
+        repo_root = Path(__file__).resolve().parents[3]
+        compose = tmp_path / "models/m/vllm/compose/single/q/_brought-x.yml"
+        compose.parent.mkdir(parents=True)
+        compose.write_text(
+            "services:\n  s:\n    image: example/engine:1\n    volumes:\n"
+            "      - ${CLUB3090_ENGINE_CACHE_DIR:-../../../cache}/triton:/root/.triton/cache\n"
+            "      - ${KV_OFFLOAD_DIR:-${CLUB3090_DATA_DIR:-../../../../../..}/kv-offload}:/kv-offload\n",
+            encoding="utf-8")
+        monkeypatch.setenv("CLUB3090_CONFIG_DIR", str(tmp_path / "cfg"))
+        monkeypatch.setenv("CLUB3090_CACHE_DIR", str(tmp_path / "cache"))
+        monkeypatch.setenv("CLUB3090_DATA_DIR", str(tmp_path / "data"))
+        monkeypatch.delenv("KV_OFFLOAD_DIR", raising=False)
+        cd = CockpitData(repo_root, runner=full_runner())
+        from scripts.lib import engine_cache
+        calls = []
+
+        def fake_image_id(ref, docker_cmd, pull=True):
+            calls.append((ref, pull))
+            return "sha256:" + "ab" * 32 if ref == "example/engine:1" else None
+
+        monkeypatch.setattr(engine_cache, "image_id", fake_image_id)
+        plan = cd.serve_generated(str(compose))
+        keyed = tmp_path / "cache" / ("example-engine-1-" + "ab" * 6)
+        assert plan.env["CLUB3090_ENGINE_CACHE_DIR"] == str(keyed)
+        assert plan.env["CLUB3090_DATA_DIR"] == str(tmp_path / "data")
+        assert (keyed / "triton").is_dir() and (tmp_path / "data" / "kv-offload").is_dir()
+        assert calls == [("example/engine:1", False)]          # plan time: never a pull
+        assert plan.cmd == ["docker", "compose", "-f", str(compose), "up", "-d"]
+        # An image that isn't on the machine: nothing handed over, the in-repo default stays.
+        compose.write_text(compose.read_text(encoding="utf-8").replace("example/engine:1", "example/missing:2"),
+                           encoding="utf-8")
+        plan = cd.serve_generated(str(compose))
+        assert "CLUB3090_ENGINE_CACHE_DIR" not in plan.env
 
     def test_serve_override_defaults_parses_sibling_compose(self):
         repo_root = Path(__file__).resolve().parents[3]
@@ -4478,3 +4677,15 @@ class TestBringGgufDownload:
         d._download_runner = R()
         asyncio.run(d.run_bring_download("org/Repo", "vllm/dual"))
         assert cap["cmd"][:2] == ["bash", "scripts/pull.sh"]           # safetensors path unchanged
+
+
+def test_exllamav3_container_is_an_engine_in_the_stack_list():
+    """#1360: the cockpit's container list classifies by ENGINE_PREFIXES, which
+    lacked `tabbyapi-`, so an exllamav3 (TabbyAPI) server never appeared in it."""
+    from club3090_cockpit.services import _classify_container_kind
+
+    assert _classify_container_kind("tabbyapi-qwen38-flash-next-exl3-405") == "engine"
+    assert _classify_container_kind("exl3-custom") == "engine"
+    # Controls: widening the prefixes must not sweep in non-engines.
+    assert _classify_container_kind("open-webui") is None
+    assert _classify_container_kind("some-flask-app") is None

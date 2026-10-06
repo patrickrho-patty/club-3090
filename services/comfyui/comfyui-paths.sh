@@ -7,7 +7,7 @@
 #
 # Rule: COMFYUI_ROOT is a "comfyui" SIBLING of the HF cache (MODEL_DIR) — matching the
 # reference rig layout /mnt/models/{huggingface,comfyui}. Resolution order for MODEL_DIR:
-#   1. an explicit env / .env value (c3 Settings writes it to repo-root .env), else
+#   1. an explicit env value or a saved setting (club3090.env; the legacy repo .env is read too), else
 #   2. $HOME/models  → a USER-OWNED default, so a zero-config clone lands in a writable
 #      tree ($HOME/comfyui/models) instead of the rig's /mnt path → no "mkdir: Permission
 #      denied" (club-3090 #503; sumo report 2026-06-27). HOME-less shells keep /mnt.
@@ -15,47 +15,44 @@
 # Explicitly-set COMFYUI_ROOT / COMFYUI_MODELS_DIR are always respected. This file is also
 # the shared home for studio host helpers — c3_lan_ip / c3_ensure_comfy_models_dir (below).
 
-# 1. MODEL_DIR is configured in repo-root .env (c3 Settings writes it there). Pick it up
-#    if the caller hasn't already exported it. Resolve this file's repo root from its own
-#    location so it works whether sourced by an in-repo script or a symlinked launcher.
-#    (C3_PATHS_NO_ENV=1 skips the .env read — for tests / fully-explicit callers.)
+# 1. MODEL_DIR comes from the saved settings (club-3090 config, then the legacy repo-root .env).
+#    Pick it up if the caller hasn't already exported it. Resolve this file's repo root from its
+#    own location so it works whether sourced by an in-repo script or a symlinked launcher.
+#    (C3_PATHS_NO_ENV=1 skips the settings read AND the saves below — for tests /
+#    fully-explicit callers.)
 # Repo root (this file is services/comfyui/comfyui-paths.sh → ../.. = repo root). Exposed so the
-# studio helpers below (c3_resolve_lanip) can find the repo-root .env to read/persist config.
+# studio helpers below read the same settings (its legacy .env is one of them).
 C3_REPO_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../.." 2>/dev/null && pwd || true)"
-if [ -z "${C3_PATHS_NO_ENV:-}" ] && [ -n "$C3_REPO_ROOT" ]; then
-  _c3_env="$C3_REPO_ROOT/.env"
-  if [ -f "$_c3_env" ]; then
-    # MODEL_DIR (the studio's one knob) — env wins over .env.
-    if [ -z "${MODEL_DIR:-}" ]; then
-      # `|| true`: a no-match grep returns 1, which pipefail propagates → the
-      # assignment fails → a `set -e` caller (setup-ai-studio.sh) exits SILENTLY
-      # before it can auto-detect. MODEL_DIR is usually present so it rarely bit;
-      # LANIP (below) is usually absent, which is the #686 silent-no-op.
-      MODEL_DIR="$(grep -E '^MODEL_DIR=' "$_c3_env" 2>/dev/null | tail -1 | cut -d= -f2- || true)"
-      MODEL_DIR="${MODEL_DIR%\"}"; MODEL_DIR="${MODEL_DIR#\"}"   # strip optional surrounding quotes
-    fi
-    # LANIP for the printed URLs — pin it here when auto-detect can't pick the right NIC, or on
-    # hosts without `hostname -I` / `ip` (club-3090 #512). Env wins; auto-detect (c3_lan_ip) is the
-    # fallback when neither sets it.
-    if [ -z "${LANIP:-}" ]; then
-      LANIP="$(grep -E '^LANIP=' "$_c3_env" 2>/dev/null | tail -1 | cut -d= -f2- || true)"   # || true: see MODEL_DIR note above (#686)
-      LANIP="${LANIP%\"}"; LANIP="${LANIP#\"}"
-      [ -n "$LANIP" ] && export LANIP
-    fi
-    # HF_TOKEN for the roster downloads (gated repos) — env wins; the repo .env is
-    # where users naturally put it, and until now it was silently ignored by the
-    # HOST-side hf calls (only the composes read .env) — MoppelMat had to env-prefix
-    # the whole setup script (#686). Same read-then-export pattern as LANIP.
-    if [ -z "${HF_TOKEN:-}" ]; then
-      HF_TOKEN="$(grep -E '^HF_TOKEN=' "$_c3_env" 2>/dev/null | tail -1 | cut -d= -f2- || true)"
-      HF_TOKEN="${HF_TOKEN%\"}"; HF_TOKEN="${HF_TOKEN#\"}"
-      [ -n "$HF_TOKEN" ] && export HF_TOKEN
-    fi
+if [ -z "${C3_PATHS_NO_ENV:-}" ] && [ -n "$C3_REPO_ROOT" ] && [ -f "$C3_REPO_ROOT/scripts/lib/club-config.sh" ]; then
+  # Saved settings through the ONE loader (club-3090#1466): your club-3090 config
+  # (~/.config/club-3090/), then the repo .env. Only these three keys, so sourcing
+  # this file doesn't export every setting into the studio scripts. As before, an
+  # EMPTY exported value counts as unset here, hence `unset` inside each lookup.
+  # `|| true` on each: a missing key returns 1, which a `set -e` caller
+  # (setup-ai-studio.sh) would otherwise exit on SILENTLY (#686).
+  # shellcheck source=../../scripts/lib/club-config.sh
+  . "$C3_REPO_ROOT/scripts/lib/club-config.sh"
+  # MODEL_DIR — the studio's one knob.
+  if [ -z "${MODEL_DIR:-}" ]; then
+    MODEL_DIR="$(unset MODEL_DIR; club_config_get MODEL_DIR "$C3_REPO_ROOT" 2>/dev/null || true)"
   fi
-  unset _c3_env
+  # LANIP for the printed URLs — pin it when auto-detect can't pick the right NIC, or on
+  # hosts without `hostname -I` / `ip` (club-3090 #512). Auto-detect (c3_lan_ip) is the
+  # fallback when neither the env nor the settings set it.
+  if [ -z "${LANIP:-}" ]; then
+    LANIP="$(unset LANIP; club_config_get LANIP "$C3_REPO_ROOT" 2>/dev/null || true)"
+    [ -n "$LANIP" ] && export LANIP
+  fi
+  # HF_TOKEN for the roster downloads (gated repos). The HOST-side hf calls used to
+  # ignore it unless exported — MoppelMat had to env-prefix the whole setup script
+  # (#686). It belongs in ~/.config/club-3090/secrets.env; the repo .env still works.
+  if [ -z "${HF_TOKEN:-}" ]; then
+    HF_TOKEN="$(unset HF_TOKEN; club_config_get HF_TOKEN "$C3_REPO_ROOT" 2>/dev/null || true)"
+    [ -n "$HF_TOKEN" ] && export HF_TOKEN
+  fi
 fi
 
-# 2. Default MODEL_DIR only when neither the env nor .env set it. Prefer a USER-OWNED location
+# 2. Default MODEL_DIR only when neither the env nor the saved settings set it. Prefer a USER-OWNED location
 #    so a zero-config clone never targets the reference rig's /mnt path (which a normal user
 #    can't write → "mkdir: Permission denied", club-3090 #503). HOME-less contexts (some
 #    CI/root shells) keep the legacy /mnt default. An explicit MODEL_DIR always wins.
@@ -97,49 +94,101 @@ c3_lan_ip() {
   return 0
 }
 
-# Resolve LANIP for the printed URLs and PERSIST it to repo-root .env so it's stable + editable —
-# the .env is the source of truth (club-3090 #512). Precedence: shell-env / .env (loaded above) >
-# auto-detect. If auto-detected, write it to .env; if nothing can be detected, fall back to
-# localhost and tell the user to set LANIP in .env. Sets + exports the global LANIP. Always 0.
+# --- saving studio settings (club-3090#1466) -----------------------------------------------
+# LANIP, COMFYUI_ROOT and COMFYUI_OUTPUT_DIR are saved through the ONE writer (club_config_set)
+# into your club-3090 settings (club3090.env), which every checkout and `gpu-mode` read. They
+# used to be appended to / sed-edited in the repo-root .env. Rules, identical for all three:
+#   • write-if-absent — a value any settings file already holds (club3090.env, secrets.env,
+#     the legacy repo .env) is never replaced;
+#   • a value the CALLER set in its shell for this run is not saved (the shell is one launch);
+#   • nothing is written under C3_PATHS_NO_ENV=1;
+#   • a failed save is reported and never fatal — a `set -e` script sourcing this file must
+#     not exit silently (#686).
+
+# _c3_saved_setting KEY → the value a settings file holds, ignoring the environment (this file
+# exports derived values, and a parent's exports reach every child). Exit 1 when none does.
+_c3_saved_setting() {
+  type club_config_get >/dev/null 2>&1 || return 1
+  ( unset "$1"; club_config_get "$1" "$C3_REPO_ROOT" ) 2>/dev/null
+}
+
+# The file saved settings go to, for messages.
+_c3_settings_file() {
+  if type club_config_dir >/dev/null 2>&1; then printf '%s/club3090.env' "$(club_config_dir)"
+  else printf 'your club-3090 settings (club3090.env)'; fi
+}
+
+# _c3_save_setting KEY=VALUE → 0 when saved; otherwise says why on stderr and returns 1.
+_c3_save_setting() {
+  local err
+  if ! type club_config_set >/dev/null 2>&1; then
+    echo "  ⚠ couldn't save ${1%%=*}: the settings writer (scripts/lib/club-config.sh) isn't available here." >&2
+    return 1
+  fi
+  if err="$(club_config_set "$1" 2>&1)"; then return 0; fi
+  echo "  ⚠ couldn't save ${1%%=*} to $(_c3_settings_file): $(printf '%s\n' "$err" | tail -n 1)" >&2
+  return 1
+}
+
+# Resolve LANIP for the printed URLs and SAVE it, so it's stable + editable (club-3090 #512).
+# Precedence: shell env / saved settings (read above) > auto-detect. An auto-detected IP is
+# saved to club3090.env (write-if-absent, see the rules above); if nothing can be detected,
+# fall back to localhost and tell the user where to set LANIP. Sets + exports the global
+# LANIP. Always 0.
 c3_resolve_lanip() {
-  if [ -n "${LANIP:-}" ]; then export LANIP; return 0; fi   # already pinned (env or .env)
-  local ip env_file="${C3_REPO_ROOT:-.}/.env"
+  if [ -n "${LANIP:-}" ]; then export LANIP; return 0; fi   # already pinned (env or saved settings)
+  local ip
   ip="$(c3_lan_ip)"
   if [ -n "$ip" ]; then
     LANIP="$ip"; export LANIP
-    if touch "$env_file" 2>/dev/null; then                  # materialize into .env (upsert)
-      if grep -qE '^LANIP=' "$env_file" 2>/dev/null; then
-        sed -i "s|^LANIP=.*|LANIP=$ip|" "$env_file" 2>/dev/null || true
-      else
-        printf 'LANIP=%s\n' "$ip" >> "$env_file" 2>/dev/null || true
-      fi
-      echo "  ✔ LAN IP $ip detected and saved to .env (edit it there if it picked the wrong NIC)." >&2
+    if [ -z "${C3_PATHS_NO_ENV:-}" ] && ! _c3_saved_setting LANIP >/dev/null \
+       && _c3_save_setting "LANIP=$ip"; then
+      echo "  ✔ LAN IP $ip detected and saved to $(_c3_settings_file) (edit LANIP there if it picked the wrong NIC)." >&2
     fi
     return 0
   fi
   LANIP="localhost"; export LANIP                            # couldn't detect → ask the user
   echo "  ⚠ Couldn't auto-detect your LAN IP — browser media links will use 'localhost'." >&2
-  echo "    Set it in $env_file so links open from other devices:   LANIP=<your-machine-ip>" >&2
+  echo "    Set LANIP=<your-machine-ip> in $(_c3_settings_file) so links open from other devices." >&2
   return 0
 }
 
-# Persist the resolved COMFYUI_ROOT + COMFYUI_OUTPUT_DIR to repo-root .env so the studio composes —
-# launched as `sudo docker compose --env-file .env` — mount the SAME trees this shell derives.
-# Without this, the vars are derived in-shell but stripped by sudo AND absent from .env, so:
+# Save the resolved COMFYUI_ROOT + COMFYUI_OUTPUT_DIR so the studio composes — launched by gpu-mode
+# as `sudo docker compose --env-file <a copy of your saved settings>` — mount the SAME trees this
+# shell derives. Without this, the vars are derived in-shell but stripped by sudo AND absent
+# from the settings, so:
 #   • `${COMFYUI_ROOT:-/mnt/models/comfyui}/models` falls back to /mnt → ComfyUI model dropdowns come
 #     up EMPTY (loaders 400 "not in []"; HiDream node "not installed"). club-3090 #510 + #530.
 #   • `${COMFYUI_OUTPUT_DIR:-/mnt/models/comfyui/output}` (gallery :8189 + orchestrator / tts /
 #     step-voice / production) falls back to /mnt → generated renders 404 in the gallery / don't show
 #     in OWUI, while ComfyUI writes them to $COMFYUI_ROOT/output. club-3090 #510 follow-on.
-# Write-if-absent PER VAR: never clobbers a hand-set value, and — critically — adds COMFYUI_OUTPUT_DIR
-# for users who already have COMFYUI_ROOT pinned from #531 (don't gate on ROOT presence). No-op under
-# C3_PATHS_NO_ENV / unwritable .env.
+# Write-if-absent PER VAR (the rules above): never clobbers a saved value, and — critically — adds
+# COMFYUI_OUTPUT_DIR for users who already have COMFYUI_ROOT saved from #531 (don't gate on ROOT
+# presence). No-op under C3_PATHS_NO_ENV.
+#
+# "Set by the caller's shell" can't be read off the environment here: this file exports the values
+# it derives, and a parent studio script's exports reach every child that sources it again. So a
+# value is treated as the caller's own one-launch override when it differs from what this file
+# derives — COMFYUI_ROOT from MODEL_DIR, COMFYUI_OUTPUT_DIR from the saved COMFYUI_ROOT — and such
+# a value is not saved. The second rule also keeps an output dir derived from a shell-only root
+# from being saved next to a different saved root (renders would 404 again, #510).
 c3_persist_comfy_root() {
   [ -n "${C3_PATHS_NO_ENV:-}" ] && return 0
-  local env_file="${C3_ENV_FILE:-${C3_REPO_ROOT:-.}/.env}"
-  touch "$env_file" 2>/dev/null || return 0
-  grep -qE '^COMFYUI_ROOT='       "$env_file" 2>/dev/null || printf 'COMFYUI_ROOT=%s\n'       "$COMFYUI_ROOT"       >> "$env_file" 2>/dev/null || true
-  grep -qE '^COMFYUI_OUTPUT_DIR=' "$env_file" 2>/dev/null || printf 'COMFYUI_OUTPUT_DIR=%s\n' "$COMFYUI_OUTPUT_DIR" >> "$env_file" 2>/dev/null || true
+  local saved_root saved=""
+  if ! saved_root="$(_c3_saved_setting COMFYUI_ROOT)"; then
+    saved_root=""
+    if [ "$COMFYUI_ROOT" = "$(dirname "$MODEL_DIR")/comfyui" ] && _c3_save_setting "COMFYUI_ROOT=$COMFYUI_ROOT"; then
+      saved_root="$COMFYUI_ROOT"; saved="COMFYUI_ROOT"
+    fi
+  fi
+  if [ -n "$saved_root" ] && [ "$COMFYUI_OUTPUT_DIR" = "$saved_root/output" ] \
+     && ! _c3_saved_setting COMFYUI_OUTPUT_DIR >/dev/null \
+     && _c3_save_setting "COMFYUI_OUTPUT_DIR=$COMFYUI_OUTPUT_DIR"; then
+    saved="${saved:+$saved + }COMFYUI_OUTPUT_DIR"
+  fi
+  if [ -n "$saved" ]; then
+    echo "  ✔ saved $saved to $(_c3_settings_file) so the studio containers mount the same tree." >&2
+  fi
   return 0
 }
 
@@ -153,7 +202,7 @@ c3_ensure_comfy_models_dir() {
   echo "ERROR: ComfyUI models dir is not writable: $COMFYUI_MODELS_DIR" >&2
   echo "       Set MODEL_DIR to a writable location and retry, e.g.:" >&2
   echo "         MODEL_DIR=\"\$HOME/models\" $(basename "${0:-this script}")" >&2
-  echo "       (or set COMFYUI_MODELS_DIR directly; c3 Settings writes MODEL_DIR to repo .env)." >&2
+  echo "       (or set COMFYUI_MODELS_DIR directly; MODEL_DIR is saved in $(_c3_settings_file))." >&2
   exit 1
 }
 

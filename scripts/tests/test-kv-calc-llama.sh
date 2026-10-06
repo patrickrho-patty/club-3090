@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export CLUB3090_CONFIG_DIR=/nonexistent/club-3090-test-config   # tests never read your real settings (#1466)
 
 # Force Python's UTF-8 mode (PEP 540) for every python3 this script runs.
 # (Same contract as test-kv-calc-fit.sh; guarded by test-locale-utf8.sh.)
@@ -146,11 +147,18 @@ check("unflipped (dual) llama slug stays unknown/SKIP",
       res_skip.get("verdict") == "unknown", json.dumps(res_skip))
 
 # ---------------------------------------------------------------------------
-# 5. vLLM path byte-unchanged (golden captured before the llama work landed)
+# 5. vLLM path golden (captured before the llama work landed)
 # ---------------------------------------------------------------------------
+# ⚠️ 19.881 -> 20.418 on 2026-09-15 (club-3090#1328). This is NOT drift and NOT a
+# regression in the llama work: the built-in MTP head was found to be a 17th
+# KV-BEARING layer (measured state<->KV exchange 2,253.2 tok/slot against a
+# 16-layer prediction of 2,394 — exactly 17/16), so per-token KV rose 6.25% on
+# every drafter compose and the estimate moved TOWARD the measured 23.60 GB.
+# The verdict CATEGORY is unchanged (fits-clean); only the estimate moved.
+# Re-baseline this literal whenever the KV math legitimately changes, and say why.
 golden = kv.fit_verdict("vllm/dual", "rtx3090", 24)
 check("vllm/dual golden verdict unchanged",
-      golden == {"verdict": "fits-clean", "vram_est_gb": 19.881,
+      golden == {"verdict": "fits-clean", "vram_est_gb": 20.418,
                  "band_gb": 1.5, "max_ctx": 262144}, json.dumps(golden))
 
 if failures:

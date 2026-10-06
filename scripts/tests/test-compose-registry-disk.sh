@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export CLUB3090_CONFIG_DIR=/nonexistent/club-3090-test-config   # tests never read your real settings (#1466)
 
 # Force Python's UTF-8 mode (PEP 540) for every python3 this script runs.
 # Repo sources are full of unicode (— × → ⚠), and without this a rig on a real
@@ -35,8 +36,8 @@ def check(cond, msg):
         print(f"FAIL: {msg}")
         failures.append(msg)
 
-check(len(COMPOSE_REGISTRY) == 111, f"registry expects 111 entries (got {len(COMPOSE_REGISTRY)})")
-check(len(disk_paths) == 112, f"disk expects 112 compose files (got {len(disk_paths)})")
+check(len(COMPOSE_REGISTRY) == 170, f"registry expects 170 entries (got {len(COMPOSE_REGISTRY)})")
+check(len(disk_paths) == 173, f"disk expects 173 compose files (got {len(disk_paths)})")
 check(registry_paths <= disk_paths, "all registry compose_path values exist on disk")
 parked_disk_only = disk_paths - registry_paths
 # Disk-only (non-registry) composes allowed: parked SGLang archives, plus the experimental

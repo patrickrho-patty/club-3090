@@ -28,78 +28,98 @@ model_list:
       model: openai/deepseek-v4-flash
       api_base: http://host.docker.internal:8030/v1
       api_key: EMPTY
+      allowed_openai_params: [reasoning_effort]
 
   - model_name: gemma-4-12b-int8
     litellm_params:
       model: openai/gemma-4-12b-int8
       api_base: http://host.docker.internal:8038/v1
       api_key: EMPTY
+      allowed_openai_params: [reasoning_effort]
 
   - model_name: gemma-4-31b
     litellm_params:
       model: openai/gemma-4-31b
       api_base: http://host.docker.internal:8032/v1
       api_key: EMPTY
+      allowed_openai_params: [reasoning_effort]
 
   - model_name: gemma-4-31b-autoround
     litellm_params:
       model: openai/gemma-4-31b-autoround
       api_base: http://host.docker.internal:8032/v1
       api_key: EMPTY
+      allowed_openai_params: [reasoning_effort]
 
   - model_name: gemma-4-31b-qat-awq-int4
     litellm_params:
       model: openai/gemma-4-31b-qat-awq-int4
       api_base: http://host.docker.internal:8032/v1
       api_key: EMPTY
+      allowed_openai_params: [reasoning_effort]
 
   - model_name: glm-5.3-flash  # status: experimental
     litellm_params:
       model: openai/glm-5.3-flash
       api_base: http://host.docker.internal:8119/v1
       api_key: EMPTY
+      allowed_openai_params: [reasoning_effort]
+
+  - model_name: mimo-v2.6-9b
+    litellm_params:
+      model: openai/mimo-v2.6-9b
+      api_base: http://host.docker.internal:8094/v1
+      api_key: EMPTY
+      allowed_openai_params: [reasoning_effort]
 
   - model_name: qwen3.6-27b
     litellm_params:
       model: openai/qwen3.6-27b
       api_base: http://host.docker.internal:8010/v1
       api_key: EMPTY
+      allowed_openai_params: [reasoning_effort]
 
   - model_name: qwen3.6-27b-autoround
     litellm_params:
       model: openai/qwen3.6-27b-autoround
       api_base: http://host.docker.internal:8010/v1
       api_key: EMPTY
+      allowed_openai_params: [reasoning_effort]
 
   - model_name: qwen3.6-35b-a3b-autoround
     litellm_params:
       model: openai/qwen3.6-35b-a3b-autoround
       api_base: http://host.docker.internal:8051/v1
       api_key: EMPTY
+      allowed_openai_params: [reasoning_effort]
 
   - model_name: deckard-40b
     litellm_params:
       model: openai/deckard-40b
       api_base: http://host.docker.internal:8199/v1
       api_key: EMPTY
+      allowed_openai_params: [reasoning_effort]
 
   - model_name: qwen3.8-27b  # status: experimental
     litellm_params:
       model: openai/qwen3.8-27b
       api_base: http://host.docker.internal:8091/v1
       api_key: EMPTY
+      allowed_openai_params: [reasoning_effort]
 
   - model_name: qwen3.8-27b-fp8  # status: experimental
     litellm_params:
       model: openai/qwen3.8-27b-fp8
       api_base: http://host.docker.internal:8091/v1
       api_key: EMPTY
+      allowed_openai_params: [reasoning_effort]
 
   - model_name: qwen3.8-flash-next  # status: experimental
     litellm_params:
       model: openai/qwen3.8-flash-next
       api_base: http://host.docker.internal:8122/v1
       api_key: EMPTY
+      allowed_openai_params: [reasoning_effort]
 
   # === END GENERATED LOCAL BLOCK ===
 
@@ -112,6 +132,7 @@ model_list:
       model: openai/agents-a1
       api_base: http://host.docker.internal:8072/v1
       api_key: EMPTY
+      allowed_openai_params: [reasoning_effort]   # route shape: see scripts/lib/litellm_sync.py ROUTE_PARAMS
 
   # (The old gemma-4-12b :8069 llama.cpp "chat brain" route was retired 2026-06-23 with the
   #  ai-studio consolidation — the studio uses the qwen director only.)
@@ -122,30 +143,20 @@ model_list:
   # (vllm/gemma-a4b-awq, :8042) is not a gpu-mode primary; add a route here if
   # it gets promoted.
 
-  # === Cloud reference endpoint (DashScope MaaS workspace, OpenAI-compatible) ===
-  # Qwen 3.8 Max Preview — first CLOUD reference for benchlocal-cli quality runs
-  # (all prior references were local composes). Same endpoint pi uses.
-  #
-  # Thinking-only model: upstream REJECTS enable_thinking=false ("The value of the
-  # enable_thinking parameter is restricted to True"), so the "thinking-off" arm is
-  # realized as thinking_budget=1 (~1 reasoning token) via the -nothink alias's
-  # extra_body — NOT enable_thinking=false. reasoning_effort is accepted but ignored.
-  #
-  # Rate limits prescribed to us: 500K TPM / 120 RPM per person, no token cap.
-  # rpm/tpm below make LiteLLM pace/queue BEFORE the upstream 429s (with ~8% headroom).
-  - model_name: qwen3.8-max
-    litellm_params:
-      model: openai/qwen3.8-max-preview
-      api_base: https://ws-rcka3ndnpjlt5fku.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1
-      api_key: os.environ/DASHSCOPE_API_KEY
-      rpm: 110
-      tpm: 480000
-  # "Thinking-off" arm: identical upstream, but thinking clamped to 1 token.
-  - model_name: qwen3.8-max-nothink
-    litellm_params:
-      model: openai/qwen3.8-max-preview
-      api_base: https://ws-rcka3ndnpjlt5fku.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1
-      api_key: os.environ/DASHSCOPE_API_KEY
-      rpm: 110
-      tpm: 480000
-      extra_body: {"thinking_budget": 1}
+  # This rig's own routes (cloud endpoints, private services) do NOT go in this
+  # tracked catalog: put them in litellm/config.local.yaml in your club-3090 config
+  # dir (~/.config/club-3090/; see config.local.yaml.example) and their keys in
+  # secrets.env there. litellm-sync merges them into the runtime view the gateway
+  # serves. Older installs kept them in services/litellm/config.local.yaml and
+  # services/litellm/local.env, which are still read.
+
+# Gateway-wide behaviour (hand-maintained; outside the generated blocks, so both
+# the catalog view and the runtime view litellm-sync renders carry it).
+litellm_settings:
+  # A coding agent's turn can be a long cold prefill plus a 32K-token reply at
+  # ~70 tok/s — well past a short default. The client (omp, claude) owns the real
+  # timeout; the gateway must not cut the request first.
+  request_timeout: 1800
+  # Never re-send a failed request: on a local GPU a retry repeats the whole
+  # prefill, doubling the wait, and it lands on a server that just failed.
+  num_retries: 0

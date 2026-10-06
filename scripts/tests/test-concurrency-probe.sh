@@ -5,6 +5,7 @@
 # without one: syntax, SWEEP-needs-SLUG, SWEEP_DRY reboot plans, --sweep dry
 # plans (no SLUG, no reboot), planner clips, and the card renderer.
 set -euo pipefail
+export CLUB3090_CONFIG_DIR=/nonexistent/club-3090-test-config   # tests never read your real settings (#1466)
 
 # Force Python UTF-8 mode (PEP 540) before the first python3 call (#779).
 export PYTHONUTF8="${PYTHONUTF8:-1}"
@@ -194,5 +195,276 @@ command grep -q "WARMUP: waiting" <<<"$out" || fail "gate should announce it is 
 command grep -q "not ready" <<<"$out" || fail "gate should report the not-ready abort"
 command grep -q "FATAL: --sweep cannot detect" <<<"$out" && fail "gate must abort BEFORE slot detection"
 echo "  ✓ --sweep WARMUP gate: opt-in, dry-skips, default-silent, fails closed"
+
+
+# #1502 (1): a skipped cell killed the sweep. emit_row ran `python3 - <<'PY'`, so the row piped into it
+# was replaced by the heredoc on stdin, json.loads("") raised and set -e ended the run before the card.
+# Run the REAL emit_row on a row, and guard every call site against piping into it again.
+EMIT_DIR="$(mktemp -d)"
+emit_fn="$(awk '/^  emit_row\(\) \{$/{f=1} f{print} f&&/^  \}$/{exit}' "$PROBE")"
+[[ -n "$emit_fn" ]] || fail "emit_row() not found in concurrency-probe.sh"
+set +e
+out="$(cells_jsonl="$EMIT_DIR/cells.jsonl" bash -euo pipefail -c "$emit_fn"$'\n''emit_row "{\"ctx\":32768,\"n\":8,\"skip\":\"KV pool\"}"; echo "rc=$?"' 2>&1)"
+set -e
+[[ "$out" == *"rc=0"* ]] || fail "emit_row failed on a skipped-cell row (the #1502 crash): $out"
+python3 -c 'import json,sys; r=json.loads(open(sys.argv[1]).read()); assert r=={"ctx":32768,"n":8,"skip":"KV pool"}, r' \
+  "$EMIT_DIR/cells.jsonl" 2>/dev/null || fail "emit_row wrote the wrong row: $(cat "$EMIT_DIR/cells.jsonl" 2>/dev/null)"
+command grep -nE '\|[[:space:]]*emit_row' "$PROBE" && fail "a call site pipes into emit_row — its stdin is the heredoc (#1502)"
+[[ "$(command grep -cE '^[[:space:]]+emit_row "' "$PROBE")" == 3 ]] \
+  || fail "expected the 3 skip paths (budget, clipped, early-stop) to pass their row as an argument"
+rm -rf "$EMIT_DIR"
+echo "  ✓ emit_row records a skipped cell (row as an argument; no call site pipes into it)"
+
+# #1502 (2): VRAM and the GPU label belong to the probed container's GPUs, not the host's. The
+# reporter's rig: 3× RTX 3090 (an unrelated service on them) + 1× RTX 3060 for the container.
+# Stub nvidia-smi and `docker inspect` (ahead of the estate-safe docker shim) and ask the library.
+GPU_STUB="$(mktemp -d)"
+cat > "$GPU_STUB/nvidia-smi" <<'SMI'
+#!/usr/bin/env bash
+cat <<'ROWS'
+0, GPU-aaaa0000-0000-0000-0000-000000000000, NVIDIA GeForce RTX 3090, 15000
+1, GPU-aaaa1111-0000-0000-0000-000000000000, NVIDIA GeForce RTX 3090, 14938
+2, GPU-aaaa2222-0000-0000-0000-000000000000, NVIDIA GeForce RTX 3090, 15000
+3, GPU-bbbb3333-0000-0000-0000-000000000000, NVIDIA GeForce RTX 3060, 10381
+ROWS
+SMI
+cat > "$GPU_STUB/docker" <<'DOCK'
+#!/usr/bin/env bash
+[ "$1" = inspect ] || exit 0
+case "$2" in
+  pinned-ids)  echo '[{"HostConfig":{"DeviceRequests":[{"Count":0,"DeviceIDs":["3"]}]},"Config":{"Env":[]}}]' ;;
+  pinned-uuid) echo '[{"HostConfig":{"DeviceRequests":[{"Count":0,"DeviceIDs":["GPU-bbbb3333-0000-0000-0000-000000000000"]}]},"Config":{"Env":[]}}]' ;;
+  pinned-env)  echo '[{"HostConfig":{"DeviceRequests":[{"Count":-1,"DeviceIDs":null}]},"Config":{"Env":["NVIDIA_VISIBLE_DEVICES=3"]}}]' ;;
+  pinned-joined) echo '[{"HostConfig":{"DeviceRequests":[{"Count":0,"DeviceIDs":["2,3"]}]},"Config":{"Env":[]}}]' ;;
+  sees-all)    echo '[{"HostConfig":{"DeviceRequests":[{"Count":-1,"DeviceIDs":null}]},"Config":{"Env":["NVIDIA_VISIBLE_DEVICES=all"]}}]' ;;
+  *) echo "Error: No such object: $2" >&2; exit 1 ;;
+esac
+DOCK
+chmod +x "$GPU_STUB/nvidia-smi" "$GPU_STUB/docker"
+scope() {  # scope <container> -> "<label>|<vram MB>|<selectors>"
+  PATH="$GPU_STUB:$PATH" python3 - "$ROOT_DIR/scripts/lib" "$1" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+import concurrency_probe as c
+sel, _ = c.container_gpus(sys.argv[2])
+print(f"{c.gpu_label(sel)}|{c.vram_used_mb(sel)}|{sel}")
+PY
+}
+for ctr in pinned-ids pinned-uuid pinned-env; do
+  got="$(scope "$ctr")"
+  [[ "$got" == "1× GeForce RTX 3060|10381|"* ]] || fail "container $ctr (the RTX 3060 only): got '$got', want 1× GeForce RTX 3060 and 10381 MB"
+done
+# device_ids: ["${ESTATE_GPUS}"] with ESTATE_GPUS=2,3 reaches docker as ONE entry "2,3" (#1537).
+got="$(scope pinned-joined)"
+[[ "$got" == "1× GeForce RTX 3090 + 1× GeForce RTX 3060|25381|"* ]] \
+  || fail "a comma-joined DeviceIDs entry (\"2,3\") must scope to GPUs 2 and 3: got '$got'"
+got="$(scope sees-all)"
+[[ "$got" == "3× GeForce RTX 3090 + 1× GeForce RTX 3060|55319|None" ]] \
+  || fail "a container that sees every GPU should cover all four, labelled by name: got '$got'"
+got="$(scope no-such-container)"
+[[ "$got" == *"|55319|None" ]] || fail "an unresolvable container falls back to rig-wide: got '$got'"
+got="$(PATH="$GPU_STUB:$PATH" CONTAINER=pinned-ids python3 "$LIB" --gpu-label)"
+[[ "$got" == "1× GeForce RTX 3060" ]] || fail "--gpu-label (the card's GPU field) for the 3060 container: got '$got'"
+rm -rf "$GPU_STUB"
+echo "  ✓ VRAM + GPU label scoped to the container's GPUs (ids, UUIDs, NVIDIA_VISIBLE_DEVICES; rig-wide fallback)"
+
+# #1537: the card's container and spec label. An SGLang container was never found (name
+# heuristic `vllm-(qwen|gemma)`), so its card listed every host GPU and "spec ?"; a vLLM compose that
+# builds --speculative-config in its entrypoint from SPEC_N read "spec off" with MTP n=4 running.
+SPEC_STUB="$(mktemp -d)"
+cat > "$SPEC_STUB/docker" <<'DOCK'
+#!/usr/bin/env bash
+case "$1" in
+  ps)
+    echo "sglang-qwen38-27b-mtp-single|0.0.0.0:8144->30000/tcp, [::]:8144->30000/tcp"
+    echo "other|0.0.0.0:18144->8000/tcp"
+    echo "vllm-qwen38-27b-single-fast|0.0.0.0:8117->8000/tcp" ;;
+  logs)
+    case "$2" in
+      vllm-mtp)
+        # The engine-config line sits at the HEAD of the log, then 3000 lines of traffic: a
+        # --tail 2500 read (what --detect-kv does) would never see it.
+        echo "INFO [core.py:123] Initializing a V1 LLM engine (v0.30.0) with config: model='/m', speculative_config=SpeculativeConfig(method='mtp', model='/m', num_spec_tokens=4), tokenizer=/m"
+        for i in $(seq 1 3000); do echo "INFO [loggers.py] Engine 000: Avg generation throughput: 80.0 tokens/s, Running: 1 reqs, Waiting: 0 reqs"; done ;;
+      vllm-off) echo "INFO Initializing a V1 LLM engine (v0.30.0) with config: model='/m', speculative_config=None, tokenizer=/m" ;;
+      *) exit 1 ;;
+    esac ;;
+  *) exit 0 ;;
+esac
+DOCK
+chmod +x "$SPEC_STUB/docker"
+got="$(PATH="$SPEC_STUB:$PATH" URL=http://localhost:8144 python3 "$LIB" --container-for-url)"
+[[ "$got" == "sglang-qwen38-27b-mtp-single" ]] || fail "--container-for-url :8144 should find the SGLang container: got '$got'"
+got="$(PATH="$SPEC_STUB:$PATH" URL=http://localhost:9999 python3 "$LIB" --container-for-url)"
+[[ -z "$got" ]] || fail "--container-for-url on a port nobody publishes must be empty: got '$got'"
+got="$(PATH="$SPEC_STUB:$PATH" CONTAINER=vllm-mtp URL=http://127.0.0.1:9 python3 "$LIB" --spec-label)"
+[[ "$got" == "MTP n=4" ]] || fail "--spec-label from vLLM's engine-config line at the log head: got '$got', want 'MTP n=4'"
+got="$(PATH="$SPEC_STUB:$PATH" CONTAINER=vllm-off URL=http://127.0.0.1:9 python3 "$LIB" --spec-label)"
+[[ "$got" == "spec off" ]] || fail "--spec-label for speculative_config=None: got '$got', want 'spec off'"
+got="$(PATH="$SPEC_STUB:$PATH" CONTAINER=no-such URL=http://127.0.0.1:9 python3 "$LIB" --spec-label)"
+[[ -z "$got" ]] || fail "--spec-label with nothing readable must be empty (the script then falls back to flags): got '$got'"
+
+# SGLang: the label comes from /get_server_info. A local stand-in serves the shape our MTP composes
+# report (EAGLE over the target's own checkpoint).
+SGL_PORT="$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')"
+python3 -c '
+import json, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+INFO = {"model_path": "/models/q", "speculative_algorithm": "EAGLE",
+        "speculative_draft_model_path": "/models/q", "speculative_num_steps": 4}
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        ok = self.path == "/get_server_info"
+        self.send_response(200 if ok else 404)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(INFO if ok else {}).encode())
+    def log_message(self, *a):
+        pass
+HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+' "$SGL_PORT" &
+SGL_PID=$!
+for _ in $(seq 1 50); do curl -s -m 1 "http://127.0.0.1:$SGL_PORT/get_server_info" >/dev/null 2>&1 && break; sleep 0.1; done
+got="$(PATH="$SPEC_STUB:$PATH" CONTAINER= URL="http://127.0.0.1:$SGL_PORT" python3 "$LIB" --spec-label)"
+kill "$SGL_PID" 2>/dev/null || true
+wait "$SGL_PID" 2>/dev/null || true
+[[ "$got" == "MTP n=4" ]] || fail "--spec-label from SGLang's server info: got '$got', want 'MTP n=4'"
+
+# The script must USE the two helpers (the library being right is no help if the card never asks it).
+command grep -qF -- '--container-for-url' "$PROBE" || fail "concurrency-probe.sh no longer resolves CONTAINER from URL's port"
+command grep -qF -- '--spec-label' "$PROBE" || fail "concurrency-probe.sh's _spec_fp no longer asks the engine"
+rm -rf "$SPEC_STUB"
+echo "  ✓ container found by URL port (any engine); spec label from the engine (vLLM log head, SGLang server info)"
+
+# #1537 follow-up: the KV pool, the slot count's source and the recommendation's knob names.
+# xtj7's cards read "KV ?" on both engines, the SGLang sweep header said "slots=4 (undetected)"
+# with the count right, and the SGLang recommendation said MAX_NUM_SEQS (a vLLM knob).
+got="$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import concurrency_probe as c; print(c.parse_kv_tokens_text("[2026-10-05] max_total_num_tokens=1059144, chunked_prefill_size=2048"))' "$ROOT_DIR/scripts/lib")"
+[[ "$got" == "1059144" ]] || fail "SGLang's max_total_num_tokens boot line should parse as the KV pool: got '$got'"
+
+KV_STUB="$(mktemp -d)"
+cat > "$KV_STUB/docker" <<'DOCK'
+#!/usr/bin/env bash
+case "$1" in
+  logs)
+    if [ "$2" = "--tail" ]; then
+      # The --tail window holds only traffic: the boot line has scrolled out of it.
+      for i in $(seq 1 50); do echo "INFO Engine 000: Running: 1 reqs, Waiting: 0 reqs"; done
+    else
+      echo "INFO [kv_cache_utils.py] GPU KV cache size: 1,019,004 tokens, Maximum concurrency for 262,144 tokens per request: 3.89x"
+      for i in $(seq 1 3000); do echo "INFO Engine 000: Running: 1 reqs, Waiting: 0 reqs"; done
+    fi ;;
+  *) exit 0 ;;
+esac
+DOCK
+chmod +x "$KV_STUB/docker"
+got="$(PATH="$KV_STUB:$PATH" CONTAINER=vllm-long-running URL=http://127.0.0.1:9 python3 "$LIB" --detect-kv)"
+[[ "$got" == "1019004" ]] || fail "--detect-kv must fall back to the log head when the boot line left the --tail window: got '$got'"
+
+# SGLang: KV and the slot source both come from /get_server_info. Drive the real script (dry sweep)
+# against a local stand-in, so the header line users see is what's asserted.
+SGL2_PORT="$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')"
+python3 -c '
+import json, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+INFO = {"model_path": "/m", "max_running_requests": 4, "max_total_num_tokens": 547147,
+        "speculative_algorithm": None}
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        ok = self.path == "/get_server_info"
+        self.send_response(200 if ok else 404)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(INFO if ok else {}).encode())
+    def log_message(self, *a):
+        pass
+HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+' "$SGL2_PORT" &
+SGL2_PID=$!
+for _ in $(seq 1 50); do curl -s -m 1 "http://127.0.0.1:$SGL2_PORT/get_server_info" >/dev/null 2>&1 && break; sleep 0.1; done
+got_kv="$(PATH="$KV_STUB:$PATH" CONTAINER= URL="http://127.0.0.1:$SGL2_PORT" python3 "$LIB" --detect-kv)"
+hdr="$(URL="http://127.0.0.1:$SGL2_PORT" N_LIST="1 2 4" CTX_SWEEP="1k" SWEEP_DRY=1 bash "$PROBE" --sweep 2>&1 | head -1)"
+kill "$SGL2_PID" 2>/dev/null || true
+wait "$SGL2_PID" 2>/dev/null || true
+rm -rf "$KV_STUB"
+[[ "$got_kv" == "547147" ]] || fail "--detect-kv from SGLang's server info: got '$got_kv', want 547147"
+[[ "$hdr" == *"slots=4 (server max_running_requests)"* ]] || fail "sweep header should name the slot source: got '$hdr'"
+[[ "$hdr" == *"KV=547147"* ]] || fail "sweep header should carry SGLang's KV pool: got '$hdr'"
+
+card_sgl="$(python3 "$LIB" --card <<'JSON'
+{
+  "model": "qwen3.8-27b", "slug": "sgl/qwen38-27b-single-fast", "spec": "MTP n=4",
+  "gpus": "1× CMP 170HX", "kv_tokens": 1059144, "slots": 4, "served_max_len": null,
+  "engine": "sglang", "gen_tokens": 256, "cache": "shared 75%",
+  "command": "bash scripts/concurrency-probe.sh --sweep",
+  "rows": [
+    {"ctx": 1024, "n": 1, "strm": 94.1, "agg": 92, "ttft_s": 0.1, "vram_gb": 58.2, "clean": 1, "pass": 1, "skip": null},
+    {"ctx": 1024, "n": 4, "strm": 85.0, "agg": 314, "ttft_s": 0.2, "vram_gb": 58.4, "clean": 1, "pass": 1, "skip": null},
+    {"ctx": 16384, "n": 1, "strm": 84.0, "agg": 81, "ttft_s": 0.1, "vram_gb": 58.4, "clean": 1, "pass": 1, "skip": null},
+    {"ctx": 16384, "n": 4, "strm": 69.7, "agg": 261, "ttft_s": 0.2, "vram_gb": 58.4, "clean": 1, "pass": 1, "skip": null}
+  ]
+}
+JSON
+)"
+command grep -q "MAX_RUNNING_REQUESTS=4" <<<"$card_sgl" || fail "an SGLang recommendation should use MAX_RUNNING_REQUESTS"
+command grep -q "CONTEXT_LENGTH=" <<<"$card_sgl" || fail "an SGLang recommendation should use CONTEXT_LENGTH"
+command grep -q "MAX_NUM_SEQS\|MAX_MODEL_LEN\|max-model-len" <<<"$card_sgl" && fail "an SGLang recommendation must not name vLLM's knobs"
+echo "  ✓ KV pool (SGLang server info; vLLM log head past the --tail window), slot source, SGLang knob names"
+
+# #1537 follow-up: the served context ("max-len"). A grep of the container's flags for
+# `max-model-len N` read "?" for vLLM auto-fit (`--max-model-len -1`) and for every SGLang compose
+# (`--context-length`, set in the entrypoint); it feeds the header, the planner's ctx clip and
+# VALIDATE's default fill. The engine's own number wins now.
+ENGINE_STUB_PY='
+import json, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+mode, port = sys.argv[1], int(sys.argv[2])
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if mode == "vllm" and self.path == "/v1/models":
+            code, body = 200, {"object": "list", "data": [{"id": "qwen3.8-27b", "max_model_len": 262144}]}
+        elif mode == "sglang" and self.path == "/get_server_info":
+            code, body = 200, {"model_path": "/m", "context_length": 32768, "max_running_requests": 1}
+        else:
+            code, body = 404, {"detail": "Not Found"}
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(body).encode())
+    def log_message(self, *a):
+        pass
+HTTPServer(("127.0.0.1", port), H).serve_forever()
+'
+free_port() { python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()'; }
+wait_up() { for _ in $(seq 1 50); do curl -s -m 1 "http://127.0.0.1:$1/" >/dev/null 2>&1 && return 0; sleep 0.1; done; }
+
+VPORT="$(free_port)"; python3 -c "$ENGINE_STUB_PY" vllm "$VPORT" & VPID=$!
+SPORT="$(free_port)"; python3 -c "$ENGINE_STUB_PY" sglang "$SPORT" & SPID=$!
+wait_up "$VPORT"; wait_up "$SPORT"
+got_v="$(URL="http://127.0.0.1:$VPORT" CONTAINER= python3 "$LIB" --served-max-len)"
+got_s="$(URL="http://127.0.0.1:$SPORT" CONTAINER= python3 "$LIB" --served-max-len)"
+hdr_v="$(URL="http://127.0.0.1:$VPORT" N_LIST="1 2" CTX_SWEEP="1k" SWEEP_DRY=1 bash "$PROBE" --sweep 2>&1 | head -1)"
+hdr_s="$(URL="http://127.0.0.1:$SPORT" N_LIST="1" CTX_SWEEP="1k" SWEEP_DRY=1 bash "$PROBE" --sweep 2>&1 | head -1)"
+kill "$VPID" "$SPID" 2>/dev/null || true
+wait "$VPID" "$SPID" 2>/dev/null || true
+[[ "$got_v" == "262144" ]] || fail "--served-max-len from vLLM's /v1/models max_model_len: got '$got_v', want 262144"
+[[ "$got_s" == "32768" ]] || fail "--served-max-len from SGLang's context_length: got '$got_s', want 32768"
+[[ "$hdr_v" == *"max-len=262144"* ]] || fail "sweep header should carry vLLM's served context: got '$hdr_v'"
+[[ "$hdr_s" == *"max-len=32768"* ]] || fail "sweep header should carry SGLang's served context: got '$hdr_s'"
+
+CTX_STUB="$(mktemp -d)"
+cat > "$CTX_STUB/docker" <<'DOCK'
+#!/usr/bin/env bash
+if [ "$1" = logs ]; then
+  echo "INFO Initializing a V1 LLM engine (v0.30.0) with config: model='/m', max_seq_len=81920, speculative_config=None"
+  for i in $(seq 1 3000); do echo "INFO Engine 000: Running: 1 reqs, Waiting: 0 reqs"; done
+fi
+exit 0
+DOCK
+chmod +x "$CTX_STUB/docker"
+got="$(PATH="$CTX_STUB:$PATH" CONTAINER=vllm-x URL=http://127.0.0.1:9 python3 "$LIB" --served-max-len)"
+rm -rf "$CTX_STUB"
+[[ "$got" == "81920" ]] || fail "--served-max-len should fall back to vLLM's max_seq_len boot line: got '$got'"
+echo "  ✓ served context from the engine (vLLM /v1/models, SGLang context_length, vLLM boot line)"
 
 echo "test-concurrency-probe: ok"

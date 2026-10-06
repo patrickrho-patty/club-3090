@@ -95,8 +95,10 @@ whether to:
 
 ```bash
 gpu-mode <appropriate-mode>
-# or, manually for one compose:
-sudo docker compose --env-file <repo>/.env -f <compose-file> up -d
+# or, manually for one compose. sudo drops your environment, so hand compose the
+# resolved settings (shell > ~/.config/club-3090/ > repo .env) the way gpu-mode does:
+envf="$(bash <repo>/scripts/settings.sh compose-env-file)"   # 0600 temp file; it holds your secrets too
+sudo docker compose --env-file "$envf" -f <compose-file> up -d; rm -f "$envf"
 docker logs -f <container-name>
 ```
 

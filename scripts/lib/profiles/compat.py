@@ -130,6 +130,9 @@ class HardwareProfile:
     cudagraph: str
     driver_pin_recommended: dict[str, Any]
     nvlink_capable: bool
+    # Device memory shared with the host CPU/OS (DGX Spark's LPDDR5X). Only such
+    # a card makes the launcher lower the compose's memory fraction (#1516).
+    unified_memory: bool = False
     power_cap_w_optimal: Optional[int] = None
     power_cap_w_prefill: Optional[int] = None
     power_cap_w_max: Optional[int] = None
@@ -271,6 +274,13 @@ class EngineProfile:
     feature_provenance: dict[str, Any] = field(default_factory=dict)
     genesis_pin: Optional[str] = None
     notes: Optional[str] = None
+    # #1365: the compose env var this engine's image is injected as. None means
+    # the engine has no single image env -- either it is not an image pin at all
+    # (pip engines, local builds), or one profile serves two binaries under
+    # different vars (llama-cpp-local: LLAMACPP_IMAGE vs IK_LLAMA_IMAGE). The
+    # resolver returns {} for those rather than raising, so a slug is still
+    # resolvable for hardware injection even when its image cannot be pinned.
+    image_env: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -548,6 +558,7 @@ def _hardware(data: dict[str, Any], path: Path) -> HardwareProfile:
         cudagraph=data.get("cudagraph", "full"),
         driver_pin_recommended=_dict(data.get("driver_pin_recommended")),
         nvlink_capable=bool(data.get("nvlink_capable", False)),
+        unified_memory=bool(data.get("unified_memory", False)),
         power_cap_w_optimal=data.get("power_cap_w_optimal"),
         power_cap_w_prefill=data.get("power_cap_w_prefill"),
         power_cap_w_max=data.get("power_cap_w_max"),
@@ -682,6 +693,7 @@ def _engine(data: dict[str, Any], path: Path) -> EngineProfile:
         required_genesis=bool(data.get("required_genesis", False)),
         genesis_pin=data.get("genesis_pin"),
         notes=data.get("notes"),
+        image_env=data.get("image_env"),
     )
 
 
@@ -1075,6 +1087,7 @@ def fits(
     requires_nvlink: bool = False,
     required_engine_features: Optional[list[str]] = None,
     required_sm: Optional[float] = None,
+    supported_sm: Optional[list[float]] = None,
     project_vram: bool = True,
 ) -> FitsResult:
     start = time.monotonic()
@@ -1130,8 +1143,11 @@ def fits(
 
     min_sm = max(float(engine.min_sm), float(required_sm or engine.min_sm))
     low_sm = [hw for hw in hardware if hw.sm < min_sm]
+    unsupported_sm = [hw for hw in hardware if supported_sm is not None and hw.sm not in supported_sm]
     if low_sm:
         fail("C3", f"engine/compose requires sm >= {min_sm:g}; below floor: " + ", ".join(f"{hw.id}=sm_{hw.sm:g}" for hw in low_sm))
+    elif unsupported_sm:
+        fail("C3", f"compose supports only SM {supported_sm}; unsupported: " + ", ".join(f"{hw.id}=sm_{hw.sm:g}" for hw in unsupported_sm))
     else:
         ok("C3")
 
@@ -1366,6 +1382,7 @@ def from_compose_name(
         # replaces required_sm as the HARD floor when present — the C3 gate then
         # admits fallback-band hardware (sm_86 live-confirmed 2026-07-11).
         required_sm=entry.get("fallback_sm") or entry.get("required_sm"),
+        supported_sm=entry.get("supported_sm"),
         project_vram=project_vram,
     )
     result.compose_name = name

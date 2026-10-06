@@ -1,11 +1,11 @@
 # ===========================================================================
 # Profile (at-a-glance):
 #   Model:     Qwen3.8-27B (Unsloth Dynamic UD-IQ4_XS GGUF, 14.3 GB) + mmproj-F16
-#   Engine:    llama.cpp (mainline server-cuda-b10236 — the shared llama-cpp-local pin)
+#   Engine:    llama.cpp mainline — the shared `llama-cpp-local` pin (build = engines/llama-cpp-mainline.yml install.spec)
 #   Topology:  Single 3090 (TP=1)
 #   Drafter:   MTP n=2 built-in (--spec-type draft-mtp; the head is EMBEDDED in this GGUF)
 #              Toggle: SPEC_N=<n> sets depth; SPEC_N=0 (or SPEC=off) disables
-#   KV:        q4_0 K + q4_0 V  ⚠️ SUB-Q8 — below the stack serving KV floor (see "KV choice")
+#   KV:        q4_0 K + q4_0 V  ⚠️ SUB-Q8 — trades KV precision for the full 262K (see "KV choice")
 #   Vision:    YES — mmproj-F16 (928 MB) mounted; multimodal input enabled
 #   Template:  native (GGUF-embedded) via --jinja
 #   Max ctx:   262144 (full n_ctx_train) — reached by halving the KV with q4_0.
@@ -14,13 +14,13 @@
 #   Genesis:   N/A — llama.cpp engine; Genesis is vLLM/Qwen3-Next-specific
 #   Status:    🧪 Experimental
 #   Caveats:   THREE, all disclosed:
-#              (1) ⚠️ q4_0 KV is BELOW the stack serving floor. Stack policy is a
-#                  q8_0-grade KV for anything that serves; q4_0 KLD is ~5.75x worse
+#              (1) ⚠️ q4_0 KV trades precision for context. q4_0 KLD is ~5.75x worse
 #                  than q8_0 and has NEVER been depth-validated on this DeltaNet
 #                  hybrid family. This variant BUYS the full 262K context WITH that
-#                  quality trade — a max-context / vision exhibit, not the
-#                  serving-grade tier. For serving-grade KV override
-#                  KV_TYPE=q8_0 CTX_SIZE=131072 on this compose (q8@131K + vision).
+#                  trade. Whether it costs quality on this model is unmeasured — a
+#                  validation question (8-pack + soak), not a bar to promotion. For
+#                  q8_0 KV, override KV_TYPE=q8_0 CTX_SIZE=131072 on this compose
+#                  (q8@131K + vision).
 #              (2) VISION is untested beyond a single correct image-recognition
 #                  probe (blue-circle + red-7, 2026-08-20). No multi-image, no
 #                  high-res, no grounding-accuracy run. Base carries the vision
@@ -33,11 +33,12 @@
 #                  on a uniform haystack, NOT retrieval quality (#1017) — do not
 #                  quote it beside real NIAH/RULER scores. Full-fidelity retrieval
 #                  NIAH + the fine ladder past 240K still unrun.
-#              Promote to 🧪/⚠️ only after bench + verify-stress NIAH + soak. q4 KV
-#              keeps this off ✅ Production permanently (floor policy).
+#              Promotion needs the standard gates: the full verify-stress ladder,
+#              soak-continuous and the 8-pack. q4 KV does NOT cap it below ✅ —
+#              Production is reachable on evidence (maintainer, 2026-09-23, disc #1385).
 #   Engine-profile: llama-cpp-local
 #   Best for:  single-3090 "max everything" — full 262K context AND vision on one
-#              card, accepting the q4 KV quality trade. NOT serving-grade; see Caveats.
+#              card, accepting the q4 KV precision trade; see Caveats.
 # ---------------------------------------------------------------------------
 # THIS is the ONLY compose for the llamacpp/qwen38-27b-single-iq4xs slug — the
 # single-card slug ships q4/262K/vision as its config (maintainer decision
@@ -45,12 +46,25 @@
 #
 #   Dual-card sibling slug: llamacpp/qwen38-27b-dual-q8kxl (2x 3090, q8_0, 262144).
 #
-# SERVING-GRADE q8_0 KV (131K) stays reachable — override the KV + ctx on THIS
+# q8_0 KV (131K) stays reachable — override the KV + ctx on THIS
 # compose:  KV_TYPE=q8_0 CTX_SIZE=131072  (gives q8@131K; the F16 projector stays
 # mounted but is decode-free, so you also get vision at no throughput cost). There
 # is no separate q8kv.yml compose anymore — the q8/131K MEASURED ladder (131072
 # boots; 196608/262144 fail on compute-pp / rs-cache) lives in
 # learnings/qwen3.8-27b.md (it was q8kv.yml's header, now removed).
+# ⚠️ That ladder was measured on IQ4_NL (15.22 GiB), NOT this compose's UD-IQ4_XS
+# (~1.95 GiB smaller), so 131072 is the validated q8_0 setting here, not a proven
+# ceiling. Community run #1380 (2026-09-21, 250 W): UD-IQ4_XS, KV_TYPE=q8_0,
+# CTX_SIZE=215000, and the F16 projector kept in system RAM (`--no-mmproj-offload`)
+# filled to 197,437 tok with 869 MiB free: it fits, but under verify-stress's 1 GiB
+# margin guard. Not reproduced on the reference rig. The recipe on this compose:
+#   KV_TYPE=q8_0 CTX_SIZE=215000 LLAMA_ARG_MMPROJ_OFFLOAD=false
+# The cost is per image: a new 640×480 image (319 tok) takes ~1.4-1.6 s of prompt
+# time with the projector on the CPU, in bursts up to ~4 s, vs 0.6 s on the GPU
+# (measured 2026-09-26 on b10920 and b11146 alike, EPYC 7543 32-vCPU VM, steal 0;
+# the burst cause is not isolated; submitter: 4.78 s on 16 vCPU). The GPU projector
+# holds ~1,180 MiB. Worth it for long text sessions with occasional images, not
+# per-turn. (The 2026-09-25 note here said 4.01 s: those runs sat in the slow mode.)
 #
 # ---------------------------------------------------------------------------
 # Qwen3.8-27B on llama.cpp — single 3090, UD-IQ4_XS weights, q4_0 KV, 262K ctx, vision.
@@ -73,11 +87,12 @@
 #   the ONE place the sub-q8 trade is on the table (see KV choice).
 #
 # KV CHOICE — why q4_0 HERE (and only here):
-#   The q8_0 sibling documents the floor: q8_0-grade KV for anything that serves;
-#   sub-q8 is a speed/context exhibit, never the serving default. This compose IS
-#   that exhibit, declared as such (🐣 + Caveat 1). It exists because the product
-#   goal — full 262K + vision on ONE 24 GB card — is unreachable at q8_0. If you
-#   want serving-grade KV, override KV_TYPE=q8_0 CTX_SIZE=131072 (q8@131K + vision).
+#   The stack prefers q8_0-grade KV, and q4_0 is its floor. This compose takes q4_0
+#   because the product goal — full 262K + vision on ONE 24 GB card — is
+#   unreachable at q8_0 (Caveat 1). Whether that costs quality on this model is
+#   unmeasured; it is judged by the same gates as any slug, and q4 alone does not
+#   keep it off ✅ (2026-09-23). For q8_0 KV, override KV_TYPE=q8_0
+#   CTX_SIZE=131072 (q8@131K + vision).
 #
 # MEASURED (fit) — ✅ 2026-08-20, single 3090 (GPU0), this exact compose:
 #   Boot: q4_0 KV @262144 + F16 projector loaded ('multimodal model'),
@@ -111,8 +126,11 @@
 #                    it if a future quant/pin changes the fit)
 #   BATCH_SIZE       llama.cpp -b        (default: 4096)
 #   UBATCH_SIZE      llama.cpp -ub       (default: 512 — the tight-headroom lever)
-#   KV_TYPE          K and V quant type  (default: q4_0 — sub-q8 exhibit; see KV CHOICE)
+#   KV_TYPE          K and V quant type  (default: q4_0 — sub-q8; see KV CHOICE)
 #   IMAGE_MIN_TOKENS min image tokens    (unset by default; set 1024 for grounding)
+#   LLAMA_ARG_MMPROJ_OFFLOAD  projector on GPU (unset by default = GPU); false keeps
+#                    it in system RAM: frees ~1,180 MiB; a new image then costs
+#                    ~1.5 s (bursts to ~4 s) instead of 0.6 s (#1380)
 #   NP               parallel slots      (default: 1)
 #   SERVED_NAME      --alias value       (default: qwen3.8-27b)
 #   REASONING        thinking gate       (default: ON — 2026-09-01 flip; INSTRUCT=1 opts out)
@@ -124,14 +142,16 @@
 #   LLAMACPP_IMAGE   engine image        (default: the llama-cpp-local pin)
 #
 # Quick start:
-#   WEIGHT_KEY=qwen3.8-27b:unsloth-iq4xs bash scripts/setup.sh qwen3.8-27b   # + mmproj via the vision slug companion
-#   bash scripts/launch.sh --variant llamacpp/qwen38-27b-single-iq4xs --force
-#   (--force is REQUIRED: 🐣 Incubating slugs are launch-gated and hidden from
-#    `switch.sh --list`; reveal with `--list --all`.)
+#   bash scripts/setup.sh llamacpp/qwen38-27b-single-iq4xs   # weights + the mmproj projector
+#   FORCE=1 bash scripts/launch.sh --variant llamacpp/qwen38-27b-single-iq4xs
+#   (or: bash scripts/switch.sh --force llamacpp/qwen38-27b-single-iq4xs)
+#   FORCE is REQUIRED while the slug is 🧪 Experimental (non-functional statuses
+#   are launch-gated). launch.sh takes it as the env var; `launch.sh … --force`
+#   fails with "Unknown flag".
 
 services:
   llama-cpp-qwen38-27b-single:
-    image: ${LLAMACPP_IMAGE:-ghcr.io/ggml-org/llama.cpp:server-cuda-b10236}
+    image: ${LLAMACPP_IMAGE:-ghcr.io/ggml-org/llama.cpp@sha256:52192a23c7b258044463aebba78826cdff39a7393b713edc313324b343a7b836}
     container_name: "${ESTATE_CONTAINER:-llama-cpp-qwen38-27b-single}"
     restart: ${CLUB3090_RESTART:-unless-stopped}
     ports:
@@ -141,11 +161,46 @@ services:
     environment:
       # Drafter toggle - docker forwards only what is declared here.
       - SPEC_N=${SPEC_N:-}
+      # MTP_DRAFT_N_MAX is read by the entrypoint too, so the drafter ON/OFF decision and the
+      # banner default to the same depth as the flag (2), and MTP_DRAFT_N_MAX=0 disables.
+      - MTP_DRAFT_N_MAX
       - SPEC=${SPEC:-}
+      # ⚠️⚠️ THE ROW VARS MUST BE DECLARED HERE OR THE FLIP SILENTLY DOES NOTHING.
+      # They used to be read by docker-compose INTERPOLATION in `command:`
+      # (${INSTRUCT:+...}), which resolves HOST-side at render time and needs no
+      # declaration. Resolving the row in the entrypoint instead moves evaluation
+      # INSIDE the container, where docker forwards ONLY what is listed here.
+      # Omitting them boots clean, logs the THINKING row, and ignores INSTRUCT=1.
+      # Bare form on purpose: `- VAR=${VAR:-}` sets the var EMPTY-but-present.
+      - INSTRUCT
+      - THINKING
+      - REASONING
+      # Reasoning knobs read by the entrypoint above. Bare form on purpose:
+      # `- VAR=${VAR:-}` would set them EMPTY-but-present, and an empty
+      # REASONING_BUDGET would land as `--reasoning-budget ''`.
+      - REASONING_BUDGET
+      - REASONING_BUDGET_MESSAGE
+      - REASONING_PRESERVE
+      - TEMP
+      - TEMPERATURE
+      - TOP_P
+      - PRESENCE_PENALTY
       # Default reasoning effort = low; ACTIVE on every request since the 2026-09-01
       # thinking flip. INERT only under INSTRUCT=1 (which passes enable_thinking:false).
       # (See the q8_0 sibling header for the full `high`->xhigh template trap on this engine.)
-      - LLAMA_ARG_CHAT_TEMPLATE_KWARGS=${LLAMA_ARG_CHAT_TEMPLATE_KWARGS:-{"reasoning_effort":"${REASONING_EFFORT:-low}"}}
+      # ⚠️⚠️ `medium`, NOT `low`. Upstream's card: low "is not supported and when
+      # selected the model will behave close to xhigh" — so a `low` default buys
+      # FULL xhigh reasoning cost while the config claims the cheapest tier.
+      # Changed low -> medium 2026-09-19; the prism-ternary sibling already
+      # defaulted to medium and documented exactly this trap.
+      - LLAMA_ARG_CHAT_TEMPLATE_KWARGS=${LLAMA_ARG_CHAT_TEMPLATE_KWARGS:-{"reasoning_effort":"${REASONING_EFFORT:-medium}"}}
+      # Projector placement: LLAMA_ARG_MMPROJ_OFFLOAD=false keeps the F16 projector in
+      # system RAM (#1380). llama-server reads it natively; nothing in `command:` may
+      # pass --mmproj-offload / --no-mmproj-offload, because argv overrides the env.
+      # Bare form on purpose: `- VAR=${VAR:-}` would set it EMPTY-but-present, and
+      # llama.cpp rejects an empty boolean ("invalid boolean value"), so every
+      # default boot would die before loading the model.
+      - LLAMA_ARG_MMPROJ_OFFLOAD
       - CUDA_VISIBLE_DEVICES=${ESTATE_GPUS:-${CUDA_VISIBLE_DEVICES:-0}}
     # ⚠ -np 1 is intentional on a single 24 GB card — extra slots divide throughput
     #   and each takes its own KV slice. The projector + 262K KV leave no room anyway.
@@ -157,16 +212,82 @@ services:
     #   repeated flags — see the q8_0 sibling header for the full rationale and the
     #   deprecated-behaviour re-test trigger on pin bumps). THINKING=1 is now a back-compat
     #   no-op. bench.sh sends its own fixed canonical sampler regardless.
-    # ⚠️ Comments CANNOT live inside the `command: >-` folded scalar — keep notes above this key.
-    # The image ENTRYPOINT is ["/app/llama-server"]; this wrapper adds the drafter toggle.
+    # ⭐ THIS IS THE ONLY ENGINE OF THE THREE THAT DELIVERS THE WHOLE CARD ROW.
+    # llama-server seeds every request from the CLI sampler params — server-task.cpp
+    # params_from_json_cmpl(): `defaults.sampling = params_base.sampling`, then each
+    # field is `json_value(data, "<key>", defaults.sampling.<field>)`, e.g.
+    # `json_value(data, "presence_penalty", defaults.sampling.penalty_present)`. No
+    # allowlist, no hard-coded request-side default — so presence_penalty 0.0/1.5 DOES
+    # land here. vLLM and SGLang both drop it: their get_diff_sampling_param() /
+    # get_default_sampling_params() allowlists carry no penalties, and both chat adapters
+    # declare presence_penalty with a hard 0.0 default that always wins, making it a
+    # client-side parameter there. (Read at llama.cpp 0d227ec; the pin is newer, b10236,
+    # but this path is longstanding.)
+    #
+    # ✅ THE INSTRUCT=1 / THINKING=1 FLIP NO LONGER RIDES A DEPRECATED SPELLING.
+    # It used to append a SECOND copy of --reasoning/--temp/--top-p/--presence-penalty
+    # and rely on llama.cpp taking the last value, which b10236 warns about:
+    #   DEPRECATED: argument '--temp' specified multiple times, use comma-separated
+    #   values instead (only last value will be used)
+    # "comma-separated" is MULTI-VALUE syntax, so had repeats ever come to mean
+    # "append" rather than "replace", INSTRUCT=1 would have served a BLEND of both
+    # rows - a wrong sampler with a clean boot and no error. The entrypoint now
+    # resolves the row ONCE and emits each flag exactly once.
+    # MEASURED on this rig (2 boots, llamacpp/qwen38-27b-single-iq4xs):
+    #   default     -> THINKING row 1.0/0.95/0.0 reasoning=on,  0 warnings, reasoning_content present
+    #   INSTRUCT=1  -> INSTRUCT row 0.7/0.80/1.5 reasoning=off, 0 warnings, reasoning_content absent
+    # (both were 4 warnings before.)
+    # ⚠️ The row vars are declared in `environment:` FOR THIS REASON: the entrypoint
+    # evaluates them INSIDE the container, unlike the old ${INSTRUCT:+...} form which
+    # docker-compose resolved host-side. Drop them from environment: and INSTRUCT=1
+    # silently does nothing - clean boot, healthy endpoint, wrong sampler.
     entrypoint:
       - /bin/bash
       - -c
       - |
+        # -- Reasoning row: resolved ONCE, appended ONCE ------------------------
+        # This used to APPEND a second copy of --reasoning/--temp/--top-p/
+        # --presence-penalty in the `command:` block and rely on llama.cpp taking the
+        # LAST value. That works on b10236, but the engine warns on exactly that:
+        #   DEPRECATED: argument '--temp' specified multiple times, use
+        #   comma-separated values instead (only last value will be used)
+        # "comma-separated" is MULTI-VALUE syntax, so if repeats ever come to mean
+        # "append" rather than "replace", INSTRUCT=1 would silently serve a BLEND of
+        # both rows - a wrong sampler with a clean boot and no error. Resolving here
+        # emits each flag exactly once, so the deprecation cannot bite.
+        # INSTRUCT wins when both INSTRUCT and THINKING are set, matching the old
+        # last-wins order (the INSTRUCT line came second).
+        if [ -n "$${INSTRUCT:-}" ]; then
+          _r="$${REASONING:-off}"; _t="$${TEMP:-$${TEMPERATURE:-0.7}}"
+          _p="$${TOP_P:-0.80}";    _pp="$${PRESENCE_PENALTY:-1.5}"
+          echo "[sampler] INSTRUCT row: reasoning=$$_r temp=$$_t top_p=$$_p presence=$$_pp" >&2
+        else
+          _r="$${REASONING:-on}";  _t="$${TEMP:-$${TEMPERATURE:-1.0}}"
+          _p="$${TOP_P:-0.95}";    _pp="$${PRESENCE_PENALTY:-0.0}"
+          echo "[sampler] THINKING row (default): reasoning=$$_r temp=$$_t top_p=$$_p presence=$$_pp" >&2
+        fi
+        ROW=(--reasoning "$$_r" --temp "$$_t" --top-p "$$_p" --presence-penalty "$$_pp")
+        # -- Reasoning knobs: all six --reasoning-* flags reachable ------------
+        # Defaults PRESERVE today's behaviour. budget -1 is llama.cpp's own default
+        # (unrestricted), and preserve is emitted ONLY when explicitly set, so unset
+        # keeps the chat template's default instead of silently overriding it.
+        # ⚠️ The budget MESSAGE is inert while budget is -1. It exists so that if a
+        # budget IS set, exhaustion is VISIBLE: upstream's default is empty, which
+        # makes a truncated trace indistinguishable from a short answer. That
+        # misattribution (blaming the model for a budget) has bitten this stack.
+        ROW+=(--reasoning-budget "$${REASONING_BUDGET:--1}")
+        ROW+=(--reasoning-budget-message "$${REASONING_BUDGET_MESSAGE:-[reasoning budget exhausted]}")
+        case "$${REASONING_PRESERVE:-}" in
+          1|on|true|yes)   ROW+=(--reasoning-preserve) ;;
+          0|off|false|no)  ROW+=(--no-reasoning-preserve) ;;
+          "")              : ;;
+          *) echo "[reasoning] REASONING_PRESERVE='$${REASONING_PRESERVE}' must be on/off/true/false/yes/no, or unset for the template default" >&2; exit 1 ;;
+        esac
+        echo "[reasoning] budget=$${REASONING_BUDGET:--1} preserve=$${REASONING_PRESERVE:-<template default>}" >&2
         # -- Drafter toggle: SPEC_N=<n> depth; SPEC_N=0 (or SPEC=off) disables ----
         # Disabling REMOVES the drafter flags (n-max=0 leaves the draft context
         # allocated). A non-numeric SPEC_N is a hard error, never a silent off.
-        _spec_n="$${SPEC_N:-1}"
+        _spec_n="$${SPEC_N:-$${MTP_DRAFT_N_MAX:-2}}"
         case "$${SPEC:-}" in off|OFF|Off|false|no|0) _spec_n=0 ;; esac
         case "$$_spec_n" in ""|*[!0-9]*)
           echo "[spec] SPEC_N='$$_spec_n' is not a non-negative integer." >&2
@@ -175,7 +296,7 @@ services:
         esac
         if [ "$$_spec_n" -gt 0 ]; then
           echo "[spec] drafter ON (SPEC_N=$$_spec_n)" >&2
-          exec /app/llama-server "$$@"
+          exec /app/llama-server "$$@" "$${ROW[@]}"
         fi
         ARGS=(); _skip=0
         for _a in "$$@"; do
@@ -186,7 +307,7 @@ services:
           ARGS+=("$$_a")
         done
         echo "[spec] drafter OFF (SPEC_N=0 / SPEC=off) - drafter flags removed" >&2
-        exec /app/llama-server "$${ARGS[@]}"
+        exec /app/llama-server "$${ARGS[@]}" "$${ROW[@]}"
       - --
     command: >-
       --host 0.0.0.0
@@ -205,17 +326,11 @@ services:
       --spec-type draft-mtp
       --spec-draft-n-max ${SPEC_N:-${MTP_DRAFT_N_MAX:-2}}
       --jinja
-      --reasoning ${REASONING:-on}
       --reasoning-format ${REASONING_FORMAT:-deepseek}
-      --temp ${TEMP:-${TEMPERATURE:-1.0}}
-      --top-p ${TOP_P:-0.95}
       --top-k ${TOP_K:-20}
       --min-p ${MIN_P:-0.0}
-      --presence-penalty ${PRESENCE_PENALTY:-0.0}
       --repeat-penalty ${REPEAT_PENALTY:-1.0}
       ${IMAGE_MIN_TOKENS:+--image-min-tokens ${IMAGE_MIN_TOKENS}}
-      ${THINKING:+--reasoning ${REASONING:-on} --temp ${TEMP:-${TEMPERATURE:-1.0}} --top-p ${TOP_P:-0.95} --presence-penalty ${PRESENCE_PENALTY:-0.0}}
-      ${INSTRUCT:+--reasoning ${REASONING:-off} --temp ${TEMP:-${TEMPERATURE:-0.7}} --top-p ${TOP_P:-0.80} --presence-penalty ${PRESENCE_PENALTY:-1.5}}
     deploy:
       resources:
         reservations:

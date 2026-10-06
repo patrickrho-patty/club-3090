@@ -8,6 +8,7 @@
 #   • firing on a GPU-RESIDENT compose (=CUDA rules are not offload)
 #   • refusing `tensor` on a compose that never offloads
 set -uo pipefail
+export CLUB3090_CONFIG_DIR=/nonexistent/club-3090-test-config   # tests never read your real settings (#1466)
 export PYTHONUTF8="${PYTHONUTF8:-1}"
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -47,12 +48,29 @@ INK_M4=models/inkling-small/llamacpp-club3090/compose/multi4/unsloth-ud-iq4xs/mo
 # and the one Inkling compose that legitimately DOES carry the bundle headers.
 # Its presence is why the no-residency-headers assertions below are per-file.
 INK_RES=models/inkling-small/llamacpp-club3090/compose/dual/unsloth-ud-iq4xs/residency.yml
+# exl3/TabbyAPI — offloads by splitting EXPERT INDICES to the host and COMPUTING
+# them there, so these carry host_ram_gb like any CPU-offload slug even though
+# they pass no `-ot`.
+EXL3_305=models/qwen3.8-flash-next/exllamav3/compose/dual/exl3-3.05bpw/cpumoe.yml
+EXL3_405=models/qwen3.8-flash-next/exllamav3/compose/dual/exl3-4.05bpw/cpumoe.yml
 GLM_DUAL=models/glm-5.3-flash/llamacpp-club3090/compose/dual/unsloth-ud-iq4xs/moecache.yml
 GLM_M4=models/glm-5.3-flash/llamacpp-club3090/compose/multi4/unsloth-ud-iq4xs/moecache.yml
 GLM_M8=models/glm-5.3-flash/llamacpp-club3090/compose/multi8/unsloth-ud-iq4xs/moecache.yml
 GLM3_DUAL=models/glm-5.3-flash/llamacpp-club3090/compose/dual/unsloth-ud-iq3xxs/moecache.yml
 GLM3_M4=models/glm-5.3-flash/llamacpp-club3090/compose/multi4/unsloth-ud-iq3xxs/moecache.yml
 GLM3_M8=models/glm-5.3-flash/llamacpp-club3090/compose/multi8/unsloth-ud-iq3xxs/moecache.yml
+GLM_Q2K_DUAL=models/glm-5.3-flash/llamacpp-club3090/compose/dual/devquasar-q2k/moecache.yml
+GLM_Q2K_M4=models/glm-5.3-flash/llamacpp-club3090/compose/multi4/devquasar-q2k/moecache.yml
+GLM_Q2K_M8=models/glm-5.3-flash/llamacpp-club3090/compose/multi8/devquasar-q2k/moecache.yml
+GLM_Q3KM_DUAL=models/glm-5.3-flash/llamacpp-club3090/compose/dual/devquasar-q3km/moecache.yml
+GLM_Q3KM_M4=models/glm-5.3-flash/llamacpp-club3090/compose/multi4/devquasar-q3km/moecache.yml
+GLM_Q3KM_M8=models/glm-5.3-flash/llamacpp-club3090/compose/multi8/devquasar-q3km/moecache.yml
+GLM_Q2K_DUAL_OFF=models/glm-5.3-flash/llamacpp-club3090/compose/dual/devquasar-q2k/offload.yml
+GLM_Q2K_M4_OFF=models/glm-5.3-flash/llamacpp-club3090/compose/multi4/devquasar-q2k/offload.yml
+GLM_Q2K_M8_OFF=models/glm-5.3-flash/llamacpp-club3090/compose/multi8/devquasar-q2k/offload.yml
+GLM_Q3KM_DUAL_OFF=models/glm-5.3-flash/llamacpp-club3090/compose/dual/devquasar-q3km/offload.yml
+GLM_Q3KM_M4_OFF=models/glm-5.3-flash/llamacpp-club3090/compose/multi4/devquasar-q3km/offload.yml
+GLM_Q3KM_M8_OFF=models/glm-5.3-flash/llamacpp-club3090/compose/multi8/devquasar-q3km/offload.yml
 QWN_DUAL=models/qwen3.8-flash-next/llamacpp-club3090/compose/dual/unsloth-ud-q4kxl/moecache.yml
 QWN_M4=models/qwen3.8-flash-next/llamacpp-club3090/compose/multi4/unsloth-ud-q4kxl/moecache.yml
 QWN_M8=models/qwen3.8-flash-next/llamacpp-club3090/compose/multi8/unsloth-ud-q4kxl/moecache.yml
@@ -419,6 +437,18 @@ while IFS='|' read -r slug reg_gb; do
     *qwen38-flash-next-dual-q4kxl-moecache)   f="$QWN_DUAL" ;;
     *qwen38-flash-next-multi4-q4kxl-moecache) f="$QWN_M4" ;;
     *qwen38-flash-next-multi8-q4kxl-moecache) f="$QWN_M8" ;;
+    *glm53-flash-dual-q2k-offload)              f="$GLM_Q2K_DUAL_OFF" ;;
+    *glm53-flash-multi4-q2k-offload)            f="$GLM_Q2K_M4_OFF" ;;
+    *glm53-flash-multi8-q2k-offload)            f="$GLM_Q2K_M8_OFF" ;;
+    *glm53-flash-dual-q3km-offload)             f="$GLM_Q3KM_DUAL_OFF" ;;
+    *glm53-flash-multi4-q3km-offload)           f="$GLM_Q3KM_M4_OFF" ;;
+    *glm53-flash-multi8-q3km-offload)           f="$GLM_Q3KM_M8_OFF" ;;
+    *glm53-flash-dual-q2k-moecache)             f="$GLM_Q2K_DUAL" ;;
+    *glm53-flash-multi4-q2k-moecache)           f="$GLM_Q2K_M4" ;;
+    *glm53-flash-multi8-q2k-moecache)           f="$GLM_Q2K_M8" ;;
+    *glm53-flash-dual-q3km-moecache)            f="$GLM_Q3KM_DUAL" ;;
+    *glm53-flash-multi4-q3km-moecache)          f="$GLM_Q3KM_M4" ;;
+    *glm53-flash-multi8-q3km-moecache)          f="$GLM_Q3KM_M8" ;;
     *glm53-flash-dual-iq3xxs-moecache)   f="$GLM3_DUAL" ;;
     *glm53-flash-multi4-iq3xxs-moecache) f="$GLM3_M4" ;;
     *glm53-flash-multi8-iq3xxs-moecache) f="$GLM3_M8" ;;
@@ -428,6 +458,8 @@ while IFS='|' read -r slug reg_gb; do
     *dual-iq4xs-moecache)   f="$INK_CACHE" ;;
     *multi4-iq4xs-moecache) f="$INK_M4" ;;
     *dual-iq4xs-residency)  f="$INK_RES" ;;
+    *dual-exl3-305-cpumoe)  f="$EXL3_305" ;;
+    *dual-exl3-405-cpumoe)  f="$EXL3_405" ;;
     *dual-q8)   f="$Q8" ;;
     *dual-iq2)  f="$IQ2" ;;
     *multi4-q8) f="$M4" ;;
@@ -484,6 +516,33 @@ command grep -q "preflight_cpu_offload_ram" scripts/switch.sh \
   && ok "switch.sh calls the RAM guard" || bad "switch.sh does not call the RAM guard"
 command grep -q "preflight_offload_split_mode" scripts/switch.sh \
   && ok "switch.sh calls the split-mode guard" || bad "switch.sh does not call the split-mode guard"
+
+# --- unit contract: the -GB key is compared in DECIMAL GB --------------------
+# The header key is `CPU-Offload-Host-RAM-GB` and every value authored against it
+# is decimal GB. preflight_cpu_offload_ram() once computed `kb/1024/1024` (GiB)
+# and compared THAT against it, so the gate ran ~7% stricter than its own
+# documented contract on every offload slug — silent, surfacing only as a refusal
+# on a rig that should have passed.
+#
+# ⚠️ Scoped to THIS function on purpose: preflight.sh has other `/1024/1024`
+# sites (general RAM reporting) that are not the -GB path and must not be
+# dragged along by a file-wide grep — an earlier version of this assertion
+# matched one of those and reported a fixed file as broken.
+_fn="$(awk '/^preflight_cpu_offload_ram\(\)/{f=1} f{print} f&&/^}/{exit}' scripts/preflight.sh)"
+if command grep -q 'kb \* 1024 / 1000000000' <<<"$_fn"; then
+  ok "preflight_cpu_offload_ram sizes host RAM in DECIMAL GB, matching the -GB key"
+else
+  bad "preflight_cpu_offload_ram host-RAM unit" "decimal GB (kb * 1024 / 1000000000)" \
+      "$(command grep -oE 'kb [*/] 1024 [*/] [0-9]+' <<<"$_fn" | head -1)"
+fi
+# ⚠️ Strip comments first: the fix's own comment QUOTES the old expression to
+# explain what changed, and a naive grep scores that as the bug still being
+# present — a gate failing on its own documentation.
+if command grep -vE '^\s*#' <<<"$_fn" | command grep -q 'kb / 1024 / 1024'; then
+  bad "preflight_cpu_offload_ram still has a GiB expression in CODE" "none" "kb / 1024 / 1024"
+else
+  ok "no GiB expression remains in the -GB comparison path (comments excluded)"
+fi
 
 [[ $fail -eq 0 ]] && echo "test-preflight-cpu-offload: ok" || echo "test-preflight-cpu-offload: FAIL"
 exit $fail

@@ -287,11 +287,21 @@ def _offload_label(e: "CatalogEntry") -> str:
     distinguished nothing while hiding the cache axis entirely.
 
     Non-CPU-offload backends ("uva" / "prefetch") still render their own value.
+
+      * ``kv opt``   — weights are resident, but the compose exposes an OPTIONAL
+                       KV-cache offload tier (registry ``kv_offload`` == "opt-in":
+                       KV_OFFLOAD_GB host RAM, KV_OFFLOAD_DISK=1 adds disk). Off by
+                       default. A different axis from weight placement, shown here
+                       because no slug has both and a second column would be empty
+                       for all but five rows.
+
     "—" for a fully-resident slug or when the contract didn't carry it.
     """
     raw = (getattr(e.row, "offload", "") or "")
     if raw in ("residency", "tensor-override"):
         return "static" if raw == "residency" else "dynamic"
+    if not raw and (getattr(e.row, "kv_offload", "") or "") == "opt-in":
+        return "kv opt"
     return raw or "—"
 
 
@@ -505,6 +515,25 @@ def _spec_token(drafter: str, spec_method: str = "") -> str:
         sm = (spec_method or "").strip().lower()
         if sm.startswith("ngram"):
             return "ngram"      # ngram-mod / -map-k / -simple / -cache
+        # ⚠️ The drafter-less branch must speak the SAME vocabulary as the
+        # drafter branch below, or the column renders the same speculation two
+        # different ways depending on which field carries it.  It used to
+        # `return sm.split("-")[0]`, i.e. the RAW registry token — so a slug with
+        # drafter=null + spec_method="mtp" printed lowercase "mtp" while every
+        # drafter-keyed MTP row printed "MTP".  Caught 2026-09-18 with three
+        # rows diverging (bucko-vllm/qwen3.8-flash-next-ple and both
+        # exllamav3/…-cpumoe slugs) against ~130 core rows — all of them
+        # BUILT-IN heads that need no external drafter artifact, which is
+        # exactly why they keep drafter=null and fell down this path.
+        if sm.startswith("mtp"):
+            # mtp_assistant / mtp-assistant → the gemma-style assistant head
+            return "MTP·asst" if "assistant" in sm else "MTP"
+        if "dflash2" in sm:         # must precede the generic dflash check
+            return "DFlash2"
+        if "dflash" in sm:
+            return "DFlash"
+        if "dspark" in sm:
+            return "DSpark"
         return sm.split("-")[0] if sm else ""
     if "dflash2" in dr:       # DFlash2 external block-drafter (must precede the
         return "DFlash2"          # generic dflash check — "dflash2" contains "dflash")
@@ -1087,6 +1116,7 @@ class HelpScreen(ModalScreen):
             "[bold]Run & Operate · Catalog[/bold]",
             "  [cyan]⏎[/cyan] serve selected slug (reconcile-gated confirm; F to Force the teardown)",
             "  [cyan]e[/cyan] explain   [cyan]i[/cyan] model info (metadata popup for the selected slug)",
+            "  [cyan]E[/cyan] launch settings — what the slug's next launch uses, per-slug edits, a running container's drift",
             "  [cyan]d[/cyan] set-default   [cyan]D[/cyan] clear-default",
             "  [cyan]O[/cyan] ▸ Optimize for my card (kv-calc recs, advisory)",
             # These six are show=False bindings whose ONLY other teaching surface
@@ -1094,8 +1124,8 @@ class HelpScreen(ModalScreen):
             # terminal.  Help is where they have to be findable.
             "  [cyan]\\ [/cyan]model scope (dropdown)   [cyan]/[/cyan] filter   "
             "[cyan]s[/cyan] sort — group-by-model → TPS ↓ → GB ↑ → ctx ↓",
-            "  [cyan]h[/cyan] reveal 🗑️ deprecated + hardware-incompatible slugs   "
-            "[cyan]w[/cyan] downloaded-only",
+            "  [cyan]h[/cyan] reveal 🗑️ deprecated + hardware-incompatible slugs and those needing more GPUs than this rig   "
+            "[cyan]w[/cyan] downloaded-only (on by default; remembered)",
             "  [cyan]|[/cyan] columns picker (show/hide + reorder; persisted)   "
             "[cyan]u[/cyan] copy the serving API URL",
             "",
@@ -1397,9 +1427,14 @@ class CatalogPane(Container):
         # [h] toggle: hide 🗑️ deprecated slugs by default (mirrors `switch.sh --list`).
         self._show_deprecated: bool = False
         # [w] toggle (#963): narrow to slugs whose weights are already on disk.
-        # OFF by default so the catalog still answers "what COULD I run?" — this
-        # is opt-in for "what can I run right now, without a download?".
-        self._downloaded_only: bool = False
+        # ON by default since 2026-10-05 (maintainer: pressing w on every launch
+        # was the common path) and REMEMBERED — the last choice is persisted as
+        # "catalog_downloaded_only" in c3-settings.json, read here from the app
+        # attribute __main__ sets (a directly-constructed app starts ON). A rig
+        # with NOTHING downloaded falls back to showing everything
+        # (_downloaded_fallback), so a fresh install never opens on an empty list.
+        _dl_pref = getattr(self.app, "catalog_downloaded_only_pref", None)
+        self._downloaded_only: bool = _dl_pref if isinstance(_dl_pref, bool) else True
         # [s] sort cycle: group-by-model (default) → TPS ↓ → GB ↑ → ctx ↓.
         # Seeded from the persisted "catalog_sort" pref (same launch plumbing
         # as the [|] picker's "catalog_columns" — an app attribute the pane
@@ -1427,6 +1462,10 @@ class CatalogPane(Container):
         # failed but the raw-tab fallback still produced rows — they render with
         # reduced columns and the reason shows as a yellow one-liner.
         self._degraded_note: str = ""
+        # refresh_enriched() gate: no re-render before the first populate (the
+        # status line still says "Loading catalog…") or over a hard load error.
+        self._populated: bool = False
+        self._load_error: str = ""
 
     # ── Column picker (#724) ─────────────────────────────────────────────────
 
@@ -1546,8 +1585,10 @@ class CatalogPane(Container):
         status_label = self.query_one("#catalog-status", Label)
         table = self.query_one("#catalog-table", DataTable)
 
+        self._populated = True
         if error and not entries:
             self._degraded_note = ""
+            self._load_error = error
             self._entries = []
             table.clear()
             status_label.update(f"[red]Catalog error:[/red] {error}")
@@ -1557,6 +1598,7 @@ class CatalogPane(Container):
         # Rows + a note = the degraded-catalog path: render the rows, surface
         # the note (yellow) on the status line instead of failing the pane.
         self._degraded_note = (error or "").strip() if entries else ""
+        self._load_error = ""
         self._entries = list(entries)
         self._refresh_model_options()
         self._render_rows()
@@ -1683,11 +1725,14 @@ class CatalogPane(Container):
         # (both 0 when revealed — one toggle, one bucket).
         dep_n = self._deprecated_hidden_count()
         inc_n = self._incompatible_hidden_count()
+        gpu_n = self._gpu_hidden_count()
         _hidden_bits = []
         if dep_n:
             _hidden_bits.append(f"+{dep_n} deprecated")
         if inc_n:
             _hidden_bits.append(f"+{inc_n} incompatible-hw")
+        if gpu_n:
+            _hidden_bits.append(f"+{gpu_n} need more GPUs")
         dep_note = (
             f"  ·  [dim]{' · '.join(_hidden_bits)} hidden — h[/dim]"
             if _hidden_bits else ""
@@ -1703,7 +1748,9 @@ class CatalogPane(Container):
         #   OFF → "+N not on disk — w"   (an invitation to narrow)
         #   ON  → "downloaded only (+N hidden) — w"  (state + how to undo)
         abs_n = self._absent_count_in_pool()
-        if self._downloaded_only:
+        if self._downloaded_only and self._downloaded_fallback():
+            dep_note += "  ·  [dim]nothing downloaded yet — showing all — w[/dim]"
+        elif self._downloaded_only:
             dep_note += (
                 f"  ·  [dim]downloaded only (+{abs_n} not on disk hidden) — w[/dim]"
                 if abs_n else "  ·  [dim]downloaded only — w[/dim]"
@@ -1746,7 +1793,14 @@ class CatalogPane(Container):
 
     def refresh_enriched(self) -> None:
         """Re-render after background enrichment mutated the shared entries in
-        place (fit / measurement), preserving the cursor row + active filter."""
+        place (fit / measurement), preserving the cursor row + active filter.
+
+        A no-op before the first populate and over a hard load error: the
+        early GPU-count sync and the Operate poll both call this, and a
+        re-render there would replace "Loading catalog…" / the red error with
+        "0 variants loaded"."""
+        if not self._populated or self._load_error:
+            return
         table = self.query_one("#catalog-table", DataTable)
         saved = table.cursor_row
         self._render_rows()
@@ -1812,15 +1866,12 @@ class CatalogPane(Container):
         # Ampere) share the SAME bucket: hidden by default, [h] reveals. The
         # verdict lands with async fit enrichment, so such rows may be visible
         # briefly on first paint, then fold away on refresh_enriched.
-        pool = (
-            self._entries
-            if self._show_deprecated
-            else [
-                e for e in self._entries
-                if (e.status or "").strip().lower() != "deprecated"
-                and not self._hw_incompatible(e)
-            ]
-        )
+        # Slugs needing MORE GPUS than this rig has (multi4 / multi8 on a 2-card
+        # rig) join the same bucket — `switch.sh --list` hides them too, and
+        # `--list --all` is its [h]. The GPU count arrives with the first estate
+        # poll, which re-renders the catalog (_poll_estate), so they fold away
+        # the same way. See _h_hidden.
+        pool = self._h_pool()
         # [w] downloaded-only (#963): an INDEPENDENT narrowing, AND-combined with
         # the [h] bucket above — the two answer different questions, so neither
         # subsumes the other. Hides ONLY `absent`; `partial` and `downloading`
@@ -1829,7 +1880,9 @@ class CatalogPane(Container):
         # tell" — most often a self-grabbed GGUF that IS present. Hiding on a
         # guess is the worse failure here: a false hide looks like the slug
         # vanished from the catalog.
-        if self._downloaded_only:
+        # Nothing on disk at all (a fresh install) → show everything rather than an
+        # empty catalog; the status line says so (_downloaded_fallback).
+        if self._downloaded_only and not self._downloaded_fallback():
             pool = [e for e in pool if not self._weights_absent(e)]
         # Model-scope dropdown first — AND-combined with the text filter below.
         base = (
@@ -1901,16 +1954,31 @@ class CatalogPane(Container):
         self._render_rows()
 
     def toggle_deprecated(self) -> None:
-        """[h] show/hide 🗑️ deprecated slugs (hidden by default, mirroring
-        `switch.sh --list`).  Re-renders (cursor resets to the top of the
-        now-widened / narrowed set)."""
+        """[h] show/hide what this rig can't or shouldn't run — 🗑️ deprecated,
+        incompatible-hw, and slugs needing more GPUs than the rig has (hidden by
+        default, mirroring `switch.sh --list`; [h] is its `--list --all`).
+        Re-renders (cursor resets to the top of the now-widened / narrowed set)."""
         self._show_deprecated = not self._show_deprecated
         self._render_rows()
 
     def toggle_downloaded_only(self) -> None:
-        """[w] show only slugs whose weights are already on disk (#963).  OFF by
-        default.  Re-renders (cursor resets to the top of the narrowed set)."""
+        """[w] show only slugs whose weights are already on disk (#963).  ON by
+        default; the choice persists ("catalog_downloaded_only" in
+        c3-settings.json, the same pattern as the [s] sort).  Re-renders (cursor
+        resets to the top of the narrowed set)."""
         self._downloaded_only = not self._downloaded_only
+        try:
+            setattr(self.app, "catalog_downloaded_only_pref", self._downloaded_only)  # in-session remounts
+        except Exception:
+            pass
+        try:
+            from .__main__ import load_settings, save_settings
+
+            s = load_settings()
+            s["catalog_downloaded_only"] = self._downloaded_only
+            save_settings(s)
+        except Exception:
+            pass
         self._render_rows()
 
     @staticmethod
@@ -1921,24 +1989,72 @@ class CatalogPane(Container):
         return (getattr(e, "weights_state", "") or "") == WEIGHTS_ABSENT
 
     def _absent_hidden_count(self) -> int:
-        """How many not-downloaded slugs [w] is currently HIDING (0 when off)."""
-        return self._absent_count_in_pool() if self._downloaded_only else 0
+        """How many not-downloaded slugs [w] is currently HIDING (0 when off, and
+        0 when the nothing-downloaded fallback is showing everything)."""
+        if not self._downloaded_only or self._downloaded_fallback():
+            return 0
+        return self._absent_count_in_pool()
+
+    def _downloaded_fallback(self) -> bool:
+        """[w] is ON but NOTHING in the [h] pool has weights on disk (a fresh
+        install): the filter would empty the catalog, so it shows everything
+        instead and the status line says so. `unknown` / `partial` /
+        `downloading` count as on disk here, exactly as in the filter."""
+        if not self._downloaded_only:
+            return False
+        pool = self._h_pool()
+        return bool(pool) and all(self._weights_absent(e) for e in pool)
+
+    def _h_pool(self) -> list[CatalogEntry]:
+        """The entries [h] leaves visible — everything when revealed."""
+        if self._show_deprecated:
+            return list(self._entries)
+        return [e for e in self._entries if not self._h_hidden(e)]
+
+    def _h_hidden(self, e: CatalogEntry) -> bool:
+        """The [h] bucket, ONE predicate for the filter and every count: 🗑️
+        deprecated, a card this slug's kernels can't run on (incompatible-hw), or
+        more GPUs than this rig has."""
+        return (
+            (e.status or "").strip().lower() == "deprecated"
+            or self._hw_incompatible(e)
+            or self._needs_more_gpus(e)
+        )
+
+    def _rig_gpu_count(self) -> Optional[int]:
+        """This rig's GPU count from the last estate poll (None until polled, or
+        on a pane mounted outside the cockpit app)."""
+        try:
+            n = self.app._known_gpu_count()
+        except Exception:
+            return None
+        return n if isinstance(n, int) and n > 0 else None
+
+    def _needs_more_gpus(self, e: CatalogEntry) -> bool:
+        """The slug's topology needs more GPUs than this rig has (multi4 on 2
+        cards). Unknown GPU count or topology → False: never hide on a guess."""
+        n = self._rig_gpu_count()
+        cards = _TOPO_CARDS.get((getattr(e, "topology", "") or "").strip())
+        return n is not None and cards is not None and cards > n
+
+    def _gpu_hidden_count(self) -> int:
+        """How many slugs [h] hides ONLY for needing more GPUs (rows already
+        hidden as deprecated / incompatible-hw are counted there, not here)."""
+        if self._show_deprecated:
+            return 0
+        return sum(
+            1 for e in self._entries
+            if self._needs_more_gpus(e)
+            and (e.status or "").strip().lower() != "deprecated"
+            and not self._hw_incompatible(e)
+        )
 
     def _absent_count_in_pool(self) -> int:
         """How many not-downloaded slugs are in the [h]-filtered pool, regardless
         of whether [w] is on.  Counted over the SAME pool the filter narrows — i.e.
         excluding rows already hidden by [h] — so the two hints never double-count
         one row.  Drives the hint in BOTH states (see _render_rows)."""
-        pool = (
-            self._entries
-            if self._show_deprecated
-            else [
-                e for e in self._entries
-                if (e.status or "").strip().lower() != "deprecated"
-                and not self._hw_incompatible(e)
-            ]
-        )
-        return sum(1 for e in pool if self._weights_absent(e))
+        return sum(1 for e in self._h_pool() if self._weights_absent(e))
 
     @staticmethod
     def _hw_incompatible(e: CatalogEntry) -> bool:
@@ -3231,7 +3347,7 @@ class ConfirmActionScreen(ModalScreen):
         # registry row carries a 'thinking' sampler profile.  [t] cycles
         # inherit → force-on → force-off; [r] resets the sampler to the card
         # row (offered while thinking resolves ON); [T] persists the CURRENT
-        # choice as the model's .env default (#1014 follow-up — the pin
+        # choice as the model's saved default (#1014 follow-up — the pin
         # switch.sh resolves into ENABLE_THINKING on later launches).  Keys
         # checked against this modal's existing set (enter/k/f/a/escape):
         # t, r and shift-t are free.
@@ -3268,8 +3384,8 @@ class ConfirmActionScreen(ModalScreen):
         )
         # Tri-state thinking toggle (#1014 L3) — per-launch choice, defaulting
         # to inherit (the entrypoint's own ENABLE_THINKING=false default).
-        # [T] can PERSIST the choice as CLUB3090_THINKING_<MODEL> in the repo
-        # .env (the --set-default mechanism); switch.sh resolves that pin into
+        # [T] can PERSIST the choice as CLUB3090_THINKING_<MODEL> in the
+        # club-3090 settings (#1466); switch.sh resolves that pin into
         # ENABLE_THINKING=true/false on every later launch of the model
         # (#1014 follow-up), so the persistence outlives this session.
         self._thinking: str = "inherit"          # inherit | on | off
@@ -3407,11 +3523,11 @@ class ConfirmActionScreen(ModalScreen):
 
     # ── persisted thinking pin (#1014 follow-up) ────────────────────────────────
     #
-    # [T] writes the CURRENT tri-state choice as CLUB3090_THINKING_<MODEL> into
-    # the repo .env — the same write --set-default performs for
-    # CLUB3090_DEFAULT_<MODEL> (switch.sh env_set_key: upsert, all other lines
-    # preserved). switch.sh's launch path reads the pin back and injects
-    # ENABLE_THINKING accordingly, so the modal choice survives the session.
+    # [T] stores the CURRENT tri-state choice as CLUB3090_THINKING_<MODEL> in the
+    # club-3090 settings (club3090.env, through the one writer — #1466), the
+    # store switch.sh reads: its launch path resolves the pin (the shell wins)
+    # and injects ENABLE_THINKING accordingly, so the modal choice survives the
+    # session. An old pin in the repo .env is read last, so the stored one wins.
 
     def _thinking_model(self) -> str:
         """The MODEL-id this serve belongs to (the pin is per-model, like
@@ -3426,68 +3542,65 @@ class ConfirmActionScreen(ModalScreen):
         suffix = "".join(c if c.isalnum() else "_" for c in self._thinking_model()).upper()
         return f"CLUB3090_THINKING_{suffix}"
 
-    def _repo_env_set_key(self, key: str, value: str) -> bool:
-        """Upsert KEY=VALUE in <repo>/.env — the Python mirror of switch.sh's
-        env_set_key (--set-default's write path): replace any existing
-        assignment for KEY (with or without ``export``), else append; every
-        other line is preserved; the file is created when absent.  False when
-        there is no repo root to write to."""
-        from pathlib import Path as _Path
+    def _pin_notify(self, message: str, severity: str = "information") -> None:
+        """Toast via the app when mounted (tests build this modal bare)."""
+        try:
+            self.app.notify(message, title="Thinking default", severity=severity, timeout=6)
+        except Exception:
+            pass
+
+    def _save_thinking_pin(self, key: str, value: str) -> bool:
+        """Store KEY=VALUE in club3090.env through the one writer (replaces any
+        existing assignment, keeps every other line). False — with the reason
+        shown — when the store refuses or can't be written, or when there is no
+        repo root (a bare modal)."""
+        from rich.markup import escape
+
+        from . import settings_store as _ss
 
         if self._repo_root is None:
             return False
-        envf = _Path(self._repo_root) / ".env"
-        lines: list[str] = []
-        if envf.is_file():
-            try:
-                lines = envf.read_text(encoding="utf-8", errors="replace").splitlines()
-            except OSError:
-                lines = []
-        pat = re.compile(rf"^\s*(?:export\s+)?{re.escape(key)}=")
-        kept = [ln for ln in lines if not pat.match(ln)]
-        kept.append(f"{key}={value}")
         try:
-            envf.write_text("\n".join(kept) + "\n", encoding="utf-8")
-        except OSError:
+            _ss.save({key: value})
+        except _ss.SettingsError as e:
+            self._pin_notify(f"Not saved: {escape(str(e))}", "error")
             return False
+        if _ss.source(key, self._repo_root) == "shell":
+            self._pin_notify(
+                f"Saved, but {key} is also set in your shell, which wins for this "
+                "session and for launches from it.", "warning")
         return True
 
+    def _thinking_persisted_source(self) -> str:
+        """Where the effective pin comes from (shell / club3090.env / secrets.env
+        / repo .env), '' when unset or without a repo root."""
+        from . import settings_store as _ss
+
+        if self._repo_root is None:
+            return ""
+        return _ss.source(self._thinking_pin_key(), self._repo_root) or ""
+
     def _thinking_persisted(self) -> str:
-        """The model's persisted thinking pin read back from <repo>/.env:
-        'on' | 'off' | '' (absent/unreadable/unparseable → treated as none).
-        Tolerant of an optional ``export`` prefix and CRLF, matching switch.sh's
-        loader."""
-        from pathlib import Path as _Path
+        """The model's thinking pin as switch.sh resolves it (the loader: the
+        shell, the club-3090 settings, then the repo .env): 'on' | 'off' | ''
+        (absent / unparseable → none; no repo root → none)."""
+        from . import settings_store as _ss
 
         key = self._thinking_pin_key()
         if not key.startswith("CLUB3090_THINKING_") or self._repo_root is None:
             return ""
-        try:
-            text = (_Path(self._repo_root) / ".env").read_text(
-                encoding="utf-8", errors="replace"
-            )
-        except OSError:
-            return ""
-        prefix = f"{key}="
-        for raw in text.splitlines():
-            line = raw.strip().rstrip("\r")
-            if line.startswith("export "):
-                line = line[len("export "):].strip()
-            if not line.startswith(prefix):
-                continue
-            val = line[len(prefix):].strip().strip('"').strip("'").lower()
-            return val if val in ("on", "off") else ""
-        return ""
+        val = (_ss.get(key, self._repo_root) or "").strip().lower()
+        return val if val in ("on", "off") else ""
 
     def action_persist_thinking(self) -> None:
         """[T] → persist the CURRENT thinking choice as the model's default
         (#1014 follow-up).  inherit offers nothing to persist (check_action
-        hides the key); on/off upsert the pin and refresh the card so the
+        hides the key); on/off store the pin and refresh the card so the
         persisted line reflects the new value.  A no-op when the repo root is
         unknown — never a silent fake success."""
         if not self._thinking_capable() or self._thinking not in ("on", "off"):
             return
-        if self._repo_env_set_key(self._thinking_pin_key(), self._thinking):
+        if self._save_thinking_pin(self._thinking_pin_key(), self._thinking):
             self._render_serve_card()
 
     def _thinking_env_pairs(self) -> list[str]:
@@ -3540,8 +3653,8 @@ class ConfirmActionScreen(ModalScreen):
         """The serve-card lines for the thinking knob — pure over modal state,
         so tests assert the rendered contract directly.  [] where the knob is
         not offered (profile-less slug / non-START mode) → no toggle rendered.
-        The trailing line surfaces the PERSISTED pin (#1014 follow-up) read
-        back from the repo .env when readable."""
+        The trailing line surfaces the PERSISTED pin (#1014 follow-up) as
+        switch.sh resolves it, and where it comes from."""
         if not self._thinking_capable():
             return []
         prof = self._thinking_profiles() or {}
@@ -3586,12 +3699,14 @@ class ConfirmActionScreen(ModalScreen):
         # later launches. inherit has nothing to save ([T] is gated off there).
         persisted = self._thinking_persisted()
         disp = persisted if persisted else "none"
+        src = self._thinking_persisted_source() if persisted else ""
+        where = f" from {src}" if src else ""
         suffix = (
             f" · \\[T] save '{self._thinking}' as default"
             if self._thinking != "inherit"
             else ""
         )
-        lines.append(f"  [dim]persisted default: {disp} ({self._thinking_pin_key()}){suffix}[/dim]")
+        lines.append(f"  [dim]persisted default: {disp} ({self._thinking_pin_key()}){where}{suffix}[/dim]")
         return lines
 
     # ── presentation predicates ───────────────────────────────────────────────────
@@ -6281,9 +6396,11 @@ class ShareBackReportScreen(_CopyableModal, ModalScreen):
 
 class SettingsScreen(ModalScreen):
     """Edit the download settings — the MODEL DIR (weights live under
-    ``<dir>/huggingface/``) and the HF TOKEN (gated/private repos).  Persisted to
-    ``c3-settings.json`` and applied LIVE (re-stats the catalog against the new
-    dir).  HF_HOME is auto-derived under the model dir — not a user field."""
+    ``<dir>/huggingface/``) and the HF TOKEN (gated/private repos).  Saved to the
+    club-3090 settings (MODEL_DIR → club3090.env, HF_TOKEN → secrets.env, 0600 —
+    #1466), which switch.sh and setup.sh read too, and applied LIVE (re-stats the
+    catalog against the new dir).  HF_HOME is auto-derived under the model dir —
+    not a user field."""
 
     DEFAULT_CSS = """
     SettingsScreen {
@@ -6335,11 +6452,17 @@ class SettingsScreen(ModalScreen):
         log_enabled: bool = False,
         log_path: str = "",
         log_env_override: bool = False,
+        model_dir_source: str = "",
+        hf_token_source: str = "",
         **kwargs,
     ):
         super().__init__(**kwargs)
         self._model_dir = model_dir or ""
         self._hf_token_set = hf_token_set
+        # Where each effective value comes from (shell / club3090.env /
+        # secrets.env / repo .env) — "" when unset or unknown.
+        self._model_dir_source = model_dir_source
+        self._hf_token_source = hf_token_source
         self._director_device = director_device if director_device in ("gpu0", "gpu1", "cpu") else "gpu0"
         self._log_enabled = log_enabled
         self._log_path = log_path
@@ -6355,10 +6478,14 @@ class SettingsScreen(ModalScreen):
                             classes="settings-field")
                 yield Input(value=self._model_dir, placeholder="/mnt/models/huggingface",
                             id="set-model-dir")
+                if self._model_dir_source:
+                    yield Label(self._source_note(self._model_dir_source, "club3090.env"))
                 tok_ph = ("hf_…  (leave blank to keep the current token)"
                           if self._hf_token_set else "hf_…  (for gated / private repos)")
                 yield Label("HuggingFace token", classes="settings-field")
                 yield Input(value="", password=True, placeholder=tok_ph, id="set-hf-token")
+                if self._hf_token_set and self._hf_token_source:
+                    yield Label(self._source_note(self._hf_token_source, "secrets.env"))
                 yield Label("Director placement  [dim](ai-studio prompt-crafter · :8090)[/dim]",
                             classes="settings-field")
                 yield Select(
@@ -6394,6 +6521,15 @@ class SettingsScreen(ModalScreen):
                 )
             yield Footer()
 
+    @staticmethod
+    def _source_note(source: str, saves_to: str) -> str:
+        """One dim line under a field: where its current value comes from, and —
+        when the shell sets it — that a saved value won't apply over it."""
+        if source == "shell":
+            return (f"[dim]from your shell, which wins over the saved value · "
+                    f"saving writes {saves_to}[/dim]")
+        return f"[dim]from {source} · saving writes {saves_to}[/dim]"
+
     def action_save(self) -> None:
         mdir = self.query_one("#set-model-dir", Input).value.strip()
         tok = self.query_one("#set-hf-token", Input).value.strip()
@@ -6409,6 +6545,366 @@ class SettingsScreen(ModalScreen):
 
     def action_cancel(self) -> None:
         self.app.pop_screen()
+
+
+class LaunchSettingsScreen(ModalScreen):
+    """[E] Launch settings for ONE slug (club-3090#1465, phase 3d).
+
+    The c3 twin of ``switch.sh --explain / --set / --unset``: every catalogued
+    launch knob the slug's compose reads, the value its NEXT launch uses and the
+    layer that value comes from, the values it allows, and what the next launch
+    would refuse. Rows come from the one resolver (scripts/lib/launch_settings.py,
+    via ``launch_settings_store``) — nothing here validates or writes a value.
+    Per the modal rule the screen only expresses intent: ⏎ hands a new value to
+    the app (``save_launch_setting``), x a removal (``remove_launch_setting``);
+    the app runs the resolver's own save / remove and pushes the fresh view back.
+    A refusal is shown in the resolver's words.
+
+    Writes are PER SLUG (slugs.json). The value for every slug stays a global
+    setting (``bash scripts/settings.sh set KEY=VALUE``), which this form shows
+    as a source but doesn't write.
+
+    A running container of the slug (found by its compose label) is compared,
+    knob by knob, with the next launch: ≠ where it was started with something
+    else. Knobs the compose only puts on the command line can't be read back
+    from the container and say so.
+    """
+
+    DEFAULT_CSS = """
+    LaunchSettingsScreen {
+        align: center middle;
+    }
+    LaunchSettingsScreen > Vertical {
+        width: 108;
+        max-width: 100%;
+        height: auto;
+        max-height: 100%;
+        border: thick $accent;
+        background: $surface;
+        padding: 0 1;
+    }
+    LaunchSettingsScreen .ls-title {
+        text-style: bold;
+        color: $accent;
+    }
+    LaunchSettingsScreen #ls-table {
+        height: auto;
+        max-height: 10;
+        margin-top: 1;
+    }
+    LaunchSettingsScreen #ls-scroll {
+        height: auto;
+        max-height: 14;
+    }
+    LaunchSettingsScreen #ls-input {
+        margin-top: 1;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Close", show=True),
+        Binding("x", "remove", "Remove this slug's value", show=True),
+        Binding("delete", "remove", "Remove", show=False),
+        Binding("r", "reload", "Reload", show=True),
+    ]
+
+    # The running-column glyphs: same / differs / can't be read / unknown.
+    _RUN_GLYPH = {"same": "=", "differs": "≠", "unchecked": "·", "unknown": "?"}
+
+    def __init__(self, slug: str, **kwargs):
+        super().__init__(**kwargs)
+        self._slug = slug
+        self._view = None                 # launch_settings_store.LaunchView
+        self._editing: str = ""           # the knob being edited ("" = none)
+        self._status: str = ""            # the last save / removal, in markup
+
+    # ── layout ──────────────────────────────────────────────────────────────
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Label(f"Launch settings · {self._slug}", classes="ls-title")
+            yield Static(
+                "[b]Changes apply on the next launch of this slug.[/b] A running "
+                "container keeps the settings it started with.",
+                id="ls-banner",
+            )
+            yield Static("Loading…", id="ls-running")
+            table: DataTable = DataTable(id="ls-table", zebra_stripes=True)
+            table.cursor_type = "row"
+            yield table
+            inp = Input(placeholder="", id="ls-input")
+            inp.display = False           # revealed only while editing a value
+            yield inp
+            # Refusals and the last save first: on a short terminal they are what
+            # must not scroll away; then the highlighted knob; then how it works.
+            with VerticalScroll(id="ls-scroll"):
+                yield Static("", id="ls-notes")
+                yield Static("", id="ls-detail")
+                yield Static("", id="ls-hints")
+            yield Footer()
+
+    def on_mount(self) -> None:
+        table = self.query_one("#ls-table", DataTable)
+        table.add_columns("setting", "next launch", "from", "running", "allowed")
+        self.app.load_launch_settings(self, self._slug)  # type: ignore[attr-defined]
+
+    # ── data in ─────────────────────────────────────────────────────────────
+
+    def set_view(self, view, status: str = "") -> None:
+        """The resolver's answer (a ``LaunchView``), plus an optional line about
+        the save / removal that produced it."""
+        self._view = view
+        if status:
+            self._status = status
+        keep = self._current_knob()
+        table = self.query_one("#ls-table", DataTable)
+        table.clear()
+        running = self._first_running()
+        for row in (view.knobs if view is not None and view.available else []):
+            name = Text(row.knob)
+            if row.errors:
+                name.append(" ✗", style="bold red")
+            table.add_row(
+                name,
+                Text(row.value),
+                Text(row.source),
+                self._running_cell(running, row.knob),
+                Text(row.allowed or "—"),
+                key=row.knob,
+            )
+        if keep and view is not None:
+            for i, row in enumerate(view.knobs):
+                if row.knob == keep:
+                    try:
+                        table.move_cursor(row=i)
+                    except Exception:
+                        pass
+        self.query_one("#ls-running", Static).update(self._running_text())
+        self._render_detail()
+        self._render_notes()
+        if not self._editing:
+            table.focus()
+
+    def show_status(self, status: str) -> None:
+        self._status = status
+        self._render_notes()
+
+    # ── pieces ──────────────────────────────────────────────────────────────
+
+    def _first_running(self):
+        v = self._view
+        if v is None or not getattr(v, "running", None):
+            return None
+        return v.running[0]
+
+    def _running_cell(self, running, knob: str) -> Text:
+        if running is None:
+            return Text("")
+        if running.error:
+            return Text("?", style="yellow")
+        r = running.knobs.get(knob)
+        if r is None:
+            return Text("")
+        glyph = self._RUN_GLYPH.get(r.status, "?")
+        if r.status == "unchecked":
+            return Text(f"{glyph} can't check", style="dim")
+        if r.status == "unknown":
+            return Text(f"{glyph} not in its env", style="yellow")
+        style = {"same": "green", "differs": "bold yellow", "unknown": "yellow"}.get(r.status, "")
+        return Text(f"{glyph} {r.shown}", style=style)
+
+    def _running_text(self) -> str:
+        from rich.markup import escape
+
+        v = self._view
+        if v is None:
+            return "Loading…"
+        if not v.available or not v.knobs:
+            return ""
+        if v.running_error:
+            return f"[yellow]{escape(v.running_error)}[/yellow]"
+        if not v.running:
+            return "[dim]Not running — nothing to compare.[/dim]"
+        lines = []
+        for rc in v.running:
+            when = f" (started {escape(rc.started_at[:19].replace('T', ' '))})" if rc.started_at else ""
+            head = f"Running: [b]{escape(rc.name)}[/b]{when}"
+            if rc.error:
+                lines.append(f"{head} — [yellow]{escape(rc.error)}[/yellow]")
+                continue
+            diff = rc.differing
+            unchecked = sorted(k for k, r in rc.knobs.items() if r.status == "unchecked")
+            unknown = sorted(k for k, r in rc.knobs.items() if r.status == "unknown")
+            if diff:
+                n = len(diff)
+                part = (f"[bold yellow]≠ {n} setting{'s' if n != 1 else ''} differ"
+                        f"{'s' if n == 1 else ''} from the next launch[/bold yellow] "
+                        f"({escape(', '.join(diff))}) — relaunch to apply")
+            else:
+                part = "[green]= started with the next launch's values[/green]"
+            if unchecked:
+                part += (f" · [dim]can't check {escape(', '.join(unchecked))} (passed on the "
+                         f"command line, not in the container's environment)[/dim]")
+            if unknown:
+                part += f" · [yellow]? {escape(', '.join(unknown))}[/yellow]"
+            lines.append(f"{head} — {part}")
+        if len(v.running) > 1:
+            lines.append("[dim]The running column shows the first container.[/dim]")
+        return "\n".join(lines)
+
+    def _current_knob(self) -> str:
+        v = self._view
+        if v is None or not v.available or not v.knobs:
+            return ""
+        try:
+            i = int(self.query_one("#ls-table", DataTable).cursor_row or 0)
+        except Exception:
+            i = 0
+        return v.knobs[max(0, min(i, len(v.knobs) - 1))].knob
+
+    def _current_row(self):
+        v = self._view
+        name = self._current_knob()
+        return v.knob(name) if (v is not None and name) else None
+
+    def _render_detail(self) -> None:
+        from rich.markup import escape
+
+        det = self.query_one("#ls-detail", Static)
+        row = self._current_row()
+        if row is None:
+            det.update("")
+            return
+        lines = [f"[b]{escape(row.knob)}[/b] — {escape(row.description)}"]
+        src = row.source + (f": {row.detail}" if row.detail else "")
+        over = "; ".join(f"{s}={val}" for s, val in row.overrides)
+        lines.append(f"  next launch  {escape(row.value)}  [dim]({escape(src)}"
+                     + (f"; overrides {escape(over)}" if over else "") + ")[/dim]")
+        lines.append(f"  allowed      {escape(row.allowed or 'not validated (no single catalogued domain)')}")
+        lines.append(f"  unset        {escape(row.unset_means)}")
+        saved = (f"{escape(row.saved)}  [dim](⏎ change · x remove)[/dim]" if row.saved is not None
+                 else "[dim]nothing — ⏎ to set a value for this slug[/dim]")
+        lines.append(f"  this slug    {saved}")
+        running = self._first_running()
+        r = running.knobs.get(row.knob) if (running is not None and not running.error) else None
+        if r is not None:
+            if r.status == "same":
+                lines.append(f"  running      [green]= started with {escape(r.shown)}[/green]")
+            elif r.status == "differs":
+                lines.append(f"  running      [bold yellow]≠ {escape(r.why)}[/bold yellow]")
+            else:
+                lines.append(f"  running      [dim]{escape(r.why)}[/dim]")
+        if row.source == "shell":
+            lines.append(f"  [yellow]⚠ your shell exports {escape(row.knob)}, which wins over saved values "
+                         "for launches from this c3 — a value saved here applies once it is unset there.[/yellow]")
+        for e in row.errors:
+            lines.append(f"  [red]✗ {escape(e)}[/red]")
+        det.update("\n".join(lines))
+
+    def _render_notes(self) -> None:
+        from rich.markup import escape
+
+        notes = self.query_one("#ls-notes", Static)
+        v = self._view
+        lines: list[str] = []
+        if self._status:
+            lines.append(self._status)
+        if v is None:
+            notes.update("\n".join(lines))
+            return
+        if not v.available:
+            lines.append(f"[red]Launch settings unavailable:[/red] {escape(v.reason)}")
+            notes.update("\n".join(lines))
+            return
+        if not v.knobs:
+            lines.append(
+                "This slug's compose reads none of the catalogued launch settings "
+                f"([dim]{escape(', '.join(v.catalogued))}[/dim]) — there is nothing to set for it."
+            )
+        refused = [e for k in v.knobs for e in k.errors]
+        other = v.general_errors
+        if refused or other:
+            lines.append("[red]✗ The next launch would be REFUSED (before the running slug is taken down):[/red]")
+            for e in list(dict.fromkeys(refused)) + other:
+                lines.append(f"  [red]- {escape(e)}[/red]")
+        if v.unread:
+            lines.append("Saved but not read by this slug (no effect here):")
+            for u in v.unread:
+                lines.append(f"  {escape(u.get('knob', ''))}={escape(u.get('value', ''))}  "
+                             f"[dim]({escape(u.get('source', ''))})[/dim]")
+        for w in v.warnings:
+            lines.append(f"[yellow]⚠ {escape(w)}[/yellow]")
+        notes.update("\n".join(lines))
+        self.query_one("#ls-hints", Static).update(
+            f"[dim]Precedence: {escape(' > '.join(v.order))}\n"
+            "⏎ saves a value for THIS slug (slugs.json). The value for every slug: "
+            "bash scripts/settings.sh set KEY=VALUE[/dim]" if v.order else "")
+
+    # ── events / actions ────────────────────────────────────────────────────
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        if event.data_table.id == "ls-table":
+            self._render_detail()
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        if event.data_table.id != "ls-table":
+            return
+        event.stop()
+        row = self._current_row()
+        if row is None:
+            return
+        self._editing = row.knob
+        inp = self.query_one("#ls-input", Input)
+        inp.placeholder = f"{row.knob} for {self._slug} — allowed: {row.allowed or 'any'}"
+        inp.value = row.saved or ""
+        inp.display = True
+        inp.focus()
+        self.show_status(f"[dim]New value for {row.knob} on this slug — ⏎ save · esc cancel[/dim]")
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id != "ls-input" or not self._editing:
+            return
+        event.stop()
+        knob = self._editing
+        val = event.value
+        if val == "":
+            self.show_status(f"[yellow]Empty value — to go back to the lower layers, press x on "
+                             f"{knob} to remove this slug's value.[/yellow]")
+            return
+        self._end_edit()
+        self.app.save_launch_setting(self, self._slug, {knob: val})  # type: ignore[attr-defined]
+
+    def _end_edit(self) -> None:
+        self._editing = ""
+        inp = self.query_one("#ls-input", Input)
+        inp.value = ""
+        inp.display = False
+        self.query_one("#ls-table", DataTable).focus()
+
+    def action_remove(self) -> None:
+        if self._editing:
+            return
+        row = self._current_row()
+        if row is None:
+            return
+        if row.saved is None:
+            self.show_status(f"[dim]Nothing is saved for {row.knob} on this slug — its value comes "
+                             f"from {row.source}.[/dim]")
+            return
+        self.app.remove_launch_setting(self, self._slug, [row.knob])  # type: ignore[attr-defined]
+
+    def action_reload(self) -> None:
+        if self._editing:
+            return
+        self.app.load_launch_settings(self, self._slug)  # type: ignore[attr-defined]
+
+    def action_cancel(self) -> None:
+        # esc leaves an edit first, then closes the form.
+        if self._editing:
+            self._end_edit()
+            self.show_status("")
+            return
+        self.dismiss(None)
 
 
 class LocalLayerScreen(ModalScreen):
@@ -9536,12 +10032,13 @@ _PALETTE_COMMANDS: tuple[tuple[str, str, str], ...] = (
     # Run & Operate · Catalog tab.
     ("primary_action", "Serve selected / primary action", "⏎ — serve the selected slug (reconcile-gated)"),
     ("explain", "Explain selected slug", "Catalog — detail + cross-rig benchmarks"),
+    ("launch_settings", "Launch settings…", "Catalog — see and change what the selected slug's next launch uses (\\[E])"),
     ("model_info", "Model info", "Catalog — metadata popup for the selected slug (\\[i])"),
     ("filter_catalog", "Filter catalog", "Catalog — filter by slug / engine / status"),
     ("toggle_catalog_model", "Model scope (Catalog)", "Catalog — narrow to one model (\\[\\] dropdown)"),
     ("catalog_columns", "Catalog columns…", "Catalog — show/hide + reorder columns (\\[|] · persisted)"),
-    ("toggle_catalog_deprecated", "Show/hide deprecated", "Catalog — reveal 🗑️ deprecated slugs (hidden by default)"),
-    ("toggle_catalog_downloaded", "Show only downloaded", "Catalog — narrow to slugs whose weights are already on disk"),
+    ("toggle_catalog_deprecated", "Show/hide deprecated", "Catalog — reveal 🗑️ deprecated, hardware-incompatible and needs-more-GPUs slugs (hidden by default)"),
+    ("toggle_catalog_downloaded", "Show only downloaded", "Catalog — narrow to slugs whose weights are already on disk (on by default; remembered)"),
     ("copy_endpoint", "Copy the serving API URL", "Run & Operate — copy http://<lan>:<port>/v1 for your agent/client (no auth by default)"),
     ("set_default", "Set default", "Catalog — pin the selected slug as model default"),
     ("clear_default", "Clear default", "Catalog — clear the model default pin"),
@@ -9748,6 +10245,9 @@ class CockpitApp(App):
         Binding("vertical_line", "catalog_columns", "Columns", show=False),
         Binding("u", "copy_endpoint", "API URL", show=False),
         Binding("e", "explain", "Explain", show=False),
+        # #1465 — [E] Launch settings for the selected slug: e explains a slug,
+        # E edits what its next launch uses (the switch.sh --set twin).
+        Binding("E", "launch_settings", "Launch settings", show=False),
         # [i] model-info popup (C6) — local-data metadata modal, sibling of Explain.
         Binding("i", "model_info", "Model info", show=False),
         # 2-mode merge: [1] = merged Run & Operate, [2] = Bring & Validate lane.
@@ -9779,7 +10279,7 @@ class CockpitApp(App):
         # space on screen.  `_relabel_binding` is still useful: it keeps the
         # command-palette/tooltip text truthful.
         Binding("enter", "primary_action", "Select", show=False),
-        # Catalog (Run) — default pin management (.env write, gated=no GPU).
+        # Catalog (Run) — default pin management (a settings write by switch.sh, gated=no GPU).
         Binding("d", "set_default", "Set default", show=False),
         Binding("D", "clear_default", "Clear default", show=False),
         # Operate · Containers — logs (read) + restart/stop (gated writes).
@@ -10048,13 +10548,14 @@ class CockpitApp(App):
     _CONTEXT_KEYS: dict[str, tuple[set[int], Optional[set[str]]]] = {
         # Merged mode 0 · Catalog tab
         "filter_catalog":   ({0}, {"tab-catalog"}),  # Catalog
-        "toggle_catalog_deprecated": ({0}, {"tab-catalog"}),  # Catalog — [h] hide/show deprecated
+        "toggle_catalog_deprecated": ({0}, {"tab-catalog"}),  # Catalog — [h] hide/show deprecated / incompatible / needs-more-GPUs
         "toggle_catalog_downloaded": ({0}, {"tab-catalog"}),  # Catalog — [w] downloaded-only (#963)
         # [u] copy the serving API URL — the endpoint is rig-global, so it's
         # live on EVERY merged-mode tab (F3; guards inside the action when
         # nothing is serving).
         "copy_endpoint":    ({0}, {"tab-catalog", "tab-orchestration", "tab-containers", "tab-doctor"}),
         "explain":          ({0}, {"tab-catalog"}),  # Catalog (guards inside action)
+        "launch_settings":  ({0}, {"tab-catalog"}),  # Catalog — [E] form (guards inside action)
         "model_info":       ({0}, {"tab-catalog"}),  # Catalog — [i] popup (guards inside action)
         "set_default":      ({0}, {"tab-catalog"}),  # Catalog
         "clear_default":    ({0}, {"tab-catalog"}),  # Catalog
@@ -10551,6 +11052,9 @@ class CockpitApp(App):
         self._session_log = None
         self._c3_log_enabled = False
         self._c3_log_env_override = False
+        # (severity, text) toasts queued before mount — e.g. the one-time move of
+        # c3-settings.json's model dir / HF token into the settings (#1466).
+        self._startup_notices: list[tuple[str, str]] = []
         self._active_mode = 0  # 0=Run & Operate (merged) · 1=Bring & Validate
         # Containers log-follow (\\[f]) — three states: off / following / paused.
         #   _log_follow_armed   True in BOTH following and paused
@@ -10773,7 +11277,14 @@ class CockpitApp(App):
         import time as _t
         self._note_activity()                              # fresh launch = user present
         self._docker_burst_until = _t.monotonic() + 15.0   # 15s startup burst → immediate + live
+        for severity, text in self._startup_notices:
+            self.notify(text, title="Settings", severity=severity, timeout=12)
+        self._startup_notices = []
         self.load_catalog()
+        # One fast, docker-free GPU read now (it otherwise waits for the first
+        # 3 s tick): the catalog hides slugs needing more GPUs than the rig has,
+        # and needs the count to do it.
+        self._refresh_gpu_bars()
         # A3: ONE periodic refresh interval, created once.  It is GATED at fire
         # time (_periodic_estate_refresh) to the MERGED Run & Operate mode
         # (_active_mode == 0 — the live estate tabs + host-stats rail + catalog
@@ -10965,6 +11476,10 @@ class CockpitApp(App):
             return
         if not gpus:
             return
+        # The GPU COUNT for the catalog's needs-more-GPUs filter — known here, on
+        # the first fast tick, long before the first estate poll (~20 s).
+        self._fast_gpu_count = len(gpus)
+        self._sync_catalog_gpu_count()
         try:
             self.query_one("#operate-orch-pane", OperateOrchPane).refresh_gpu_cards(gpus)
         except Exception:
@@ -11272,6 +11787,12 @@ class CockpitApp(App):
             dl_metas = self._data.download_set_metas(entry, _index)
         except Exception:
             dl_metas = [meta] if meta is not None else []
+        # Artifacts already on disk at the start stay out of the %, so a present core
+        # can't pin the bar at 98-99 % while its companions land (#1508).
+        try:
+            done_at_start = self._data.download_complete_at_start(dl_metas)
+        except Exception:
+            done_at_start = frozenset()
         # Progress loop: refresh ⏳NN% every ~2s until the run signals done.  Read
         # the CURRENT entry from the tracker each tick — a catalog refresh rebuilds
         # entries and _reapply_active_downloads re-points info['entry'] at the
@@ -11281,7 +11802,8 @@ class CockpitApp(App):
             if info is None:
                 return  # cancelled — cancel_download already reset + re-stat'd
             if dl_metas:
-                pct = self._data.weights_download_progress_set(dl_metas)
+                pct = self._data.weights_download_progress_set(
+                    dl_metas, complete_at_start=done_at_start)
                 if pct is not None:
                     info["pct"] = pct                        # slug-keyed → survives refresh
                     cur = info.get("entry", entry)
@@ -11353,13 +11875,28 @@ class CockpitApp(App):
         return out
 
     def _known_gpu_count(self) -> Optional[int]:
-        """Best-known live GPU count (from the last estate poll), or None when the
-        estate hasn't been polled yet (the dropdown default then degrades to the
-        first matching/`dual` template)."""
+        """Best-known live GPU count: the last estate poll's, else the fast
+        docker-free nvidia-smi read (_refresh_gpu_bars), else None. The fast read
+        matters: the first estate poll lands ~20 s after launch (docker + host
+        batch), and the catalog's needs-more-GPUs filter waited for it, so a 2-GPU
+        rig showed every multi4/multi8 slug for those 20 s (#1552 follow-up)."""
         st = self._last_estate_state
         if st is not None and getattr(st, "gpus", None):
             return len(st.gpus)
-        return None
+        n = getattr(self, "_fast_gpu_count", None)
+        return n if isinstance(n, int) and n > 0 else None
+
+    def _sync_catalog_gpu_count(self) -> None:
+        """Re-render the catalog when the known GPU count changes — its [h] bucket
+        hides slugs needing more GPUs than the rig has. Called from BOTH the fast
+        GPU read and the estate poll, so whichever learns the count first wins."""
+        n = self._known_gpu_count()
+        if n != getattr(self, "_catalog_gpu_count_seen", None):
+            self._catalog_gpu_count_seen = n
+            try:
+                self.query_one("#catalog-pane", CatalogPane).refresh_enriched()
+            except Exception:
+                pass
 
     def _refresh_profile_templates(self, *, reapply_default: bool = False) -> None:
         """#6/A12 — (re)derive the profile-template options from the loaded variants
@@ -11476,6 +12013,9 @@ class CockpitApp(App):
                 self._refresh_profile_templates(reapply_default=True)
             except Exception:
                 pass
+        # The catalog's [h] bucket hides slugs needing more GPUs than the rig has;
+        # re-render if this poll changed the count (refresh_enriched keeps the cursor).
+        self._sync_catalog_gpu_count()
         # Capture the live target for profile-triage / validation launches.
         self._target_slug = state.matched_slug or ""
         tgt = state.target
@@ -13223,15 +13763,21 @@ class CockpitApp(App):
 
     def action_settings(self) -> None:
         """[S] — open Settings (MODEL_DIR + HF_TOKEN + director placement)."""
-        import os as _os
+        hf_src = self._data.setting_source("HF_TOKEN") or ""
+        if hf_src == "shell" and getattr(self._data, "_hf_token_injected", False):
+            hf_src = self._data.saved_setting_source("HF_TOKEN")
         self.push_screen(
             SettingsScreen(
                 self._data.weights_model_dir(),
-                bool(_os.environ.get("HF_TOKEN")),
+                bool(self._data.hf_token()),
                 self._data.director_device(),
                 log_enabled=self._c3_log_enabled,
                 log_path=str(getattr(self._session_log, "path", "") or ""),
                 log_env_override=self._c3_log_env_override,
+                model_dir_source=(
+                    "" if getattr(self._data, "_model_dir", None)
+                    else self._data.setting_source("MODEL_DIR") or ""),
+                hf_token_source=hf_src,
             )
         )
 
@@ -13243,43 +13789,86 @@ class CockpitApp(App):
         director_device: str = "gpu0",
         log_enabled: Optional[bool] = None,
     ) -> None:
-        """Persist + apply Settings.  MODEL_DIR / HF_TOKEN persist to c3-settings.json;
-        the director placement persists to the repo .env (STUDIO_DIRECTOR_DEVICE — what
-        gpu-mode reads, applied on the next ai-studio start).  Empty text fields are
-        no-ops; a model-dir change re-stats the catalog."""
+        """Persist + apply Settings (club-3090#1466).  MODEL_DIR and the director
+        placement (STUDIO_DIRECTOR_DEVICE — applied on the next ai-studio start)
+        are stored in club3090.env and the HF token in secrets.env (0600), through
+        the one writer: the settings switch.sh, setup.sh and gpu-mode read, so c3
+        and the scripts can't disagree about where the weights are.  The master
+        logging switch is c3's own and stays in c3-settings.json.
+
+        Empty text fields are no-ops.  A value the writer refuses (one bash,
+        docker compose and systemd would read differently) is reported — by key
+        and reason, never the value — and not saved.  A value the shell also
+        sets is saved, and c3 says the shell wins (as it does for every script).
+        A model-dir change re-stats the catalog."""
         import os as _os
+
+        from rich.markup import escape
+
         from .__main__ import load_settings, save_settings
-        s = load_settings()
-        json_changed = False
-        if model_dir and model_dir != self._data.weights_model_dir():
-            self._data._model_dir = model_dir
-            s["model_dir"] = model_dir
-            json_changed = True
+        from .settings_store import SettingsError
+
+        data = self._data
+        saved: list[str] = []
+        errors: list[str] = []
+        shell_wins: list[str] = []
+
+        def _store(label: str, values: dict, *, secret: bool = False) -> bool:
+            try:
+                data.store_settings(values, secret=secret)
+            except SettingsError as e:
+                errors.append(f"{label}: {escape(str(e))}")
+                return False
+            return True
+
+        dir_saved = False
+        if model_dir and model_dir != data.weights_model_dir():
+            if _store("model dir", {"MODEL_DIR": model_dir}):
+                saved.append("model dir")
+                dir_saved = True
+                # The settings decide from here on (an explicit override would
+                # keep showing the old dir — e.g. a pre-#1466 fallback).
+                data._model_dir = None
+                if data.setting_source("MODEL_DIR") == "shell":
+                    shell_wins.append("MODEL_DIR")
         if hf_token:
-            _os.environ["HF_TOKEN"] = hf_token
-            s["hf_token"] = hf_token
-            json_changed = True
+            if _store("HF token", {"HF_TOKEN": hf_token}, secret=True):
+                saved.append("HF token")
+                if _os.environ.get("HF_TOKEN") and not getattr(data, "_hf_token_injected", False):
+                    shell_wins.append("HF_TOKEN")
+                else:
+                    # c3's own children (downloads, HF search) inherit it now.
+                    _os.environ["HF_TOKEN"] = hf_token
+                    data._hf_token_injected = True
+        if director_device and director_device != data.director_device():
+            if _store("director placement", {"STUDIO_DIRECTOR_DEVICE": director_device}):
+                saved.append(f"director → {director_device} (next ai-studio start)")
+                if data.setting_source("STUDIO_DIRECTOR_DEVICE") == "shell":
+                    shell_wins.append("STUDIO_DIRECTOR_DEVICE")
+        s = load_settings()
         if (
             log_enabled is not None
             and not self._c3_log_env_override
             and log_enabled != s.get("logging_enabled")
         ):
             s["logging_enabled"] = bool(log_enabled)
-            json_changed = True
-        if json_changed:
             save_settings(s)
-        env_changed = False
-        if director_device and director_device != self._data.director_device():
-            env_changed = self._data.set_repo_env_var("STUDIO_DIRECTOR_DEVICE", director_device)
-        if json_changed or env_changed:
-            msg = (f"Saved · director → {director_device} (next ai-studio start)."
-                   if env_changed else "Settings saved.")
-            self.notify(msg, title="Settings", timeout=4)
-        else:
+            saved.append("logging")
+        if errors:
+            self.notify("Not saved — " + " · ".join(errors), title="Settings",
+                        severity="error", timeout=12)
+        if saved:
+            msg = "Saved: " + ", ".join(saved) + "."
+            if shell_wins:
+                msg += (f" {', '.join(shell_wins)} is also set in your shell, which wins "
+                        "for this session and for launches from it.")
+            self.notify(msg, title="Settings", severity="warning" if shell_wins else "information",
+                        timeout=8 if shell_wins else 4)
+        elif not errors:
             self.notify("No changes.", title="Settings", timeout=2)
         if log_enabled is not None and not self._c3_log_env_override:
             self.configure_session_logging(log_enabled)
-        if model_dir:
+        if dir_saved:
             self.load_catalog()   # re-stat weights against the (possibly new) dir
 
     def configure_session_logging(self, enabled: bool) -> None:
@@ -13483,7 +14072,7 @@ class CockpitApp(App):
                 pass
 
     def action_toggle_catalog_deprecated(self) -> None:
-        """[h] show/hide 🗑️ deprecated slugs (merged mode 0 · Catalog tab)."""
+        """[h] show/hide deprecated, incompatible-hw and needs-more-GPUs slugs (merged mode 0 · Catalog tab)."""
         if self._active_mode == 0 and self._current_subtab() == "tab-catalog":
             try:
                 self.query_one("#catalog-pane", CatalogPane).toggle_deprecated()
@@ -13634,6 +14223,90 @@ class CockpitApp(App):
                 status=entry.status,
             )
         )
+
+    def action_launch_settings(self) -> None:
+        """[E] — the Launch settings form for the selected catalog slug (merged
+        mode 0 · Catalog tab): what its next launch uses and where each value
+        comes from, per-slug edits, and a running container's drift."""
+        if self._active_mode != 0 or self._current_subtab() != "tab-catalog":
+            return
+        try:
+            entry = self.query_one("#catalog-pane", CatalogPane).selected_entry()
+        except Exception:
+            entry = None
+        if entry is None:
+            self.notify(
+                "No slug selected.", title="Launch settings", severity="warning", timeout=3
+            )
+            return
+        self.push_screen(LaunchSettingsScreen(entry.slug))
+
+    @work(group="launch-settings")
+    async def load_launch_settings(self, screen: "LaunchSettingsScreen", slug: str,
+                                   status: str = "") -> None:
+        """Resolve the slug's launch settings (+ the running container) and hand
+        them to the form. A resolver that can't run at all shows as unavailable."""
+        from . import launch_settings_store as _ls
+
+        try:
+            view = await self._data.launch_settings(slug)
+        except Exception as exc:          # never take the app down over a read
+            view = _ls.LaunchView(slug=slug, available=False,
+                                  reason=f"{type(exc).__name__}: {exc}")
+        try:
+            screen.set_view(view, status)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _launch_change_status(ch, verb: str) -> str:
+        """One markup block for a save / removal: the resolver's own words."""
+        from rich.markup import escape
+
+        if ch.problems:
+            what = "Not saved" if verb == "saved" else "Nothing removed"
+            lines = [f"[red]✗ {what} for {escape(ch.slug)}:[/red]"]
+            lines += [f"  [red]- {escape(p)}[/red]" for p in ch.problems]
+        elif ch.changed:
+            lines = [f"[green]✓ {verb.capitalize()} {escape(', '.join(ch.changed))} for "
+                     f"{escape(ch.slug)}[/green] [dim]({escape(ch.path)})[/dim] — applies from the "
+                     "next launch; a running container keeps the settings it started with."]
+        else:
+            lines = []
+        lines += [f"[dim]{escape(n)}[/dim]" for n in ch.notes]
+        lines += [f"[yellow]⚠ {escape(w)}[/yellow]" for w in ch.warnings]
+        return "\n".join(lines)
+
+    @work(group="launch-settings-write")
+    async def save_launch_setting(self, screen: "LaunchSettingsScreen", slug: str,
+                                  values: dict) -> None:
+        """Save per-slug values through the resolver (``switch.sh --set``); a
+        refusal comes back in its words and nothing is written."""
+        from rich.markup import escape
+
+        from . import launch_settings_store as _ls
+
+        try:
+            ch = await self._data.save_launch_settings(slug, values)
+        except _ls.LaunchSettingsError as exc:
+            screen.show_status(f"[red]✗ Not saved: {escape(str(exc))}[/red]")
+            return
+        self.load_launch_settings(screen, slug, self._launch_change_status(ch, "saved"))
+
+    @work(group="launch-settings-write")
+    async def remove_launch_setting(self, screen: "LaunchSettingsScreen", slug: str,
+                                    keys: list) -> None:
+        """Remove this slug's own values (``switch.sh --unset``)."""
+        from rich.markup import escape
+
+        from . import launch_settings_store as _ls
+
+        try:
+            ch = await self._data.remove_launch_settings(slug, list(keys))
+        except _ls.LaunchSettingsError as exc:
+            screen.show_status(f"[red]✗ Nothing removed: {escape(str(exc))}[/red]")
+            return
+        self.load_launch_settings(screen, slug, self._launch_change_status(ch, "removed"))
 
     def action_model_info(self) -> None:
         """[i] — the local-data model-info popup for the selected catalog row
@@ -14106,7 +14779,7 @@ class CockpitApp(App):
     def action_set_default(self) -> None:
         """[d] in Run · Catalog: pin the selected slug as its model default.
 
-        A ``.env`` write — no GPU contention — but still routed through the same
+        A settings write (switch.sh) — no GPU contention — but still routed through the same
         ConfirmActionScreen → dispatch_action → execute_action gate so every
         write has one path.  The plan's ``requires_reconcile=False`` makes the
         gate report clear immediately."""
@@ -14123,7 +14796,7 @@ class CockpitApp(App):
 
     def action_clear_default(self) -> None:
         """[D] on the merged mode's Catalog tab: clear the model default pin for
-        the selected slug's model (gated path, .env write)."""
+        the selected slug's model (gated path, a settings write by switch.sh)."""
         if self._active_mode != 0 or self._current_subtab() != "tab-catalog":
             return
         entry = self._selected_catalog_entry()
